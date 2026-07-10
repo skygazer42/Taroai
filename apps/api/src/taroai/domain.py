@@ -36,11 +36,100 @@ class RunMode(str, Enum):
     AUTONOMOUS = "autonomous"
 
 
+class ChatThreadStatus(str, Enum):
+    ACTIVE = "active"
+    ARCHIVED = "archived"
+    DELETED = "deleted"
+
+
+class ChatMessageRole(str, Enum):
+    USER = "user"
+    ASSISTANT = "assistant"
+    SYSTEM = "system"
+    TOOL = "tool"
+
+
+class ChatMessageDispatchStatus(str, Enum):
+    READY = "ready"
+    QUEUED = "queued"
+    STEERING = "steering"
+    INFLIGHT = "inflight"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+
+
+class ChatMessageDeliveryStatus(str, Enum):
+    PENDING = "pending"
+    STREAMING = "streaming"
+    DELIVERED = "delivered"
+    FAILED = "failed"
+
+
 class ApprovalStatus(str, Enum):
     PENDING = "pending"
     APPROVED = "approved"
     REJECTED = "rejected"
     CANCELLED = "cancelled"
+
+
+class ResourceReference(BaseModel):
+    type: Literal["skill", "connector", "agent", "knowledge"]
+    id: str = Field(min_length=1)
+    version: str | None = None
+
+
+class ChatThreadCreate(BaseModel):
+    workspace_id: str = Field(min_length=1)
+    title: str = ""
+    provider_id: str | None = None
+    model_id: str | None = None
+    reasoning_effort: str | None = None
+    sandbox_session_id: str | None = None
+
+
+class ChatThread(BaseModel):
+    id: str
+    tenant_id: str
+    workspace_id: str
+    created_by_user_id: str
+    title: str
+    status: ChatThreadStatus
+    pinned: bool = False
+    provider_id: str | None = None
+    model_id: str | None = None
+    reasoning_effort: str | None = None
+    sandbox_session_id: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ChatMessageCreate(BaseModel):
+    role: ChatMessageRole = ChatMessageRole.USER
+    content: str = Field(min_length=1)
+    kind: str = "text"
+    dispatch_status: ChatMessageDispatchStatus = ChatMessageDispatchStatus.READY
+    delivery_status: ChatMessageDeliveryStatus = ChatMessageDeliveryStatus.PENDING
+    attachments: list[str] = Field(default_factory=list)
+    resource_refs: list[ResourceReference] = Field(default_factory=list)
+
+
+class ChatMessage(BaseModel):
+    id: str
+    tenant_id: str
+    workspace_id: str
+    thread_id: str
+    sequence: int = Field(ge=1)
+    created_by_user_id: str | None = None
+    role: ChatMessageRole
+    content: str
+    kind: str = "text"
+    dispatch_status: ChatMessageDispatchStatus
+    delivery_status: ChatMessageDeliveryStatus
+    attachments: list[str] = Field(default_factory=list)
+    resource_refs: list[ResourceReference] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
 
 
 class RunCreate(BaseModel):
@@ -49,6 +138,12 @@ class RunCreate(BaseModel):
     message: str = Field(min_length=1)
     attachments: list[str] = Field(default_factory=list)
     mode: RunMode = RunMode.CHAT
+    thread_id: str | None = None
+    trigger_message_id: str | None = None
+    provider_id: str | None = None
+    model_id: str | None = None
+    reasoning_effort: str | None = None
+    resource_refs: list[ResourceReference] = Field(default_factory=list)
 
 
 class Run(BaseModel):
@@ -63,6 +158,12 @@ class Run(BaseModel):
     status: RunStatus
     created_at: datetime
     updated_at: datetime
+    thread_id: str | None = None
+    trigger_message_id: str | None = None
+    provider_id: str | None = None
+    model_id: str | None = None
+    reasoning_effort: str | None = None
+    resource_refs: list[ResourceReference] = Field(default_factory=list)
 
 
 class RunEvent(BaseModel):
@@ -74,6 +175,8 @@ class RunEvent(BaseModel):
     type: str
     payload: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
+    thread_id: str | None = None
+    thread_sequence: int | None = Field(default=None, ge=1)
 
 
 class IdempotencyRecord(BaseModel):

@@ -352,3 +352,265 @@ def test_runtime_state_snapshot_is_tenant_scoped():
 
     with pytest.raises(TenantAccessError):
         store.get_runtime_state("tenant_other", run.id)
+
+
+def test_agent_loop_v2_domain_models_pin_thread_and_model_snapshot():
+    from taroai.domain import (
+        ChatMessage,
+        ChatMessageCreate,
+        ChatMessageDeliveryStatus,
+        ChatMessageDispatchStatus,
+        ChatMessageRole,
+        ChatThread,
+        ChatThreadCreate,
+        ChatThreadStatus,
+        ResourceReference,
+    )
+
+    resource_ref = ResourceReference(
+        type="skill",
+        id="skill_report_repair",
+        version="1.2.0",
+    )
+    thread_payload = ChatThreadCreate(
+        workspace_id="workspace_sales",
+        title="Repair the sales report",
+        provider_id="deepseek",
+        model_id="deepseek-chat",
+        reasoning_effort="medium",
+    )
+    now = utc_now()
+    thread = ChatThread(
+        id="thread_1",
+        tenant_id="tenant_acme",
+        created_by_user_id="user_1",
+        status=ChatThreadStatus.ACTIVE,
+        pinned=False,
+        created_at=now,
+        updated_at=now,
+        **thread_payload.model_dump(),
+    )
+    message_payload = ChatMessageCreate(
+        role=ChatMessageRole.USER,
+        content="Fix the failing report.",
+        dispatch_status=ChatMessageDispatchStatus.QUEUED,
+        delivery_status=ChatMessageDeliveryStatus.PENDING,
+        attachments=["file_123"],
+        resource_refs=[resource_ref],
+    )
+    message = ChatMessage(
+        id="message_1",
+        tenant_id=thread.tenant_id,
+        workspace_id=thread.workspace_id,
+        thread_id=thread.id,
+        sequence=1,
+        created_by_user_id="user_1",
+        created_at=now,
+        updated_at=now,
+        **message_payload.model_dump(),
+    )
+    run_payload = RunCreate(
+        workspace_id=thread.workspace_id,
+        thread_id=thread.id,
+        trigger_message_id=message.id,
+        provider_id=thread.provider_id,
+        model_id=thread.model_id,
+        reasoning_effort=thread.reasoning_effort,
+        resource_refs=message.resource_refs,
+        message=message.content,
+    )
+
+    store = InMemoryControlPlaneStore()
+    run = store.create_run("tenant_acme", "user_1", run_payload)
+
+    assert thread.status == ChatThreadStatus.ACTIVE
+    assert message.role == ChatMessageRole.USER
+    assert message.dispatch_status == ChatMessageDispatchStatus.QUEUED
+    assert message.delivery_status == ChatMessageDeliveryStatus.PENDING
+    assert run.thread_id == "thread_1"
+    assert run.trigger_message_id == "message_1"
+    assert run.provider_id == "deepseek"
+    assert run.model_id == "deepseek-chat"
+    assert run.reasoning_effort == "medium"
+    assert run.resource_refs == [resource_ref]
+
+    legacy_payload = RunCreate(
+        workspace_id="workspace_sales",
+        message="Legacy payload remains valid.",
+    )
+    assert legacy_payload.thread_id is None
+    assert legacy_payload.model_id is None
+    assert legacy_payload.resource_refs == []
+
+
+def test_agent_loop_v2_persistence_models_and_runtime_state_are_serializable():
+    from taroai.agent.models import (
+        AgentAction,
+        AgentCheckpoint,
+        AgentCycle,
+        AgentDecision,
+        AgentObservation,
+        AgentVerificationResult,
+    )
+    from taroai.store import RunStateSnapshot
+
+    now = utc_now()
+    observation = AgentObservation(
+        action_id="action_1",
+        success=False,
+        output={"exit_code": 1},
+        error="report generator failed",
+        failure_class="tool_error",
+        created_at=now,
+    )
+    decision = AgentDecision(
+        kind="action",
+        rationale_summary="Repair the failing report generator.",
+        tool_name="sandbox.command",
+        tool_input={"command": "python repair.py"},
+    )
+    verification = AgentVerificationResult(
+        outcome="repair",
+        feedback="The report is still missing its summary.",
+    )
+    cycle = AgentCycle(
+        id="cycle_1",
+        tenant_id="tenant_acme",
+        workspace_id="workspace_sales",
+        thread_id="thread_1",
+        run_id="run_1",
+        iteration=2,
+        plan_revision=3,
+        decision=decision,
+        verifier_result=verification,
+        budget_snapshot={"model_calls": 2},
+        started_at=now,
+    )
+    action = AgentAction(
+        id="action_1",
+        tenant_id="tenant_acme",
+        workspace_id="workspace_sales",
+        thread_id="thread_1",
+        run_id="run_1",
+        cycle_id=cycle.id,
+        action_key="run_1:cycle_1:action_1",
+        decision=decision,
+        status="failed",
+        observation=observation,
+        usage={"sandbox_seconds": 1.5},
+        started_at=now,
+        completed_at=now,
+    )
+    checkpoint = AgentCheckpoint(
+        id="checkpoint_1",
+        tenant_id="tenant_acme",
+        workspace_id="workspace_sales",
+        thread_id="thread_1",
+        run_id="run_1",
+        cycle_id=cycle.id,
+        sequence=4,
+        last_committed_action_id=action.id,
+        state_payload={"iteration": 2, "repair_attempts": 1},
+        checksum="sha256:checkpoint",
+        created_at=now,
+    )
+    state = AgentRuntimeState(
+        tenant_id="tenant_acme",
+        workspace_id="workspace_sales",
+        user_id="user_1",
+        run_id="run_1",
+        goal="Fix the failing report.",
+        status=RunStatus.RUNNING,
+        iteration=2,
+        max_iterations=8,
+        observations=[observation],
+        active_plan_revision=3,
+        pending_actions=[decision],
+        verifier_result=verification,
+        repair_attempts=1,
+        replan_count=2,
+        steering_messages=["Keep the executive summary concise."],
+        started_at=now,
+        deadline_at=now,
+        checkpoint_sequence=4,
+    )
+
+    snapshot = RunStateSnapshot.from_runtime_state(state)
+    restored_payload = snapshot.to_runtime_state_payload()
+
+    assert cycle.decision == decision
+    assert action.observation == observation
+    assert checkpoint.state_payload["repair_attempts"] == 1
+    assert state.iteration == 2
+    assert state.max_iterations == 8
+    assert state.observations == [observation]
+    assert state.active_plan_revision == 3
+    assert state.pending_actions == [decision]
+    assert state.verifier_result == verification
+    assert state.repair_attempts == 1
+    assert state.replan_count == 2
+    assert state.steering_messages == ["Keep the executive summary concise."]
+    assert state.checkpoint_sequence == 4
+    assert snapshot.state_payload["iteration"] == 2
+    assert snapshot.state_payload["observations"][0]["action_id"] == "action_1"
+    assert restored_payload["pending_actions"][0]["tool_name"] == "sandbox.command"
+
+
+def test_legacy_runtime_snapshot_without_state_payload_remains_readable():
+    from taroai.store import RunStateSnapshot
+
+    snapshot = RunStateSnapshot(
+        tenant_id="tenant_acme",
+        workspace_id="workspace_sales",
+        user_id="user_1",
+        run_id="run_legacy",
+        goal="Continue a legacy run.",
+        status=RunStatus.RUNNING,
+        updated_at=utc_now(),
+    )
+
+    payload = snapshot.to_runtime_state_payload()
+
+    assert payload["run_id"] == "run_legacy"
+    assert payload["goal"] == "Continue a legacy run."
+    assert "state_payload" not in payload
+
+
+def test_in_memory_chat_message_sequences_are_scoped_to_each_thread():
+    from taroai.domain import ChatMessageCreate, ChatThreadCreate
+
+    store = InMemoryControlPlaneStore()
+    first_thread = store.create_chat_thread(
+        "tenant_acme",
+        "user_1",
+        ChatThreadCreate(workspace_id="workspace_sales", title="First"),
+    )
+    second_thread = store.create_chat_thread(
+        "tenant_acme",
+        "user_1",
+        ChatThreadCreate(workspace_id="workspace_sales", title="Second"),
+    )
+
+    first_message = store.append_chat_message(
+        "tenant_acme",
+        first_thread.id,
+        "user_1",
+        ChatMessageCreate(content="First message"),
+    )
+    second_message = store.append_chat_message(
+        "tenant_acme",
+        first_thread.id,
+        "user_1",
+        ChatMessageCreate(content="Second message"),
+    )
+    other_thread_message = store.append_chat_message(
+        "tenant_acme",
+        second_thread.id,
+        "user_1",
+        ChatMessageCreate(content="Other thread message"),
+    )
+
+    assert [first_message.sequence, second_message.sequence] == [1, 2]
+    assert other_thread_message.sequence == 1
+    with pytest.raises(TenantAccessError):
+        store.list_chat_messages("tenant_other", first_thread.id)

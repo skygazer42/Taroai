@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import json
 from datetime import datetime
-from typing import Any
+from threading import RLock
+from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 from taroai.domain import (
     Artifact,
@@ -10,6 +13,12 @@ from taroai.domain import (
     ApprovalRequest,
     ApprovalStatus,
     BillingMeterEvent,
+    ChatMessage,
+    ChatMessageCreate,
+    ChatMessageDispatchStatus,
+    ChatThread,
+    ChatThreadCreate,
+    ChatThreadStatus,
     IdempotencyRecord,
     Run,
     RunCreate,
@@ -20,6 +29,15 @@ from taroai.domain import (
 )
 from taroai.errors import NotFoundError, RunTransitionError, TenantAccessError
 from taroai.licensing.models import LicenseValidationResult
+
+if TYPE_CHECKING:
+    from taroai.agent.models import (
+        AgentAction,
+        AgentCheckpoint,
+        AgentCycle,
+        AgentObservation,
+        AgentVerificationResult,
+    )
 
 
 TERMINAL_RUN_STATUSES = {
@@ -56,17 +74,25 @@ class RunStateSnapshot(BaseModel):
     browser_session_id: str | None = None
     approval_id: str | None = None
     failure_reason: str | None = None
+    state_payload: dict[str, Any] = Field(default_factory=dict)
     updated_at: datetime
 
     @classmethod
     def from_runtime_state(cls, state: Any) -> "RunStateSnapshot":
+        state_payload = state.model_dump(mode="json")
         return cls(
-            **state.model_dump(mode="json"),
+            **state_payload,
+            state_payload=state_payload,
             updated_at=utc_now(),
         )
 
     def to_runtime_state_payload(self) -> dict[str, Any]:
-        return self.model_dump(mode="json", exclude={"updated_at"})
+        if self.state_payload:
+            return dict(self.state_payload)
+        return self.model_dump(
+            mode="json",
+            exclude={"state_payload", "updated_at"},
+        )
 
 
 class InMemoryControlPlaneStore(BaseModel):
@@ -79,6 +105,12 @@ class InMemoryControlPlaneStore(BaseModel):
     runtime_states: dict[str, RunStateSnapshot] = Field(default_factory=dict)
     idempotency_records: dict[str, IdempotencyRecord] = Field(default_factory=dict)
     license_validations: dict[str, LicenseValidationResult] = Field(default_factory=dict)
+    chat_threads: dict[str, ChatThread] = Field(default_factory=dict)
+    chat_messages: dict[str, ChatMessage] = Field(default_factory=dict)
+    agent_cycles: dict[str, Any] = Field(default_factory=dict)
+    agent_actions: dict[str, Any] = Field(default_factory=dict)
+    agent_checkpoints: dict[str, list[Any]] = Field(default_factory=dict)
+    _repository_lock: RLock = PrivateAttr(default_factory=RLock)
 
     def create_run(self, tenant_id: str, user_id: str, payload: RunCreate) -> Run:
         now = utc_now()
@@ -94,6 +126,12 @@ class InMemoryControlPlaneStore(BaseModel):
             status=RunStatus.CREATED,
             created_at=now,
             updated_at=now,
+            thread_id=payload.thread_id,
+            trigger_message_id=payload.trigger_message_id,
+            provider_id=payload.provider_id,
+            model_id=payload.model_id,
+            reasoning_effort=payload.reasoning_effort,
+            resource_refs=payload.resource_refs,
         )
         self.runs[run.id] = run
         self._append_run_event(
@@ -115,6 +153,410 @@ class InMemoryControlPlaneStore(BaseModel):
             metadata={"mode": run.mode.value, "agent_id": run.agent_id},
         )
         return run
+
+    def create_chat_thread(
+        self,
+        tenant_id: str,
+        user_id: str,
+        payload: ChatThreadCreate,
+    ) -> ChatThread:
+        now = utc_now()
+        thread = ChatThread(
+            id=new_id("thread"),
+            tenant_id=tenant_id,
+            workspace_id=payload.workspace_id,
+            created_by_user_id=user_id,
+            title=payload.title,
+            status=ChatThreadStatus.ACTIVE,
+            pinned=False,
+            provider_id=payload.provider_id,
+            model_id=payload.model_id,
+            reasoning_effort=payload.reasoning_effort,
+            sandbox_session_id=payload.sandbox_session_id,
+            created_at=now,
+            updated_at=now,
+        )
+        with self._repository_lock:
+            self.chat_threads[thread.id] = thread.model_copy(deep=True)
+        return thread
+
+    def get_chat_thread(self, tenant_id: str, thread_id: str) -> ChatThread:
+        thread = self.chat_threads.get(thread_id)
+        if thread is None:
+            raise NotFoundError(f"Chat thread not found: {thread_id}")
+        if thread.tenant_id != tenant_id:
+            raise TenantAccessError(f"Chat thread {thread_id} is not in tenant {tenant_id}")
+        return thread.model_copy(deep=True)
+
+    def list_chat_threads(
+        self,
+        tenant_id: str,
+        workspace_id: str | None = None,
+    ) -> list[ChatThread]:
+        threads = [
+            thread.model_copy(deep=True)
+            for thread in self.chat_threads.values()
+            if thread.tenant_id == tenant_id
+            and (workspace_id is None or thread.workspace_id == workspace_id)
+        ]
+        return sorted(threads, key=lambda thread: (thread.updated_at, thread.id), reverse=True)
+
+    def update_chat_thread(
+        self,
+        tenant_id: str,
+        thread_id: str,
+        **changes: Any,
+    ) -> ChatThread:
+        allowed_fields = {
+            "title",
+            "status",
+            "pinned",
+            "provider_id",
+            "model_id",
+            "reasoning_effort",
+            "sandbox_session_id",
+        }
+        unknown_fields = set(changes) - allowed_fields
+        if unknown_fields:
+            raise ValueError(f"Unsupported chat thread fields: {sorted(unknown_fields)}")
+        with self._repository_lock:
+            thread = self.get_chat_thread(tenant_id, thread_id)
+            updated = ChatThread.model_validate(
+                {
+                    **thread.model_dump(),
+                    **changes,
+                    "updated_at": utc_now(),
+                }
+            )
+            self.chat_threads[thread_id] = updated.model_copy(deep=True)
+        return updated
+
+    def append_chat_message(
+        self,
+        tenant_id: str,
+        thread_id: str,
+        user_id: str | None,
+        payload: ChatMessageCreate,
+    ) -> ChatMessage:
+        with self._repository_lock:
+            thread = self.get_chat_thread(tenant_id, thread_id)
+            sequence = max(
+                (
+                    message.sequence
+                    for message in self.chat_messages.values()
+                    if message.thread_id == thread_id
+                ),
+                default=0,
+            ) + 1
+            now = utc_now()
+            message = ChatMessage(
+                id=new_id("message"),
+                tenant_id=tenant_id,
+                workspace_id=thread.workspace_id,
+                thread_id=thread_id,
+                sequence=sequence,
+                created_by_user_id=user_id,
+                role=payload.role,
+                content=payload.content,
+                kind=payload.kind,
+                dispatch_status=payload.dispatch_status,
+                delivery_status=payload.delivery_status,
+                attachments=payload.attachments,
+                resource_refs=payload.resource_refs,
+                created_at=now,
+                updated_at=now,
+            )
+            self.chat_messages[message.id] = message.model_copy(deep=True)
+        return message
+
+    def get_chat_message(self, tenant_id: str, message_id: str) -> ChatMessage:
+        message = self.chat_messages.get(message_id)
+        if message is None:
+            raise NotFoundError(f"Chat message not found: {message_id}")
+        if message.tenant_id != tenant_id:
+            raise TenantAccessError(f"Chat message {message_id} is not in tenant {tenant_id}")
+        return message.model_copy(deep=True)
+
+    def list_chat_messages(self, tenant_id: str, thread_id: str) -> list[ChatMessage]:
+        self.get_chat_thread(tenant_id, thread_id)
+        messages = [
+            message.model_copy(deep=True)
+            for message in self.chat_messages.values()
+            if message.tenant_id == tenant_id and message.thread_id == thread_id
+        ]
+        return sorted(messages, key=lambda message: (message.sequence, message.id))
+
+    def update_chat_message(
+        self,
+        tenant_id: str,
+        message_id: str,
+        **changes: Any,
+    ) -> ChatMessage:
+        allowed_fields = {"content", "dispatch_status", "delivery_status"}
+        unknown_fields = set(changes) - allowed_fields
+        if unknown_fields:
+            raise ValueError(f"Unsupported chat message fields: {sorted(unknown_fields)}")
+        with self._repository_lock:
+            message = self.get_chat_message(tenant_id, message_id)
+            updated = ChatMessage.model_validate(
+                {
+                    **message.model_dump(),
+                    **changes,
+                    "updated_at": utc_now(),
+                }
+            )
+            self.chat_messages[message_id] = updated.model_copy(deep=True)
+        return updated
+
+    def claim_next_queued_message(
+        self,
+        tenant_id: str,
+        thread_id: str,
+    ) -> ChatMessage | None:
+        with self._repository_lock:
+            candidates = [
+                message
+                for message in self.list_chat_messages(tenant_id, thread_id)
+                if message.dispatch_status
+                in {
+                    ChatMessageDispatchStatus.READY,
+                    ChatMessageDispatchStatus.QUEUED,
+                }
+            ]
+            if not candidates:
+                return None
+            return self.update_chat_message(
+                tenant_id,
+                candidates[0].id,
+                dispatch_status=ChatMessageDispatchStatus.INFLIGHT,
+            )
+
+    def list_pending_steering_messages(
+        self,
+        tenant_id: str,
+        thread_id: str,
+    ) -> list[ChatMessage]:
+        return [
+            message
+            for message in self.list_chat_messages(tenant_id, thread_id)
+            if message.dispatch_status == ChatMessageDispatchStatus.STEERING
+        ]
+
+    def mark_steering_applied(self, tenant_id: str, message_id: str) -> ChatMessage:
+        with self._repository_lock:
+            message = self.get_chat_message(tenant_id, message_id)
+            if message.dispatch_status != ChatMessageDispatchStatus.STEERING:
+                raise ValueError(f"Chat message {message_id} is not pending steering")
+            return self.update_chat_message(
+                tenant_id,
+                message_id,
+                dispatch_status=ChatMessageDispatchStatus.COMPLETED,
+            )
+
+    def create_agent_cycle(self, cycle: AgentCycle) -> AgentCycle:
+        run = self.get_run(cycle.tenant_id, cycle.run_id)
+        if run.workspace_id != cycle.workspace_id:
+            raise TenantAccessError(
+                f"Run {run.id} is not in workspace {cycle.workspace_id}"
+            )
+        if run.thread_id != cycle.thread_id:
+            raise ValueError(
+                f"Agent cycle {cycle.id} thread does not match run {run.id}"
+            )
+        with self._repository_lock:
+            if cycle.id in self.agent_cycles:
+                raise ValueError(f"Agent cycle already exists: {cycle.id}")
+            if any(
+                existing.run_id == cycle.run_id
+                and existing.iteration == cycle.iteration
+                for existing in self.agent_cycles.values()
+            ):
+                raise ValueError(
+                    f"Agent cycle iteration already exists: {cycle.run_id}:{cycle.iteration}"
+                )
+            self.agent_cycles[cycle.id] = cycle.model_copy(deep=True)
+        return cycle.model_copy(deep=True)
+
+    def complete_agent_cycle(
+        self,
+        tenant_id: str,
+        cycle_id: str,
+        *,
+        status: str,
+        verifier_result: AgentVerificationResult | None = None,
+    ) -> AgentCycle:
+        from taroai.agent.models import AgentCycle
+
+        if status not in {"completed", "failed", "waiting"}:
+            raise ValueError(f"Unsupported completed agent cycle status: {status}")
+        with self._repository_lock:
+            cycle = self._get_agent_cycle(tenant_id, cycle_id)
+            updated = AgentCycle.model_validate(
+                {
+                    **cycle.model_dump(),
+                    "status": status,
+                    "verifier_result": (
+                        verifier_result.model_dump() if verifier_result is not None else None
+                    ),
+                    "completed_at": utc_now() if status != "waiting" else None,
+                }
+            )
+            self.agent_cycles[cycle_id] = updated.model_copy(deep=True)
+        return updated
+
+    def create_agent_action(self, action: AgentAction) -> AgentAction:
+        cycle = self._get_agent_cycle(action.tenant_id, action.cycle_id)
+        if cycle.run_id != action.run_id or cycle.workspace_id != action.workspace_id:
+            raise TenantAccessError(f"Agent action {action.id} does not match its cycle")
+        if cycle.thread_id != action.thread_id:
+            raise ValueError(
+                f"Agent action {action.id} thread does not match cycle {cycle.id}"
+            )
+        with self._repository_lock:
+            if action.id in self.agent_actions:
+                raise ValueError(f"Agent action already exists: {action.id}")
+            if any(
+                existing.run_id == action.run_id
+                and existing.action_key == action.action_key
+                for existing in self.agent_actions.values()
+            ):
+                raise ValueError(
+                    f"Duplicate action_key for run {action.run_id}: {action.action_key}"
+                )
+            self.agent_actions[action.id] = action.model_copy(deep=True)
+        return action.model_copy(deep=True)
+
+    def get_agent_action(self, tenant_id: str, action_id: str) -> AgentAction:
+        action = self.agent_actions.get(action_id)
+        if action is None:
+            raise NotFoundError(f"Agent action not found: {action_id}")
+        if action.tenant_id != tenant_id:
+            raise TenantAccessError(f"Agent action {action_id} is not in tenant {tenant_id}")
+        return action.model_copy(deep=True)
+
+    def commit_agent_action_observation(
+        self,
+        tenant_id: str,
+        action_id: str,
+        observation: AgentObservation,
+        *,
+        usage: dict[str, Any],
+        state_payload: dict[str, Any],
+        checksum: str,
+        sandbox_checkpoint_ref: str | None = None,
+    ) -> tuple[AgentAction, AgentCheckpoint]:
+        from taroai.agent.models import AgentAction, AgentCheckpoint
+
+        json.dumps(
+            {
+                "observation": observation.model_dump(mode="json"),
+                "usage": usage,
+                "state_payload": state_payload,
+            }
+        )
+        with self._repository_lock:
+            action = self.get_agent_action(tenant_id, action_id)
+            if observation.action_id != action.id:
+                raise ValueError("Observation action_id does not match the committed action")
+            if action.status not in {"pending", "running", "uncertain"}:
+                raise ValueError(
+                    f"Agent action {action_id} observation is already committed"
+                )
+            checkpoint_sequence = self._next_checkpoint_sequence(action.run_id)
+            completed_at = utc_now()
+            updated_action = AgentAction.model_validate(
+                {
+                    **action.model_dump(),
+                    "status": "succeeded" if observation.success else "failed",
+                    "observation": observation.model_dump(),
+                    "usage": usage,
+                    "completed_at": completed_at,
+                }
+            )
+            checkpoint = AgentCheckpoint(
+                id=new_id("checkpoint"),
+                tenant_id=action.tenant_id,
+                workspace_id=action.workspace_id,
+                thread_id=action.thread_id,
+                run_id=action.run_id,
+                cycle_id=action.cycle_id,
+                sequence=checkpoint_sequence,
+                last_committed_action_id=action.id,
+                state_payload=state_payload,
+                sandbox_checkpoint_ref=sandbox_checkpoint_ref,
+                checksum=checksum,
+                created_at=completed_at,
+            )
+            self.agent_actions[action_id] = updated_action.model_copy(deep=True)
+            self.agent_checkpoints.setdefault(action.run_id, []).append(
+                checkpoint.model_copy(deep=True)
+            )
+        return updated_action, checkpoint
+
+    def create_agent_checkpoint(self, checkpoint: AgentCheckpoint) -> AgentCheckpoint:
+        run = self.get_run(checkpoint.tenant_id, checkpoint.run_id)
+        if run.workspace_id != checkpoint.workspace_id:
+            raise TenantAccessError(
+                f"Run {run.id} is not in workspace {checkpoint.workspace_id}"
+            )
+        if run.thread_id != checkpoint.thread_id:
+            raise ValueError(
+                f"Agent checkpoint {checkpoint.id} thread does not match run {run.id}"
+            )
+        if checkpoint.cycle_id is not None:
+            cycle = self._get_agent_cycle(checkpoint.tenant_id, checkpoint.cycle_id)
+            if cycle.run_id != checkpoint.run_id:
+                raise ValueError(
+                    f"Agent checkpoint {checkpoint.id} cycle does not match its run"
+                )
+        if checkpoint.last_committed_action_id is not None:
+            action = self.get_agent_action(
+                checkpoint.tenant_id,
+                checkpoint.last_committed_action_id,
+            )
+            if action.run_id != checkpoint.run_id:
+                raise ValueError(
+                    f"Agent checkpoint {checkpoint.id} action does not match its run"
+                )
+        json.dumps(checkpoint.model_dump(mode="json"))
+        with self._repository_lock:
+            expected_sequence = self._next_checkpoint_sequence(checkpoint.run_id)
+            if checkpoint.sequence != expected_sequence:
+                raise ValueError(
+                    "Agent checkpoint sequence must be the next checkpoint sequence "
+                    f"({expected_sequence}), got {checkpoint.sequence}"
+                )
+            stored = checkpoint.model_copy(deep=True)
+            self.agent_checkpoints.setdefault(checkpoint.run_id, []).append(stored)
+        return checkpoint.model_copy(deep=True)
+
+    def get_latest_agent_checkpoint(
+        self,
+        tenant_id: str,
+        run_id: str,
+    ) -> AgentCheckpoint | None:
+        self.get_run(tenant_id, run_id)
+        checkpoints = self.agent_checkpoints.get(run_id, [])
+        if not checkpoints:
+            return None
+        return max(checkpoints, key=lambda item: item.sequence).model_copy(deep=True)
+
+    def _get_agent_cycle(self, tenant_id: str, cycle_id: str) -> AgentCycle:
+        cycle = self.agent_cycles.get(cycle_id)
+        if cycle is None:
+            raise NotFoundError(f"Agent cycle not found: {cycle_id}")
+        if cycle.tenant_id != tenant_id:
+            raise TenantAccessError(f"Agent cycle {cycle_id} is not in tenant {tenant_id}")
+        return cycle.model_copy(deep=True)
+
+    def _next_checkpoint_sequence(self, run_id: str) -> int:
+        return max(
+            (
+                checkpoint.sequence
+                for checkpoint in self.agent_checkpoints.get(run_id, [])
+            ),
+            default=0,
+        ) + 1
 
     def get_run(self, tenant_id: str, run_id: str) -> Run:
         run = self.runs.get(run_id)
@@ -534,18 +976,33 @@ class InMemoryControlPlaneStore(BaseModel):
         )
 
     def _append_run_event(self, run: Run, event_type: str, payload: dict) -> RunEvent:
-        sequence = len(self.run_events.get(run.id, [])) + 1
-        event = RunEvent(
-            id=new_id("event"),
-            sequence=sequence,
-            tenant_id=run.tenant_id,
-            workspace_id=run.workspace_id,
-            run_id=run.id,
-            type=event_type,
-            payload=payload,
-            created_at=utc_now(),
-        )
-        self.run_events.setdefault(run.id, []).append(event)
+        with self._repository_lock:
+            sequence = len(self.run_events.get(run.id, [])) + 1
+            thread_sequence: int | None = None
+            if run.thread_id is not None:
+                thread_sequence = max(
+                    (
+                        event.thread_sequence or 0
+                        for events in self.run_events.values()
+                        for event in events
+                        if event.tenant_id == run.tenant_id
+                        and event.thread_id == run.thread_id
+                    ),
+                    default=0,
+                ) + 1
+            event = RunEvent(
+                id=new_id("event"),
+                sequence=sequence,
+                tenant_id=run.tenant_id,
+                workspace_id=run.workspace_id,
+                run_id=run.id,
+                type=event_type,
+                payload=payload,
+                created_at=utc_now(),
+                thread_id=run.thread_id,
+                thread_sequence=thread_sequence,
+            )
+            self.run_events.setdefault(run.id, []).append(event)
         return event
 
     def _idempotency_record_key(

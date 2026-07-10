@@ -1,6 +1,7 @@
 from pathlib import Path
 from datetime import datetime, timezone
 import os
+import sqlite3
 import subprocess
 import sys
 
@@ -64,6 +65,7 @@ def test_migration_runner_applies_pending_schema_and_records_versions(tmp_path: 
         "030_customer_feedback_records.sql",
         "031_solution_pack_publication_draft_application.sql",
         "032_solution_pack_publication_draft_multi_manifest.sql",
+        "033_chat_threads_agent_loop_v2.sql",
     ]
     runner = MigrationRunner(
         config=DatabaseConfig(url=f"sqlite:///{database_path}"),
@@ -86,6 +88,12 @@ def test_migration_runner_applies_pending_schema_and_records_versions(tmp_path: 
                 "SELECT version FROM schema_migrations ORDER BY version"
             ).fetchall()
         ]
+        runtime_state_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(runtime_states)"
+            ).fetchall()
+        }
 
     assert "runs" in tables
     assert "runtime_states" in tables
@@ -105,7 +113,90 @@ def test_migration_runner_applies_pending_schema_and_records_versions(tmp_path: 
     assert "billing_pricing_rules" in tables
     assert "billing_invoices" in tables
     assert "share_grants" in tables
+    assert {
+        "chat_threads",
+        "chat_messages",
+        "agent_cycles",
+        "agent_actions",
+        "agent_checkpoints",
+    } <= tables
+    assert "state_payload" in runtime_state_columns
     assert versions == expected_versions
+
+
+def test_chat_loop_migration_adds_state_payload_to_existing_runtime_states(
+    tmp_path: Path,
+):
+    database_path = tmp_path / "runtime-state-upgrade.sqlite3"
+    migrations_path = Path("apps/api/migrations")
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE schema_migrations (
+                version TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        for migration in sorted(
+            path.name
+            for path in migrations_path.glob("*.sql")
+            if path.name < "033_chat_threads_agent_loop_v2.sql"
+        ):
+            connection.execute(
+                "INSERT INTO schema_migrations (version) VALUES (?)",
+                (migration,),
+            )
+        connection.execute(
+            """
+            CREATE TABLE runtime_states (
+                run_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                goal TEXT NOT NULL,
+                status TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO runtime_states (
+                run_id, tenant_id, workspace_id, user_id, goal, status
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "run_legacy",
+                "tenant_acme",
+                "workspace_sales",
+                "user_1",
+                "Continue the legacy run.",
+                "running",
+            ),
+        )
+
+    result = MigrationRunner(
+        config=DatabaseConfig(url=f"sqlite:///{database_path}"),
+        migrations_path=migrations_path,
+    ).apply()
+
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(runtime_states)"
+            ).fetchall()
+        }
+        state_payload = connection.execute(
+            "SELECT state_payload FROM runtime_states WHERE run_id = ?",
+            ("run_legacy",),
+        ).fetchone()[0]
+
+    assert result.applied_versions == ["033_chat_threads_agent_loop_v2.sql"]
+    assert "state_payload" in columns
+    assert state_payload == "{}"
 
 
 def test_migration_runner_plans_pending_and_unknown_versions(tmp_path: Path):
@@ -343,8 +434,24 @@ def test_sql_repository_persists_run_events_and_runtime_state_across_instances(
         pending_guardrail_approval_stage="model_request",
         sandbox_session_id="sandbox_session_1",
         browser_session_id="browser_session_1",
+        iteration=3,
+        max_iterations=9,
+        active_plan_revision=2,
+        repair_attempts=1,
+        replan_count=1,
+        steering_messages=["Keep the report concise."],
+        checkpoint_sequence=4,
     )
     repository.save_runtime_state(runtime_state)
+    repository.save_runtime_state(
+        runtime_state.model_copy(
+            update={
+                "iteration": 4,
+                "steering_messages": ["Add an executive summary."],
+                "checkpoint_sequence": 5,
+            }
+        )
+    )
 
     restarted = SqlControlPlaneRepository(config=DatabaseConfig(url=database_url))
     persisted_run = restarted.get_run("tenant_acme", run.id)
@@ -371,9 +478,62 @@ def test_sql_repository_persists_run_events_and_runtime_state_across_instances(
     assert snapshot.pending_guardrail_approval_stage == "model_request"
     assert snapshot.sandbox_session_id == "sandbox_session_1"
     assert snapshot.browser_session_id == "browser_session_1"
+    assert snapshot.state_payload["iteration"] == 4
+    assert snapshot.state_payload["steering_messages"] == [
+        "Add an executive summary."
+    ]
+    restored_payload = snapshot.to_runtime_state_payload()
+    assert restored_payload["max_iterations"] == 9
+    assert restored_payload["active_plan_revision"] == 2
+    assert restored_payload["repair_attempts"] == 1
+    assert restored_payload["replan_count"] == 1
+    assert restored_payload["checkpoint_sequence"] == 5
 
     with pytest.raises(NotFoundError):
         restarted.get_run("tenant_other", run.id)
+
+
+def test_sql_repository_falls_back_to_legacy_projection_for_empty_state_payload(
+    tmp_path: Path,
+):
+    database_url = f"sqlite:///{tmp_path / 'legacy-runtime-state.sqlite3'}"
+    repository = SqlControlPlaneRepository(config=DatabaseConfig(url=database_url))
+    repository.initialize_schema(Path("apps/api/migrations"))
+    run = repository.create_run(
+        tenant_id="tenant_acme",
+        user_id="user_1",
+        payload=RunCreate(
+            workspace_id="workspace_sales",
+            message="Continue a legacy run.",
+        ),
+    )
+    repository.save_runtime_state(
+        AgentRuntimeState(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_sales",
+            user_id="user_1",
+            run_id=run.id,
+            goal=run.message,
+            status=RunStatus.RUNNING,
+            current_step_id="step_legacy",
+            completed_step_ids=["step_previous"],
+        )
+    )
+    with repository._connect() as connection:
+        connection.execute(
+            "UPDATE runtime_states SET state_payload = ? WHERE run_id = ?",
+            ("{}", run.id),
+        )
+
+    restarted = SqlControlPlaneRepository(config=DatabaseConfig(url=database_url))
+    snapshot = restarted.get_runtime_state("tenant_acme", run.id)
+    restored_payload = snapshot.to_runtime_state_payload()
+
+    assert snapshot.state_payload == {}
+    assert restored_payload["goal"] == "Continue a legacy run."
+    assert restored_payload["current_step_id"] == "step_legacy"
+    assert restored_payload["completed_step_ids"] == ["step_previous"]
+    assert "state_payload" not in restored_payload
 
 
 def test_sql_repository_hydrates_postgresql_native_json_and_datetime_values():

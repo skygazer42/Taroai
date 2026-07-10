@@ -35,6 +35,11 @@ def test_postgresql_rls_verification_tracks_core_tenant_scoped_tables():
     assert "model_provider_change_requests" in TENANT_SCOPED_RLS_TABLES
     assert "model_provider_rate_limit_samples" in TENANT_SCOPED_RLS_TABLES
     assert "model_policy_change_requests" in TENANT_SCOPED_RLS_TABLES
+    assert "chat_threads" in TENANT_SCOPED_RLS_TABLES
+    assert "chat_messages" in TENANT_SCOPED_RLS_TABLES
+    assert "agent_cycles" in TENANT_SCOPED_RLS_TABLES
+    assert "agent_actions" in TENANT_SCOPED_RLS_TABLES
+    assert "agent_checkpoints" in TENANT_SCOPED_RLS_TABLES
     assert "tenants" not in TENANT_SCOPED_RLS_TABLES
 
 

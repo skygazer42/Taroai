@@ -1353,3 +1353,72 @@ def test_migration_runner_ignores_duplicate_column_errors_from_postgresql():
         "ROLLBACK TO SAVEPOINT taroai_migration_statement",
         "RELEASE SAVEPOINT taroai_migration_statement",
     ]
+
+
+def test_chat_threads_agent_loop_v2_migration_is_additive_and_sqlite_compatible(
+    tmp_path: Path,
+):
+    migration = Path("apps/api/migrations/033_chat_threads_agent_loop_v2.sql")
+    sql = migration.read_text()
+
+    tenant_tables = [
+        "chat_threads",
+        "chat_messages",
+        "agent_cycles",
+        "agent_actions",
+        "agent_checkpoints",
+    ]
+    for table_name in tenant_tables:
+        assert f"CREATE TABLE IF NOT EXISTS {table_name}" in sql
+        assert f"ALTER TABLE {table_name} ENABLE ROW LEVEL SECURITY;" in sql
+        assert f"ALTER TABLE {table_name} FORCE ROW LEVEL SECURITY;" in sql
+        assert f"CREATE POLICY {table_name}_tenant_isolation" in sql
+
+    for column in [
+        "thread_id",
+        "trigger_message_id",
+        "provider_id",
+        "model_id",
+        "reasoning_effort",
+        "resource_refs",
+    ]:
+        assert f"ALTER TABLE runs ADD COLUMN {column}" in sql
+
+    assert "ALTER TABLE run_events ADD COLUMN thread_id" in sql
+    assert "ALTER TABLE run_events ADD COLUMN thread_sequence" in sql
+    assert "idx_chat_messages_thread_sequence" in sql
+    assert "idx_agent_checkpoints_run_sequence" in sql
+    assert "-- taroai:postgresql-only-start" in sql
+    assert "-- taroai:postgresql-only-end" in sql
+
+    sqlite_path = tmp_path / "chat-agent-loop-v2.sqlite3"
+    MigrationRunner(
+        config=DatabaseConfig(url=f"sqlite:///{sqlite_path}"),
+        migrations_path=Path("apps/api/migrations"),
+    ).apply()
+
+    with sqlite3.connect(sqlite_path) as connection:
+        existing_tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        run_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(runs)").fetchall()
+        }
+        run_event_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(run_events)").fetchall()
+        }
+
+    assert set(tenant_tables) <= existing_tables
+    assert {
+        "thread_id",
+        "trigger_message_id",
+        "provider_id",
+        "model_id",
+        "reasoning_effort",
+        "resource_refs",
+    } <= run_columns
+    assert {"thread_id", "thread_sequence"} <= run_event_columns

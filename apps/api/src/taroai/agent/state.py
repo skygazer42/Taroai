@@ -1,8 +1,15 @@
+from datetime import datetime
+
 from pydantic import BaseModel, Field
 
+from taroai.agent.models import (
+    AgentDecision,
+    AgentObservation,
+    AgentVerificationResult,
+)
 from taroai.agent.planning import PlanStep
 from taroai.agent.tools import ToolResult
-from taroai.domain import RunStatus
+from taroai.domain import RunStatus, utc_now
 from taroai.knowledge import RetrievalResult
 from taroai.memory import MemoryRecord
 
@@ -35,3 +42,15 @@ class AgentRuntimeState(BaseModel):
     promoted_sandbox_artifact_paths: list[str] = Field(default_factory=list)
     approval_id: str | None = None
     failure_reason: str | None = None
+    iteration: int = Field(default=0, ge=0)
+    max_iterations: int = Field(default=20, ge=1)
+    observations: list[AgentObservation] = Field(default_factory=list)
+    active_plan_revision: int = Field(default=1, ge=1)
+    pending_actions: list[AgentDecision] = Field(default_factory=list)
+    verifier_result: AgentVerificationResult | None = None
+    repair_attempts: int = Field(default=0, ge=0)
+    replan_count: int = Field(default=0, ge=0)
+    steering_messages: list[str] = Field(default_factory=list)
+    started_at: datetime = Field(default_factory=utc_now)
+    deadline_at: datetime | None = None
+    checkpoint_sequence: int = Field(default=0, ge=0)
