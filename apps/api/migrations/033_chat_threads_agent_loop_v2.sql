@@ -74,6 +74,9 @@ CREATE TABLE IF NOT EXISTS agent_actions (
     status TEXT NOT NULL DEFAULT 'pending',
     observation JSONB,
     failure_class TEXT,
+    lease_owner_id TEXT,
+    lease_expires_at TIMESTAMPTZ,
+    lease_generation BIGINT NOT NULL DEFAULT 0 CHECK (lease_generation >= 0),
     usage JSONB NOT NULL DEFAULT '{}'::jsonb,
     started_at TIMESTAMPTZ,
     completed_at TIMESTAMPTZ,
@@ -82,6 +85,9 @@ CREATE TABLE IF NOT EXISTS agent_actions (
 
 CREATE INDEX IF NOT EXISTS idx_agent_actions_run_cycle
     ON agent_actions (tenant_id, run_id, cycle_id);
+
+CREATE INDEX IF NOT EXISTS idx_agent_actions_lease_recovery
+    ON agent_actions (tenant_id, status, lease_expires_at, id);
 
 CREATE TABLE IF NOT EXISTS agent_checkpoints (
     id TEXT PRIMARY KEY,

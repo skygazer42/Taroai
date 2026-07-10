@@ -3,6 +3,9 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
+ReasoningEffort = Literal["none", "minimal", "low", "medium", "high"]
+
+
 class ModelGatewayError(RuntimeError):
     pass
 
@@ -56,7 +59,9 @@ class ModelGatewayRequest(BaseModel):
     workspace_id: str = Field(min_length=1)
     user_id: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
+    provider_id: str | None = None
     model: str | None = None
+    reasoning_effort: ReasoningEffort | None = None
     sensitivity_level: int = Field(default=0, ge=0)
     messages: list[ModelMessage] = Field(min_length=1)
     input: str | None = None
@@ -66,6 +71,13 @@ class ModelGatewayRequest(BaseModel):
     max_output_tokens: int | None = None
     stream: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ModelCatalogEntry(BaseModel):
+    provider_id: str = Field(min_length=1)
+    model_id: str = Field(min_length=1)
+    display_name: str = Field(min_length=1)
+    reasoning_efforts: list[ReasoningEffort] = Field(default_factory=list)
 
 
 class ModelGatewayResponse(BaseModel):

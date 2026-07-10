@@ -588,7 +588,7 @@ def test_post_run_idempotency_key_is_tenant_scoped():
             "X-User-ID": "user_2",
             "Idempotency-Key": "run-create-003",
         },
-        json=payload,
+        json={**payload, "workspace_id": "workspace_other"},
     )
 
     assert first.status_code == 201

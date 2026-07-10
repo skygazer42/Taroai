@@ -63,6 +63,10 @@ class AgentAction(BaseModel):
         "uncertain",
     ] = "pending"
     observation: AgentObservation | None = None
+    failure_class: str | None = None
+    lease_owner_id: str | None = None
+    lease_expires_at: datetime | None = None
+    lease_generation: int = Field(default=0, ge=0)
     usage: dict[str, Any] = Field(default_factory=dict)
     started_at: datetime | None = None
     completed_at: datetime | None = None

@@ -60,6 +60,35 @@ def create_model_request(
     )
 
 
+def test_model_provider_registry_filters_explicit_provider_and_reasoning_capability():
+    registry = ModelProviderRegistry(
+        providers=[
+            ModelProviderConfig(
+                id="deepseek",
+                display_name="DeepSeek",
+                default_model="deepseek-chat",
+                model_ids=["deepseek-chat"],
+                reasoning_efforts=["low", "medium", "high"],
+                default_reasoning_effort="medium",
+            ),
+            ModelProviderConfig(
+                id="fallback",
+                default_model="deepseek-chat",
+                model_ids=["deepseek-chat"],
+                reasoning_efforts=["low"],
+            ),
+        ]
+    )
+
+    supported = create_model_request(model="deepseek-chat").model_copy(
+        update={"provider_id": "deepseek", "reasoning_effort": "medium"}
+    )
+    unsupported = supported.model_copy(update={"reasoning_effort": "minimal"})
+
+    assert [provider.id for provider in registry.candidates(supported)] == ["deepseek"]
+    assert registry.candidates(unsupported) == []
+
+
 class RecordingModelGatewayRouter(ModelGatewayRouter):
     failing_provider_ids: set[str] = Field(default_factory=set, exclude=True)
     calls: list[tuple[str, str | None]] = Field(default_factory=list, exclude=True)
@@ -862,10 +891,13 @@ def test_model_provider_store_persists_status_and_secret_reference(tmp_path):
         ModelProviderUpsert(
             tenant_id="tenant_acme",
             id="sales-openai",
+            display_name="Sales OpenAI",
             base_url="https://sales-model.example.com/v1",
             api_key_secret_ref_id="secret_sales_model_key",
             default_model="gpt-enterprise",
             model_ids=["gpt-enterprise"],
+            reasoning_efforts=["low", "medium", "high"],
+            default_reasoning_effort="medium",
             workspace_id="workspace_sales",
             priority=5,
             timeout_seconds=17,
@@ -905,6 +937,9 @@ def test_model_provider_store_persists_status_and_secret_reference(tmp_path):
     assert records[0].status == "disabled"
     assert records[0].provider.api_key_secret_ref_id == "secret_sales_model_key_v2"
     assert records[0].provider.api_key == ""
+    assert records[0].provider.display_name == "Sales OpenAI"
+    assert records[0].provider.reasoning_efforts == ["low", "medium", "high"]
+    assert records[0].provider.default_reasoning_effort == "medium"
     assert records[0].provider.workspace_id == "workspace_sales"
     assert records[0].provider.rate_limit.max_requests_per_minute == 60
     assert records[0].provider.fallback_enabled is False

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel, PrivateAttr
+from pydantic import BaseModel
 
 from taroai.db.connection import connect_database
 from taroai.db.migrations import MigrationRunner
@@ -29,6 +29,7 @@ from taroai.domain import (
     new_id,
     utc_now,
 )
+from taroai.errors import AgentActionLeaseConflictError
 from taroai.licensing.models import LicenseValidationResult
 from taroai.store import (
     NotFoundError,
@@ -51,12 +52,101 @@ if TYPE_CHECKING:
 
 class SqlControlPlaneRepository(BaseModel):
     config: DatabaseConfig
-    _owned_running_action_ids: set[str] = PrivateAttr(default_factory=set)
 
     def initialize_schema(self, migrations_path: Path) -> None:
         MigrationRunner(config=self.config, migrations_path=migrations_path).apply()
 
     def create_run(self, tenant_id: str, user_id: str, payload: RunCreate) -> Run:
+        with self._connect() as connection:
+            return self._create_run_with_connection(
+                connection,
+                tenant_id,
+                user_id,
+                payload,
+            )
+
+    def create_queued_thread_run_if_absent(
+        self,
+        tenant_id: str,
+        user_id: str,
+        payload: RunCreate,
+    ) -> tuple[Run, bool]:
+        if payload.thread_id is None:
+            raise ValueError("Thread run creation requires thread_id")
+        terminal_statuses = sorted(status.value for status in TERMINAL_RUN_STATUSES)
+        placeholders = ", ".join("?" for _ in terminal_statuses)
+        with self._connect() as connection:
+            if self.config.dialect == "sqlite":
+                connection.execute("BEGIN IMMEDIATE")
+                lock_suffix = ""
+            else:
+                lock_suffix = " FOR UPDATE"
+            self._ensure_context(
+                connection,
+                tenant_id,
+                payload.workspace_id,
+                user_id,
+            )
+            thread_row = connection.execute(
+                """
+                SELECT id FROM chat_threads
+                WHERE tenant_id = ? AND id = ? AND workspace_id = ?
+                """
+                + lock_suffix,
+                (tenant_id, payload.thread_id, payload.workspace_id),
+            ).fetchone()
+            if thread_row is None:
+                raise ValueError(
+                    f"Run thread {payload.thread_id} does not match tenant/workspace"
+                )
+            active_row = connection.execute(
+                f"""
+                SELECT * FROM runs
+                WHERE tenant_id = ? AND thread_id = ?
+                  AND status NOT IN ({placeholders})
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (tenant_id, payload.thread_id, *terminal_statuses),
+            ).fetchone()
+            if active_row is not None:
+                return self._run_from_row(active_row), False
+            run = self._create_run_with_connection(
+                connection,
+                tenant_id,
+                user_id,
+                payload,
+            )
+            queued = run.model_copy(
+                update={"status": RunStatus.QUEUED, "updated_at": utc_now()}
+            )
+            connection.execute(
+                """
+                UPDATE runs SET status = ?, updated_at = ?
+                WHERE tenant_id = ? AND id = ?
+                """,
+                (
+                    queued.status.value,
+                    self._dt(queued.updated_at),
+                    tenant_id,
+                    queued.id,
+                ),
+            )
+            self._append_run_event(
+                connection,
+                queued,
+                "run.status_changed",
+                {"status": RunStatus.QUEUED.value},
+            )
+            return queued, True
+
+    def _create_run_with_connection(
+        self,
+        connection,
+        tenant_id: str,
+        user_id: str,
+        payload: RunCreate,
+    ) -> Run:
         now = utc_now()
         run = Run(
             id=new_id("run"),
@@ -77,85 +167,94 @@ class SqlControlPlaneRepository(BaseModel):
             reasoning_effort=payload.reasoning_effort,
             resource_refs=payload.resource_refs,
         )
-        with self._connect() as connection:
-            self._ensure_context(connection, tenant_id, payload.workspace_id, user_id)
-            if payload.thread_id is not None:
-                thread_row = connection.execute(
-                    """
-                    SELECT id FROM chat_threads
-                    WHERE tenant_id = ? AND id = ? AND workspace_id = ?
-                    """,
-                    (tenant_id, payload.thread_id, payload.workspace_id),
-                ).fetchone()
-                if thread_row is None:
-                    raise ValueError(
-                        f"Run thread {payload.thread_id} does not match tenant/workspace"
-                    )
-            if payload.trigger_message_id is not None:
-                if payload.thread_id is None:
-                    raise ValueError("Run trigger_message_id requires thread_id")
-                message_row = connection.execute(
-                    """
-                    SELECT id FROM chat_messages
-                    WHERE tenant_id = ? AND id = ? AND workspace_id = ?
-                      AND thread_id = ?
-                    """,
-                    (
-                        tenant_id,
-                        payload.trigger_message_id,
-                        payload.workspace_id,
-                        payload.thread_id,
-                    ),
-                ).fetchone()
-                if message_row is None:
-                    raise ValueError(
-                        "Run trigger message does not match its thread/tenant/workspace"
-                    )
-            connection.execute(
+        self._ensure_context(connection, tenant_id, payload.workspace_id, user_id)
+        if payload.thread_id is not None:
+            thread_row = connection.execute(
                 """
-                INSERT INTO runs (
-                    id, tenant_id, workspace_id, user_id, agent_id, message,
-                    attachments, mode, status, created_at, updated_at,
-                    thread_id, trigger_message_id, provider_id, model_id,
-                    reasoning_effort, resource_refs
+                SELECT id FROM chat_threads
+                WHERE tenant_id = ? AND id = ? AND workspace_id = ?
+                """,
+                (tenant_id, payload.thread_id, payload.workspace_id),
+            ).fetchone()
+            if thread_row is None:
+                raise ValueError(
+                    f"Run thread {payload.thread_id} does not match tenant/workspace"
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        if payload.trigger_message_id is not None:
+            if payload.thread_id is None:
+                raise ValueError("Run trigger_message_id requires thread_id")
+            message_row = connection.execute(
+                """
+                SELECT id FROM chat_messages
+                WHERE tenant_id = ? AND id = ? AND workspace_id = ?
+                  AND thread_id = ?
                 """,
                 (
-                    run.id,
-                    run.tenant_id,
-                    run.workspace_id,
-                    run.user_id,
-                    run.agent_id,
-                    run.message,
-                    self._json(run.attachments),
-                    run.mode.value,
-                    run.status.value,
-                    self._dt(run.created_at),
-                    self._dt(run.updated_at),
-                    run.thread_id,
-                    run.trigger_message_id,
-                    run.provider_id,
-                    run.model_id,
-                    run.reasoning_effort,
-                    self._json(
-                        [
-                            reference.model_dump(mode="json")
-                            for reference in run.resource_refs
-                        ]
-                    ),
+                    tenant_id,
+                    payload.trigger_message_id,
+                    payload.workspace_id,
+                    payload.thread_id,
                 ),
+            ).fetchone()
+            if message_row is None:
+                raise ValueError(
+                    "Run trigger message does not match its thread/tenant/workspace"
+                )
+        connection.execute(
+            """
+            INSERT INTO runs (
+                id, tenant_id, workspace_id, user_id, agent_id, message,
+                attachments, mode, status, created_at, updated_at,
+                thread_id, trigger_message_id, provider_id, model_id,
+                reasoning_effort, resource_refs
             )
-            self._append_run_event(connection, run, "run.created", {
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run.id,
+                run.tenant_id,
+                run.workspace_id,
+                run.user_id,
+                run.agent_id,
+                run.message,
+                self._json(run.attachments),
+                run.mode.value,
+                run.status.value,
+                self._dt(run.created_at),
+                self._dt(run.updated_at),
+                run.thread_id,
+                run.trigger_message_id,
+                run.provider_id,
+                run.model_id,
+                run.reasoning_effort,
+                self._json(
+                    [
+                        reference.model_dump(mode="json")
+                        for reference in run.resource_refs
+                    ]
+                ),
+            ),
+        )
+        self._append_run_event(
+            connection,
+            run,
+            "run.created",
+            {
                 "status": run.status.value,
                 "mode": run.mode.value,
                 "agent_id": run.agent_id,
-            })
-            self._record_run_meter(connection, run)
-            self._record_audit_event(connection, run, "run.created", {
+            },
+        )
+        self._record_run_meter(connection, run)
+        self._record_audit_event(
+            connection,
+            run,
+            "run.created",
+            {
                 "mode": run.mode.value,
                 "agent_id": run.agent_id,
-            })
+            },
+        )
         return run
 
     def create_chat_thread(
@@ -315,6 +414,13 @@ class SqlControlPlaneRepository(BaseModel):
             if thread_row is None:
                 raise NotFoundError(f"Chat thread not found: {thread_id}")
             thread = self._chat_thread_from_row(thread_row)
+            if user_id is not None:
+                self._ensure_context(
+                    connection,
+                    tenant_id,
+                    thread.workspace_id,
+                    user_id,
+                )
             sequence_row = connection.execute(
                 """
                 SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence
@@ -373,6 +479,13 @@ class SqlControlPlaneRepository(BaseModel):
                     self._dt(message.created_at),
                     self._dt(message.updated_at),
                 ),
+            )
+            connection.execute(
+                """
+                UPDATE chat_threads SET updated_at = ?
+                WHERE tenant_id = ? AND id = ?
+                """,
+                (self._dt(now), tenant_id, thread_id),
             )
         return message
 
@@ -452,6 +565,15 @@ class SqlControlPlaneRepository(BaseModel):
                 (*values, tenant_id, message_id),
             )
         return updated
+
+    def delete_chat_message(self, tenant_id: str, message_id: str) -> None:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM chat_messages WHERE tenant_id = ? AND id = ?",
+                (tenant_id, message_id),
+            )
+            if cursor.rowcount != 1:
+                raise NotFoundError(f"Chat message not found: {message_id}")
 
     def claim_next_queued_message(
         self,
@@ -680,6 +802,10 @@ class SqlControlPlaneRepository(BaseModel):
         )
 
     def create_agent_action(self, action: AgentAction) -> AgentAction:
+        if action.status != "pending":
+            raise ValueError(
+                f"Agent action {action.id} must be pending until it is claimed"
+            )
         try:
             with self._connect() as connection:
                 if self.config.dialect == "sqlite":
@@ -723,9 +849,10 @@ class SqlControlPlaneRepository(BaseModel):
                     INSERT INTO agent_actions (
                         id, tenant_id, workspace_id, thread_id, run_id, cycle_id,
                         action_key, decision, status, observation, failure_class,
+                        lease_owner_id, lease_expires_at, lease_generation,
                         usage, started_at, completed_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         action.id,
@@ -742,11 +869,14 @@ class SqlControlPlaneRepository(BaseModel):
                             if action.observation is not None
                             else None
                         ),
+                        action.failure_class,
+                        action.lease_owner_id,
                         (
-                            action.observation.failure_class
-                            if action.observation is not None
+                            self._dt(action.lease_expires_at)
+                            if action.lease_expires_at is not None
                             else None
                         ),
+                        action.lease_generation,
                         self._json(action.usage),
                         self._dt(action.started_at) if action.started_at is not None else None,
                         self._dt(action.completed_at) if action.completed_at is not None else None,
@@ -760,8 +890,6 @@ class SqlControlPlaneRepository(BaseModel):
                     f"Duplicate action_key for run {action.run_id}: {action.action_key}"
                 ) from error
             raise
-        if action.status == "running":
-            self._owned_running_action_ids.add(action.id)
         return action.model_copy(deep=True)
 
     def get_agent_action(self, tenant_id: str, action_id: str) -> AgentAction:
@@ -770,26 +898,130 @@ class SqlControlPlaneRepository(BaseModel):
                 "SELECT * FROM agent_actions WHERE tenant_id = ? AND id = ?",
                 (tenant_id, action_id),
             ).fetchone()
-            if row is None:
-                raise NotFoundError(f"Agent action not found: {action_id}")
-            action = self._agent_action_from_row(row)
-            if action.status == "running" and action.id not in self._owned_running_action_ids:
-                result = connection.execute(
+        if row is None:
+            raise NotFoundError(f"Agent action not found: {action_id}")
+        return self._agent_action_from_row(row)
+
+    def claim_agent_action(
+        self,
+        tenant_id: str,
+        action_id: str,
+        *,
+        lease_owner_id: str,
+        lease_seconds: int,
+        now: datetime | None = None,
+    ) -> AgentAction | None:
+        claimed_at = self._lease_time(now or utc_now())
+        lease_expires_at = self._lease_expiration(claimed_at, lease_seconds)
+        if not lease_owner_id:
+            raise ValueError("lease_owner_id must not be empty")
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                UPDATE agent_actions
+                SET status = ?, lease_owner_id = ?, lease_expires_at = ?,
+                    lease_generation = lease_generation + 1, started_at = ?
+                WHERE tenant_id = ? AND id = ? AND status = ?
+                RETURNING *
+                """,
+                (
+                    "running",
+                    lease_owner_id,
+                    self._dt(lease_expires_at),
+                    self._dt(claimed_at),
+                    tenant_id,
+                    action_id,
+                    "pending",
+                ),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._agent_action_from_row(row)
+
+    def renew_agent_action_lease(
+        self,
+        tenant_id: str,
+        action_id: str,
+        *,
+        lease_owner_id: str,
+        lease_generation: int,
+        lease_seconds: int,
+        now: datetime | None = None,
+    ) -> AgentAction | None:
+        renewed_at = self._lease_time(now or utc_now())
+        lease_expires_at = self._lease_expiration(renewed_at, lease_seconds)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                UPDATE agent_actions
+                SET lease_expires_at = ?
+                WHERE tenant_id = ? AND id = ? AND status = ?
+                  AND lease_owner_id = ? AND lease_generation = ?
+                  AND lease_expires_at IS NOT NULL AND lease_expires_at > ?
+                RETURNING *
+                """,
+                (
+                    self._dt(lease_expires_at),
+                    tenant_id,
+                    action_id,
+                    "running",
+                    lease_owner_id,
+                    lease_generation,
+                    self._dt(renewed_at),
+                ),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._agent_action_from_row(row)
+
+    def recover_expired_agent_actions(
+        self,
+        tenant_id: str,
+        *,
+        now: datetime | None = None,
+        limit: int = 100,
+    ) -> list[AgentAction]:
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        recovered_at = self._lease_time(now or utc_now())
+        with self._connect() as connection:
+            if self.config.dialect == "sqlite":
+                connection.execute("BEGIN IMMEDIATE")
+                lock_clause = ""
+            else:
+                lock_clause = "FOR UPDATE SKIP LOCKED"
+            rows = connection.execute(
+                f"""
+                SELECT id FROM agent_actions
+                WHERE tenant_id = ? AND status = ?
+                  AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+                ORDER BY id
+                {lock_clause}
+                LIMIT ?
+                """,
+                (tenant_id, "running", self._dt(recovered_at), limit),
+            ).fetchall()
+            recovered: list[AgentAction] = []
+            for candidate in rows:
+                row = connection.execute(
                     """
                     UPDATE agent_actions
-                    SET status = ?
+                    SET status = ?, lease_owner_id = NULL, lease_expires_at = NULL
                     WHERE tenant_id = ? AND id = ? AND status = ?
+                      AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+                    RETURNING *
                     """,
                     (
                         "uncertain",
                         tenant_id,
-                        action_id,
+                        candidate["id"],
                         "running",
+                        self._dt(recovered_at),
                     ),
-                )
-                if result.rowcount == 1:
-                    action = action.model_copy(update={"status": "uncertain"})
-        return action
+                ).fetchone()
+                if row is not None:
+                    recovered.append(self._agent_action_from_row(row))
+        return recovered
 
     def commit_agent_action_observation(
         self,
@@ -797,12 +1029,15 @@ class SqlControlPlaneRepository(BaseModel):
         action_id: str,
         observation: AgentObservation,
         *,
+        lease_owner_id: str,
+        lease_generation: int,
+        now: datetime | None = None,
         usage: dict[str, Any],
         state_payload: dict[str, Any],
         checksum: str,
         sandbox_checkpoint_ref: str | None = None,
     ) -> tuple[AgentAction, AgentCheckpoint]:
-        from taroai.agent.models import AgentAction, AgentCheckpoint
+        from taroai.agent.models import AgentCheckpoint
 
         json.dumps(
             {
@@ -814,24 +1049,47 @@ class SqlControlPlaneRepository(BaseModel):
         with self._connect() as connection:
             if self.config.dialect == "sqlite":
                 connection.execute("BEGIN IMMEDIATE")
-                lock_suffix = ""
-            else:
-                lock_suffix = " FOR UPDATE"
             row = connection.execute(
-                "SELECT * FROM agent_actions WHERE tenant_id = ? AND id = ?"
-                + lock_suffix,
+                "SELECT * FROM agent_actions WHERE tenant_id = ? AND id = ?",
                 (tenant_id, action_id),
             ).fetchone()
             if row is None:
                 raise NotFoundError(f"Agent action not found: {action_id}")
             action = self._agent_action_from_row(row)
-            self._lock_run_for_sequence(connection, tenant_id, action.run_id)
             if observation.action_id != action.id:
                 raise ValueError("Observation action_id does not match the committed action")
-            if action.status not in {"pending", "running", "uncertain"}:
-                raise ValueError(
-                    f"Agent action {action_id} observation is already committed"
+            completed_at = self._lease_time(now or utc_now())
+            completed_status = "succeeded" if observation.success else "failed"
+            committed_row = connection.execute(
+                """
+                UPDATE agent_actions
+                SET status = ?, observation = ?, failure_class = ?, usage = ?,
+                    lease_owner_id = NULL, lease_expires_at = NULL, completed_at = ?
+                WHERE tenant_id = ? AND id = ? AND status = ?
+                  AND lease_owner_id = ? AND lease_generation = ?
+                  AND lease_expires_at IS NOT NULL AND lease_expires_at > ?
+                RETURNING *
+                """,
+                (
+                    completed_status,
+                    self._json(observation.model_dump(mode="json")),
+                    observation.failure_class,
+                    self._json(usage),
+                    self._dt(completed_at),
+                    tenant_id,
+                    action_id,
+                    "running",
+                    lease_owner_id,
+                    lease_generation,
+                    self._dt(completed_at),
+                ),
+            ).fetchone()
+            if committed_row is None:
+                raise AgentActionLeaseConflictError(
+                    f"Agent action {action_id} lease fence is no longer valid"
                 )
+            updated_action = self._agent_action_from_row(committed_row)
+            self._lock_run_for_sequence(connection, tenant_id, action.run_id)
             sequence_row = connection.execute(
                 """
                 SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence
@@ -840,16 +1098,6 @@ class SqlControlPlaneRepository(BaseModel):
                 """,
                 (tenant_id, action.run_id),
             ).fetchone()
-            completed_at = utc_now()
-            updated_action = AgentAction.model_validate(
-                {
-                    **action.model_dump(),
-                    "status": "succeeded" if observation.success else "failed",
-                    "observation": observation.model_dump(),
-                    "usage": usage,
-                    "completed_at": completed_at,
-                }
-            )
             checkpoint = AgentCheckpoint(
                 id=new_id("checkpoint"),
                 tenant_id=action.tenant_id,
@@ -864,33 +1112,18 @@ class SqlControlPlaneRepository(BaseModel):
                 checksum=checksum,
                 created_at=completed_at,
             )
-            result = connection.execute(
-                """
-                UPDATE agent_actions
-                SET status = ?, observation = ?, failure_class = ?, usage = ?,
-                    completed_at = ?
-                WHERE tenant_id = ? AND id = ? AND status IN (?, ?, ?)
-                """,
-                (
-                    updated_action.status,
-                    self._json(observation.model_dump(mode="json")),
-                    observation.failure_class,
-                    self._json(usage),
-                    self._dt(completed_at),
-                    tenant_id,
-                    action_id,
-                    "pending",
-                    "running",
-                    "uncertain",
-                ),
-            )
-            if result.rowcount != 1:
-                raise ValueError(
-                    f"Agent action {action_id} observation is already committed"
-                )
             self._insert_agent_checkpoint(connection, checkpoint)
-        self._owned_running_action_ids.discard(action_id)
         return updated_action, checkpoint
+
+    def _lease_expiration(self, now: datetime, lease_seconds: int) -> datetime:
+        if lease_seconds < 1:
+            raise ValueError("lease_seconds must be at least 1")
+        return now + timedelta(seconds=lease_seconds)
+
+    def _lease_time(self, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("Agent action lease times must be timezone-aware")
+        return value.astimezone(timezone.utc)
 
     def create_agent_checkpoint(self, checkpoint: AgentCheckpoint) -> AgentCheckpoint:
         json.dumps(checkpoint.model_dump(mode="json"))
@@ -1025,6 +1258,75 @@ class SqlControlPlaneRepository(BaseModel):
             return None
         return self._idempotency_record_from_row(row)
 
+    def reserve_idempotency_record(self, record: IdempotencyRecord) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO idempotency_records (
+                    tenant_id, key, method, path, request_hash, status_code,
+                    response_body, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.tenant_id,
+                    record.key,
+                    record.method,
+                    record.path,
+                    record.request_hash,
+                    record.status_code,
+                    self._json(record.response_body),
+                    self._dt(record.created_at),
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def reclaim_stale_idempotency_record(
+        self,
+        record: IdempotencyRecord,
+        stale_before: datetime,
+    ) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE idempotency_records
+                SET status_code = ?, response_body = ?, created_at = ?
+                WHERE tenant_id = ? AND key = ? AND method = ? AND path = ?
+                  AND request_hash = ? AND status_code = ? AND created_at <= ?
+                """,
+                (
+                    record.status_code,
+                    self._json(record.response_body),
+                    self._dt(record.created_at),
+                    record.tenant_id,
+                    record.key,
+                    record.method,
+                    record.path,
+                    record.request_hash,
+                    102,
+                    self._dt(stale_before),
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def delete_idempotency_record(
+        self,
+        tenant_id: str,
+        key: str,
+        method: str,
+        path: str,
+        request_hash: str,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                DELETE FROM idempotency_records
+                WHERE tenant_id = ? AND key = ? AND method = ? AND path = ?
+                  AND request_hash = ?
+                """,
+                (tenant_id, key, method, path, request_hash),
+            )
+
     def save_idempotency_record(self, record: IdempotencyRecord) -> IdempotencyRecord:
         with self._connect() as connection:
             connection.execute(
@@ -1118,6 +1420,37 @@ class SqlControlPlaneRepository(BaseModel):
                 params,
             ).fetchall()
         return [self._run_from_row(row) for row in rows]
+
+    def get_active_thread_run(
+        self,
+        tenant_id: str,
+        thread_id: str,
+    ) -> Run | None:
+        with self._connect() as connection:
+            thread_row = connection.execute(
+                "SELECT id FROM chat_threads WHERE tenant_id = ? AND id = ?",
+                (tenant_id, thread_id),
+            ).fetchone()
+            if thread_row is None:
+                raise NotFoundError(f"Chat thread not found: {thread_id}")
+            placeholders = ", ".join("?" for _ in TERMINAL_RUN_STATUSES)
+            rows = connection.execute(
+                f"""
+                SELECT * FROM runs
+                WHERE tenant_id = ? AND thread_id = ?
+                  AND status NOT IN ({placeholders})
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (
+                    tenant_id,
+                    thread_id,
+                    *(status.value for status in TERMINAL_RUN_STATUSES),
+                ),
+            ).fetchall()
+        if not rows:
+            return None
+        return self._run_from_row(rows[0])
 
     def list_run_events(
         self,
@@ -1707,7 +2040,7 @@ class SqlControlPlaneRepository(BaseModel):
                 """
                 SELECT * FROM audit_events
                 WHERE tenant_id = ?
-                ORDER BY created_at, id
+                ORDER BY created_at, event_type, id
                 """,
                 (tenant_id,),
             ).fetchall()
@@ -1786,19 +2119,65 @@ class SqlControlPlaneRepository(BaseModel):
     def _ensure_context(self, connection, tenant_id: str, workspace_id: str, user_id: str) -> None:
         self._ensure_tenant(connection, tenant_id)
         now = self._dt(utc_now())
-        connection.execute(
-            "INSERT OR IGNORE INTO workspaces (id, tenant_id, name, created_at) VALUES (?, ?, ?, ?)",
-            (workspace_id, tenant_id, workspace_id, now),
-        )
-        connection.execute(
-            """
-            INSERT OR IGNORE INTO users (
-                id, tenant_id, email, display_name, password_hash, status, created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+        self._insert_context_record_or_verify_owner(
+            connection,
+            insert_sql="""
+                INSERT INTO workspaces (id, tenant_id, name, created_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT DO NOTHING
+                RETURNING id
             """,
-            (user_id, tenant_id, f"{user_id}@local", user_id, "not_used_for_dev_context", "active", now),
+            insert_params=(workspace_id, tenant_id, workspace_id, now),
+            lookup_sql="""
+                SELECT id FROM workspaces
+                WHERE tenant_id = ? AND id = ?
+            """,
+            lookup_params=(tenant_id, workspace_id),
+            resource_name=f"Workspace {workspace_id}",
         )
+        self._insert_context_record_or_verify_owner(
+            connection,
+            insert_sql="""
+                INSERT INTO users (
+                    id, tenant_id, email, display_name, password_hash, status, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT DO NOTHING
+                RETURNING id
+            """,
+            insert_params=(
+                user_id,
+                tenant_id,
+                f"{user_id}@local",
+                user_id,
+                "not_used_for_dev_context",
+                "active",
+                now,
+            ),
+            lookup_sql="""
+                SELECT id FROM users
+                WHERE tenant_id = ? AND id = ?
+            """,
+            lookup_params=(tenant_id, user_id),
+            resource_name=f"User {user_id}",
+        )
+
+    def _insert_context_record_or_verify_owner(
+        self,
+        connection,
+        *,
+        insert_sql: str,
+        insert_params: tuple[Any, ...],
+        lookup_sql: str,
+        lookup_params: tuple[Any, ...],
+        resource_name: str,
+    ) -> None:
+        inserted = connection.execute(insert_sql, insert_params).fetchone()
+        if inserted is not None:
+            return
+        owned = connection.execute(lookup_sql, lookup_params).fetchone()
+        if owned is None:
+            raise TenantAccessError(f"{resource_name} is not in the active tenant")
 
     def _ensure_tenant(self, connection, tenant_id: str) -> None:
         connection.execute(
@@ -2147,6 +2526,12 @@ class SqlControlPlaneRepository(BaseModel):
             decision=self._loads(row["decision"]),
             status=row["status"],
             observation=self._loads(row["observation"]),
+            failure_class=self._row_value(row, "failure_class"),
+            lease_owner_id=self._row_value(row, "lease_owner_id"),
+            lease_expires_at=self._parse_optional_dt(
+                self._row_value(row, "lease_expires_at")
+            ),
+            lease_generation=int(self._row_value(row, "lease_generation", 0)),
             usage=self._loads(row["usage"]),
             started_at=self._parse_optional_dt(row["started_at"]),
             completed_at=self._parse_optional_dt(row["completed_at"]),

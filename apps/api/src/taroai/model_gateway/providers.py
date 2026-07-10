@@ -12,6 +12,7 @@ from taroai.model_gateway.models import (
     ModelGatewayError,
     ModelGatewayRequest,
     ModelUsage,
+    ReasoningEffort,
 )
 
 
@@ -65,6 +66,7 @@ def validate_chat_request_options(options: dict[str, Any]) -> dict[str, Any]:
 
 class ModelProviderConfig(BaseModel):
     id: str = Field(min_length=1)
+    display_name: str | None = None
     provider_type: Literal["openai_compatible"] = "openai_compatible"
     base_url: str = Field(default="https://api.openai.com/v1", min_length=1)
     api_key: str = Field(default="", exclude=True, repr=False)
@@ -72,6 +74,8 @@ class ModelProviderConfig(BaseModel):
     secret_lease_ttl_seconds: int = Field(default=60, ge=1)
     default_model: str | None = None
     model_ids: list[str] = Field(default_factory=list)
+    reasoning_efforts: list[ReasoningEffort] = Field(default_factory=list)
+    default_reasoning_effort: ReasoningEffort | None = None
     tenant_id: str | None = None
     workspace_id: str | None = None
     priority: int = Field(default=100, ge=0)
@@ -90,9 +94,18 @@ class ModelProviderConfig(BaseModel):
         if self.workspace_id is not None and self.tenant_id is None:
             raise ValueError("tenant_id is required when workspace_id is set")
         validate_chat_request_options(self.chat_request_options)
+        if (
+            self.default_reasoning_effort is not None
+            and self.default_reasoning_effort not in self.reasoning_efforts
+        ):
+            raise ValueError(
+                "default_reasoning_effort must be listed in reasoning_efforts"
+            )
         return self
 
     def matches(self, request: ModelGatewayRequest) -> bool:
+        if request.provider_id is not None and self.id != request.provider_id:
+            return False
         if self.tenant_id is not None and self.tenant_id != request.tenant_id:
             return False
         if self.workspace_id is not None and self.workspace_id != request.workspace_id:
@@ -100,7 +113,22 @@ class ModelProviderConfig(BaseModel):
         model = self.model_for_request(request)
         if self.model_ids and model is not None and model not in self.model_ids:
             return False
+        if request.reasoning_effort is not None:
+            no_reasoning_requested = (
+                request.reasoning_effort == "none" and not self.reasoning_efforts
+            )
+            if (
+                not no_reasoning_requested
+                and request.reasoning_effort not in self.reasoning_efforts
+            ):
+                return False
         return True
+
+    def catalog_model_ids(self) -> list[str]:
+        configured_models = self.model_ids or (
+            [self.default_model] if self.default_model else []
+        )
+        return list(dict.fromkeys(configured_models))
 
     def model_for_request(self, request: ModelGatewayRequest) -> str | None:
         return request.model or self.default_model

@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field, model_validator
 from taroai.db import DatabaseConfig
 from taroai.db.connection import connect_database
 from taroai.domain import new_id, utc_now
+from taroai.model_gateway.models import ReasoningEffort
 from taroai.model_gateway.policy import ModelPolicyScope
 from taroai.model_gateway.providers import (
     ModelProviderConfig,
@@ -215,12 +216,15 @@ class ModelPolicyStore(BaseModel):
 
 
 class ModelProviderApiUpsert(BaseModel):
+    display_name: str | None = None
     provider_type: Literal["openai_compatible"] = "openai_compatible"
     base_url: str = Field(default="https://api.openai.com/v1", min_length=1)
     api_key_secret_ref_id: str = Field(min_length=1)
     secret_lease_ttl_seconds: int = Field(default=60, ge=1)
     default_model: str | None = None
     model_ids: list[str] = Field(default_factory=list)
+    reasoning_efforts: list[ReasoningEffort] = Field(default_factory=list)
+    default_reasoning_effort: ReasoningEffort | None = None
     workspace_id: str | None = None
     priority: int = Field(default=100, ge=0)
     timeout_seconds: int = Field(default=30, ge=1)
@@ -245,12 +249,15 @@ class ModelProviderApiUpsert(BaseModel):
         return ModelProviderUpsert(
             tenant_id=tenant_id,
             id=provider_id,
+            display_name=self.display_name,
             provider_type=self.provider_type,
             base_url=self.base_url,
             api_key_secret_ref_id=self.api_key_secret_ref_id,
             secret_lease_ttl_seconds=self.secret_lease_ttl_seconds,
             default_model=self.default_model,
             model_ids=self.model_ids,
+            reasoning_efforts=self.reasoning_efforts,
+            default_reasoning_effort=self.default_reasoning_effort,
             workspace_id=self.workspace_id,
             priority=self.priority,
             timeout_seconds=self.timeout_seconds,
@@ -327,12 +334,15 @@ class ModelProviderChangeRequestApiCreate(BaseModel):
 class ModelProviderUpsert(BaseModel):
     tenant_id: str
     id: str = Field(min_length=1)
+    display_name: str | None = None
     provider_type: Literal["openai_compatible"] = "openai_compatible"
     base_url: str = Field(default="https://api.openai.com/v1", min_length=1)
     api_key_secret_ref_id: str = Field(min_length=1)
     secret_lease_ttl_seconds: int = Field(default=60, ge=1)
     default_model: str | None = None
     model_ids: list[str] = Field(default_factory=list)
+    reasoning_efforts: list[ReasoningEffort] = Field(default_factory=list)
+    default_reasoning_effort: ReasoningEffort | None = None
     workspace_id: str | None = None
     priority: int = Field(default=100, ge=0)
     timeout_seconds: int = Field(default=30, ge=1)
@@ -352,12 +362,15 @@ class ModelProviderUpsert(BaseModel):
     def to_provider_config(self) -> ModelProviderConfig:
         return ModelProviderConfig(
             id=self.id,
+            display_name=self.display_name,
             provider_type=self.provider_type,
             base_url=self.base_url,
             api_key_secret_ref_id=self.api_key_secret_ref_id,
             secret_lease_ttl_seconds=self.secret_lease_ttl_seconds,
             default_model=self.default_model,
             model_ids=self.model_ids,
+            reasoning_efforts=self.reasoning_efforts,
+            default_reasoning_effort=self.default_reasoning_effort,
             tenant_id=self.tenant_id,
             workspace_id=self.workspace_id,
             priority=self.priority,

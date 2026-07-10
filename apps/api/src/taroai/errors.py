@@ -8,3 +8,7 @@ class NotFoundError(LookupError):
 
 class RunTransitionError(ValueError):
     """Raised when a run status transition is not allowed."""
+
+
+class AgentActionLeaseConflictError(RuntimeError):
+    """Raised when an action observation is committed without a valid lease fence."""

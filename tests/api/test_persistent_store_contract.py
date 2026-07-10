@@ -1,8 +1,10 @@
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import subprocess
 import sys
+from threading import Barrier
 from typing import Callable
 
 import pytest
@@ -74,6 +76,41 @@ def build_sql_store(
         return SqlControlPlaneRepository(config=DatabaseConfig(url=database_url))
 
     return store, reopen
+
+
+def create_pending_agent_action(
+    store: ControlPlaneStore,
+    suffix: str,
+) -> tuple[object, AgentCycle, AgentAction]:
+    run = store.create_run(
+        "tenant_acme",
+        "user_owner",
+        RunCreate(
+            workspace_id=f"workspace_{suffix}",
+            message=f"Run action {suffix}.",
+        ),
+    )
+    cycle = store.create_agent_cycle(
+        AgentCycle(
+            id=f"cycle_{suffix}",
+            tenant_id=run.tenant_id,
+            workspace_id=run.workspace_id,
+            run_id=run.id,
+            iteration=1,
+        )
+    )
+    action = store.create_agent_action(
+        AgentAction(
+            id=f"action_{suffix}",
+            tenant_id=run.tenant_id,
+            workspace_id=run.workspace_id,
+            run_id=run.id,
+            cycle_id=cycle.id,
+            action_key=f"action-key-{suffix}",
+            decision=AgentDecision(kind="action", tool_name="sandbox.command"),
+        )
+    )
+    return run, cycle, action
 
 
 @pytest.mark.parametrize(
@@ -269,8 +306,12 @@ def test_chat_thread_and_message_repository_contract_matches_persistent_behavior
     )
 
     assert [ready.sequence, queued.sequence, steering.sequence] == [1, 2, 3]
-    assert store.get_chat_thread("tenant_acme", thread.id) == updated_thread
-    assert store.list_chat_threads("tenant_acme", "workspace_sales") == [updated_thread]
+    current_thread = store.get_chat_thread("tenant_acme", thread.id)
+    assert current_thread.model_dump(exclude={"updated_at"}) == updated_thread.model_dump(
+        exclude={"updated_at"}
+    )
+    assert current_thread.updated_at >= updated_thread.updated_at
+    assert store.list_chat_threads("tenant_acme", "workspace_sales") == [current_thread]
     assert store.get_chat_message("tenant_acme", queued.id) == queued
     assert store.list_chat_messages("tenant_acme", thread.id) == [ready, queued, steering]
 
@@ -382,10 +423,22 @@ def test_agent_cycle_action_and_checkpoint_repository_contract_is_atomic_and_dur
         success=True,
         output={"exit_code": 0},
     )
+    lease_now = datetime(2026, 7, 11, 5, 0, tzinfo=timezone.utc)
+    claimed = store.claim_agent_action(
+        "tenant_acme",
+        action.id,
+        lease_owner_id="worker_contract",
+        lease_seconds=30,
+        now=lease_now,
+    )
+    assert claimed is not None
     committed_action, first_checkpoint = store.commit_agent_action_observation(
         "tenant_acme",
         action.id,
         observation,
+        lease_owner_id="worker_contract",
+        lease_generation=claimed.lease_generation,
+        now=lease_now + timedelta(seconds=1),
         usage={"sandbox_seconds": 0.25},
         state_payload={"iteration": 1, "phase": "verify"},
         checksum="sha256:first",
@@ -492,19 +545,32 @@ def test_action_observation_commit_rolls_back_when_checkpoint_cannot_be_persiste
         )
     )
 
+    lease_now = datetime(2026, 7, 11, 5, 10, tzinfo=timezone.utc)
+    claimed = store.claim_agent_action(
+        "tenant_acme",
+        action.id,
+        lease_owner_id="worker_atomic",
+        lease_seconds=30,
+        now=lease_now,
+    )
+    assert claimed is not None
     with pytest.raises(TypeError):
         store.commit_agent_action_observation(
             "tenant_acme",
             action.id,
             AgentObservation(action_id=action.id, success=False, error="failed"),
+            lease_owner_id="worker_atomic",
+            lease_generation=claimed.lease_generation,
+            now=lease_now + timedelta(seconds=1),
             usage={"tool_calls": 1},
             state_payload={"not_json_serializable": object()},
             checksum="sha256:rollback",
         )
 
     persisted_action = store.get_agent_action("tenant_acme", action.id)
-    assert persisted_action.status == "pending"
+    assert persisted_action.status == "running"
     assert persisted_action.observation is None
+    assert persisted_action.lease_owner_id == "worker_atomic"
     assert store.get_latest_agent_checkpoint("tenant_acme", run.id) is None
 
 
@@ -542,7 +608,9 @@ def test_sql_queue_claim_compare_and_set_prevents_duplicate_claims(tmp_path: Pat
     assert claimed[0].dispatch_status == ChatMessageDispatchStatus.INFLIGHT
 
 
-def test_sql_restart_marks_interrupted_running_action_uncertain(tmp_path: Path):
+def test_sql_restart_preserves_running_action_until_explicit_lease_recovery(
+    tmp_path: Path,
+):
     store, reopen_store = build_sql_store(tmp_path)
     run = store.create_run(
         "tenant_acme",
@@ -567,16 +635,27 @@ def test_sql_restart_marks_interrupted_running_action_uncertain(tmp_path: Path):
             cycle_id=cycle.id,
             action_key="long-action",
             decision=AgentDecision(kind="action", tool_name="sandbox.command"),
-            status="running",
-            started_at=utc_now(),
         )
     )
-    assert store.get_agent_action("tenant_acme", action.id).status == "running"
-
-    recovered = reopen_store().get_agent_action("tenant_acme", action.id)
-
-    assert recovered.status == "uncertain"
-    assert reopen_store().get_agent_action("tenant_acme", action.id).status == "uncertain"
+    lease_now = datetime(2026, 7, 11, 5, 20, tzinfo=timezone.utc)
+    claimed = store.claim_agent_action(
+        "tenant_acme",
+        action.id,
+        lease_owner_id="worker_restart",
+        lease_seconds=30,
+        now=lease_now,
+    )
+    assert claimed is not None
+    assert reopen_store().get_agent_action("tenant_acme", action.id).status == "running"
+    assert reopen_store().recover_expired_agent_actions(
+        "tenant_acme",
+        now=lease_now + timedelta(seconds=29),
+    ) == []
+    recovered = reopen_store().recover_expired_agent_actions(
+        "tenant_acme",
+        now=lease_now + timedelta(seconds=31),
+    )
+    assert [item.status for item in recovered] == ["uncertain"]
 
 
 def test_sql_action_observation_rolls_back_when_checkpoint_insert_fails(
@@ -609,6 +688,15 @@ def test_sql_action_observation_rolls_back_when_checkpoint_insert_fails(
             decision=AgentDecision(kind="action", tool_name="sandbox.command"),
         )
     )
+    lease_now = datetime(2026, 7, 11, 5, 30, tzinfo=timezone.utc)
+    claimed = store.claim_agent_action(
+        "tenant_acme",
+        action.id,
+        lease_owner_id="worker_insert_failure",
+        lease_seconds=30,
+        now=lease_now,
+    )
+    assert claimed is not None
 
     def fail_checkpoint_insert(*_args, **_kwargs):
         raise RuntimeError("checkpoint insert failed")
@@ -624,14 +712,20 @@ def test_sql_action_observation_rolls_back_when_checkpoint_insert_fails(
                 "tenant_acme",
                 action.id,
                 AgentObservation(action_id=action.id, success=True),
+                lease_owner_id="worker_insert_failure",
+                lease_generation=claimed.lease_generation,
+                now=lease_now + timedelta(seconds=1),
                 usage={"tool_calls": 1},
                 state_payload={"iteration": 1},
                 checksum="sha256:insert-failure",
             )
 
     persisted = store.get_agent_action("tenant_acme", action.id)
-    assert persisted.status == "pending"
+    assert persisted.status == "running"
     assert persisted.observation is None
+    assert persisted.lease_owner_id == "worker_insert_failure"
+    assert persisted.lease_generation == claimed.lease_generation
+    assert persisted.lease_expires_at == claimed.lease_expires_at
     assert store.get_latest_agent_checkpoint("tenant_acme", run.id) is None
 
 
@@ -698,13 +792,30 @@ def test_sql_concurrent_observation_commits_allocate_strict_checkpoint_sequences
             )
         )
     repositories = [reopen_store(), reopen_store()]
+    lease_now = datetime(2026, 7, 11, 5, 40, tzinfo=timezone.utc)
+    claims = [
+        repositories[index].claim_agent_action(
+            "tenant_acme",
+            action.id,
+            lease_owner_id=f"worker_concurrent_{index}",
+            lease_seconds=30,
+            now=lease_now,
+        )
+        for index, action in enumerate(actions)
+    ]
+    assert all(claim is not None for claim in claims)
 
     def commit(index: int) -> AgentCheckpoint:
         action = actions[index]
+        claim = claims[index]
+        assert claim is not None
         _, checkpoint = repositories[index].commit_agent_action_observation(
             "tenant_acme",
             action.id,
             AgentObservation(action_id=action.id, success=True),
+            lease_owner_id=f"worker_concurrent_{index}",
+            lease_generation=claim.lease_generation,
+            now=lease_now + timedelta(seconds=1),
             usage={"tool_calls": 1},
             state_payload={"iteration": index + 1},
             checksum=f"sha256:concurrent-{index + 1}",
@@ -717,3 +828,557 @@ def test_sql_concurrent_observation_commits_allocate_strict_checkpoint_sequences
     assert sorted(checkpoint.sequence for checkpoint in checkpoints) == [1, 2]
     latest = reopen_store().get_latest_agent_checkpoint("tenant_acme", run.id)
     assert latest is not None and latest.sequence == 2
+
+
+@pytest.mark.parametrize(
+    "store_builder",
+    [build_in_memory_store, build_sql_store],
+    ids=["in_memory", "sql"],
+)
+def test_workspace_and_user_identifiers_cannot_cross_tenant_boundaries(
+    tmp_path: Path,
+    store_builder: Callable[
+        [Path],
+        tuple[ControlPlaneStore, Callable[[], ControlPlaneStore]],
+    ],
+):
+    store, reopen_store = store_builder(tmp_path)
+    store.create_chat_thread(
+        "tenant_acme",
+        "user_shared",
+        ChatThreadCreate(workspace_id="workspace_shared", title="Acme thread"),
+    )
+    store.create_run(
+        "tenant_acme",
+        "user_shared",
+        RunCreate(workspace_id="workspace_shared", message="Acme run"),
+    )
+
+    with pytest.raises(TenantAccessError):
+        store.create_chat_thread(
+            "tenant_other",
+            "user_other",
+            ChatThreadCreate(workspace_id="workspace_shared", title="Illegal thread"),
+        )
+    with pytest.raises(TenantAccessError):
+        store.create_chat_thread(
+            "tenant_other",
+            "user_shared",
+            ChatThreadCreate(workspace_id="workspace_other", title="Illegal user"),
+        )
+    with pytest.raises(TenantAccessError):
+        store.create_run(
+            "tenant_other",
+            "user_other",
+            RunCreate(workspace_id="workspace_shared", message="Illegal run"),
+        )
+    with pytest.raises(TenantAccessError):
+        store.create_run(
+            "tenant_other",
+            "user_shared",
+            RunCreate(workspace_id="workspace_other", message="Illegal user run"),
+        )
+
+    reopened = reopen_store()
+    assert reopened.list_chat_threads("tenant_other", "workspace_shared") == []
+    assert reopened.list_chat_threads("tenant_other", "workspace_other") == []
+    assert reopened.list_runs("tenant_other", "workspace_shared") == []
+    assert reopened.list_runs("tenant_other", "workspace_other") == []
+    if isinstance(reopened, InMemoryControlPlaneStore):
+        assert "workspace_other" not in reopened.workspace_tenants
+        assert "user_other" not in reopened.user_tenants
+    else:
+        with reopened._connect() as connection:
+            assert connection.execute(
+                """
+                SELECT id FROM workspaces
+                WHERE tenant_id = ? AND id = ?
+                """,
+                ("tenant_other", "workspace_other"),
+            ).fetchone() is None
+
+
+@pytest.mark.parametrize(
+    "store_builder",
+    [build_in_memory_store, build_sql_store],
+    ids=["in_memory", "sql"],
+)
+def test_run_thread_and_trigger_message_must_share_tenant_workspace_and_thread(
+    tmp_path: Path,
+    store_builder: Callable[
+        [Path],
+        tuple[ControlPlaneStore, Callable[[], ControlPlaneStore]],
+    ],
+):
+    store, _ = store_builder(tmp_path)
+    first_thread = store.create_chat_thread(
+        "tenant_acme",
+        "user_owner",
+        ChatThreadCreate(workspace_id="workspace_sales"),
+    )
+    second_thread = store.create_chat_thread(
+        "tenant_acme",
+        "user_owner",
+        ChatThreadCreate(workspace_id="workspace_sales"),
+    )
+    first_message = store.append_chat_message(
+        "tenant_acme",
+        first_thread.id,
+        "user_owner",
+        ChatMessageCreate(content="First thread"),
+    )
+    second_message = store.append_chat_message(
+        "tenant_acme",
+        second_thread.id,
+        "user_owner",
+        ChatMessageCreate(content="Second thread"),
+    )
+
+    with pytest.raises((ValueError, TenantAccessError, NotFoundError)):
+        store.create_run(
+            "tenant_acme",
+            "user_owner",
+            RunCreate(
+                workspace_id="workspace_other",
+                thread_id=first_thread.id,
+                trigger_message_id=first_message.id,
+                message="Wrong workspace",
+            ),
+        )
+    with pytest.raises((ValueError, TenantAccessError, NotFoundError)):
+        store.create_run(
+            "tenant_acme",
+            "user_owner",
+            RunCreate(
+                workspace_id="workspace_sales",
+                thread_id=first_thread.id,
+                trigger_message_id=second_message.id,
+                message="Wrong trigger thread",
+            ),
+        )
+
+    valid = store.create_run(
+        "tenant_acme",
+        "user_owner",
+        RunCreate(
+            workspace_id="workspace_sales",
+            thread_id=first_thread.id,
+            trigger_message_id=first_message.id,
+            message="Valid run",
+        ),
+    )
+    assert store.list_runs("tenant_acme") == [valid]
+
+
+@pytest.mark.parametrize(
+    "store_builder",
+    [build_in_memory_store, build_sql_store],
+    ids=["in_memory", "sql"],
+)
+def test_action_failure_class_round_trips_at_action_level(
+    tmp_path: Path,
+    store_builder: Callable[
+        [Path],
+        tuple[ControlPlaneStore, Callable[[], ControlPlaneStore]],
+    ],
+):
+    store, reopen_store = store_builder(tmp_path)
+    run = store.create_run(
+        "tenant_acme",
+        "user_owner",
+        RunCreate(workspace_id="workspace_sales", message="Run a failing action."),
+    )
+    cycle = store.create_agent_cycle(
+        AgentCycle(
+            id="cycle_failure_class",
+            tenant_id=run.tenant_id,
+            workspace_id=run.workspace_id,
+            run_id=run.id,
+            iteration=1,
+        )
+    )
+    action = store.create_agent_action(
+        AgentAction(
+            id="action_failure_class",
+            tenant_id=run.tenant_id,
+            workspace_id=run.workspace_id,
+            run_id=run.id,
+            cycle_id=cycle.id,
+            action_key="failure-class",
+            decision=AgentDecision(kind="action", tool_name="sandbox.command"),
+        )
+    )
+    observation = AgentObservation(
+        action_id=action.id,
+        success=False,
+        error="command failed",
+        failure_class="tool_error",
+    )
+    lease_now = datetime(2026, 7, 11, 5, 50, tzinfo=timezone.utc)
+    claimed = store.claim_agent_action(
+        "tenant_acme",
+        action.id,
+        lease_owner_id="worker_failure_class",
+        lease_seconds=30,
+        now=lease_now,
+    )
+    assert claimed is not None
+
+    committed, _ = store.commit_agent_action_observation(
+        "tenant_acme",
+        action.id,
+        observation,
+        lease_owner_id="worker_failure_class",
+        lease_generation=claimed.lease_generation,
+        now=lease_now + timedelta(seconds=1),
+        usage={"tool_calls": 1},
+        state_payload={"iteration": 1},
+        checksum="sha256:failure-class",
+    )
+
+    assert committed.failure_class == "tool_error"
+    assert (
+        reopen_store().get_agent_action("tenant_acme", action.id).failure_class
+        == "tool_error"
+    )
+
+
+@pytest.mark.parametrize(
+    "store_builder",
+    [build_in_memory_store, build_sql_store],
+    ids=["in_memory", "sql"],
+)
+def test_agent_action_lease_claim_renew_commit_and_fencing_contract(
+    tmp_path: Path,
+    store_builder: Callable[
+        [Path],
+        tuple[ControlPlaneStore, Callable[[], ControlPlaneStore]],
+    ],
+):
+    from taroai.errors import AgentActionLeaseConflictError
+
+    store, reopen_store = store_builder(tmp_path)
+    run, cycle, action = create_pending_agent_action(store, "lease_contract")
+    now = datetime(2026, 7, 11, 6, 0, tzinfo=timezone.utc)
+
+    assert action.status == "pending"
+    assert action.lease_owner_id is None
+    assert action.lease_expires_at is None
+    assert action.lease_generation == 0
+    with pytest.raises(ValueError, match="claim"):
+        store.create_agent_action(
+            action.model_copy(
+                update={
+                    "id": "action_illegal_running",
+                    "action_key": "illegal-running",
+                    "status": "running",
+                }
+            )
+        )
+
+    assert store.claim_agent_action(
+        "tenant_other",
+        action.id,
+        lease_owner_id="worker_other",
+        lease_seconds=30,
+        now=now,
+    ) is None
+    claimed = store.claim_agent_action(
+        "tenant_acme",
+        action.id,
+        lease_owner_id="worker_a",
+        lease_seconds=30,
+        now=now,
+    )
+    assert claimed is not None
+    assert claimed.status == "running"
+    assert claimed.lease_owner_id == "worker_a"
+    assert claimed.lease_generation == 1
+    assert claimed.lease_expires_at == now + timedelta(seconds=30)
+    assert claimed.started_at == now
+    assert store.claim_agent_action(
+        "tenant_acme",
+        action.id,
+        lease_owner_id="worker_b",
+        lease_seconds=30,
+        now=now,
+    ) is None
+
+    hydrated = reopen_store().get_agent_action("tenant_acme", action.id)
+    assert hydrated.status == "running"
+    assert hydrated.lease_owner_id == "worker_a"
+    assert hydrated.lease_generation == 1
+    assert store.renew_agent_action_lease(
+        "tenant_acme",
+        action.id,
+        lease_owner_id="worker_b",
+        lease_generation=1,
+        lease_seconds=60,
+        now=now + timedelta(seconds=1),
+    ) is None
+    assert store.renew_agent_action_lease(
+        "tenant_acme",
+        action.id,
+        lease_owner_id="worker_a",
+        lease_generation=2,
+        lease_seconds=60,
+        now=now + timedelta(seconds=1),
+    ) is None
+    renewed = store.renew_agent_action_lease(
+        "tenant_acme",
+        action.id,
+        lease_owner_id="worker_a",
+        lease_generation=1,
+        lease_seconds=60,
+        now=now + timedelta(seconds=1),
+    )
+    assert renewed is not None
+    assert renewed.lease_generation == 1
+    assert renewed.lease_expires_at == now + timedelta(seconds=61)
+
+    with pytest.raises(AgentActionLeaseConflictError):
+        store.commit_agent_action_observation(
+            "tenant_acme",
+            action.id,
+            AgentObservation(action_id=action.id, success=True),
+            lease_owner_id="worker_a",
+            lease_generation=2,
+            now=now + timedelta(seconds=2),
+            usage={"tool_calls": 1},
+            state_payload={"iteration": 1},
+            checksum="sha256:wrong-fence",
+        )
+    assert store.get_latest_agent_checkpoint("tenant_acme", run.id) is None
+    assert store.get_agent_action("tenant_acme", action.id).status == "running"
+
+    committed, checkpoint = store.commit_agent_action_observation(
+        "tenant_acme",
+        action.id,
+        AgentObservation(action_id=action.id, success=True),
+        lease_owner_id="worker_a",
+        lease_generation=1,
+        now=now + timedelta(seconds=2),
+        usage={"tool_calls": 1},
+        state_payload={"iteration": 1},
+        checksum="sha256:correct-fence",
+    )
+    assert committed.status == "succeeded"
+    assert committed.lease_owner_id is None
+    assert committed.lease_expires_at is None
+    assert committed.lease_generation == 1
+    assert checkpoint.last_committed_action_id == action.id
+
+
+@pytest.mark.parametrize(
+    "store_builder",
+    [build_in_memory_store, build_sql_store],
+    ids=["in_memory", "sql"],
+)
+def test_expired_agent_action_requires_explicit_recovery_and_rejects_stale_worker(
+    tmp_path: Path,
+    store_builder: Callable[
+        [Path],
+        tuple[ControlPlaneStore, Callable[[], ControlPlaneStore]],
+    ],
+):
+    from taroai.errors import AgentActionLeaseConflictError
+
+    store, reopen_store = store_builder(tmp_path)
+    run, _, action = create_pending_agent_action(store, "expired_lease")
+    now = datetime(2026, 7, 11, 7, 0, tzinfo=timezone.utc)
+    claimed = store.claim_agent_action(
+        "tenant_acme",
+        action.id,
+        lease_owner_id="worker_expired",
+        lease_seconds=2,
+        now=now,
+    )
+    assert claimed is not None
+
+    hydrated = reopen_store().get_agent_action("tenant_acme", action.id)
+    assert hydrated.status == "running"
+    assert hydrated.lease_owner_id == "worker_expired"
+    with pytest.raises(AgentActionLeaseConflictError):
+        store.commit_agent_action_observation(
+            "tenant_acme",
+            action.id,
+            AgentObservation(action_id=action.id, success=True),
+            lease_owner_id="worker_expired",
+            lease_generation=claimed.lease_generation,
+            now=now + timedelta(seconds=3),
+            usage={},
+            state_payload={"iteration": 1},
+            checksum="sha256:expired",
+        )
+    assert store.get_latest_agent_checkpoint("tenant_acme", run.id) is None
+    assert store.recover_expired_agent_actions(
+        "tenant_other",
+        now=now + timedelta(seconds=3),
+    ) == []
+
+    recovered = store.recover_expired_agent_actions(
+        "tenant_acme",
+        now=now + timedelta(seconds=3),
+    )
+    assert [item.id for item in recovered] == [action.id]
+    assert recovered[0].status == "uncertain"
+    assert recovered[0].lease_owner_id is None
+    assert recovered[0].lease_expires_at is None
+    assert recovered[0].lease_generation == claimed.lease_generation
+    assert store.renew_agent_action_lease(
+        "tenant_acme",
+        action.id,
+        lease_owner_id="worker_expired",
+        lease_generation=claimed.lease_generation,
+        lease_seconds=30,
+        now=now + timedelta(seconds=3),
+    ) is None
+    with pytest.raises(AgentActionLeaseConflictError):
+        store.commit_agent_action_observation(
+            "tenant_acme",
+            action.id,
+            AgentObservation(action_id=action.id, success=True),
+            lease_owner_id="worker_expired",
+            lease_generation=claimed.lease_generation,
+            now=now + timedelta(seconds=3),
+            usage={},
+            state_payload={"iteration": 1},
+            checksum="sha256:stale-after-recovery",
+        )
+    assert store.recover_expired_agent_actions(
+        "tenant_acme",
+        now=now + timedelta(seconds=4),
+    ) == []
+
+
+@pytest.mark.parametrize(
+    "store_builder",
+    [build_in_memory_store, build_sql_store],
+    ids=["in_memory", "sql"],
+)
+def test_legacy_running_action_with_null_lease_is_only_recovered_explicitly(
+    tmp_path: Path,
+    store_builder: Callable[
+        [Path],
+        tuple[ControlPlaneStore, Callable[[], ControlPlaneStore]],
+    ],
+):
+    store, reopen_store = store_builder(tmp_path)
+    _, _, action = create_pending_agent_action(store, "legacy_null_lease")
+    if isinstance(store, InMemoryControlPlaneStore):
+        with store._repository_lock:
+            store.agent_actions[action.id] = action.model_copy(
+                update={"status": "running"},
+                deep=True,
+            )
+    else:
+        with store._connect() as connection:
+            connection.execute(
+                """
+                UPDATE agent_actions
+                SET status = ?, lease_owner_id = NULL, lease_expires_at = NULL
+                WHERE tenant_id = ? AND id = ?
+                """,
+                ("running", "tenant_acme", action.id),
+            )
+
+    hydrated = reopen_store().get_agent_action("tenant_acme", action.id)
+    assert hydrated.status == "running"
+    assert hydrated.lease_owner_id is None
+    recovered = reopen_store().recover_expired_agent_actions(
+        "tenant_acme",
+        now=datetime(2026, 7, 11, 8, 0, tzinfo=timezone.utc),
+    )
+    assert [item.id for item in recovered] == [action.id]
+    assert recovered[0].status == "uncertain"
+    assert recovered[0].lease_generation == 0
+
+
+@pytest.mark.parametrize(
+    "store_builder",
+    [build_in_memory_store, build_sql_store],
+    ids=["in_memory", "sql"],
+)
+def test_concurrent_agent_action_claim_has_exactly_one_winner(
+    tmp_path: Path,
+    store_builder: Callable[
+        [Path],
+        tuple[ControlPlaneStore, Callable[[], ControlPlaneStore]],
+    ],
+):
+    store, reopen_store = store_builder(tmp_path)
+    _, _, action = create_pending_agent_action(store, "concurrent_claim")
+    repositories = [store, reopen_store()]
+    barrier = Barrier(2)
+    now = datetime(2026, 7, 11, 9, 0, tzinfo=timezone.utc)
+
+    def claim(index: int):
+        barrier.wait()
+        return repositories[index].claim_agent_action(
+            "tenant_acme",
+            action.id,
+            lease_owner_id=f"worker_{index}",
+            lease_seconds=30,
+            now=now,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        claims = list(executor.map(claim, (0, 1)))
+
+    winners = [claim for claim in claims if claim is not None]
+    assert len(winners) == 1
+    assert winners[0].lease_generation == 1
+    persisted = reopen_store().get_agent_action("tenant_acme", action.id)
+    assert persisted.status == "running"
+    assert persisted.lease_owner_id == winners[0].lease_owner_id
+
+
+@pytest.mark.parametrize(
+    "store_builder",
+    [build_in_memory_store, build_sql_store],
+    ids=["in_memory", "sql"],
+)
+def test_agent_action_lease_times_are_utc_and_reject_naive_inputs(
+    tmp_path: Path,
+    store_builder: Callable[
+        [Path],
+        tuple[ControlPlaneStore, Callable[[], ControlPlaneStore]],
+    ],
+):
+    store, _ = store_builder(tmp_path)
+    _, _, action = create_pending_agent_action(store, "lease_time_contract")
+    local_now = datetime(
+        2026,
+        7,
+        11,
+        13,
+        0,
+        tzinfo=timezone(timedelta(hours=8)),
+    )
+
+    claimed = store.claim_agent_action(
+        "tenant_acme",
+        action.id,
+        lease_owner_id="worker_time_contract",
+        lease_seconds=30,
+        now=local_now,
+    )
+
+    assert claimed is not None
+    assert claimed.started_at == datetime(2026, 7, 11, 5, 0, tzinfo=timezone.utc)
+    assert claimed.started_at.utcoffset() == timedelta(0)
+    assert claimed.lease_expires_at == datetime(
+        2026,
+        7,
+        11,
+        5,
+        0,
+        30,
+        tzinfo=timezone.utc,
+    )
+    assert claimed.lease_expires_at.utcoffset() == timedelta(0)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        store.recover_expired_agent_actions(
+            "tenant_acme",
+            now=datetime(2026, 7, 11, 5, 1),
+        )

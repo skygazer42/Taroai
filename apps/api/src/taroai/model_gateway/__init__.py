@@ -14,11 +14,13 @@ from taroai.model_gateway.models import (
     ModelGatewayRequest,
     ModelGatewayResponse,
     ModelGatewayResponseError,
+    ModelCatalogEntry,
     ModelMessage,
     ModelPolicyDeniedError,
     ModelProviderAttempt,
     ModelUsage,
     PlannedToolCall,
+    ReasoningEffort,
 )
 from taroai.model_gateway.policy import ModelPolicy, ModelPolicyScope
 from taroai.model_gateway.providers import (
@@ -71,6 +73,7 @@ __all__ = [
     "ModelGatewayRequest",
     "ModelGatewayResponse",
     "ModelGatewayResponseError",
+    "ModelCatalogEntry",
     "ModelGatewayRouter",
     "ModelMessage",
     "ModelPolicy",
@@ -117,6 +120,7 @@ __all__ = [
     "ModelProviderVersionRecord",
     "OpenAICompatibleModelGateway",
     "PlannedToolCall",
+    "ReasoningEffort",
     "InMemoryModelProviderStore",
     "InMemoryModelPolicyStore",
     "SqlModelProviderStore",

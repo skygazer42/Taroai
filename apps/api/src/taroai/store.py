@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from threading import RLock
 from typing import TYPE_CHECKING, Any
 
@@ -27,7 +27,12 @@ from taroai.domain import (
     new_id,
     utc_now,
 )
-from taroai.errors import NotFoundError, RunTransitionError, TenantAccessError
+from taroai.errors import (
+    AgentActionLeaseConflictError,
+    NotFoundError,
+    RunTransitionError,
+    TenantAccessError,
+)
 from taroai.licensing.models import LicenseValidationResult
 
 if TYPE_CHECKING:
@@ -110,49 +115,96 @@ class InMemoryControlPlaneStore(BaseModel):
     agent_cycles: dict[str, Any] = Field(default_factory=dict)
     agent_actions: dict[str, Any] = Field(default_factory=dict)
     agent_checkpoints: dict[str, list[Any]] = Field(default_factory=dict)
+    workspace_tenants: dict[str, str] = Field(default_factory=dict)
+    user_tenants: dict[str, str] = Field(default_factory=dict)
     _repository_lock: RLock = PrivateAttr(default_factory=RLock)
 
     def create_run(self, tenant_id: str, user_id: str, payload: RunCreate) -> Run:
-        now = utc_now()
-        run = Run(
-            id=new_id("run"),
-            tenant_id=tenant_id,
-            workspace_id=payload.workspace_id,
-            user_id=user_id,
-            agent_id=payload.agent_id,
-            message=payload.message,
-            attachments=payload.attachments,
-            mode=payload.mode,
-            status=RunStatus.CREATED,
-            created_at=now,
-            updated_at=now,
-            thread_id=payload.thread_id,
-            trigger_message_id=payload.trigger_message_id,
-            provider_id=payload.provider_id,
-            model_id=payload.model_id,
-            reasoning_effort=payload.reasoning_effort,
-            resource_refs=payload.resource_refs,
-        )
-        self.runs[run.id] = run
-        self._append_run_event(
-            run,
-            "run.created",
-            {
-                "status": run.status.value,
-                "mode": run.mode.value,
-                "agent_id": run.agent_id,
-            },
-        )
-        self._record_run_meter(run)
-        self._record_audit_event(
-            tenant_id=tenant_id,
-            workspace_id=run.workspace_id,
-            user_id=user_id,
-            run_id=run.id,
-            event_type="run.created",
-            metadata={"mode": run.mode.value, "agent_id": run.agent_id},
-        )
+        with self._repository_lock:
+            self._validate_context_ownership(
+                tenant_id,
+                payload.workspace_id,
+                user_id,
+            )
+            if payload.thread_id is not None:
+                thread = self.get_chat_thread(tenant_id, payload.thread_id)
+                if thread.workspace_id != payload.workspace_id:
+                    raise ValueError(
+                        f"Run thread {thread.id} does not match workspace "
+                        f"{payload.workspace_id}"
+                    )
+            elif payload.trigger_message_id is not None:
+                raise ValueError("Run trigger_message_id requires thread_id")
+            if payload.trigger_message_id is not None:
+                trigger = self.get_chat_message(tenant_id, payload.trigger_message_id)
+                if (
+                    trigger.workspace_id != payload.workspace_id
+                    or trigger.thread_id != payload.thread_id
+                ):
+                    raise ValueError(
+                        "Run trigger message does not match its thread/tenant/workspace"
+                    )
+            self._register_context(tenant_id, payload.workspace_id, user_id)
+            now = utc_now()
+            run = Run(
+                id=new_id("run"),
+                tenant_id=tenant_id,
+                workspace_id=payload.workspace_id,
+                user_id=user_id,
+                agent_id=payload.agent_id,
+                message=payload.message,
+                attachments=payload.attachments,
+                mode=payload.mode,
+                status=RunStatus.CREATED,
+                created_at=now,
+                updated_at=now,
+                thread_id=payload.thread_id,
+                trigger_message_id=payload.trigger_message_id,
+                provider_id=payload.provider_id,
+                model_id=payload.model_id,
+                reasoning_effort=payload.reasoning_effort,
+                resource_refs=payload.resource_refs,
+            )
+            self.runs[run.id] = run
+            self._append_run_event(
+                run,
+                "run.created",
+                {
+                    "status": run.status.value,
+                    "mode": run.mode.value,
+                    "agent_id": run.agent_id,
+                },
+            )
+            self._record_run_meter(run)
+            self._record_audit_event(
+                tenant_id=tenant_id,
+                workspace_id=run.workspace_id,
+                user_id=user_id,
+                run_id=run.id,
+                event_type="run.created",
+                metadata={"mode": run.mode.value, "agent_id": run.agent_id},
+            )
         return run
+
+    def create_queued_thread_run_if_absent(
+        self,
+        tenant_id: str,
+        user_id: str,
+        payload: RunCreate,
+    ) -> tuple[Run, bool]:
+        if payload.thread_id is None:
+            raise ValueError("Thread run creation requires thread_id")
+        with self._repository_lock:
+            active_run = self.get_active_thread_run(tenant_id, payload.thread_id)
+            if active_run is not None:
+                return active_run, False
+            run = self.create_run(tenant_id, user_id, payload)
+            queued = self.update_run_status(
+                tenant_id,
+                run.id,
+                RunStatus.QUEUED,
+            )
+            return queued, True
 
     def create_chat_thread(
         self,
@@ -177,29 +229,38 @@ class InMemoryControlPlaneStore(BaseModel):
             updated_at=now,
         )
         with self._repository_lock:
+            self._ensure_context(tenant_id, payload.workspace_id, user_id)
             self.chat_threads[thread.id] = thread.model_copy(deep=True)
         return thread
 
     def get_chat_thread(self, tenant_id: str, thread_id: str) -> ChatThread:
-        thread = self.chat_threads.get(thread_id)
-        if thread is None:
-            raise NotFoundError(f"Chat thread not found: {thread_id}")
-        if thread.tenant_id != tenant_id:
-            raise TenantAccessError(f"Chat thread {thread_id} is not in tenant {tenant_id}")
-        return thread.model_copy(deep=True)
+        with self._repository_lock:
+            thread = self.chat_threads.get(thread_id)
+            if thread is None:
+                raise NotFoundError(f"Chat thread not found: {thread_id}")
+            if thread.tenant_id != tenant_id:
+                raise TenantAccessError(
+                    f"Chat thread {thread_id} is not in tenant {tenant_id}"
+                )
+            return thread.model_copy(deep=True)
 
     def list_chat_threads(
         self,
         tenant_id: str,
         workspace_id: str | None = None,
     ) -> list[ChatThread]:
-        threads = [
-            thread.model_copy(deep=True)
-            for thread in self.chat_threads.values()
-            if thread.tenant_id == tenant_id
-            and (workspace_id is None or thread.workspace_id == workspace_id)
-        ]
-        return sorted(threads, key=lambda thread: (thread.updated_at, thread.id), reverse=True)
+        with self._repository_lock:
+            threads = [
+                thread.model_copy(deep=True)
+                for thread in self.chat_threads.values()
+                if thread.tenant_id == tenant_id
+                and (workspace_id is None or thread.workspace_id == workspace_id)
+            ]
+            return sorted(
+                threads,
+                key=lambda thread: (thread.updated_at, thread.id),
+                reverse=True,
+            )
 
     def update_chat_thread(
         self,
@@ -240,6 +301,8 @@ class InMemoryControlPlaneStore(BaseModel):
     ) -> ChatMessage:
         with self._repository_lock:
             thread = self.get_chat_thread(tenant_id, thread_id)
+            if user_id is not None:
+                self._ensure_context(tenant_id, thread.workspace_id, user_id)
             sequence = max(
                 (
                     message.sequence
@@ -267,24 +330,32 @@ class InMemoryControlPlaneStore(BaseModel):
                 updated_at=now,
             )
             self.chat_messages[message.id] = message.model_copy(deep=True)
+            self.chat_threads[thread_id] = thread.model_copy(
+                update={"updated_at": now},
+                deep=True,
+            )
         return message
 
     def get_chat_message(self, tenant_id: str, message_id: str) -> ChatMessage:
-        message = self.chat_messages.get(message_id)
-        if message is None:
-            raise NotFoundError(f"Chat message not found: {message_id}")
-        if message.tenant_id != tenant_id:
-            raise TenantAccessError(f"Chat message {message_id} is not in tenant {tenant_id}")
-        return message.model_copy(deep=True)
+        with self._repository_lock:
+            message = self.chat_messages.get(message_id)
+            if message is None:
+                raise NotFoundError(f"Chat message not found: {message_id}")
+            if message.tenant_id != tenant_id:
+                raise TenantAccessError(
+                    f"Chat message {message_id} is not in tenant {tenant_id}"
+                )
+            return message.model_copy(deep=True)
 
     def list_chat_messages(self, tenant_id: str, thread_id: str) -> list[ChatMessage]:
-        self.get_chat_thread(tenant_id, thread_id)
-        messages = [
-            message.model_copy(deep=True)
-            for message in self.chat_messages.values()
-            if message.tenant_id == tenant_id and message.thread_id == thread_id
-        ]
-        return sorted(messages, key=lambda message: (message.sequence, message.id))
+        with self._repository_lock:
+            self.get_chat_thread(tenant_id, thread_id)
+            messages = [
+                message.model_copy(deep=True)
+                for message in self.chat_messages.values()
+                if message.tenant_id == tenant_id and message.thread_id == thread_id
+            ]
+            return sorted(messages, key=lambda message: (message.sequence, message.id))
 
     def update_chat_message(
         self,
@@ -307,6 +378,11 @@ class InMemoryControlPlaneStore(BaseModel):
             )
             self.chat_messages[message_id] = updated.model_copy(deep=True)
         return updated
+
+    def delete_chat_message(self, tenant_id: str, message_id: str) -> None:
+        with self._repository_lock:
+            self.get_chat_message(tenant_id, message_id)
+            del self.chat_messages[message_id]
 
     def claim_next_queued_message(
         self,
@@ -336,11 +412,12 @@ class InMemoryControlPlaneStore(BaseModel):
         tenant_id: str,
         thread_id: str,
     ) -> list[ChatMessage]:
-        return [
-            message
-            for message in self.list_chat_messages(tenant_id, thread_id)
-            if message.dispatch_status == ChatMessageDispatchStatus.STEERING
-        ]
+        with self._repository_lock:
+            return [
+                message
+                for message in self.list_chat_messages(tenant_id, thread_id)
+                if message.dispatch_status == ChatMessageDispatchStatus.STEERING
+            ]
 
     def mark_steering_applied(self, tenant_id: str, message_id: str) -> ChatMessage:
         with self._repository_lock:
@@ -354,16 +431,16 @@ class InMemoryControlPlaneStore(BaseModel):
             )
 
     def create_agent_cycle(self, cycle: AgentCycle) -> AgentCycle:
-        run = self.get_run(cycle.tenant_id, cycle.run_id)
-        if run.workspace_id != cycle.workspace_id:
-            raise TenantAccessError(
-                f"Run {run.id} is not in workspace {cycle.workspace_id}"
-            )
-        if run.thread_id != cycle.thread_id:
-            raise ValueError(
-                f"Agent cycle {cycle.id} thread does not match run {run.id}"
-            )
         with self._repository_lock:
+            run = self.get_run(cycle.tenant_id, cycle.run_id)
+            if run.workspace_id != cycle.workspace_id:
+                raise TenantAccessError(
+                    f"Run {run.id} is not in workspace {cycle.workspace_id}"
+                )
+            if run.thread_id != cycle.thread_id:
+                raise ValueError(
+                    f"Agent cycle {cycle.id} thread does not match run {run.id}"
+                )
             if cycle.id in self.agent_cycles:
                 raise ValueError(f"Agent cycle already exists: {cycle.id}")
             if any(
@@ -405,14 +482,20 @@ class InMemoryControlPlaneStore(BaseModel):
         return updated
 
     def create_agent_action(self, action: AgentAction) -> AgentAction:
-        cycle = self._get_agent_cycle(action.tenant_id, action.cycle_id)
-        if cycle.run_id != action.run_id or cycle.workspace_id != action.workspace_id:
-            raise TenantAccessError(f"Agent action {action.id} does not match its cycle")
-        if cycle.thread_id != action.thread_id:
-            raise ValueError(
-                f"Agent action {action.id} thread does not match cycle {cycle.id}"
-            )
         with self._repository_lock:
+            if action.status != "pending":
+                raise ValueError(
+                    f"Agent action {action.id} must be pending until it is claimed"
+                )
+            cycle = self._get_agent_cycle(action.tenant_id, action.cycle_id)
+            if cycle.run_id != action.run_id or cycle.workspace_id != action.workspace_id:
+                raise TenantAccessError(
+                    f"Agent action {action.id} does not match its cycle"
+                )
+            if cycle.thread_id != action.thread_id:
+                raise ValueError(
+                    f"Agent action {action.id} thread does not match cycle {cycle.id}"
+                )
             if action.id in self.agent_actions:
                 raise ValueError(f"Agent action already exists: {action.id}")
             if any(
@@ -427,12 +510,118 @@ class InMemoryControlPlaneStore(BaseModel):
         return action.model_copy(deep=True)
 
     def get_agent_action(self, tenant_id: str, action_id: str) -> AgentAction:
-        action = self.agent_actions.get(action_id)
-        if action is None:
-            raise NotFoundError(f"Agent action not found: {action_id}")
-        if action.tenant_id != tenant_id:
-            raise TenantAccessError(f"Agent action {action_id} is not in tenant {tenant_id}")
-        return action.model_copy(deep=True)
+        with self._repository_lock:
+            action = self.agent_actions.get(action_id)
+            if action is None:
+                raise NotFoundError(f"Agent action not found: {action_id}")
+            if action.tenant_id != tenant_id:
+                raise TenantAccessError(
+                    f"Agent action {action_id} is not in tenant {tenant_id}"
+                )
+            return action.model_copy(deep=True)
+
+    def claim_agent_action(
+        self,
+        tenant_id: str,
+        action_id: str,
+        *,
+        lease_owner_id: str,
+        lease_seconds: int,
+        now: datetime | None = None,
+    ) -> AgentAction | None:
+        claimed_at = self._lease_time(now or utc_now())
+        lease_expires_at = self._lease_expiration(claimed_at, lease_seconds)
+        if not lease_owner_id:
+            raise ValueError("lease_owner_id must not be empty")
+        with self._repository_lock:
+            action = self.agent_actions.get(action_id)
+            if (
+                action is None
+                or action.tenant_id != tenant_id
+                or action.status != "pending"
+            ):
+                return None
+            claimed = action.model_copy(
+                update={
+                    "status": "running",
+                    "lease_owner_id": lease_owner_id,
+                    "lease_expires_at": lease_expires_at,
+                    "lease_generation": action.lease_generation + 1,
+                    "started_at": claimed_at,
+                },
+                deep=True,
+            )
+            self.agent_actions[action_id] = claimed.model_copy(deep=True)
+            return claimed.model_copy(deep=True)
+
+    def renew_agent_action_lease(
+        self,
+        tenant_id: str,
+        action_id: str,
+        *,
+        lease_owner_id: str,
+        lease_generation: int,
+        lease_seconds: int,
+        now: datetime | None = None,
+    ) -> AgentAction | None:
+        renewed_at = self._lease_time(now or utc_now())
+        lease_expires_at = self._lease_expiration(renewed_at, lease_seconds)
+        with self._repository_lock:
+            action = self.agent_actions.get(action_id)
+            if (
+                action is None
+                or action.tenant_id != tenant_id
+                or action.status != "running"
+                or action.lease_owner_id != lease_owner_id
+                or action.lease_generation != lease_generation
+                or action.lease_expires_at is None
+                or action.lease_expires_at <= renewed_at
+            ):
+                return None
+            renewed = action.model_copy(
+                update={"lease_expires_at": lease_expires_at},
+                deep=True,
+            )
+            self.agent_actions[action_id] = renewed.model_copy(deep=True)
+            return renewed.model_copy(deep=True)
+
+    def recover_expired_agent_actions(
+        self,
+        tenant_id: str,
+        *,
+        now: datetime | None = None,
+        limit: int = 100,
+    ) -> list[AgentAction]:
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        recovered_at = self._lease_time(now or utc_now())
+        with self._repository_lock:
+            candidates = sorted(
+                (
+                    action
+                    for action in self.agent_actions.values()
+                    if action.tenant_id == tenant_id
+                    and action.status == "running"
+                    and (
+                        action.lease_expires_at is None
+                        or action.lease_expires_at <= recovered_at
+                    )
+                ),
+                key=lambda action: action.id,
+            )[:limit]
+            recovered: list[AgentAction] = []
+            for action in candidates:
+                uncertain = action.model_copy(
+                    update={
+                        "status": "uncertain",
+                        "lease_owner_id": None,
+                        "lease_expires_at": None,
+                    },
+                    deep=True,
+                )
+                self.agent_actions[action.id] = uncertain.model_copy(deep=True)
+                recovered.append(uncertain.model_copy(deep=True))
+            return recovered
 
     def commit_agent_action_observation(
         self,
@@ -440,6 +629,9 @@ class InMemoryControlPlaneStore(BaseModel):
         action_id: str,
         observation: AgentObservation,
         *,
+        lease_owner_id: str,
+        lease_generation: int,
+        now: datetime | None = None,
         usage: dict[str, Any],
         state_payload: dict[str, Any],
         checksum: str,
@@ -458,19 +650,28 @@ class InMemoryControlPlaneStore(BaseModel):
             action = self.get_agent_action(tenant_id, action_id)
             if observation.action_id != action.id:
                 raise ValueError("Observation action_id does not match the committed action")
-            if action.status not in {"pending", "running", "uncertain"}:
-                raise ValueError(
-                    f"Agent action {action_id} observation is already committed"
+            committed_at = self._lease_time(now or utc_now())
+            if (
+                action.status != "running"
+                or action.lease_owner_id != lease_owner_id
+                or action.lease_generation != lease_generation
+                or action.lease_expires_at is None
+                or action.lease_expires_at <= committed_at
+            ):
+                raise AgentActionLeaseConflictError(
+                    f"Agent action {action_id} lease fence is no longer valid"
                 )
             checkpoint_sequence = self._next_checkpoint_sequence(action.run_id)
-            completed_at = utc_now()
             updated_action = AgentAction.model_validate(
                 {
                     **action.model_dump(),
                     "status": "succeeded" if observation.success else "failed",
                     "observation": observation.model_dump(),
+                    "failure_class": observation.failure_class,
+                    "lease_owner_id": None,
+                    "lease_expires_at": None,
                     "usage": usage,
-                    "completed_at": completed_at,
+                    "completed_at": committed_at,
                 }
             )
             checkpoint = AgentCheckpoint(
@@ -485,41 +686,64 @@ class InMemoryControlPlaneStore(BaseModel):
                 state_payload=state_payload,
                 sandbox_checkpoint_ref=sandbox_checkpoint_ref,
                 checksum=checksum,
-                created_at=completed_at,
+                created_at=committed_at,
             )
-            self.agent_actions[action_id] = updated_action.model_copy(deep=True)
-            self.agent_checkpoints.setdefault(action.run_id, []).append(
-                checkpoint.model_copy(deep=True)
-            )
+            original_action = self.agent_actions[action_id]
+            had_checkpoint_list = action.run_id in self.agent_checkpoints
+            checkpoints = self.agent_checkpoints.setdefault(action.run_id, [])
+            original_checkpoints = list(checkpoints)
+            try:
+                self.agent_actions[action_id] = updated_action.model_copy(deep=True)
+                checkpoints.append(checkpoint.model_copy(deep=True))
+            except Exception:
+                self.agent_actions[action_id] = original_action
+                if had_checkpoint_list:
+                    checkpoints[:] = original_checkpoints
+                else:
+                    self.agent_checkpoints.pop(action.run_id, None)
+                raise
         return updated_action, checkpoint
 
+    def _lease_expiration(self, now: datetime, lease_seconds: int) -> datetime:
+        if lease_seconds < 1:
+            raise ValueError("lease_seconds must be at least 1")
+        return now + timedelta(seconds=lease_seconds)
+
+    def _lease_time(self, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("Agent action lease times must be timezone-aware")
+        return value.astimezone(timezone.utc)
+
     def create_agent_checkpoint(self, checkpoint: AgentCheckpoint) -> AgentCheckpoint:
-        run = self.get_run(checkpoint.tenant_id, checkpoint.run_id)
-        if run.workspace_id != checkpoint.workspace_id:
-            raise TenantAccessError(
-                f"Run {run.id} is not in workspace {checkpoint.workspace_id}"
-            )
-        if run.thread_id != checkpoint.thread_id:
-            raise ValueError(
-                f"Agent checkpoint {checkpoint.id} thread does not match run {run.id}"
-            )
-        if checkpoint.cycle_id is not None:
-            cycle = self._get_agent_cycle(checkpoint.tenant_id, checkpoint.cycle_id)
-            if cycle.run_id != checkpoint.run_id:
-                raise ValueError(
-                    f"Agent checkpoint {checkpoint.id} cycle does not match its run"
-                )
-        if checkpoint.last_committed_action_id is not None:
-            action = self.get_agent_action(
-                checkpoint.tenant_id,
-                checkpoint.last_committed_action_id,
-            )
-            if action.run_id != checkpoint.run_id:
-                raise ValueError(
-                    f"Agent checkpoint {checkpoint.id} action does not match its run"
-                )
         json.dumps(checkpoint.model_dump(mode="json"))
         with self._repository_lock:
+            run = self.get_run(checkpoint.tenant_id, checkpoint.run_id)
+            if run.workspace_id != checkpoint.workspace_id:
+                raise TenantAccessError(
+                    f"Run {run.id} is not in workspace {checkpoint.workspace_id}"
+                )
+            if run.thread_id != checkpoint.thread_id:
+                raise ValueError(
+                    f"Agent checkpoint {checkpoint.id} thread does not match run {run.id}"
+                )
+            if checkpoint.cycle_id is not None:
+                cycle = self._get_agent_cycle(
+                    checkpoint.tenant_id,
+                    checkpoint.cycle_id,
+                )
+                if cycle.run_id != checkpoint.run_id:
+                    raise ValueError(
+                        f"Agent checkpoint {checkpoint.id} cycle does not match its run"
+                    )
+            if checkpoint.last_committed_action_id is not None:
+                action = self.get_agent_action(
+                    checkpoint.tenant_id,
+                    checkpoint.last_committed_action_id,
+                )
+                if action.run_id != checkpoint.run_id:
+                    raise ValueError(
+                        f"Agent checkpoint {checkpoint.id} action does not match its run"
+                    )
             expected_sequence = self._next_checkpoint_sequence(checkpoint.run_id)
             if checkpoint.sequence != expected_sequence:
                 raise ValueError(
@@ -535,19 +759,56 @@ class InMemoryControlPlaneStore(BaseModel):
         tenant_id: str,
         run_id: str,
     ) -> AgentCheckpoint | None:
-        self.get_run(tenant_id, run_id)
-        checkpoints = self.agent_checkpoints.get(run_id, [])
-        if not checkpoints:
-            return None
-        return max(checkpoints, key=lambda item: item.sequence).model_copy(deep=True)
+        with self._repository_lock:
+            self.get_run(tenant_id, run_id)
+            checkpoints = self.agent_checkpoints.get(run_id, [])
+            if not checkpoints:
+                return None
+            return max(checkpoints, key=lambda item: item.sequence).model_copy(deep=True)
+
+    def _ensure_context(
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        user_id: str,
+    ) -> None:
+        self._validate_context_ownership(tenant_id, workspace_id, user_id)
+        self._register_context(tenant_id, workspace_id, user_id)
+
+    def _validate_context_ownership(
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        user_id: str,
+    ) -> None:
+        workspace_tenant = self.workspace_tenants.get(workspace_id)
+        if workspace_tenant is not None and workspace_tenant != tenant_id:
+            raise TenantAccessError(
+                f"Workspace {workspace_id} is not in tenant {tenant_id}"
+            )
+        user_tenant = self.user_tenants.get(user_id)
+        if user_tenant is not None and user_tenant != tenant_id:
+            raise TenantAccessError(f"User {user_id} is not in tenant {tenant_id}")
+
+    def _register_context(
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        user_id: str,
+    ) -> None:
+        self.workspace_tenants[workspace_id] = tenant_id
+        self.user_tenants[user_id] = tenant_id
 
     def _get_agent_cycle(self, tenant_id: str, cycle_id: str) -> AgentCycle:
-        cycle = self.agent_cycles.get(cycle_id)
-        if cycle is None:
-            raise NotFoundError(f"Agent cycle not found: {cycle_id}")
-        if cycle.tenant_id != tenant_id:
-            raise TenantAccessError(f"Agent cycle {cycle_id} is not in tenant {tenant_id}")
-        return cycle.model_copy(deep=True)
+        with self._repository_lock:
+            cycle = self.agent_cycles.get(cycle_id)
+            if cycle is None:
+                raise NotFoundError(f"Agent cycle not found: {cycle_id}")
+            if cycle.tenant_id != tenant_id:
+                raise TenantAccessError(
+                    f"Agent cycle {cycle_id} is not in tenant {tenant_id}"
+                )
+            return cycle.model_copy(deep=True)
 
     def _next_checkpoint_sequence(self, run_id: str) -> int:
         return max(
@@ -559,12 +820,13 @@ class InMemoryControlPlaneStore(BaseModel):
         ) + 1
 
     def get_run(self, tenant_id: str, run_id: str) -> Run:
-        run = self.runs.get(run_id)
-        if run is None:
-            raise NotFoundError(f"Run not found: {run_id}")
-        if run.tenant_id != tenant_id:
-            raise TenantAccessError(f"Run {run_id} is not in tenant {tenant_id}")
-        return run
+        with self._repository_lock:
+            run = self.runs.get(run_id)
+            if run is None:
+                raise NotFoundError(f"Run not found: {run_id}")
+            if run.tenant_id != tenant_id:
+                raise TenantAccessError(f"Run {run_id} is not in tenant {tenant_id}")
+            return run.model_copy(deep=True)
 
     def get_idempotency_record(
         self,
@@ -576,6 +838,56 @@ class InMemoryControlPlaneStore(BaseModel):
         return self.idempotency_records.get(
             self._idempotency_record_key(tenant_id, key, method, path)
         )
+
+    def reserve_idempotency_record(self, record: IdempotencyRecord) -> bool:
+        key = self._idempotency_record_key(
+            record.tenant_id,
+            record.key,
+            record.method,
+            record.path,
+        )
+        with self._repository_lock:
+            if key in self.idempotency_records:
+                return False
+            self.idempotency_records[key] = record.model_copy(deep=True)
+            return True
+
+    def reclaim_stale_idempotency_record(
+        self,
+        record: IdempotencyRecord,
+        stale_before: datetime,
+    ) -> bool:
+        key = self._idempotency_record_key(
+            record.tenant_id,
+            record.key,
+            record.method,
+            record.path,
+        )
+        with self._repository_lock:
+            existing = self.idempotency_records.get(key)
+            if (
+                existing is None
+                or existing.request_hash != record.request_hash
+                or existing.status_code != 102
+                or existing.created_at > stale_before
+            ):
+                return False
+            self.idempotency_records[key] = record.model_copy(deep=True)
+            return True
+
+    def delete_idempotency_record(
+        self,
+        tenant_id: str,
+        key: str,
+        method: str,
+        path: str,
+        request_hash: str,
+    ) -> None:
+        record_key = self._idempotency_record_key(tenant_id, key, method, path)
+        with self._repository_lock:
+            record = self.idempotency_records.get(record_key)
+            if record is not None and record.request_hash == request_hash:
+                del self.idempotency_records[record_key]
 
     def save_idempotency_record(self, record: IdempotencyRecord) -> IdempotencyRecord:
         self.idempotency_records[
@@ -610,13 +922,35 @@ class InMemoryControlPlaneStore(BaseModel):
         workspace_id: str | None = None,
         status: RunStatus | None = None,
     ) -> list[Run]:
-        return [
-            run
-            for run in self.runs.values()
-            if run.tenant_id == tenant_id
-            and (workspace_id is None or run.workspace_id == workspace_id)
-            and (status is None or run.status == status)
-        ]
+        with self._repository_lock:
+            return [
+                run.model_copy(deep=True)
+                for run in self.runs.values()
+                if run.tenant_id == tenant_id
+                and (workspace_id is None or run.workspace_id == workspace_id)
+                and (status is None or run.status == status)
+            ]
+
+    def get_active_thread_run(
+        self,
+        tenant_id: str,
+        thread_id: str,
+    ) -> Run | None:
+        with self._repository_lock:
+            self.get_chat_thread(tenant_id, thread_id)
+            active_runs = [
+                run
+                for run in self.runs.values()
+                if run.tenant_id == tenant_id
+                and run.thread_id == thread_id
+                and run.status not in TERMINAL_RUN_STATUSES
+            ]
+            if not active_runs:
+                return None
+            return max(
+                active_runs,
+                key=lambda run: (run.created_at, run.id),
+            ).model_copy(deep=True)
 
     def list_run_events(
         self,
@@ -624,11 +958,15 @@ class InMemoryControlPlaneStore(BaseModel):
         run_id: str,
         after_sequence: int | None = None,
     ) -> list[RunEvent]:
-        self.get_run(tenant_id, run_id)
-        events = list(self.run_events.get(run_id, []))
-        if after_sequence is None:
-            return events
-        return [event for event in events if event.sequence > after_sequence]
+        with self._repository_lock:
+            self.get_run(tenant_id, run_id)
+            events = [
+                event.model_copy(deep=True)
+                for event in self.run_events.get(run_id, [])
+            ]
+            if after_sequence is None:
+                return events
+            return [event for event in events if event.sequence > after_sequence]
 
     def update_run_status(
         self,
@@ -904,7 +1242,10 @@ class InMemoryControlPlaneStore(BaseModel):
         return list(self.billing_meters.get(tenant_id, []))
 
     def list_audit_events(self, tenant_id: str) -> list[AuditEvent]:
-        return list(self.audit_events.get(tenant_id, []))
+        return sorted(
+            self.audit_events.get(tenant_id, []),
+            key=lambda event: (event.created_at, event.event_type, event.id),
+        )
 
     def record_billing_meter(
         self,

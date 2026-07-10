@@ -56,6 +56,26 @@ def test_model_policy_uses_most_specific_workspace_defaults_and_allowlist():
     }
 
 
+def test_model_policy_keeps_provider_and_reasoning_selection_orthogonal_to_model_allowlist():
+    policy = ModelPolicy(
+        allowed_models=["deepseek-chat"],
+        scoped_policies=[
+            ModelPolicyScope(
+                tenant_id="tenant_acme",
+                workspace_id="workspace_sales",
+                allowed_models=["deepseek-chat"],
+            )
+        ],
+    )
+    request = create_model_request(model="deepseek-chat").model_copy(
+        update={"provider_id": "deepseek", "reasoning_effort": "high"}
+    )
+
+    assert request.provider_id == "deepseek"
+    assert request.reasoning_effort == "high"
+    assert policy.assert_request_allowed(request) == "deepseek-chat"
+
+
 def test_model_policy_applies_global_and_scoped_denied_models():
     policy = ModelPolicy(
         allowed_models=["global-default", "workspace-default"],

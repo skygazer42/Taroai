@@ -56,6 +56,13 @@ from taroai.billing import (
     SqlBillingInvoiceStore,
     SqlBillingPricingRuleStore,
 )
+from taroai.chat import (
+    ChatMessageSubmit,
+    ChatService,
+    ChatThreadApiCreate,
+    ChatThreadPatch,
+    MessageDispatch,
+)
 from taroai.config import ENTERPRISE_SANDBOX_PROVIDERS, Settings, load_settings
 from taroai.connectors import (
     ConnectorCreateRequest,
@@ -1416,6 +1423,16 @@ def create_app(
         long_term_memory_service=app.state.long_term_memory_service,
         guardrail_service=app.state.guardrail_service,
     )
+    app.state.chat_service = ChatService(
+        store=app.state.store,
+        model_policy_resolver=lambda: app.state.runtime.model_policy,
+        provider_registry_resolver=lambda: ModelProviderRegistry(
+            providers=effective_model_gateway_providers(
+                app.state.settings,
+                app.state.model_provider_store,
+            )
+        ),
+    )
     app.state.exception_manager = ApiExceptionManager()
     app.state.exception_manager.register(app)
     app.add_event_handler("shutdown", close_database_pools)
@@ -1531,6 +1548,211 @@ def create_app(
             validation,
             activated=True,
         ).model_dump(mode="json")
+
+    @app.post("/api/threads", status_code=status.HTTP_201_CREATED)
+    def create_chat_thread(
+        payload: ChatThreadApiCreate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        thread = app.state.chat_service.create_thread(
+            context.tenant_id,
+            context.user_id,
+            payload,
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=thread.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="chat.thread.created",
+            metadata={
+                "thread_id": thread.id,
+                "provider_id": thread.provider_id,
+                "model_id": thread.model_id,
+                "reasoning_effort": thread.reasoning_effort,
+            },
+            request=request,
+        )
+        return thread.model_dump(mode="json")
+
+    @app.get("/api/threads")
+    def list_chat_threads(
+        workspace_id: str | None = None,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict[str, Any]]:
+        return [
+            thread.model_dump(mode="json")
+            for thread in app.state.chat_service.list_threads(
+                context.tenant_id,
+                workspace_id,
+            )
+        ]
+
+    @app.get("/api/threads/{thread_id}")
+    def get_chat_thread(
+        thread_id: str,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        return app.state.chat_service.get_thread(
+            context.tenant_id,
+            thread_id,
+        ).model_dump(mode="json")
+
+    @app.patch("/api/threads/{thread_id}")
+    def update_chat_thread(
+        thread_id: str,
+        payload: ChatThreadPatch,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        thread = app.state.chat_service.update_thread(
+            context.tenant_id,
+            context.user_id,
+            thread_id,
+            payload,
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=thread.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="chat.thread.updated",
+            metadata={
+                "thread_id": thread.id,
+                "updated_fields": sorted(payload.model_fields_set),
+                "provider_id": thread.provider_id,
+                "model_id": thread.model_id,
+                "reasoning_effort": thread.reasoning_effort,
+            },
+            request=request,
+        )
+        return thread.model_dump(mode="json")
+
+    @app.delete("/api/threads/{thread_id}")
+    def delete_chat_thread(
+        thread_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        thread = app.state.chat_service.delete_thread(
+            context.tenant_id,
+            thread_id,
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=thread.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="chat.thread.deleted",
+            metadata={"thread_id": thread.id},
+            request=request,
+        )
+        return thread.model_dump(mode="json")
+
+    @app.get("/api/threads/{thread_id}/messages")
+    def list_chat_messages(
+        thread_id: str,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict[str, Any]]:
+        return [
+            message.model_dump(mode="json")
+            for message in app.state.chat_service.list_messages(
+                context.tenant_id,
+                thread_id,
+            )
+        ]
+
+    @app.post(
+        "/api/threads/{thread_id}/messages",
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def post_chat_message(
+        thread_id: str,
+        payload: ChatMessageSubmit,
+        response: Response,
+        request: Request,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        path = f"/api/threads/{thread_id}/messages"
+        idempotency_request = build_idempotency_request(
+            tenant_id=context.tenant_id,
+            key=idempotency_key,
+            method="POST",
+            path=path,
+            payload=payload,
+        )
+
+        def accept_message() -> MessageDispatch:
+            dispatch = app.state.chat_service.post_message(
+                context.tenant_id,
+                context.user_id,
+                thread_id,
+                payload,
+            )
+            run = app.state.store.get_run(context.tenant_id, dispatch.run_id)
+            record_audit_event(
+                app,
+                tenant_id=context.tenant_id,
+                workspace_id=run.workspace_id,
+                user_id=context.user_id,
+                run_id=run.id,
+                event_type="chat.message.accepted",
+                metadata={
+                    "thread_id": thread_id,
+                    "message_id": dispatch.message_id,
+                    "run_id": run.id,
+                    "dispatch_status": dispatch.dispatch_status.value,
+                    "delivery_mode": payload.delivery_mode,
+                    "attachment_count": len(payload.attachments),
+                    "resource_ref_count": len(payload.resource_refs),
+                },
+                request=request,
+            )
+            if dispatch.run_started:
+                record_audit_event(
+                    app,
+                    tenant_id=context.tenant_id,
+                    workspace_id=run.workspace_id,
+                    user_id=context.user_id,
+                    run_id=run.id,
+                    event_type="chat.run.queued",
+                    metadata={
+                        "thread_id": thread_id,
+                        "run_id": run.id,
+                        "status": run.status.value,
+                        "provider_id": run.provider_id,
+                        "model_id": run.model_id,
+                        "reasoning_effort": run.reasoning_effort,
+                    },
+                    request=request,
+                )
+            return dispatch
+
+        status_code, response_body = app.state.chat_service.execute_idempotently(
+            idempotency_request,
+            accept_message,
+        )
+        response.status_code = status_code
+        return response_body
+
+    @app.get("/api/model-catalog")
+    def get_model_catalog(
+        workspace_id: str = Query(min_length=1),
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict[str, Any]]:
+        return [
+            entry.model_dump(mode="json")
+            for entry in app.state.chat_service.model_catalog(
+                context.tenant_id,
+                workspace_id,
+                context.user_id,
+            )
+        ]
 
     @app.post("/api/runs", status_code=status.HTTP_201_CREATED)
     def create_run(

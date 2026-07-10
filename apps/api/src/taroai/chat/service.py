@@ -1,0 +1,525 @@
+from __future__ import annotations
+
+import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from datetime import timedelta
+from threading import Lock, RLock
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from taroai.api.idempotency import (
+    IdempotencyConflictError,
+    IdempotencyRequest,
+    build_idempotency_record,
+    find_idempotent_replay,
+    save_idempotent_response,
+)
+from taroai.domain import (
+    ChatMessage,
+    ChatMessageCreate,
+    ChatMessageDispatchStatus,
+    ChatThread,
+    ChatThreadCreate,
+    ChatThreadStatus,
+    ResourceReference,
+    Run,
+    RunCreate,
+    IdempotencyRecord,
+    utc_now,
+)
+from taroai.model_gateway import (
+    ModelCatalogEntry,
+    ModelGatewayRequest,
+    ModelMessage,
+    ModelPolicy,
+    ModelPolicyDeniedError,
+    ModelProviderRegistry,
+    ReasoningEffort,
+)
+from taroai.store import NotFoundError, TenantAccessError
+
+
+class ChatThreadApiCreate(BaseModel):
+    workspace_id: str = Field(min_length=1)
+    title: str = ""
+    provider_id: str | None = None
+    model_id: str | None = None
+    reasoning_effort: ReasoningEffort | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ChatThreadPatch(BaseModel):
+    title: str | None = None
+    pinned: bool | None = None
+    provider_id: str | None = None
+    model_id: str | None = None
+    reasoning_effort: ReasoningEffort | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ChatMessageSubmit(BaseModel):
+    content: str = Field(min_length=1)
+    delivery_mode: Literal["auto", "queue", "steer"] = "auto"
+    attachments: list[str] = Field(default_factory=list)
+    resource_refs: list[ResourceReference] = Field(default_factory=list)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class MessageDispatch(BaseModel):
+    message_id: str
+    run_id: str
+    dispatch_status: ChatMessageDispatchStatus
+    events_url: str
+    run_started: bool = Field(default=False, exclude=True)
+
+
+class ModelSelection(BaseModel):
+    provider_id: str
+    model_id: str
+    reasoning_effort: ReasoningEffort
+
+
+@dataclass
+class _NamedLockEntry:
+    lock: RLock = field(default_factory=RLock)
+    users: int = 0
+
+
+class ChatService:
+    _PENDING_MARKER = "_taroai_idempotency_pending"
+    _IDEMPOTENCY_RESERVATION_TTL_SECONDS = 30
+
+    def __init__(
+        self,
+        *,
+        store: Any,
+        model_policy_resolver: Callable[[], ModelPolicy],
+        provider_registry_resolver: Callable[[], ModelProviderRegistry],
+    ) -> None:
+        self.store = store
+        self._model_policy_resolver = model_policy_resolver
+        self._provider_registry_resolver = provider_registry_resolver
+        self._lock_guard = Lock()
+        self._locks: dict[str, _NamedLockEntry] = {}
+
+    def create_thread(
+        self,
+        tenant_id: str,
+        user_id: str,
+        payload: ChatThreadApiCreate,
+    ) -> ChatThread:
+        selection = self.resolve_selection(
+            tenant_id=tenant_id,
+            workspace_id=payload.workspace_id,
+            user_id=user_id,
+            provider_id=payload.provider_id,
+            model_id=payload.model_id,
+            reasoning_effort=payload.reasoning_effort,
+        )
+        return self.store.create_chat_thread(
+            tenant_id,
+            user_id,
+            ChatThreadCreate(
+                workspace_id=payload.workspace_id,
+                title=payload.title,
+                provider_id=selection.provider_id,
+                model_id=selection.model_id,
+                reasoning_effort=selection.reasoning_effort,
+            ),
+        )
+
+    def get_thread(self, tenant_id: str, thread_id: str) -> ChatThread:
+        try:
+            thread = self.store.get_chat_thread(tenant_id, thread_id)
+        except TenantAccessError as error:
+            raise NotFoundError(f"Chat thread not found: {thread_id}") from error
+        if thread.status == ChatThreadStatus.DELETED:
+            raise NotFoundError(f"Chat thread not found: {thread_id}")
+        return thread
+
+    def list_threads(
+        self,
+        tenant_id: str,
+        workspace_id: str | None = None,
+    ) -> list[ChatThread]:
+        return [
+            thread
+            for thread in self.store.list_chat_threads(tenant_id, workspace_id)
+            if thread.status != ChatThreadStatus.DELETED
+        ]
+
+    def update_thread(
+        self,
+        tenant_id: str,
+        user_id: str,
+        thread_id: str,
+        payload: ChatThreadPatch,
+    ) -> ChatThread:
+        thread = self.get_thread(tenant_id, thread_id)
+        changes = payload.model_dump(exclude_unset=True)
+        selection = self.resolve_selection(
+            tenant_id=tenant_id,
+            workspace_id=thread.workspace_id,
+            user_id=user_id,
+            provider_id=changes.get("provider_id", thread.provider_id),
+            model_id=changes.get("model_id", thread.model_id),
+            reasoning_effort=changes.get(
+                "reasoning_effort", thread.reasoning_effort
+            ),
+        )
+        changes.update(
+            provider_id=selection.provider_id,
+            model_id=selection.model_id,
+            reasoning_effort=selection.reasoning_effort,
+        )
+        return self.store.update_chat_thread(tenant_id, thread_id, **changes)
+
+    def delete_thread(self, tenant_id: str, thread_id: str) -> ChatThread:
+        self.get_thread(tenant_id, thread_id)
+        return self.store.update_chat_thread(
+            tenant_id,
+            thread_id,
+            status=ChatThreadStatus.DELETED,
+        )
+
+    def list_messages(self, tenant_id: str, thread_id: str) -> list[ChatMessage]:
+        self.get_thread(tenant_id, thread_id)
+        return self.store.list_chat_messages(tenant_id, thread_id)
+
+    def post_message(
+        self,
+        tenant_id: str,
+        user_id: str,
+        thread_id: str,
+        payload: ChatMessageSubmit,
+    ) -> MessageDispatch:
+        with self._named_lock(f"thread:{tenant_id}:{thread_id}"):
+            thread = self.get_thread(tenant_id, thread_id)
+            if thread.status != ChatThreadStatus.ACTIVE:
+                raise ValueError("messages cannot be posted to an archived thread")
+            selection = self.resolve_selection(
+                tenant_id=tenant_id,
+                workspace_id=thread.workspace_id,
+                user_id=user_id,
+                provider_id=thread.provider_id,
+                model_id=thread.model_id,
+                reasoning_effort=thread.reasoning_effort,
+            )
+            active_run = self.store.get_active_thread_run(tenant_id, thread_id)
+            if active_run is not None:
+                return self._append_to_active_run(
+                    tenant_id,
+                    user_id,
+                    thread,
+                    active_run,
+                    payload,
+                )
+            return self._start_run(
+                tenant_id,
+                user_id,
+                thread,
+                selection,
+                payload,
+            )
+
+    def execute_idempotently(
+        self,
+        request: IdempotencyRequest | None,
+        operation: Callable[[], MessageDispatch],
+    ) -> tuple[int, dict[str, Any]]:
+        if request is None:
+            result = operation()
+            return 202, result.model_dump(mode="json")
+        lock_name = (
+            f"idempotency:{request.tenant_id}:{request.method}:"
+            f"{request.path}:{request.key}"
+        )
+        with self._named_lock(lock_name):
+            replay = find_idempotent_replay(self.store, request)
+            if replay is not None and not self._is_pending(replay.response_body):
+                return replay.status_code, replay.response_body
+            if replay is None:
+                reservation = build_idempotency_record(
+                    request,
+                    102,
+                    {self._PENDING_MARKER: True},
+                )
+                if not self.store.reserve_idempotency_record(reservation):
+                    replay = self._wait_for_idempotent_completion(request)
+                    return replay.status_code, replay.response_body
+            elif self._is_pending(replay.response_body):
+                replacement = build_idempotency_record(
+                    request,
+                    102,
+                    {self._PENDING_MARKER: True},
+                )
+                stale_before = utc_now() - timedelta(
+                    seconds=self._IDEMPOTENCY_RESERVATION_TTL_SECONDS
+                )
+                reclaimed = self.store.reclaim_stale_idempotency_record(
+                    replacement,
+                    stale_before,
+                )
+                if not reclaimed:
+                    replay = self._wait_for_idempotent_completion(request)
+                    return replay.status_code, replay.response_body
+            try:
+                result = operation()
+            except Exception:
+                self.store.delete_idempotency_record(
+                    request.tenant_id,
+                    request.key,
+                    request.method,
+                    request.path,
+                    request.request_hash,
+                )
+                raise
+            response_body = result.model_dump(mode="json")
+            save_idempotent_response(self.store, request, 202, response_body)
+            return 202, response_body
+
+    def model_catalog(
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        user_id: str,
+    ) -> list[ModelCatalogEntry]:
+        entries: dict[tuple[str, str], ModelCatalogEntry] = {}
+        registry = self._provider_registry_resolver()
+        for provider in registry.providers:
+            for model_id in provider.catalog_model_ids():
+                request = self._selection_request(
+                    tenant_id=tenant_id,
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    provider_id=provider.id,
+                    model_id=model_id,
+                    reasoning_effort=None,
+                )
+                if not provider.matches(request):
+                    continue
+                try:
+                    self._model_policy_resolver().assert_request_allowed(request)
+                except ModelPolicyDeniedError:
+                    continue
+                entries[(provider.id, model_id)] = ModelCatalogEntry(
+                    provider_id=provider.id,
+                    model_id=model_id,
+                    display_name=f"{provider.display_name or provider.id} / {model_id}",
+                    reasoning_efforts=provider.reasoning_efforts,
+                )
+        return [entries[key] for key in sorted(entries)]
+
+    def resolve_selection(
+        self,
+        *,
+        tenant_id: str,
+        workspace_id: str,
+        user_id: str,
+        provider_id: str | None,
+        model_id: str | None,
+        reasoning_effort: str | None,
+    ) -> ModelSelection:
+        request = self._selection_request(
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            provider_id=provider_id,
+            model_id=model_id,
+            reasoning_effort=reasoning_effort,
+        )
+        policy = self._model_policy_resolver()
+        resolved_model = policy.assert_request_allowed(request)
+        request = request.model_copy(update={"model": resolved_model})
+        registry = self._provider_registry_resolver()
+        candidates = registry.candidates(request)
+        if not candidates and resolved_model is None:
+            candidates = registry.candidates(request.model_copy(update={"model": None}))
+        if not candidates:
+            raise ModelPolicyDeniedError(
+                "selected model provider is unavailable for this workspace",
+                metadata={
+                    "provider_id": provider_id,
+                    "model_id": resolved_model,
+                    "reasoning_effort": reasoning_effort,
+                },
+            )
+        provider = candidates[0]
+        resolved_model = resolved_model or provider.default_model
+        if resolved_model is None:
+            raise ModelPolicyDeniedError("selected provider has no model")
+        policy.assert_request_allowed(request.model_copy(update={"model": resolved_model}))
+        resolved_effort: str = (
+            reasoning_effort
+            or provider.default_reasoning_effort
+            or (provider.reasoning_efforts[0] if provider.reasoning_efforts else "none")
+        )
+        final_request = request.model_copy(
+            update={
+                "provider_id": provider.id,
+                "model": resolved_model,
+                "reasoning_effort": resolved_effort,
+            }
+        )
+        if not provider.matches(final_request):
+            raise ModelPolicyDeniedError(
+                "selected reasoning effort is not supported by the model provider",
+                metadata={
+                    "provider_id": provider.id,
+                    "model_id": resolved_model,
+                    "reasoning_effort": resolved_effort,
+                },
+            )
+        return ModelSelection(
+            provider_id=provider.id,
+            model_id=resolved_model,
+            reasoning_effort=resolved_effort,
+        )
+
+    def _append_to_active_run(
+        self,
+        tenant_id: str,
+        user_id: str,
+        thread: ChatThread,
+        run: Run,
+        payload: ChatMessageSubmit,
+    ) -> MessageDispatch:
+        dispatch_status = (
+            ChatMessageDispatchStatus.STEERING
+            if payload.delivery_mode == "steer"
+            else ChatMessageDispatchStatus.QUEUED
+        )
+        message = self.store.append_chat_message(
+            tenant_id,
+            thread.id,
+            user_id,
+            ChatMessageCreate(
+                content=payload.content,
+                dispatch_status=dispatch_status,
+                attachments=payload.attachments,
+                resource_refs=payload.resource_refs,
+            ),
+        )
+        return self._dispatch_response(message, run, run_started=False)
+
+    def _start_run(
+        self,
+        tenant_id: str,
+        user_id: str,
+        thread: ChatThread,
+        selection: ModelSelection,
+        payload: ChatMessageSubmit,
+    ) -> MessageDispatch:
+        message = self.store.append_chat_message(
+            tenant_id,
+            thread.id,
+            user_id,
+            ChatMessageCreate(
+                content=payload.content,
+                dispatch_status=ChatMessageDispatchStatus.INFLIGHT,
+                attachments=payload.attachments,
+                resource_refs=payload.resource_refs,
+            ),
+        )
+        try:
+            run, run_started = self.store.create_queued_thread_run_if_absent(
+                tenant_id,
+                user_id,
+                RunCreate(
+                    workspace_id=thread.workspace_id,
+                    message=message.content,
+                    attachments=message.attachments,
+                    thread_id=thread.id,
+                    trigger_message_id=message.id,
+                    provider_id=selection.provider_id,
+                    model_id=selection.model_id,
+                    reasoning_effort=selection.reasoning_effort,
+                    resource_refs=message.resource_refs,
+                ),
+            )
+        except Exception:
+            self.store.delete_chat_message(tenant_id, message.id)
+            raise
+        if not run_started:
+            fallback_status = (
+                ChatMessageDispatchStatus.STEERING
+                if payload.delivery_mode == "steer"
+                else ChatMessageDispatchStatus.QUEUED
+            )
+            message = self.store.update_chat_message(
+                tenant_id,
+                message.id,
+                dispatch_status=fallback_status,
+            )
+        return self._dispatch_response(message, run, run_started=run_started)
+
+    def _selection_request(
+        self,
+        *,
+        tenant_id: str,
+        workspace_id: str,
+        user_id: str,
+        provider_id: str | None,
+        model_id: str | None,
+        reasoning_effort: str | None,
+    ) -> ModelGatewayRequest:
+        return ModelGatewayRequest(
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            run_id="chat_model_selection",
+            provider_id=provider_id,
+            model=model_id,
+            reasoning_effort=reasoning_effort,
+            messages=[ModelMessage(role="user", content="Validate model selection")],
+        )
+
+    def _dispatch_response(
+        self,
+        message: ChatMessage,
+        run: Run,
+        *,
+        run_started: bool,
+    ) -> MessageDispatch:
+        return MessageDispatch(
+            message_id=message.id,
+            run_id=run.id,
+            dispatch_status=message.dispatch_status,
+            events_url=f"/api/runs/{run.id}/events",
+            run_started=run_started,
+        )
+
+    def _wait_for_idempotent_completion(
+        self,
+        request: IdempotencyRequest,
+    ) -> IdempotencyRecord:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            replay = find_idempotent_replay(self.store, request)
+            if replay is not None and not self._is_pending(replay.response_body):
+                return replay
+            time.sleep(0.01)
+        raise IdempotencyConflictError("Idempotent request is still in progress")
+
+    def _is_pending(self, response_body: dict[str, Any]) -> bool:
+        return response_body.get(self._PENDING_MARKER) is True
+
+    @contextmanager
+    def _named_lock(self, name: str) -> Iterator[None]:
+        with self._lock_guard:
+            entry = self._locks.setdefault(name, _NamedLockEntry())
+            entry.users += 1
+        try:
+            with entry.lock:
+                yield
+        finally:
+            with self._lock_guard:
+                entry.users -= 1
+                if entry.users == 0 and self._locks.get(name) is entry:
+                    del self._locks[name]

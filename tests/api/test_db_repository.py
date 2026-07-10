@@ -789,6 +789,65 @@ def test_sql_repository_persists_status_artifacts_approvals_and_reads(tmp_path: 
     }
 
 
+def test_sql_repository_audit_tie_break_is_deterministic(tmp_path: Path):
+    database_url = f"sqlite:///{tmp_path / 'taroai.sqlite3'}"
+    repository = SqlControlPlaneRepository(config=DatabaseConfig(url=database_url))
+    repository.initialize_schema(Path("apps/api/migrations"))
+    run = repository.create_run(
+        "tenant_acme",
+        "user_owner",
+        RunCreate(workspace_id="workspace_sales", message="Create a report."),
+    )
+    fixed_time = datetime(2026, 7, 11, 4, 0, tzinfo=timezone.utc).isoformat()
+    with repository._connect() as connection:
+        connection.execute(
+            "DELETE FROM audit_events WHERE tenant_id = ?",
+            ("tenant_acme",),
+        )
+        connection.execute(
+            """
+            INSERT INTO audit_events (
+                id, tenant_id, workspace_id, user_id, run_id,
+                event_type, metadata, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "audit_a_run_created",
+                "tenant_acme",
+                "workspace_sales",
+                "user_owner",
+                run.id,
+                "run.created",
+                "{}",
+                fixed_time,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO audit_events (
+                id, tenant_id, workspace_id, user_id, run_id,
+                event_type, metadata, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "audit_z_billing_metered",
+                "tenant_acme",
+                "workspace_sales",
+                "user_owner",
+                run.id,
+                "billing.metered",
+                "{}",
+                fixed_time,
+            ),
+        )
+
+    assert [
+        event.event_type for event in repository.list_audit_events("tenant_acme")
+    ] == ["billing.metered", "run.created"]
+
+
 def test_sql_repository_persists_approval_rejection(tmp_path: Path):
     database_url = f"sqlite:///{tmp_path / 'taroai.sqlite3'}"
     repository = SqlControlPlaneRepository(config=DatabaseConfig(url=database_url))

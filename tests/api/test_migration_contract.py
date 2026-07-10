@@ -1411,6 +1411,10 @@ def test_chat_threads_agent_loop_v2_migration_is_additive_and_sqlite_compatible(
             row[1]
             for row in connection.execute("PRAGMA table_info(run_events)").fetchall()
         }
+        agent_action_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(agent_actions)").fetchall()
+        }
 
     assert set(tenant_tables) <= existing_tables
     assert {
@@ -1422,3 +1426,16 @@ def test_chat_threads_agent_loop_v2_migration_is_additive_and_sqlite_compatible(
         "resource_refs",
     } <= run_columns
     assert {"thread_id", "thread_sequence"} <= run_event_columns
+    assert "lease_owner_id TEXT" in sql
+    assert "lease_expires_at TIMESTAMPTZ" in sql
+    assert (
+        "lease_generation BIGINT NOT NULL DEFAULT 0 CHECK (lease_generation >= 0)"
+        in sql
+    )
+    assert {
+        "lease_owner_id",
+        "lease_expires_at",
+        "lease_generation",
+    } <= agent_action_columns
+    assert "idx_agent_actions_lease_recovery" in sql
+    assert "(tenant_id, status, lease_expires_at, id)" in sql

@@ -1,3 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+
 import pytest
 
 from taroai.agent import AgentRuntimeState, PlanStep, ToolResult
@@ -421,6 +424,10 @@ def test_agent_loop_v2_domain_models_pin_thread_and_model_snapshot():
     )
 
     store = InMemoryControlPlaneStore()
+    store.chat_threads[thread.id] = thread
+    store.chat_messages[message.id] = message
+    store.workspace_tenants[thread.workspace_id] = thread.tenant_id
+    store.user_tenants["user_1"] = thread.tenant_id
     run = store.create_run("tenant_acme", "user_1", run_payload)
 
     assert thread.status == ChatThreadStatus.ACTIVE
@@ -614,3 +621,112 @@ def test_in_memory_chat_message_sequences_are_scoped_to_each_thread():
     assert other_thread_message.sequence == 1
     with pytest.raises(TenantAccessError):
         store.list_chat_messages("tenant_other", first_thread.id)
+
+
+def test_in_memory_observation_commit_restores_action_when_checkpoint_append_fails():
+    from taroai.agent.models import AgentAction, AgentCycle, AgentDecision, AgentObservation
+
+    class FailingCheckpointList(list):
+        def append(self, _checkpoint):
+            raise RuntimeError("checkpoint append failed")
+
+    store = InMemoryControlPlaneStore()
+    run = store.create_run(
+        "tenant_acme",
+        "user_1",
+        RunCreate(workspace_id="workspace_sales", message="Run atomically."),
+    )
+    cycle = store.create_agent_cycle(
+        AgentCycle(
+            id="cycle_append_failure",
+            tenant_id=run.tenant_id,
+            workspace_id=run.workspace_id,
+            run_id=run.id,
+            iteration=1,
+        )
+    )
+    action = store.create_agent_action(
+        AgentAction(
+            id="action_append_failure",
+            tenant_id=run.tenant_id,
+            workspace_id=run.workspace_id,
+            run_id=run.id,
+            cycle_id=cycle.id,
+            action_key="append-failure",
+            decision=AgentDecision(kind="action", tool_name="sandbox.command"),
+        )
+    )
+    store.agent_checkpoints[run.id] = FailingCheckpointList()
+    claimed = store.claim_agent_action(
+        "tenant_acme",
+        action.id,
+        lease_owner_id="worker_append_failure",
+        lease_seconds=30,
+    )
+    assert claimed is not None
+
+    with pytest.raises(RuntimeError, match="checkpoint append failed"):
+        store.commit_agent_action_observation(
+            "tenant_acme",
+            action.id,
+            AgentObservation(action_id=action.id, success=True),
+            lease_owner_id="worker_append_failure",
+            lease_generation=claimed.lease_generation,
+            usage={"tool_calls": 1},
+            state_payload={"iteration": 1},
+            checksum="sha256:append-failure",
+        )
+
+    persisted = store.get_agent_action("tenant_acme", action.id)
+    assert persisted.status == "running"
+    assert persisted.observation is None
+    assert persisted.lease_owner_id == "worker_append_failure"
+    assert persisted.lease_generation == claimed.lease_generation
+    assert persisted.lease_expires_at == claimed.lease_expires_at
+    assert store.get_latest_agent_checkpoint("tenant_acme", run.id) is None
+
+
+def test_in_memory_concurrent_message_reads_return_consistent_snapshots():
+    from taroai.domain import ChatMessageCreate, ChatThreadCreate
+
+    store = InMemoryControlPlaneStore()
+    thread = store.create_chat_thread(
+        "tenant_acme",
+        "user_1",
+        ChatThreadCreate(workspace_id="workspace_sales"),
+    )
+    barrier = Barrier(3)
+
+    def write_messages(offset: int) -> None:
+        barrier.wait()
+        for index in range(250):
+            store.append_chat_message(
+                "tenant_acme",
+                thread.id,
+                "user_1",
+                ChatMessageCreate(content=f"Message {offset + index}"),
+            )
+
+    def read_snapshots() -> list[list[int]]:
+        barrier.wait()
+        snapshots: list[list[int]] = []
+        for _ in range(500):
+            snapshots.append(
+                [
+                    message.sequence
+                    for message in store.list_chat_messages("tenant_acme", thread.id)
+                ]
+            )
+        return snapshots
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        writer_a = executor.submit(write_messages, 0)
+        writer_b = executor.submit(write_messages, 250)
+        reader = executor.submit(read_snapshots)
+        writer_a.result()
+        writer_b.result()
+        snapshots = reader.result()
+
+    for sequence_snapshot in snapshots:
+        assert sequence_snapshot == list(range(1, len(sequence_snapshot) + 1))
+    assert len(store.list_chat_messages("tenant_acme", thread.id)) == 500
