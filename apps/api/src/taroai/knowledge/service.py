@@ -36,6 +36,40 @@ class InMemoryKnowledgeService(BaseModel):
         self.bases[knowledge_base.id] = knowledge_base
         return knowledge_base
 
+    def list_bases_for_tenant(self, tenant_id: str) -> list[KnowledgeBase]:
+        return [
+            base
+            for base in sorted(self.bases.values(), key=lambda item: (item.created_at, item.id))
+            if base.tenant_id == tenant_id
+        ]
+
+    def list_bases_for_workspace(self, tenant_id: str, workspace_id: str) -> list[KnowledgeBase]:
+        return [
+            base
+            for base in self.list_bases_for_tenant(tenant_id)
+            if base.workspace_id == workspace_id
+        ]
+
+    def list_documents(
+        self,
+        tenant_id: str,
+        knowledge_base_id: str | None = None,
+        workspace_id: str | None = None,
+    ) -> list[KnowledgeDocument]:
+        return [
+            document
+            for document in sorted(
+                self.documents.values(),
+                key=lambda item: (item.created_at, item.id),
+            )
+            if document.tenant_id == tenant_id
+            and (
+                knowledge_base_id is None
+                or document.knowledge_base_id == knowledge_base_id
+            )
+            and (workspace_id is None or document.workspace_id == workspace_id)
+        ]
+
     def register_document(self, request: KnowledgeDocumentCreate) -> KnowledgeDocument:
         knowledge_base = self.bases.get(request.knowledge_base_id)
         if knowledge_base is None:
@@ -64,6 +98,10 @@ class InMemoryKnowledgeService(BaseModel):
                 citation=chunk.citation,
                 acl_subjects=document.acl_subjects,
                 sensitivity_level=document.sensitivity_level,
+                embedding=chunk.embedding,
+                embedding_model=chunk.embedding_model,
+                embedding_provider=chunk.embedding_provider,
+                embedded_at=chunk.embedded_at,
             )
             for chunk in request.chunks
         ]

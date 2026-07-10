@@ -12,7 +12,7 @@ from taroai.guardrails.models import (
     GuardrailRedaction,
     GuardrailStage,
 )
-from taroai.secrets import InMemorySecretService, SecretAccessDeniedError, SecretNotFoundError
+from taroai.secrets import SecretAccessDeniedError, SecretNotFoundError, SecretService
 from taroai.tool_gateway.models import (
     ToolAuditRecord,
     ToolAuditRecorder,
@@ -41,7 +41,7 @@ class ToolGateway(BaseModel):
     policies: dict[str, ToolPolicy] = Field(default_factory=dict)
     audit_recorder: ToolAuditRecorder | None = None
     audit_service: Any | None = None
-    secret_service: InMemorySecretService | None = None
+    secret_service: SecretService | None = None
     guardrail_service: Any | None = None
     _handlers: dict[str, ToolHandler] = PrivateAttr(default_factory=dict)
 
@@ -50,7 +50,15 @@ class ToolGateway(BaseModel):
         self._handlers[policy.tool_name] = handler
         return policy
 
-    def execute_for_run(self, state, step) -> ToolResult:
+    def can_execute_tool(self, tool_name: str) -> bool:
+        return tool_name in self.policies and tool_name in self._handlers
+
+    def execute_for_run(
+        self,
+        state,
+        step,
+        granted_scopes: list[str] | None = None,
+    ) -> ToolResult:
         return self.execute_request(
             ToolGatewayRequest(
                 tenant_id=state.tenant_id,
@@ -59,7 +67,9 @@ class ToolGateway(BaseModel):
                 run_id=state.run_id,
                 step_id=step.id,
                 tool_name=step.tool_name,
+                skill_id=step.skill_id,
                 tool_input=step.tool_input,
+                granted_scopes=granted_scopes or [],
                 approved=step.id in state.approved_step_ids,
             )
         )
@@ -68,15 +78,21 @@ class ToolGateway(BaseModel):
         decision = self.check_policy(request)
         if not decision.allowed:
             self._record_audit("tool.blocked", request, decision)
-            raise ToolExecutionError(decision.reason or f"Tool is not permitted: {request.tool_name}")
+            raise ToolExecutionError(
+                decision.reason or f"Tool is not permitted: {request.tool_name}"
+            )
         if decision.approval_required and not request.approved:
             self._record_audit("tool.approval_required", request, decision)
-            raise ToolApprovalRequiredError(f"Tool approval required: {request.tool_name}")
+            raise ToolApprovalRequiredError(
+                f"Tool approval required: {request.tool_name}"
+            )
 
         request = self._apply_guardrails(request)
         handler = self._handlers.get(request.tool_name)
         if handler is None:
-            raise ToolExecutionError(f"Tool handler is not registered: {request.tool_name}")
+            raise ToolExecutionError(
+                f"Tool handler is not registered: {request.tool_name}"
+            )
 
         policy = self.policies[request.tool_name]
         request = self._with_secret_leases(request, policy)
@@ -102,7 +118,9 @@ class ToolGateway(BaseModel):
                 reason=f"Tool is disabled: {request.tool_name}",
             )
 
-        missing_scopes = sorted(set(policy.required_scopes) - set(request.granted_scopes))
+        missing_scopes = sorted(
+            set(policy.required_scopes) - set(request.granted_scopes)
+        )
         if missing_scopes:
             return ToolPolicyDecision(
                 allowed=False,
@@ -132,10 +150,16 @@ class ToolGateway(BaseModel):
         )
         if decision.blocked:
             self._record_guardrail_audit("tool.guardrail_blocked", request, decision)
-            raise ToolExecutionError(decision.message or f"Tool is blocked by guardrail: {request.tool_name}")
+            raise ToolExecutionError(
+                decision.message or f"Tool is blocked by guardrail: {request.tool_name}"
+            )
         if decision.approval_required and not request.approved:
-            self._record_guardrail_audit("tool.guardrail_approval_required", request, decision)
-            raise ToolApprovalRequiredError(decision.message or f"Tool approval required: {request.tool_name}")
+            self._record_guardrail_audit(
+                "tool.guardrail_approval_required", request, decision
+            )
+            raise ToolApprovalRequiredError(
+                decision.message or f"Tool approval required: {request.tool_name}"
+            )
         if decision.action == GuardrailAction.REDACT and decision.redactions:
             return request.model_copy(
                 update={
@@ -155,6 +179,7 @@ class ToolGateway(BaseModel):
         attributes.update(
             {
                 "tool_name": request.tool_name,
+                "skill_id": request.skill_id,
                 "tenant_id": request.tenant_id,
                 "workspace_id": request.workspace_id,
                 "user_id": request.user_id,
@@ -175,7 +200,9 @@ class ToolGateway(BaseModel):
                 for key, item in value.items()
             }
         if isinstance(value, list):
-            return [self._apply_guardrail_redactions(item, redactions) for item in value]
+            return [
+                self._apply_guardrail_redactions(item, redactions) for item in value
+            ]
         if isinstance(value, str):
             redacted = value
             for redaction in redactions:
@@ -207,12 +234,21 @@ class ToolGateway(BaseModel):
                     tool_name=request.tool_name,
                     actions=requirement.actions,
                     ttl_seconds=requirement.ttl_seconds,
+                    run_id=request.run_id,
+                    step_id=request.step_id,
+                    session_id=self._lease_session_id(request),
                 )
                 for requirement in policy.secret_requirements
             ]
         except (SecretAccessDeniedError, SecretNotFoundError) as error:
             raise ToolExecutionError(str(error)) from error
         return request.model_copy(update={"secret_leases": leases})
+
+    def _lease_session_id(self, request: ToolGatewayRequest) -> str | None:
+        session_id = request.tool_input.get("session_id")
+        if session_id is None:
+            return None
+        return str(session_id)
 
     def _record_audit(
         self,
@@ -229,6 +265,7 @@ class ToolGateway(BaseModel):
             run_id=request.run_id,
             step_id=request.step_id,
             tool_name=request.tool_name,
+            skill_id=request.skill_id,
             reason=decision.reason,
             missing_scopes=decision.missing_scopes,
             risk_level=policy.risk_level if policy is not None else None,
@@ -279,6 +316,7 @@ class ToolGateway(BaseModel):
             run_id=request.run_id,
             step_id=request.step_id,
             tool_name=request.tool_name,
+            skill_id=request.skill_id,
             reason=decision.message,
             risk_level=policy.risk_level if policy is not None else None,
             granted_scopes=request.granted_scopes,
@@ -337,7 +375,14 @@ class ToolGateway(BaseModel):
 
     def _is_sensitive_key(self, key: str) -> bool:
         normalized = key.lower().replace("-", "_")
-        if normalized in {"secret", "token", "password", "api_key", "apikey", "credential"}:
+        if normalized in {
+            "secret",
+            "token",
+            "password",
+            "api_key",
+            "apikey",
+            "credential",
+        }:
             return True
         return normalized.endswith(
             (

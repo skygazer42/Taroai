@@ -28,25 +28,33 @@ class PolicyDecision(BaseModel):
     approval_required: bool = False
     reason: str | None = None
     missing_permissions: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
     @classmethod
-    def allow(cls):
-        return cls(effect=PolicyEffect.ALLOW, allowed=True)
+    def allow(cls, metadata: dict[str, Any] | None = None):
+        return cls(effect=PolicyEffect.ALLOW, allowed=True, metadata=metadata or {})
 
     @classmethod
-    def deny(cls, reason: str, missing_permissions: list[str] | None = None):
+    def deny(
+        cls,
+        reason: str,
+        missing_permissions: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ):
         return cls(
             effect=PolicyEffect.DENY,
             allowed=False,
             reason=reason,
             missing_permissions=missing_permissions or [],
+            metadata=metadata or {},
         )
 
     @classmethod
-    def require_approval(cls, reason: str):
+    def require_approval(cls, reason: str, metadata: dict[str, Any] | None = None):
         return cls(
             effect=PolicyEffect.APPROVAL_REQUIRED,
             allowed=False,
             approval_required=True,
             reason=reason,
+            metadata=metadata or {},
         )

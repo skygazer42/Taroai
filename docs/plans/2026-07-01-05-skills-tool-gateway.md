@@ -12,7 +12,7 @@
 
 ## Summary
 
-Current state has a Pydantic `SkillManifest`, tenant-scoped registry lifecycle records, workspace installation records, SQLite-compatible SQL registry persistence selectable through settings, `/api/skills` management endpoints behind identity permissions, and initial `taroai/tool_gateway` package with request/policy/result models, scope checks, approval-required decisions, input/output schema validation, registered-handler execution, runtime context invocation, runtime policy-approval pause, successful-call audit/billing records, failed-call audit redaction, and unified API error mapping. This plan turns that foundation into a governed enterprise skill layer and complete Tool Gateway.
+Current state has a Pydantic `SkillManifest`, tenant-scoped registry lifecycle records, workspace installation records, SQLite-compatible SQL registry persistence selectable through settings, `/api/skills` management endpoints behind identity permissions, and initial `taroai/tool_gateway` package with request/policy/result models, scope checks, approval-required decisions, input/output schema validation, registered-handler execution, runtime context invocation, runtime policy-approval pause, successful-call audit/billing records, skill-specific `skill_call_count` meters, failed-call audit redaction, and unified API error mapping. This plan turns that foundation into a governed enterprise skill layer and complete Tool Gateway.
 
 ## Task 1: Skill Manifest Validation
 
@@ -60,7 +60,7 @@ Current state has a Pydantic `SkillManifest`, tenant-scoped registry lifecycle r
 
 - `InMemorySkillRegistry` now tracks tenant-scoped skill entries with `draft`, `published`, and `disabled` lifecycle states plus workspace installation status.
 - `SqlSkillRegistry` persists tenant-scoped skill entries and workspace installation records to the SQLite-compatible SQL repository through `TAROAI_SKILL_REGISTRY_BACKEND`.
-- Disabled-skill invocation enforcement remains implementation work.
+- Dev-mode workspace skill invocation is started through `POST /api/workspaces/{workspace_id}/skills/{skill_id}/invoke`. The endpoint is available only while dev request headers are enabled, requires `skills.invoke`, requires the skill to be published and installed/enabled for the workspace, enforces manifest-required scopes through the Policy Service before calling the Tool Gateway, and records `skill.invoked` audit metadata plus `skill_call_count` billing without raw input or output payload storage.
 
 ## Task 3: Tool Gateway Package
 
@@ -137,10 +137,11 @@ Current state has a Pydantic `SkillManifest`, tenant-scoped registry lifecycle r
 **Current Implementation Notes:**
 
 - Successful runtime tool calls now create `tool_call_count` billing meter events and `tool.executed` audit events through `InMemoryControlPlaneStore` and `SqlControlPlaneRepository`.
+- OpenAI-compatible planned tool calls can carry `skill_id`; runtime records `skill_call_count` meters with that `skill_id`, and billing pricing rules can be scoped by skill for enterprise custom-skill cost estimates.
 - Runtime tool calls now pause when Tool Gateway policy requires approval, and failed runtime tool calls create `tool.failed` audit records with sensitive tool input redaction.
 - Tool Gateway service calls can now emit `tool.blocked` and `tool.approval_required` audit records through injected `AuditService` before blocked or approval-gated handlers run, with sensitive tool input redaction.
 - The older callable audit recorder path remains available for local contract hooks.
-- Skill-specific billing meter selection, connector-backed tool execution, and broader secret policy remain implementation work.
+- Connector-backed tool execution and broader secret policy remain implementation work.
 
 ## Task 6: API Endpoints
 
@@ -168,7 +169,7 @@ Current state has a Pydantic `SkillManifest`, tenant-scoped registry lifecycle r
 
 - `/api/skills`, `/api/skills/{skill_id}`, `/api/skills/{skill_id}/publish`, and `/api/skills/{skill_id}/disable` are started behind identity permission checks.
 - `/api/workspaces/{workspace_id}/skills` install/list/enable/disable endpoints are started behind identity permission checks.
-- Dev-mode tool invocation endpoint and connector-backed skill execution remain implementation work.
+- Dev-mode workspace skill invocation is started behind identity permission checks and Tool Gateway execution. Connector-backed skill execution remains implementation work.
 
 ## Verification
 

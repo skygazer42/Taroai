@@ -8,6 +8,7 @@ node_modules/
 .idea/
 dist/
 build/
+a.out
 .env
 .env.*
 !.env.example

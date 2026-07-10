@@ -6,7 +6,7 @@ import pytest
 from taroai.domain import utc_now
 from taroai.db import DatabaseConfig, MigrationRunner
 from taroai.storage import SqlStorageCatalog, StorageObjectCreate, StoragePurpose
-from taroai.store import NotFoundError, TenantAccessError
+from taroai.store import NotFoundError
 
 
 def test_sql_storage_catalog_persists_objects_across_instances(tmp_path: Path):
@@ -158,6 +158,150 @@ def test_sql_storage_catalog_updates_uploaded_object_size(tmp_path: Path):
     assert restarted.get("tenant_acme", stored.id).size_bytes == 256
 
 
+def test_sql_storage_catalog_get_query_sets_tenant_context(tmp_path: Path):
+    database_url = f"sqlite:///{tmp_path / 'taroai.sqlite3'}"
+    MigrationRunner(
+        config=DatabaseConfig(url=database_url),
+        migrations_path=Path("apps/api/migrations"),
+    ).apply()
+    catalog = SqlStorageCatalog(
+        config=DatabaseConfig(url=database_url),
+        bucket="taroai-artifacts",
+    )
+    stored = catalog.register(
+        StorageObjectCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_sales",
+            run_id="run_123",
+            purpose=StoragePurpose.SANDBOX_SNAPSHOT,
+            filename="snapshot.json",
+            content_type="application/json",
+            size_bytes=0,
+        )
+    )
+
+    fetched = catalog.get("tenant_acme", stored.id)
+
+    assert fetched == stored
+
+
+def test_sql_storage_catalog_get_uses_tenant_scoped_lookup(monkeypatch):
+    executed_sql: list[str] = []
+    now = datetime(2026, 7, 3, 13, 50, tzinfo=timezone.utc)
+
+    class Result:
+        def fetchone(self):
+            return {
+                "id": "storage_1",
+                "tenant_id": "tenant_acme",
+                "workspace_id": "workspace_sales",
+                "run_id": "run_123",
+                "purpose": StoragePurpose.SANDBOX_SNAPSHOT.value,
+                "filename": "snapshot.json",
+                "content_type": "application/json",
+                "size_bytes": 256,
+                "acl_subjects": [],
+                "sensitivity_level": 0,
+                "bucket": "taroai-artifacts",
+                "object_key": "tenant_acme/workspace_sales/runs/run_123/sandbox-snapshots/snapshot.json",
+                "retention_expires_at": None,
+                "deleted_at": None,
+                "created_at": now,
+            }
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, error_type, error, traceback):
+            return None
+
+        def execute(self, sql, params):
+            executed_sql.append(" ".join(sql.split()))
+            return Result()
+
+    monkeypatch.setattr(
+        "taroai.storage.repository.connect_database",
+        lambda _config: Connection(),
+    )
+
+    catalog = SqlStorageCatalog(
+        config=DatabaseConfig(url="postgresql://example"),
+        bucket="taroai-artifacts",
+    )
+
+    catalog.get("tenant_acme", "storage_1")
+
+    assert executed_sql == ["SELECT * FROM storage_objects WHERE tenant_id = ? AND id = ?"]
+
+
+def test_sql_storage_catalog_hydrates_postgresql_native_values(tmp_path: Path):
+    database_url = f"sqlite:///{tmp_path / 'taroai.sqlite3'}"
+    MigrationRunner(
+        config=DatabaseConfig(url=database_url),
+        migrations_path=Path("apps/api/migrations"),
+    ).apply()
+    created_at = utc_now()
+    retention_expires_at = utc_now()
+    with SqlStorageCatalog(
+        config=DatabaseConfig(url=database_url),
+        bucket="taroai-artifacts",
+    )._connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO storage_objects (
+                id, tenant_id, workspace_id, run_id, purpose, filename,
+                content_type, size_bytes, acl_subjects, sensitivity_level,
+                bucket, object_key, retention_expires_at, deleted_at, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "storage_native",
+                "tenant_acme",
+                "workspace_sales",
+                "run_123",
+                StoragePurpose.ARTIFACT.value,
+                "native.md",
+                "text/markdown",
+                128,
+                '["team:sales"]',
+                2,
+                "taroai-artifacts",
+                "tenant_acme/workspace_sales/runs/run_123/artifacts/native.md",
+                retention_expires_at.isoformat(),
+                None,
+                created_at.isoformat(),
+            ),
+        )
+    catalog = SqlStorageCatalog(
+        config=DatabaseConfig(url=database_url),
+        bucket="taroai-artifacts",
+    )
+    row = {
+        "id": "storage_native",
+        "tenant_id": "tenant_acme",
+        "workspace_id": "workspace_sales",
+        "run_id": "run_123",
+        "purpose": StoragePurpose.ARTIFACT.value,
+        "filename": "native.md",
+        "content_type": "text/markdown",
+        "size_bytes": 128,
+        "acl_subjects": ["team:sales"],
+        "sensitivity_level": 2,
+        "bucket": "taroai-artifacts",
+        "object_key": "tenant_acme/workspace_sales/runs/run_123/artifacts/native.md",
+        "retention_expires_at": retention_expires_at,
+        "deleted_at": None,
+        "created_at": created_at,
+    }
+    hydrated = catalog._from_row(row)
+
+    assert hydrated.acl_subjects == ["team:sales"]
+    assert hydrated.retention_expires_at == retention_expires_at
+    assert hydrated.created_at == created_at
+
+
 def test_sql_storage_catalog_enforces_tenant_boundary(tmp_path: Path):
     database_url = f"sqlite:///{tmp_path / 'taroai.sqlite3'}"
     MigrationRunner(
@@ -182,7 +326,7 @@ def test_sql_storage_catalog_enforces_tenant_boundary(tmp_path: Path):
     )
 
     assert catalog.list_for_run("tenant_other", "run_123") == []
-    with pytest.raises(TenantAccessError):
+    with pytest.raises(NotFoundError):
         catalog.get("tenant_other", stored.id)
 
 

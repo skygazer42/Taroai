@@ -67,11 +67,23 @@ class Run(BaseModel):
 
 class RunEvent(BaseModel):
     id: str
+    sequence: int = Field(ge=1)
     tenant_id: str
     workspace_id: str
     run_id: str
     type: str
     payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+
+
+class IdempotencyRecord(BaseModel):
+    tenant_id: str
+    key: str = Field(min_length=1)
+    method: str = Field(min_length=1)
+    path: str = Field(min_length=1)
+    request_hash: str = Field(min_length=1)
+    status_code: int = Field(ge=100, le=599)
+    response_body: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
 
 
@@ -90,21 +102,29 @@ class BillingMeterEvent(BaseModel):
     tenant_id: str
     workspace_id: str
     user_id: str
-    run_id: str
+    run_id: str | None
     agent_id: str | None
     skill_id: str | None = None
     meter_type: Literal[
         "model_tokens_input",
         "model_tokens_output",
+        "model_tokens_cached_input",
         "model_call_count",
+        "model_latency_ms",
+        "embedding_call_count",
+        "embedding_tokens",
         "sandbox_minutes",
         "browser_action_count",
         "tool_call_count",
         "storage_bytes",
         "artifact_bytes",
+        "external_artifact_download_bytes",
         "egress_bytes",
         "run_count",
         "skill_call_count",
+        "trigger_invocation_count",
+        "connector_invocation_count",
+        "connector_sync_document_count",
     ]
     quantity: float
     unit: str

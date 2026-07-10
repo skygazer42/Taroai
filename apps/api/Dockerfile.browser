@@ -1,0 +1,25 @@
+FROM mcr.microsoft.com/playwright/python:v1.61.0-noble
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app/src
+ENV PIP_DEFAULT_TIMEOUT=120
+ENV PIP_RETRIES=10
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+WORKDIR /app
+
+RUN addgroup --system taroai && adduser --system --ingroup taroai taroai
+
+COPY requirements-browser.txt /app/requirements-browser.txt
+RUN python -m pip install --no-cache-dir --retries 10 --timeout 120 -r /app/requirements-browser.txt
+
+COPY src /app/src
+
+RUN chown -R taroai:taroai /app
+
+USER taroai
+
+EXPOSE 8001
+
+CMD ["uvicorn", "taroai.sandbox.playwright_service:app", "--host", "0.0.0.0", "--port", "8001"]

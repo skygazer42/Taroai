@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from taroai.audit import AuditEventCreate
 from taroai.db import DatabaseConfig
+from taroai.db.connection import connect_database
 from taroai.domain import utc_now
 from taroai.identity.models import (
     PasswordHasher,
@@ -15,6 +16,8 @@ from taroai.identity.models import (
     RoleAssignment,
     UserAccount,
     UserAccountCreate,
+    UserAccountStatus,
+    normalize_email,
 )
 from taroai.store import NotFoundError, TenantAccessError
 
@@ -71,29 +74,67 @@ class SqlIdentityService(BaseModel):
         return self.password_hasher.verify_password(password, account.password_hash)
 
     def disable_user(self, tenant_id: str, user_id: str) -> UserAccount:
+        return self._set_user_status(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            status="disabled",
+            event_type="identity.user.disabled",
+        )
+
+    def mark_user_pending(self, tenant_id: str, user_id: str) -> UserAccount:
+        return self._set_user_status(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            status="pending",
+            event_type="identity.user.pending",
+        )
+
+    def activate_user(self, tenant_id: str, user_id: str) -> UserAccount:
+        return self._set_user_status(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            status="active",
+            event_type="identity.user.activated",
+        )
+
+    def delete_user(self, tenant_id: str, user_id: str) -> UserAccount:
+        return self._set_user_status(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            status="deleted",
+            event_type="identity.user.deleted",
+        )
+
+    def _set_user_status(
+        self,
+        tenant_id: str,
+        user_id: str,
+        status: UserAccountStatus,
+        event_type: str,
+    ) -> UserAccount:
         account = self.get_user(tenant_id, user_id)
-        disabled = account.model_copy(update={"status": "disabled"})
+        updated = account.model_copy(update={"status": status})
         with self._connect() as connection:
             connection.execute(
                 "UPDATE users SET status = ? WHERE tenant_id = ? AND id = ?",
-                (disabled.status, tenant_id, user_id),
+                (updated.status, tenant_id, user_id),
             )
         self._record_audit_event(
             tenant_id=tenant_id,
             user_id=user_id,
-            event_type="identity.user.disabled",
+            event_type=event_type,
             metadata={
                 "user_id": user_id,
-                "status": disabled.status,
+                "status": updated.status,
             },
         )
-        return disabled
+        return updated
 
     def get_user_by_email(self, tenant_id: str, email: str) -> UserAccount:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT * FROM users WHERE tenant_id = ? AND lower(email) = lower(?)",
-                (tenant_id, email),
+                "SELECT * FROM users WHERE tenant_id = ? AND lower(trim(email)) = lower(trim(?))",
+                (tenant_id, normalize_email(email)),
             ).fetchone()
         if row is None:
             raise NotFoundError(f"User not found: {email}")
@@ -102,8 +143,8 @@ class SqlIdentityService(BaseModel):
     def get_user(self, tenant_id: str, user_id: str) -> UserAccount:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT * FROM users WHERE id = ?",
-                (user_id,),
+                "SELECT * FROM users WHERE tenant_id = ? AND id = ?",
+                (tenant_id, user_id),
             ).fetchone()
         if row is None:
             raise NotFoundError(f"User not found: {user_id}")
@@ -183,7 +224,9 @@ class SqlIdentityService(BaseModel):
         return self._role_from_row(row)
 
     def has_permission(self, tenant_id: str, user_id: str, action: str, resource: str) -> bool:
-        self.get_user(tenant_id, user_id)
+        account = self.get_user(tenant_id, user_id)
+        if account.status != "active":
+            return False
         roles = [
             self.get_role(tenant_id, role_id)
             for role_id in self.list_role_ids_for_user(tenant_id, user_id)
@@ -208,11 +251,7 @@ class SqlIdentityService(BaseModel):
         return [row["role_id"] for row in rows]
 
     def _connect(self):
-        path = self.config.sqlite_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(path)
-        connection.row_factory = sqlite3.Row
-        return connection
+        return connect_database(self.config)
 
     def _ensure_tenant(self, connection, tenant_id: str) -> None:
         connection.execute(
@@ -245,15 +284,19 @@ class SqlIdentityService(BaseModel):
     def _json(self, value) -> str:
         return json.dumps(value, separators=(",", ":"))
 
-    def _loads(self, value: str | None):
+    def _loads(self, value: Any | None):
         if value is None:
             return []
+        if not isinstance(value, str):
+            return value
         return json.loads(value)
 
     def _dt(self, value: datetime) -> str:
         return value.isoformat()
 
-    def _parse_dt(self, value: str) -> datetime:
+    def _parse_dt(self, value: datetime | str) -> datetime:
+        if isinstance(value, datetime):
+            return value
         return datetime.fromisoformat(value)
 
     def _record_audit_event(

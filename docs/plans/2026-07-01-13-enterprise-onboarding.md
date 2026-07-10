@@ -6,7 +6,7 @@
 
 **Architecture:** Tenant onboarding is a control-plane workflow, not a one-off script. The API owns tenant, workspace, identity, policy, billing, and default-resource creation through Pydantic request/result models; background jobs handle slow imports such as SCIM users, starter knowledge, and starter skill packs. Every onboarding action writes audit events and can be resumed safely.
 
-**Tech Stack:** FastAPI, Pydantic, PostgreSQL, Redis job queue later, pytest, optional SSO/OIDC/SAML/SCIM providers.
+**Tech Stack:** FastAPI, Pydantic, PostgreSQL, Redis job queue later, pytest, SSO provider configuration, and later OIDC/SAML/SCIM integrations.
 
 ---
 
@@ -64,15 +64,16 @@ This plan fills the enterprise-delivery gap between platform foundation and actu
 
 **Files:**
 
-- Create: `apps/api/src/taroai/identity/sso.py`
-- Create: `apps/api/src/taroai/identity/scim.py`
+- Create: `apps/api/src/taroai/sso/`
+- Create: `apps/api/src/taroai/scim/`
 - Modify: `apps/api/src/taroai/config.py`
-- Test: `tests/api/test_sso_scim_contract.py`
+- Test: `tests/api/test_sso_providers.py`
+- Test: `tests/api/test_scim_provisioning.py`
 
 **Steps:**
 
-1. Add Pydantic models for `SsoProviderConfig`, `ScimProviderConfig`, and `IdentityProviderType`.
-2. Support PoC password login as fallback, but mark enterprise SSO as tenant configuration.
+1. Add Pydantic OIDC/SAML provider config models under a dedicated `taroai/sso` package.
+2. Support PoC password login as fallback, but mark enterprise SSO provider configuration as tenant configuration.
 3. Add SCIM user and group import models without implementing external provider calls yet.
 4. Map SCIM groups to tenant/workspace roles.
 5. Add tests that disabled password fallback rejects password login for SSO-only tenants.
@@ -82,6 +83,7 @@ This plan fills the enterprise-delivery gap between platform foundation and actu
 - Tenant identity mode is explicit.
 - Password fallback can be disabled per tenant.
 - SCIM group-to-role mapping is represented before external sync is implemented.
+- SSO provider configuration is managed separately from protocol login handling.
 
 ## Task 4: Starter Knowledge Spaces and Skill Packs
 
@@ -150,7 +152,9 @@ This plan fills the enterprise-delivery gap between platform foundation and actu
 - `apps/api/src/taroai/onboarding/` now contains Pydantic bootstrap/readiness models, `TenantBootstrapService`, and `TenantReadinessService`.
 - `/api/tenants/bootstrap` creates the first tenant owner, seeds the `tenant_owner` role with explicit tenant-scoped permissions, requires `TAROAI_TENANT_BOOTSTRAP_TOKEN`, and records `tenant.bootstrap.completed` audit metadata without password content.
 - `/api/tenants/current/readiness` reports owner, role, auth mode, quota profile, audit read, billing read, object storage config, job queue config, starter skill, and knowledge space checks through authenticated tenant context.
-- Starter pack seeding, full onboarding orchestration, workspace seed, readiness runbooks, SSO/OIDC/SAML, SCIM, quota enforcement, and production rollout remain implementation work.
+- `apps/api/src/taroai/sso/` now contains Pydantic OIDC/SAML provider metadata, memory and SQL registries, tenant-scoped management APIs for configure/list/get/enable/disable, SQL/RLS persistence, SSO entitlement checks on configure/enable, sanitized audit events, and AuthService enforcement that rejects password login for enabled SSO providers when `password_fallback_enabled=false`.
+- `apps/api/src/taroai/scim/` now contains Pydantic SCIM provider config, SCIM User/Group import resources, group-to-role mapping, memory/SQL provisioning stores, external user links, import records, tenant-scoped configure/list/get/enable/disable/mapping/import APIs behind RBAC, SQL/RLS persistence, SCIM entitlement checks on configure/enable/import, and sanitized import audit events. Full `/scim/v2` service-provider compatibility, IdP push-token enforcement, PATCH/filter/bulk operations, reactivation flows, OIDC/SAML protocol redirects, callback/assertion validation, and MFA remain implementation work.
+- Starter pack seeding, full onboarding orchestration, workspace seed, readiness runbooks, quota enforcement, and production rollout remain implementation work.
 
 **Acceptance Criteria:**
 
@@ -164,7 +168,8 @@ Run after implementation:
 ```bash
 python -m pytest tests/api/test_onboarding_contract.py -q
 python -m pytest tests/api/test_onboarding_identity_defaults.py -q
-python -m pytest tests/api/test_sso_scim_contract.py -q
+python -m pytest tests/api/test_sso_providers.py -q
+python -m pytest tests/api/test_scim_provisioning.py -q
 python -m pytest tests/api/test_onboarding_starter_packs.py -q
 python -m pytest tests/api/test_onboarding_quota_defaults.py -q
 python -m pytest tests/api/test_tenant_readiness.py -q

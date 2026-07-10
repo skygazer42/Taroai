@@ -1,0 +1,3 @@
+ALTER TABLE customer_solution_pack_publication_drafts ADD COLUMN proposed_pack_version TEXT;
+
+ALTER TABLE customer_solution_pack_publication_drafts ADD COLUMN proposed_skill_manifest JSONB;

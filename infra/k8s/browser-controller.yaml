@@ -1,0 +1,123 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: browser-controller
+  labels:
+    app.kubernetes.io/name: browser-controller
+    app.kubernetes.io/component: browser-controller
+    app.kubernetes.io/part-of: taroai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: browser-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: browser-controller
+        app.kubernetes.io/component: browser-controller
+        app.kubernetes.io/part-of: taroai
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: browser-controller
+          image: ghcr.io/creao-ai/taroai-browser-controller:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - uvicorn
+          args:
+            - taroai.sandbox.playwright_service:app
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8001"
+          ports:
+            - name: http
+              containerPort: 8001
+          env:
+            - name: TAROAI_BROWSER_CONTROLLER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: taroai-runtime-secrets
+                  key: TAROAI_BROWSER_CONTROLLER_API_KEY
+            - name: TAROAI_BROWSER_CONTROLLER_SESSION_TTL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: taroai-runtime-config
+                  key: TAROAI_BROWSER_CONTROLLER_SESSION_TTL_SECONDS
+            - name: TAROAI_BROWSER_CONTROLLER_MAX_SESSIONS
+              valueFrom:
+                configMapKeyRef:
+                  name: taroai-runtime-config
+                  key: TAROAI_BROWSER_CONTROLLER_MAX_SESSIONS
+            - name: TAROAI_BROWSER_CONTROLLER_MAX_SESSIONS_PER_TENANT
+              valueFrom:
+                configMapKeyRef:
+                  name: taroai-runtime-config
+                  key: TAROAI_BROWSER_CONTROLLER_MAX_SESSIONS_PER_TENANT
+            - name: TAROAI_BROWSER_CONTROLLER_MAX_SESSIONS_PER_RUN
+              valueFrom:
+                configMapKeyRef:
+                  name: taroai-runtime-config
+                  key: TAROAI_BROWSER_CONTROLLER_MAX_SESSIONS_PER_RUN
+            - name: TAROAI_BROWSER_CONTROLLER_NAVIGATION_ALLOWED_HOSTS
+              valueFrom:
+                configMapKeyRef:
+                  name: taroai-runtime-config
+                  key: TAROAI_BROWSER_CONTROLLER_NAVIGATION_ALLOWED_HOSTS
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: browser-profile
+              mountPath: /home/taroai
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: browser-profile
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: browser-controller
+  labels:
+    app.kubernetes.io/name: browser-controller
+    app.kubernetes.io/component: browser-controller
+    app.kubernetes.io/part-of: taroai
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: browser-controller
+  ports:
+    - name: http
+      port: 8001
+      targetPort: http

@@ -59,15 +59,15 @@ The source requirements come from `a.md` and the user discussion:
 | Pydantic backend management models | 02-24 | Covered | Each service plan calls for Pydantic request/result/domain models. |
 | No future annotations in backend source | 02, 03, 11 | Covered | Existing tests enforce the style; keep it as a quality gate. |
 | Storage: PostgreSQL, Redis, object storage | 02, 03, 09, 20 | Covered | Source of truth and transient storage roles are separated. |
-| User accounts, password hashing, roles | 03, 10, 13 | Covered | Password login is PoC fallback; SSO/SCIM comes through onboarding. |
+| User accounts, password hashing, roles | 03, 10, 13 | Covered | Password login is PoC fallback; SSO provider config and SCIM provisioning foundations come through onboarding. |
 | RBAC/ABAC and tenant isolation | 03, 10, 13 | Covered | Must remain enforced before data access, not only at route layer. |
 | Short-term and long-term memory | 03, 04, 12, 16 | Covered | Short-term Redis TTL and long-term reviewed memory are separate. |
 | Knowledge base and ACL-aware RAG | 04, 10, 15, 20 | Covered | Query-time ACL filtering is mandatory. |
 | Skill registry and marketplace | 05, 08, 12, 16, 23 | Covered | Marketplace UI and solution packs depend on registry and versioning. |
 | Tool Gateway and connector governance | 05, 10, 15 | Covered | Tool and connector calls must share policy/audit/billing path. |
-| Agent runtime and agent loop | 06, 07, 17, 21 | Covered | Runtime should integrate state, model gateway, traces, guardrails, approval resume, and approval rejection. |
+| Agent runtime and agent loop | 06, 07, 17, 21 | Covered and started | Runtime integrates state snapshots, model gateway, traces, guardrails, cancellation, approval resume, and approval rejection in first-pass form. |
 | Sandbox / virtual employee workspace | 06, 09, 10, 20, 24 | Covered | Cloud-first adapter path; private deployments add packaging constraints. |
-| Multi-agent delegation | 06, 18 | Covered | Bounded delegation and agent-to-agent handoff triggers are planned. |
+| Multi-agent delegation | 06, 18 | Covered | Bounded agent handoff triggers are started; advanced delegation approval policy remains follow-up work. |
 | Billing, audit, observability | 07, 10, 11, 17, 22 | Covered | Admin APIs, meter events, trace spans, SLOs, incidents are separated by phase. |
 | CREAO-consistent frontend | 08 | Covered as final-phase contract | Chat column, composer behavior, timeline, artifacts, admin, and skill routes are documented; implementation is deferred. |
 | Deployment operations | 09, 20, 24 | Covered | Docker local PoC first; Kubernetes cloud path and private packaging later. |
@@ -75,11 +75,11 @@ The source requirements come from `a.md` and the user discussion:
 | Testing and release quality | 11 | Covered | Defines test taxonomy, CI, release checklist, frontend gates. |
 | Self-evolving safely | 12, 16, 21, 23 | Covered | Changes remain candidates until reviewed, evaluated, versioned, and published. |
 | Enterprise onboarding | 13, 23 | Covered | Tenant creation, starter packs, readiness, rollout playbooks. |
-| API/SDK contracts | 14 | Covered | Versioning, errors, pagination, idempotency, event streaming, SDK shape. |
-| Enterprise SaaS/API/MCP connectors | 15 | Covered | Credentials stay behind connector/secret boundary. |
+| API/SDK contracts | 14 | Covered and started | Versioning, errors, pagination, idempotency, event streaming, SDK shape. The MVP route checklist and OpenAPI contract test now freeze the first `/api/*` cloud PoC routes plus owner boundaries until an explicit `/api/v1` migration is approved. |
+| Enterprise SaaS/API/MCP connectors | 15 | Covered and started | Connector models, credential-reference boundary, SQL-backed admin APIs with update/enable/disable, ACL sync planning, worker-driven sync ingestion into knowledge with sync-volume billing, run-scoped invocation decisions with safe audit/billing, persisted approval-request linkage with approved execution gating, internal API HTTP dispatch with API-key plus OAuth2 bearer access-token injection, read-only database dispatch with secret-referenced DSNs plus table allowlists, OAuth authorize/callback/refresh management with token rotation through secret references, and AWS Secrets Manager value storage behind the same lease API are started; SaaS/file/MCP adapters, provider-specific OAuth edge cases, broader database dialect/query governance, tenant-specific KMS/IAM policy hardening, and additional secret backend providers remain follow-up. |
 | Sharing and artifact collaboration | 16 | Covered | Grants, external links, promotion, retention, audit. |
-| Model Gateway | 17 | Covered and started | OpenAI-compatible boundary, runtime planning metering, run/tenant/workspace/user/agent budget guards, and first-pass policy management exist; provider references, credentials, richer metering, rate limits, and fallback remain planned. |
-| Schedules, webhooks, automation | 18 | Covered | Automatic runs still create governed runs through control plane. |
+| Model Gateway | 17 | Covered and started | OpenAI-compatible boundary, runtime planning metering, run/tenant/workspace/user/agent budget guards, first-pass policy management, staged model policy change-request approval APIs, model policy version history, model sensitivity limits, secret-ref credential resolution, provider registry wiring, typed provider fallback policy, safe provider fallback attempt summaries, safe provider listing, tenant-scoped provider write/enable/disable/credential-rotation/version-list/rollback APIs, staged provider change-request approval APIs, SQL-backed provider rate-limit samples, Redis-backed request reservations, and Redis-backed `max_output_tokens` token reservations exist; broader distributed budget governance remains planned. |
+| Schedules, webhooks, automation | 18 | Covered and started | Automatic runs still create governed runs through control plane; trigger operations visibility is started. |
 | Agent Builder and workflow templates | 19 | Covered | Reusable agents become versioned configurations. |
 | Data lifecycle and backup/restore | 20 | Covered | Retention, export, offboarding, backup, DR, residency. |
 | Prompt and guardrail governance | 21 | Covered | Prompt registry, variable handling, injection checks, publication gates. |
@@ -163,10 +163,10 @@ The source requirements come from `a.md` and the user discussion:
 
 **Exit Criteria:**
 
-- Future frontend starts on the workspace, not a landing page.
+- Frontend starts on the workspace, not a landing page.
 - Chat composer requirements preserve Enter/Shift+Enter behavior.
 - Backend contracts expose admin, sharing, approval, and trigger data.
-- No frontend implementation starts until final-phase approval.
+- No full portal implementation starts beyond the static workspace slice until separately approved.
 
 ### Phase 4: Enterprise Delivery and Continuous Improvement
 
@@ -240,15 +240,15 @@ The source requirements come from `a.md` and the user discussion:
 The smallest useful enterprise cloud PoC should include:
 
 1. Tenant/workspace/user/role and request-context enforcement.
-2. Password login for PoC plus SSO configuration model.
+2. Password login for PoC plus SSO configuration and SCIM provisioning foundations.
 3. PostgreSQL metadata, Redis short-term memory, S3/MinIO artifact storage.
-4. API run lifecycle with event stream and unified errors.
+4. API run lifecycle with event stream, cancellation, retry, state read, and unified errors.
 5. ACL-aware knowledge retrieval.
 6. Skill registry with manifest validation and Tool Gateway policy checks.
 7. OpenAI-compatible Model Gateway boundary with provider policy and usage metering.
-8. Agent Runtime with bounded steps, approval pause/resume/rejection, and sandbox adapter seam.
+8. Agent Runtime with bounded steps, cancellation, approval pause/resume/rejection, and sandbox adapter seam.
 9. Billing/audit events for run, model, tool, storage, approval, and memory operations.
-10. CREAO-consistent frontend contract for the final user-managed phase.
+10. CREAO-consistent minimal static workspace for the local PoC, with full portal later.
 11. Enterprise onboarding with starter workspaces and readiness report.
 
 Explicitly defer from MVP:
@@ -265,11 +265,11 @@ Explicitly defer from MVP:
 Use this checklist before approving the next implementation milestone:
 
 - Confirm whether MVP targets one industry pack first, such as ecommerce, sales, support, or operations.
-- Confirm first sandbox provider: E2B, Kubernetes Docker, or another managed sandbox.
+- Confirm shared-enterprise sandbox provider: keep `local_process` for local PoC, use first-pass `docker` for disabled-network container execution where explicitly available, and select E2B, Kubernetes-managed containers, or microVM-backed execution before broad employee use.
 - Confirm first vector backend: pgvector, Qdrant, Milvus, Weaviate, or hosted provider.
 - Confirm first model gateway strategy: OpenAI-compatible contract first, then direct adapters, LiteLLM, or both behind it.
-- Confirm SSO timing: password-only PoC, OIDC first, or SAML/SCIM first.
-- Confirm frontend remains deferred to the final user-managed phase.
+- Confirm protocol timing: password-only PoC, OIDC/SAML login first, or full SCIM v2 provider compatibility first.
+- Confirm full frontend portal remains deferred beyond the static workspace slice.
 - Confirm whether solution packs are internal-only at first or tenant-visible.
 - Confirm whether BYOC/private packaging is roadmap-only or sales-critical.
 

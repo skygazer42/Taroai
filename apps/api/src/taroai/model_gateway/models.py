@@ -30,12 +30,23 @@ class ModelUsage(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
+    cached_input_tokens: int = 0
+
+
+class ModelProviderAttempt(BaseModel):
+    provider_id: str = Field(min_length=1)
+    model: str | None = None
+    status: Literal["succeeded", "response_error", "rate_limited"]
+    invoked: bool
+    fallback_allowed: bool = False
+    error_type: str | None = None
 
 
 class PlannedToolCall(BaseModel):
     id: str = Field(min_length=1)
     title: str = Field(min_length=1)
     tool_name: str = Field(min_length=1)
+    skill_id: str | None = None
     tool_input: dict[str, Any] = Field(default_factory=dict)
     approval_required: bool = False
 
@@ -46,6 +57,7 @@ class ModelGatewayRequest(BaseModel):
     user_id: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
     model: str | None = None
+    sensitivity_level: int = Field(default=0, ge=0)
     messages: list[ModelMessage] = Field(min_length=1)
     input: str | None = None
     tools: list[dict[str, Any]] = Field(default_factory=list)
@@ -58,7 +70,9 @@ class ModelGatewayRequest(BaseModel):
 
 class ModelGatewayResponse(BaseModel):
     id: str = Field(min_length=1)
+    provider: str | None = None
     model: str | None = None
     output_text: str = ""
     planned_steps: list[PlannedToolCall] = Field(default_factory=list)
     usage: ModelUsage | None = None
+    provider_attempts: list[ModelProviderAttempt] = Field(default_factory=list)

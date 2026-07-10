@@ -1,0 +1,132 @@
+{{- if .Values.browserController.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "taroai.fullname" . }}-browser-controller
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-browser-controller
+    app.kubernetes.io/component: browser-controller
+spec:
+  replicas: {{ .Values.browserController.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "taroai.fullname" . }}-browser-controller
+  template:
+    metadata:
+      labels:
+        {{- include "taroai.labels" . | nindent 8 }}
+        app.kubernetes.io/name: {{ include "taroai.fullname" . }}-browser-controller
+        app.kubernetes.io/component: browser-controller
+    spec:
+      serviceAccountName: {{ include "taroai.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: browser-controller
+          image: {{ printf "%s:%s" .Values.browserController.image.repository .Values.browserController.image.tag | quote }}
+          imagePullPolicy: {{ .Values.browserController.image.pullPolicy }}
+          command:
+            - uvicorn
+          args:
+            - taroai.sandbox.playwright_service:app
+            - --host
+            - 0.0.0.0
+            - --port
+            - {{ .Values.browserController.service.port | quote }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.browserController.service.port }}
+          env:
+            - name: TAROAI_BROWSER_CONTROLLER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret | quote }}
+                  key: {{ .Values.secrets.secretKeys.browserControllerApiKey | quote }}
+            - name: TAROAI_BROWSER_CONTROLLER_SESSION_TTL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_BROWSER_CONTROLLER_SESSION_TTL_SECONDS
+            - name: TAROAI_BROWSER_CONTROLLER_MAX_SESSIONS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_BROWSER_CONTROLLER_MAX_SESSIONS
+            - name: TAROAI_BROWSER_CONTROLLER_MAX_SESSIONS_PER_TENANT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_BROWSER_CONTROLLER_MAX_SESSIONS_PER_TENANT
+            - name: TAROAI_BROWSER_CONTROLLER_MAX_SESSIONS_PER_RUN
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_BROWSER_CONTROLLER_MAX_SESSIONS_PER_RUN
+            - name: TAROAI_BROWSER_CONTROLLER_NAVIGATION_ALLOWED_HOSTS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_BROWSER_CONTROLLER_NAVIGATION_ALLOWED_HOSTS
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.browserController.readinessProbe.path }}
+              port: http
+            periodSeconds: {{ .Values.browserController.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.browserController.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.browserController.readinessProbe.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.browserController.livenessProbe.path }}
+              port: http
+            periodSeconds: {{ .Values.browserController.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.browserController.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.browserController.livenessProbe.failureThreshold }}
+          resources:
+            {{- toYaml .Values.browserController.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: {{ .Values.persistence.tmp.mountPath }}
+            - name: browser-profile
+              mountPath: /home/taroai
+          securityContext:
+            {{- toYaml .Values.browserController.securityContext | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: browser-profile
+          emptyDir: {}
+      {{- with .Values.browserController.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.browserController.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.browserController.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "taroai.fullname" . }}-browser-controller
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-browser-controller
+    app.kubernetes.io/component: browser-controller
+spec:
+  type: {{ .Values.browserController.service.type }}
+  selector:
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-browser-controller
+  ports:
+    - name: http
+      port: {{ .Values.browserController.service.port }}
+      targetPort: http
+{{- end }}

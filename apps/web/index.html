@@ -1,0 +1,752 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="Taroai workspace for governed agent runs, approvals, terminal output, and artifacts."
+    />
+    <title>Taroai Workspace</title>
+    <link rel="stylesheet" href="./assets/styles.css" />
+  </head>
+  <body>
+    <div class="workspace-shell" data-app="taroai-workspace">
+      <aside class="rail" aria-label="Workspace navigation">
+        <div class="brand-mark" aria-label="Taroai">T</div>
+        <nav class="rail-nav" aria-label="Primary">
+          <button class="rail-button is-active" type="button" title="Chat" aria-label="Chat">
+            <span aria-hidden="true">⌁</span>
+          </button>
+          <button class="rail-button" type="button" title="Runs" aria-label="Runs">
+            <span aria-hidden="true">▦</span>
+          </button>
+          <button class="rail-button" type="button" title="Artifacts" aria-label="Artifacts">
+            <span aria-hidden="true">◫</span>
+          </button>
+        </nav>
+      </aside>
+
+      <main class="chat-column" data-testid="chat-column" aria-label="Agent chat">
+        <div class="chat-topbar">
+          <div>
+            <p class="eyebrow">Enterprise Agent Workspace</p>
+            <h1>How can I help, luke?</h1>
+          </div>
+          <div class="status-pill" data-status-pill>Idle</div>
+        </div>
+
+        <div class="conversation" data-testid="conversation-log" aria-live="polite">
+          <article class="message message-agent">
+            <p>
+              Start a governed run. I will stream timeline events, terminal output,
+              approvals, and artifacts from the Taroai backend.
+            </p>
+          </article>
+        </div>
+
+        <div class="quick-row" aria-label="Task shortcuts">
+          <button type="button" data-prompt="Generate a hello report in the sandbox.">
+            Hello report
+          </button>
+          <button type="button" data-prompt="Inspect the latest run events and summarize blockers.">
+            Run review
+          </button>
+          <button type="button" data-prompt="Create a concise artifact from the sandbox output.">
+            Artifact pass
+          </button>
+        </div>
+
+        <div class="composer-shell">
+          <div class="composer-row">
+            <textarea
+              id="composer-input"
+              rows="1"
+              placeholder="Ask Taroai to execute a task"
+              aria-label="Message"
+            ></textarea>
+            <button id="send-button" class="send-button" type="button" aria-label="Send">
+              <span aria-hidden="true">↵</span>
+            </button>
+          </div>
+          <div class="composer-hint">
+            Press Enter to send, Shift+Enter for a new line.
+          </div>
+        </div>
+      </main>
+
+      <aside
+        class="workbench"
+        data-testid="workspace-workbench"
+        aria-label="Run workspace"
+      >
+        <div
+          class="workbench-view-switcher"
+          data-testid="workspace-view-switcher"
+          role="tablist"
+          aria-label="Workspace views"
+        >
+          <button
+            class="is-active"
+            type="button"
+            role="tab"
+            aria-selected="true"
+            data-workbench-view-toggle="run"
+          >
+            Run
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected="false"
+            data-workbench-view-toggle="inspect"
+          >
+            Inspect
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected="false"
+            data-workbench-view-toggle="admin"
+          >
+            Admin
+          </button>
+        </div>
+
+        <div class="workbench-view is-active" data-workbench-view="run">
+        <section class="runtime-config" aria-label="Connection">
+          <label>
+            <span>API</span>
+            <input id="api-base" value="http://localhost:8000" autocomplete="off" />
+          </label>
+          <label>
+            <span>Tenant</span>
+            <input id="tenant-id" value="tenant_acme" autocomplete="off" />
+          </label>
+          <label>
+            <span>User</span>
+            <input id="user-id" value="user_luke" autocomplete="off" />
+          </label>
+          <label>
+            <span>Workspace</span>
+            <input id="workspace-id" value="workspace_sales" autocomplete="off" />
+          </label>
+          <label>
+            <span>Slug</span>
+            <input id="tenant-slug" value="acme" autocomplete="off" />
+          </label>
+          <label>
+            <span>Owner</span>
+            <input id="owner-display-name" value="Owner" autocomplete="name" />
+          </label>
+          <label>
+            <span>Email</span>
+            <input id="login-email" value="owner@example.com" autocomplete="username" />
+          </label>
+          <label>
+            <span>Password</span>
+            <input
+              id="login-password"
+              type="password"
+              placeholder="Password"
+              autocomplete="current-password"
+            />
+          </label>
+          <label>
+            <span>Bootstrap</span>
+            <input
+              id="bootstrap-token"
+              type="password"
+              placeholder="Bootstrap token"
+              autocomplete="off"
+            />
+          </label>
+          <div class="auth-actions">
+            <button id="bootstrap-login-button" type="button">Bootstrap</button>
+            <button id="login-button" type="button">Login</button>
+            <button id="logout-button" type="button" disabled>Logout</button>
+            <span data-bootstrap-status>Not bootstrapped</span>
+            <span data-auth-status>No token</span>
+          </div>
+          <div class="readiness-strip" aria-label="Runtime preflight">
+            <span data-readiness-status>Preflight unchecked</span>
+            <span data-readiness-model>Model unchecked</span>
+            <span data-readiness-sandbox>Sandbox unchecked</span>
+          </div>
+        </section>
+
+        <section class="panel run-controls" data-testid="run-controls" aria-label="Run controls">
+          <div class="panel-header">
+            <h2>Run Control</h2>
+            <span data-run-control-status>No active run</span>
+          </div>
+          <div class="run-control-actions">
+            <button id="cancel-run-button" type="button" disabled>Cancel</button>
+            <button id="retry-run-button" type="button" disabled>Retry</button>
+          </div>
+        </section>
+
+        <section
+          class="panel execution-loop"
+          data-testid="execution-loop"
+          aria-label="Execution loop"
+        >
+          <div class="panel-header">
+            <h2>Execution</h2>
+            <span data-execution-summary>No active run</span>
+          </div>
+          <div class="execution-model-route" data-execution-model-route>No model route</div>
+          <ol class="execution-loop-steps">
+            <li data-execution-stage="run" data-state="waiting">
+              <span>Run</span>
+              <strong data-execution-run>Idle</strong>
+            </li>
+            <li data-execution-stage="plan" data-state="waiting">
+              <span>Plan</span>
+              <strong data-execution-plan>Waiting</strong>
+            </li>
+            <li data-execution-stage="sandbox" data-state="waiting">
+              <span>Sandbox</span>
+              <strong data-execution-sandbox>Waiting</strong>
+            </li>
+            <li data-execution-stage="browser" data-state="waiting">
+              <span>Browser</span>
+              <strong data-execution-browser>Waiting</strong>
+            </li>
+            <li data-execution-stage="artifact" data-state="waiting">
+              <span>Artifact</span>
+              <strong data-execution-artifact>Waiting</strong>
+            </li>
+          </ol>
+        </section>
+
+        <section class="panel run-evidence" data-testid="run-evidence" aria-label="Run evidence">
+          <div class="panel-header">
+            <h2>Evidence</h2>
+            <span data-evidence-summary>No run evidence</span>
+          </div>
+          <ol class="run-evidence-list">
+            <li data-evidence-plan data-evidence-status="waiting">
+              <span>Plan</span>
+              <strong>Waiting</strong>
+            </li>
+            <li data-evidence-sandbox data-evidence-status="waiting">
+              <span>Sandbox</span>
+              <strong>Waiting</strong>
+            </li>
+            <li data-evidence-artifact data-evidence-status="waiting">
+              <span>Artifact</span>
+              <strong>Waiting</strong>
+            </li>
+            <li data-evidence-browser data-evidence-status="waiting">
+              <span>Browser</span>
+              <strong>Waiting</strong>
+            </li>
+            <li data-evidence-terminal data-evidence-status="waiting">
+              <span>Terminal</span>
+              <strong>Waiting</strong>
+            </li>
+          </ol>
+        </section>
+
+        <section
+          class="panel delivery-chain"
+          data-testid="delivery-chain"
+          aria-label="Delivery chain"
+        >
+          <div class="panel-header">
+            <h2>Delivery Chain</h2>
+            <span data-delivery-chain-status data-delivery-chain-state="waiting">
+              No delivery chain
+            </span>
+          </div>
+          <dl class="delivery-chain-grid">
+            <div>
+              <dt>Run</dt>
+              <dd data-delivery-chain-run>--</dd>
+            </div>
+            <div>
+              <dt>Sandbox</dt>
+              <dd data-delivery-chain-sandbox>--</dd>
+            </div>
+            <div>
+              <dt>Artifact</dt>
+              <dd data-delivery-chain-artifact-storage>--</dd>
+            </div>
+            <div>
+              <dt>Terminal</dt>
+              <dd data-delivery-chain-terminal-storage>--</dd>
+            </div>
+            <div>
+              <dt>Browser</dt>
+              <dd data-delivery-chain-browser-storage>--</dd>
+            </div>
+          </dl>
+        </section>
+
+        <section
+          class="panel event-integrity"
+          data-testid="event-integrity"
+          aria-label="Event integrity"
+        >
+          <div class="panel-header">
+            <h2>Event Integrity</h2>
+            <span data-event-integrity-status data-event-integrity-state="waiting">
+              No event stream
+            </span>
+          </div>
+          <dl class="event-integrity-grid">
+            <div>
+              <dt>Events</dt>
+              <dd data-event-integrity-count>--</dd>
+            </div>
+            <div>
+              <dt>Sequence</dt>
+              <dd data-event-integrity-sequence>--</dd>
+            </div>
+            <div>
+              <dt>Closure</dt>
+              <dd data-event-integrity-closure>--</dd>
+            </div>
+          </dl>
+        </section>
+        </div>
+
+        <div class="workbench-view" data-workbench-view="inspect" hidden>
+        <section class="panel run-history" data-testid="run-history" aria-label="Run history">
+          <div class="panel-header">
+            <h2>Run History</h2>
+            <button
+              data-run-history-refresh
+              type="button"
+              title="Refresh runs"
+              aria-label="Refresh runs"
+            >
+              ↻
+            </button>
+          </div>
+          <div class="run-history-status" data-run-history-status>No runs loaded</div>
+          <ul class="run-history-list" data-run-history-list>
+            <li>No runs.</li>
+          </ul>
+        </section>
+        </div>
+
+        <div class="workbench-view is-active" data-workbench-view="run">
+        <section class="panel" data-testid="run-timeline" aria-label="Run timeline">
+          <div class="panel-header">
+            <h2>Timeline</h2>
+            <button id="refresh-button" type="button" title="Refresh" aria-label="Refresh">
+              ↻
+            </button>
+          </div>
+          <ol class="timeline-list" data-timeline-list>
+            <li class="timeline-empty">No run yet.</li>
+          </ol>
+        </section>
+        </div>
+
+        <div class="workbench-view" data-workbench-view="inspect" hidden>
+        <section class="panel trace-panel" data-testid="run-trace" aria-label="Run trace">
+          <div class="panel-header">
+            <h2>Trace</h2>
+            <span data-trace-status>Not loaded</span>
+          </div>
+          <dl class="trace-metrics">
+            <div>
+              <dt>Spans</dt>
+              <dd data-trace-span-count>--</dd>
+            </div>
+            <div>
+              <dt>Events</dt>
+              <dd data-trace-event-count>--</dd>
+            </div>
+            <div>
+              <dt>Billing</dt>
+              <dd data-trace-billing-count>--</dd>
+            </div>
+            <div>
+              <dt>Audit</dt>
+              <dd data-trace-audit-count>--</dd>
+            </div>
+          </dl>
+          <div class="trace-classification" data-trace-error-classification>No error</div>
+          <ul class="trace-list" data-trace-list>
+            <li>No trace loaded.</li>
+          </ul>
+        </section>
+
+        <section
+          class="panel runtime-state-panel"
+          data-testid="runtime-state"
+          aria-label="Runtime state"
+        >
+          <div class="panel-header">
+            <h2>Runtime State</h2>
+            <span data-runtime-state-status>Not loaded</span>
+          </div>
+          <dl class="runtime-state-grid">
+            <div>
+              <dt>Step</dt>
+              <dd data-runtime-current-step>--</dd>
+            </div>
+            <div>
+              <dt>Done</dt>
+              <dd data-runtime-completed-count>--</dd>
+            </div>
+            <div>
+              <dt>Sandbox</dt>
+              <dd data-runtime-sandbox-session>--</dd>
+            </div>
+            <div>
+              <dt>Browser</dt>
+              <dd data-runtime-browser-session>--</dd>
+            </div>
+          </dl>
+          <div class="runtime-artifacts" data-runtime-artifact-count>No promoted artifacts</div>
+        </section>
+        </div>
+
+        <div class="workbench-view is-active" data-workbench-view="run">
+        <section class="panel" data-testid="sandbox-terminal" aria-label="Sandbox terminal">
+          <div class="panel-header">
+            <h2>Terminal</h2>
+            <span data-terminal-status>Waiting</span>
+          </div>
+          <div
+            class="terminal-output-object"
+            data-terminal-output-storage-object
+            data-terminal-storage-object-id=""
+          >
+            --
+          </div>
+          <pre class="terminal-output" data-terminal-output>stdout and stderr will appear here.</pre>
+        </section>
+
+        <section class="panel browser-panel" data-testid="browser-panel" aria-label="Browser">
+          <div class="panel-header">
+            <h2>Browser</h2>
+            <span data-browser-status>Waiting</span>
+          </div>
+          <div class="browser-frame">
+            <div class="browser-empty" data-browser-empty>No browser actions.</div>
+            <img
+              class="browser-screenshot-preview"
+              data-browser-screenshot-preview
+              alt="Browser capture"
+              hidden
+            />
+            <a class="browser-screenshot" data-browser-screenshot href="#" hidden>Capture</a>
+          </div>
+          <dl class="browser-meta">
+            <div>
+              <dt>Session</dt>
+              <dd data-browser-session>--</dd>
+            </div>
+            <div>
+              <dt>Action</dt>
+              <dd data-browser-action>--</dd>
+            </div>
+            <div>
+              <dt>URL</dt>
+              <dd data-browser-url>--</dd>
+            </div>
+            <div>
+              <dt>Storage</dt>
+              <dd data-browser-storage-object>--</dd>
+            </div>
+            <div>
+              <dt>Preview</dt>
+              <dd
+                data-browser-preview-storage-object
+                data-browser-preview-storage-object-id=""
+              >
+                --
+              </dd>
+            </div>
+          </dl>
+        </section>
+
+        <section class="panel" data-testid="artifact-list" aria-label="Artifacts">
+          <div class="panel-header">
+            <h2>Artifacts</h2>
+            <span data-artifact-count>0</span>
+          </div>
+          <div
+            class="delivery-summary"
+            data-delivery-summary
+            data-delivery-state="waiting"
+          >
+            No artifacts delivered
+          </div>
+          <ul class="artifact-list" data-artifact-list>
+            <li>No artifacts.</li>
+          </ul>
+          <div
+            class="artifact-download-status"
+            data-artifact-download-status
+            data-download-state="idle"
+          >
+            No artifact downloaded
+          </div>
+          <div
+            class="artifact-download-object"
+            data-artifact-downloaded-storage-object
+            data-download-storage-object-id=""
+          >
+            --
+          </div>
+          <div class="artifact-preview">
+            <div class="artifact-preview-header">
+              <span data-artifact-preview-title>No artifact selected</span>
+              <small data-artifact-preview-status>Preview idle</small>
+            </div>
+            <div
+              class="artifact-preview-object"
+              data-artifact-preview-storage-object
+              data-preview-storage-object-id=""
+            >
+              --
+            </div>
+            <pre data-artifact-preview-content>Select an artifact preview.</pre>
+          </div>
+          <div class="run-feedback" data-run-feedback-panel>
+            <span
+              data-run-feedback-status
+              data-run-feedback-state="waiting"
+            >
+              Feedback unavailable
+            </span>
+            <div class="run-feedback-actions">
+              <button id="run-feedback-positive" type="button" disabled>Useful</button>
+              <button id="run-feedback-negative" type="button" disabled>Needs work</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel approval-panel" data-testid="approval-panel" aria-label="Approvals">
+          <div class="panel-header">
+            <h2>Approval</h2>
+            <span data-approval-status>Clear</span>
+          </div>
+          <p data-approval-copy>No pending approval.</p>
+          <div
+            class="approval-resolution"
+            data-approval-resolution
+            data-resolution-state="idle"
+          >
+            No approval decision yet.
+          </div>
+          <div class="approval-actions">
+            <button id="approve-button" type="button" disabled>Approve</button>
+            <button id="reject-button" type="button" disabled>Reject</button>
+          </div>
+        </section>
+        </div>
+
+        <div class="workbench-view" data-workbench-view="admin" hidden>
+        <section
+          class="panel solution-pack-panel"
+          data-testid="solution-pack-panel"
+          aria-label="Solution packs"
+        >
+          <div class="panel-header">
+            <h2>Solution Packs</h2>
+            <button
+              data-solution-pack-refresh
+              type="button"
+              title="Refresh solution packs"
+              aria-label="Refresh solution packs"
+            >
+              ↻
+            </button>
+          </div>
+          <div class="solution-pack-status" data-solution-pack-status>No packs loaded</div>
+          <ul class="solution-pack-list" data-solution-pack-list>
+            <li>No solution packs.</li>
+          </ul>
+          <div class="solution-pack-install" aria-label="Install selected solution pack">
+            <button id="install-solution-pack-button" type="button" disabled>
+              Install to workspace
+            </button>
+            <span data-solution-pack-install-status>Select a published pack</span>
+          </div>
+        </section>
+
+        <section
+          class="panel workspace-skills-panel"
+          data-testid="workspace-skills-panel"
+          aria-label="Workspace skills"
+        >
+          <div class="panel-header">
+            <h2>Workspace Skills</h2>
+            <button
+              data-skills-refresh
+              type="button"
+              title="Refresh skills"
+              aria-label="Refresh skills"
+            >
+              ↻
+            </button>
+          </div>
+          <div class="workspace-skills-status" data-skills-status>No skills loaded</div>
+          <ul class="workspace-skills-list" data-skills-list>
+            <li>No installed skills.</li>
+          </ul>
+          <div class="skill-invoke" aria-label="Invoke selected skill">
+            <textarea
+              id="skill-invoke-input"
+              rows="4"
+              autocomplete="off"
+              spellcheck="false"
+            >{"account_id":"acct_123"}</textarea>
+            <button id="invoke-skill-button" type="button" disabled>
+              Invoke skill
+            </button>
+            <span data-skill-invoke-status>Select a ready skill</span>
+          </div>
+        </section>
+
+        <section
+          class="panel customer-success-panel"
+          data-testid="customer-success-panel"
+          aria-label="Customer success"
+        >
+          <div class="panel-header">
+            <h2>Customer Success</h2>
+            <button
+              data-cs-refresh
+              type="button"
+              title="Refresh customer success"
+              aria-label="Refresh customer success"
+            >
+              ↻
+            </button>
+          </div>
+          <div class="customer-success-status" data-cs-status>Not loaded</div>
+          <dl class="customer-success-metrics">
+            <div>
+              <dt>Health</dt>
+              <dd data-cs-health>--</dd>
+            </div>
+            <div>
+              <dt>Runs</dt>
+              <dd data-cs-runs>--</dd>
+            </div>
+            <div>
+              <dt>Feedback</dt>
+              <dd data-cs-feedback>--</dd>
+            </div>
+          </dl>
+          <div class="candidate-queue">
+            <div>
+              <span>Eval candidates</span>
+              <strong data-cs-eval-candidates>--</strong>
+            </div>
+            <div>
+              <span>Pack candidates</span>
+              <strong data-cs-pack-candidates>--</strong>
+            </div>
+          </div>
+          <div class="skill-request" aria-label="Missing skill feedback">
+            <div class="skill-request-header">
+              <span>Skill request</span>
+              <strong data-cs-missing-skill-status>Request idle</strong>
+            </div>
+            <div class="skill-request-grid">
+              <input
+                id="cs-missing-skill-name"
+                autocomplete="off"
+                placeholder="Skill name"
+              />
+              <input
+                id="cs-missing-skill-solution-pack"
+                autocomplete="off"
+                value="sales.renewal_ops"
+              />
+            </div>
+            <textarea
+              id="cs-missing-skill-comment"
+              rows="2"
+              placeholder="Blocked workflow"
+            ></textarea>
+            <button id="cs-submit-missing-skill" type="button">
+              Record request
+            </button>
+          </div>
+          <div class="candidate-actions" aria-label="Customer feedback candidate actions">
+            <span data-cs-candidate-action-status>Candidate actions idle</span>
+            <div>
+              <button id="cs-create-eval-candidates" type="button">
+                Generate eval candidates
+              </button>
+              <button id="cs-create-pack-candidates" type="button">
+                Generate pack candidates
+              </button>
+            </div>
+          </div>
+          <div class="candidate-review" aria-label="Evaluation candidate review">
+            <span data-cs-eval-candidate-selected>No eval candidate selected</span>
+            <div>
+              <button id="cs-accept-eval-candidate" type="button" disabled>
+                Accept eval
+              </button>
+              <button id="cs-reject-eval-candidate" type="button" disabled>
+                Reject eval
+              </button>
+            </div>
+          </div>
+          <div class="candidate-review" aria-label="Solution pack candidate review">
+            <span data-cs-pack-candidate-selected>No pack candidate selected</span>
+            <div>
+              <button id="cs-accept-pack-candidate" type="button" disabled>
+                Accept pack
+              </button>
+              <button id="cs-reject-pack-candidate" type="button" disabled>
+                Reject pack
+              </button>
+            </div>
+          </div>
+          <div class="draft-workflow" aria-label="Solution pack publication drafts">
+            <div class="draft-workflow-header">
+              <span>Publication drafts</span>
+              <strong data-cs-draft-selected>No draft selected</strong>
+            </div>
+            <ul class="draft-list" data-cs-drafts-list>
+              <li>No drafts.</li>
+            </ul>
+            <div class="draft-editor">
+              <label>
+                <span>Skill</span>
+                <input id="cs-draft-skill" autocomplete="off" disabled />
+              </label>
+              <label>
+                <span>Change</span>
+                <textarea id="cs-draft-summary" rows="3" disabled></textarea>
+              </label>
+              <label>
+                <span>Pack version</span>
+                <input id="cs-draft-pack-version" autocomplete="off" disabled />
+              </label>
+              <label>
+                <span>Skill manifest JSON</span>
+                <textarea id="cs-draft-skill-manifest" rows="6" disabled></textarea>
+              </label>
+              <div class="draft-actions">
+                <button id="cs-draft-save" type="button" disabled>Save</button>
+                <button id="cs-draft-submit" type="button" disabled>Submit</button>
+                <button id="cs-draft-approve" type="button" disabled>Approve</button>
+                <button id="cs-draft-reject" type="button" disabled>Reject</button>
+                <button id="cs-draft-apply" type="button" disabled>Apply</button>
+              </div>
+              <div class="draft-status" data-cs-draft-status>No draft selected</div>
+            </div>
+          </div>
+        </section>
+        </div>
+      </aside>
+    </div>
+
+    <script src="./assets/main.js" type="module"></script>
+  </body>
+</html>

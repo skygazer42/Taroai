@@ -36,7 +36,7 @@ Initial state: all plans are `draft` until a human reviewer starts review.
 | 05 | Skills and Tool Gateway | Runtime and governance | draft | yes | Required for governed tools and custom skill direction. |
 | 06 | Agent Runtime and Sandbox | Runtime and governance | draft | yes | Required for long-running agent execution and sandbox seam. |
 | 07 | Billing, Audit, and Observability | Backend foundation | draft | yes | Required for enterprise governance and cost visibility. |
-| 08 | Client Portal Contract and CREAO-Compatible UI | Client and onboarding | draft | partial | Required as frontend contract; implementation deferred to final user-managed phase. |
+| 08 | Client Portal Contract and CREAO-Compatible UI | Client and onboarding | draft | partial | Minimal static workspace slice started; full portal remains later. |
 | 09 | Deployment and Operations | Enterprise hardening | draft | partial | Local cloud PoC pieces are MVP; broader K8s/ops can follow. |
 | 10 | Security and Compliance | Backend foundation | draft | yes | Required for tenant isolation, secrets, policy, and audit. |
 | 11 | Testing, Release, and Quality Gates | Backend foundation | draft | yes | Required before implementation can be trusted. |

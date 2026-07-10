@@ -58,6 +58,31 @@ The platform already has early API endpoints, but enterprise delivery needs a co
 - List APIs can scale beyond in-memory PoC.
 - Retried writes are safe.
 
+**Current Implementation Notes:**
+
+- `POST /api/runs`, `POST /api/runs/{run_id}/approvals`, `POST /api/runs/{run_id}/approvals/reject`, `POST /api/triggers/{trigger_id}/webhook`, and restore drill execution enqueue now accept retry-safe idempotency semantics.
+- The key is scoped by tenant, HTTP method, route path, and key value.
+- The request body is hashed from the Pydantic request model using stable JSON ordering.
+- Webhook delivery replay uses `X-Taroai-Webhook-Delivery-ID` before `Idempotency-Key` and stores only trigger id plus raw-body SHA-256 hash for conflict detection.
+- Run-creation replays with the same request body return the original `201` response without creating another run or run event stream.
+- Approval resolve/reject replays with the same request body return the original `200` response without resolving the same approval twice or writing duplicate approval audit records.
+- Webhook delivery replays with the same body return the original `202` response without creating another autonomous run, trigger audit event, or trigger billing meter.
+- Restore drill execution enqueue replays with the same request body return the original `202` response without creating another execution job or execution-queued audit record.
+- Reuse with a different request body returns `409` with `idempotency_key_conflict`.
+- Idempotency records are backed by the control-plane store and SQL migration `005_idempotency_records.sql`.
+- `docs/contracts/idempotency-contract.md` documents the implemented routes and remaining write routes.
+- `apps/api/src/taroai/api/pagination.py` now defines Pydantic `PageRequest`, `PageResult`, `PageCursor`, and `SortDirection` models.
+- `GET /api/runs` now returns the shared page shape with `limit`, `cursor`, `sort_direction`, `workspace_id`, and `status` support.
+- Run list pagination is tenant-scoped and uses `created_at + id` cursor ordering.
+- `GET /api/billing/meters` and `GET /api/audit-events` now return the shared page shape when pagination parameters are supplied, while preserving the existing array response for callers that have not migrated.
+- `GET /api/skills`, `GET /api/memory`, and `GET /api/memory/short-term` now return the shared page shape when pagination parameters are supplied, while preserving the existing array response for callers that have not migrated.
+- `GET /api/runs/{run_id}/artifacts`, `GET /api/runs/{run_id}/storage-objects`, `GET /api/knowledge-bases`, and `GET /api/knowledge-documents` now return the shared page shape when pagination parameters are supplied.
+- Knowledge base and knowledge document list routes were added to close the management API gap for knowledge packages.
+- `docs/contracts/api-pagination-contract.md` documents the implemented routes, shared response shape, and migration compatibility.
+- `docs/contracts/license-import-contract.md` documents the signed license import endpoint, permission boundary, activation rules, sanitized response shape, and audit requirements.
+- The main backend list routes now have a shared pagination contract; generated SDKs and clients still need to migrate to always request the page shape.
+- Idempotency for skill publication and tenant onboarding remains open.
+
 ## Task 3: Run and Event Streaming Contract
 
 **Files:**
@@ -73,6 +98,12 @@ The platform already has early API endpoints, but enterprise delivery needs a co
 3. Include monotonic sequence numbers per run.
 4. Add replay API using `after_sequence`.
 5. Test that frontend can fetch events after reconnect.
+
+**Current Implementation Notes:**
+
+- `RunEvent` now carries a per-run monotonic `sequence`.
+- `GET /api/runs/{run_id}/events` emits SSE `id: <sequence>` and supports `after_sequence` plus `Last-Event-ID` replay.
+- `docs/contracts/run-event-stream-contract.md` documents the reconnect contract for the static workspace and later full portal.
 
 **Acceptance Criteria:**
 

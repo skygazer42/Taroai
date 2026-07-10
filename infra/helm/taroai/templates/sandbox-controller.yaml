@@ -1,0 +1,297 @@
+{{- if .Values.sandboxController.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "taroai.fullname" . }}-sandbox-controller
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-sandbox-controller
+    app.kubernetes.io/component: sandbox-controller
+automountServiceAccountToken: true
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "taroai.fullname" . }}-sandbox-runner
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-sandbox-runner
+    app.kubernetes.io/component: sandbox-runtime
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "taroai.fullname" . }}-sandbox-controller
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-sandbox-controller
+    app.kubernetes.io/component: sandbox-controller
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "taroai.fullname" . }}-sandbox-controller
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-sandbox-controller
+    app.kubernetes.io/component: sandbox-controller
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "taroai.fullname" . }}-sandbox-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "taroai.fullname" . }}-sandbox-controller
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "taroai.fullname" . }}-sandbox-controller
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-sandbox-controller
+    app.kubernetes.io/component: sandbox-controller
+spec:
+  replicas: {{ .Values.sandboxController.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "taroai.fullname" . }}-sandbox-controller
+  template:
+    metadata:
+      labels:
+        {{- include "taroai.labels" . | nindent 8 }}
+        app.kubernetes.io/name: {{ include "taroai.fullname" . }}-sandbox-controller
+        app.kubernetes.io/component: sandbox-controller
+    spec:
+      serviceAccountName: {{ include "taroai.fullname" . }}-sandbox-controller
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: sandbox-controller
+          image: {{ printf "%s:%s" .Values.sandboxController.image.repository .Values.sandboxController.image.tag | quote }}
+          imagePullPolicy: {{ .Values.sandboxController.image.pullPolicy }}
+          command:
+            - uvicorn
+          args:
+            - taroai.sandbox.controller_service:app
+            - --host
+            - 0.0.0.0
+            - --port
+            - {{ .Values.sandboxController.service.port | quote }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.sandboxController.service.port }}
+          env:
+            - name: TAROAI_SANDBOX_CONTROLLER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret | quote }}
+                  key: {{ .Values.secrets.secretKeys.sandboxControllerApiKey | quote }}
+            - name: TAROAI_SANDBOX_CONTROLLER_PROVIDER
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_SANDBOX_CONTROLLER_PROVIDER
+            - name: TAROAI_SANDBOX_CONTROLLER_SESSION_TTL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_SANDBOX_CONTROLLER_SESSION_TTL_SECONDS
+            - name: TAROAI_SANDBOX_CONTROLLER_MAX_SESSIONS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_SANDBOX_CONTROLLER_MAX_SESSIONS
+            - name: TAROAI_SANDBOX_CONTROLLER_MAX_SESSIONS_PER_TENANT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_SANDBOX_CONTROLLER_MAX_SESSIONS_PER_TENANT
+            - name: TAROAI_SANDBOX_CONTROLLER_MAX_SESSIONS_PER_RUN
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_SANDBOX_CONTROLLER_MAX_SESSIONS_PER_RUN
+            - name: TAROAI_SANDBOX_CONTROLLER_DOCKER_MEMORY_LIMIT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_SANDBOX_CONTROLLER_DOCKER_MEMORY_LIMIT
+            - name: TAROAI_SANDBOX_CONTROLLER_DOCKER_CPUS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_SANDBOX_CONTROLLER_DOCKER_CPUS
+            - name: TAROAI_SANDBOX_CONTROLLER_DOCKER_PIDS_LIMIT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_SANDBOX_CONTROLLER_DOCKER_PIDS_LIMIT
+            - name: TAROAI_SANDBOX_CONTROLLER_DOCKER_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_SANDBOX_CONTROLLER_DOCKER_USER
+            - name: TAROAI_SANDBOX_CONTROLLER_DOCKER_READ_ONLY_ROOTFS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_SANDBOX_CONTROLLER_DOCKER_READ_ONLY_ROOTFS
+            - name: TAROAI_SANDBOX_CONTROLLER_DOCKER_DROP_ALL_CAPABILITIES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_SANDBOX_CONTROLLER_DOCKER_DROP_ALL_CAPABILITIES
+            - name: TAROAI_SANDBOX_CONTROLLER_DOCKER_SECURITY_OPTS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_SANDBOX_CONTROLLER_DOCKER_SECURITY_OPTS
+            - name: TAROAI_SANDBOX_CONTROLLER_DOCKER_TMPFS_MOUNTS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_SANDBOX_CONTROLLER_DOCKER_TMPFS_MOUNTS
+            - name: TAROAI_SANDBOX_CONTROLLER_KUBERNETES_NAMESPACE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_SANDBOX_CONTROLLER_KUBERNETES_NAMESPACE
+            - name: TAROAI_SANDBOX_CONTROLLER_KUBERNETES_KUBECTL_BINARY
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_SANDBOX_CONTROLLER_KUBERNETES_KUBECTL_BINARY
+            - name: TAROAI_SANDBOX_CONTROLLER_KUBERNETES_SERVICE_ACCOUNT_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_SANDBOX_CONTROLLER_KUBERNETES_SERVICE_ACCOUNT_NAME
+            - name: TAROAI_SANDBOX_CONTROLLER_KUBERNETES_RUNTIME_CLASS_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_SANDBOX_CONTROLLER_KUBERNETES_RUNTIME_CLASS_NAME
+            - name: TAROAI_SANDBOX_CONTROLLER_KUBERNETES_RUNTIME_CLASS_REQUIRED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_SANDBOX_CONTROLLER_KUBERNETES_RUNTIME_CLASS_REQUIRED
+            - name: TAROAI_SANDBOX_CONTROLLER_KUBERNETES_ALLOWED_IMAGES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_SANDBOX_CONTROLLER_KUBERNETES_ALLOWED_IMAGES
+            - name: TAROAI_SANDBOX_CONTROLLER_KUBERNETES_ORPHAN_CLEANUP_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_SANDBOX_CONTROLLER_KUBERNETES_ORPHAN_CLEANUP_ENABLED
+            - name: TAROAI_SANDBOX_CONTROLLER_KUBERNETES_IMAGE_PULL_POLICY
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_SANDBOX_CONTROLLER_KUBERNETES_IMAGE_PULL_POLICY
+            - name: TAROAI_SANDBOX_CONTROLLER_KUBERNETES_POD_READY_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_SANDBOX_CONTROLLER_KUBERNETES_POD_READY_TIMEOUT_SECONDS
+            - name: TAROAI_SANDBOX_CONTROLLER_KUBERNETES_MEMORY_LIMIT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_SANDBOX_CONTROLLER_KUBERNETES_MEMORY_LIMIT
+            - name: TAROAI_SANDBOX_CONTROLLER_KUBERNETES_CPU_LIMIT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_SANDBOX_CONTROLLER_KUBERNETES_CPU_LIMIT
+            - name: TAROAI_SANDBOX_CONTROLLER_KUBERNETES_EPHEMERAL_STORAGE_LIMIT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_SANDBOX_CONTROLLER_KUBERNETES_EPHEMERAL_STORAGE_LIMIT
+            - name: TAROAI_SANDBOX_CONTROLLER_KUBERNETES_RUN_AS_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_SANDBOX_CONTROLLER_KUBERNETES_RUN_AS_USER
+            - name: TAROAI_SANDBOX_CONTROLLER_KUBERNETES_RUN_AS_GROUP
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "taroai.fullname" . }}-runtime-config
+                  key: TAROAI_SANDBOX_CONTROLLER_KUBERNETES_RUN_AS_GROUP
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.sandboxController.readinessProbe.path }}
+              port: http
+            periodSeconds: {{ .Values.sandboxController.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.sandboxController.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.sandboxController.readinessProbe.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.sandboxController.livenessProbe.path }}
+              port: http
+            periodSeconds: {{ .Values.sandboxController.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.sandboxController.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.sandboxController.livenessProbe.failureThreshold }}
+          resources:
+            {{- toYaml .Values.sandboxController.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: {{ .Values.persistence.tmp.mountPath }}
+            - name: sandbox-workspaces
+              mountPath: /data/taroai/sandboxes
+          securityContext:
+            {{- toYaml .Values.sandboxController.securityContext | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: sandbox-workspaces
+          emptyDir: {}
+      {{- with .Values.sandboxController.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.sandboxController.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.sandboxController.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "taroai.fullname" . }}-sandbox-controller
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-sandbox-controller
+    app.kubernetes.io/component: sandbox-controller
+spec:
+  type: {{ .Values.sandboxController.service.type }}
+  selector:
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-sandbox-controller
+  ports:
+    - name: http
+      port: {{ .Values.sandboxController.service.port }}
+      targetPort: http
+{{- end }}

@@ -1,0 +1,237 @@
+name: taroai-local-cloud-poc
+
+services:
+  web:
+    image: nginx:1.27-alpine
+    ports:
+      - "${TAROAI_WEB_PORT:-3000}:80"
+    volumes:
+      - ../apps/web:/usr/share/nginx/html:ro
+    depends_on:
+      api:
+        condition: service_healthy
+
+  api:
+    build:
+      context: ../apps/api
+      dockerfile: Dockerfile
+      network: host
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        ALL_PROXY: ${ALL_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
+    env_file:
+      - path: ../.env.example
+        required: true
+      - path: ../.env
+        required: false
+    environment:
+      TAROAI_DATABASE_URL: ${TAROAI_DATABASE_URL:-postgresql://taroai_app:taroai_app@postgres:5432/taroai}
+      TAROAI_REDIS_URL: ${TAROAI_REDIS_URL:-redis://redis:6379/0}
+      TAROAI_OBJECT_STORAGE_ENDPOINT: ${TAROAI_OBJECT_STORAGE_ENDPOINT:-http://minio:9000}
+      TAROAI_OBJECT_STORAGE_BUCKET: ${TAROAI_OBJECT_STORAGE_BUCKET:-taroai-artifacts}
+      TAROAI_OBJECT_STORAGE_REGION: ${TAROAI_OBJECT_STORAGE_REGION:-us-east-1}
+      TAROAI_OBJECT_STORAGE_ACCESS_KEY_ID: ${TAROAI_OBJECT_STORAGE_ACCESS_KEY_ID:-taroai_minio}
+      TAROAI_OBJECT_STORAGE_SECRET_ACCESS_KEY: ${TAROAI_OBJECT_STORAGE_SECRET_ACCESS_KEY:-taroai_minio_password}
+      TAROAI_ACCESS_TOKEN_SECRET: ${TAROAI_ACCESS_TOKEN_SECRET:-local_cloud_poc_access_token_key}
+      TAROAI_PASSWORD_HASH_SALT: ${TAROAI_PASSWORD_HASH_SALT:-local_cloud_poc_password_salt}
+      TAROAI_TENANT_BOOTSTRAP_TOKEN: ${TAROAI_TENANT_BOOTSTRAP_TOKEN:-local_bootstrap_token}
+      TAROAI_EXTERNAL_SHARE_LINK_TOKEN_HASH_SECRET: ${TAROAI_EXTERNAL_SHARE_LINK_TOKEN_HASH_SECRET:-}
+      TAROAI_SANDBOX_SECRET_RESOLVER_TOKEN: ${TAROAI_SANDBOX_SECRET_RESOLVER_TOKEN:-}
+      TAROAI_SANDBOX_CONTROLLER_BASE_URL: ${TAROAI_SANDBOX_CONTROLLER_BASE_URL:-http://sandbox-controller:8002}
+      TAROAI_SANDBOX_CONTROLLER_API_KEY: ${TAROAI_SANDBOX_CONTROLLER_API_KEY:-local_sandbox_controller_key_2026_dev_only}
+      TAROAI_SANDBOX_CONTROLLER_TIMEOUT_SECONDS: ${TAROAI_SANDBOX_CONTROLLER_TIMEOUT_SECONDS:-30}
+      TAROAI_TRIGGER_WEBHOOK_SIGNING_SECRETS: '${TAROAI_TRIGGER_WEBHOOK_SIGNING_SECRETS:-["replace-with-webhook-signing-secret"]}'
+      TAROAI_BROWSER_PROVIDER: ${TAROAI_BROWSER_PROVIDER:-playwright}
+      TAROAI_BROWSER_CONTROLLER_BASE_URL: ${TAROAI_BROWSER_CONTROLLER_BASE_URL:-http://browser-controller:8001}
+      TAROAI_BROWSER_CONTROLLER_API_KEY: ${TAROAI_BROWSER_CONTROLLER_API_KEY:-local_browser_controller_key_2026_dev_only}
+      TAROAI_BROWSER_CONTROLLER_TIMEOUT_SECONDS: ${TAROAI_BROWSER_CONTROLLER_TIMEOUT_SECONDS:-30}
+      TAROAI_MODEL_GATEWAY_BASE_URL: ${TAROAI_MODEL_GATEWAY_BASE_URL:-https://api.openai.com/v1}
+      TAROAI_MODEL_GATEWAY_API_KEY: ${TAROAI_MODEL_GATEWAY_API_KEY:-}
+      TAROAI_MODEL_GATEWAY_API_KEY_SECRET_REF_ID: ${TAROAI_MODEL_GATEWAY_API_KEY_SECRET_REF_ID:-}
+      TAROAI_MODEL_GATEWAY_SECRET_LEASE_TTL_SECONDS: ${TAROAI_MODEL_GATEWAY_SECRET_LEASE_TTL_SECONDS:-60}
+      TAROAI_MODEL_GATEWAY_MODEL: ${TAROAI_MODEL_GATEWAY_MODEL:-}
+      TAROAI_MODEL_GATEWAY_TIMEOUT_SECONDS: ${TAROAI_MODEL_GATEWAY_TIMEOUT_SECONDS:-30}
+      TAROAI_MODEL_GATEWAY_CHAT_REQUEST_OPTIONS: '${TAROAI_MODEL_GATEWAY_CHAT_REQUEST_OPTIONS:-{}}'
+      TAROAI_MODEL_GATEWAY_PROVIDERS: '${TAROAI_MODEL_GATEWAY_PROVIDERS:-[]}'
+      TAROAI_RUN_MIGRATIONS: ${TAROAI_RUN_MIGRATIONS:-true}
+    ports:
+      - "${TAROAI_API_PORT:-8000}:8000"
+    volumes:
+      - api-data:/data/taroai
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      sandbox-controller:
+        condition: service_healthy
+      browser-controller:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 12
+
+  sandbox-controller:
+    build:
+      context: ../apps/api
+      dockerfile: Dockerfile.sandbox
+      network: host
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        ALL_PROXY: ${ALL_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
+    environment:
+      TAROAI_SANDBOX_CONTROLLER_API_KEY: ${TAROAI_SANDBOX_CONTROLLER_API_KEY:-local_sandbox_controller_key_2026_dev_only}
+      TAROAI_SANDBOX_CONTROLLER_PROVIDER: ${TAROAI_SANDBOX_CONTROLLER_PROVIDER:-docker}
+      TAROAI_SANDBOX_CONTROLLER_SESSION_TTL_SECONDS: ${TAROAI_SANDBOX_CONTROLLER_SESSION_TTL_SECONDS:-1800}
+      TAROAI_SANDBOX_CONTROLLER_MAX_SESSIONS: ${TAROAI_SANDBOX_CONTROLLER_MAX_SESSIONS:-50}
+      TAROAI_SANDBOX_CONTROLLER_MAX_SESSIONS_PER_TENANT: ${TAROAI_SANDBOX_CONTROLLER_MAX_SESSIONS_PER_TENANT:-20}
+      TAROAI_SANDBOX_CONTROLLER_MAX_SESSIONS_PER_RUN: ${TAROAI_SANDBOX_CONTROLLER_MAX_SESSIONS_PER_RUN:-3}
+      TAROAI_SANDBOX_CONTROLLER_DOCKER_MEMORY_LIMIT: ${TAROAI_SANDBOX_CONTROLLER_DOCKER_MEMORY_LIMIT:-1g}
+      TAROAI_SANDBOX_CONTROLLER_DOCKER_CPUS: ${TAROAI_SANDBOX_CONTROLLER_DOCKER_CPUS:-1.0}
+      TAROAI_SANDBOX_CONTROLLER_DOCKER_PIDS_LIMIT: ${TAROAI_SANDBOX_CONTROLLER_DOCKER_PIDS_LIMIT:-256}
+      TAROAI_SANDBOX_CONTROLLER_DOCKER_USER: ${TAROAI_SANDBOX_CONTROLLER_DOCKER_USER:-65532:65532}
+      TAROAI_SANDBOX_CONTROLLER_DOCKER_READ_ONLY_ROOTFS: ${TAROAI_SANDBOX_CONTROLLER_DOCKER_READ_ONLY_ROOTFS:-true}
+      TAROAI_SANDBOX_CONTROLLER_DOCKER_DROP_ALL_CAPABILITIES: ${TAROAI_SANDBOX_CONTROLLER_DOCKER_DROP_ALL_CAPABILITIES:-true}
+      TAROAI_SANDBOX_CONTROLLER_DOCKER_SECURITY_OPTS: '${TAROAI_SANDBOX_CONTROLLER_DOCKER_SECURITY_OPTS:-["no-new-privileges:true"]}'
+      TAROAI_SANDBOX_CONTROLLER_DOCKER_TMPFS_MOUNTS: '${TAROAI_SANDBOX_CONTROLLER_DOCKER_TMPFS_MOUNTS:-["/tmp:rw,noexec,nosuid,size=256m"]}'
+      TAROAI_SANDBOX_CONTROLLER_KUBERNETES_NAMESPACE: ${TAROAI_SANDBOX_CONTROLLER_KUBERNETES_NAMESPACE:-default}
+      TAROAI_SANDBOX_CONTROLLER_KUBERNETES_KUBECTL_BINARY: ${TAROAI_SANDBOX_CONTROLLER_KUBERNETES_KUBECTL_BINARY:-kubectl}
+      TAROAI_SANDBOX_CONTROLLER_KUBERNETES_SERVICE_ACCOUNT_NAME: ${TAROAI_SANDBOX_CONTROLLER_KUBERNETES_SERVICE_ACCOUNT_NAME:-sandbox-runner}
+      TAROAI_SANDBOX_CONTROLLER_KUBERNETES_RUNTIME_CLASS_NAME: ${TAROAI_SANDBOX_CONTROLLER_KUBERNETES_RUNTIME_CLASS_NAME:-gvisor}
+      TAROAI_SANDBOX_CONTROLLER_KUBERNETES_RUNTIME_CLASS_REQUIRED: ${TAROAI_SANDBOX_CONTROLLER_KUBERNETES_RUNTIME_CLASS_REQUIRED:-true}
+      TAROAI_SANDBOX_CONTROLLER_KUBERNETES_ALLOWED_IMAGES: '${TAROAI_SANDBOX_CONTROLLER_KUBERNETES_ALLOWED_IMAGES:-["ghcr.io/customer/sandbox-runtime@sha256:*"]}'
+      TAROAI_SANDBOX_CONTROLLER_KUBERNETES_ORPHAN_CLEANUP_ENABLED: ${TAROAI_SANDBOX_CONTROLLER_KUBERNETES_ORPHAN_CLEANUP_ENABLED:-false}
+      TAROAI_SANDBOX_CONTROLLER_KUBERNETES_IMAGE_PULL_POLICY: ${TAROAI_SANDBOX_CONTROLLER_KUBERNETES_IMAGE_PULL_POLICY:-IfNotPresent}
+      TAROAI_SANDBOX_CONTROLLER_KUBERNETES_POD_READY_TIMEOUT_SECONDS: ${TAROAI_SANDBOX_CONTROLLER_KUBERNETES_POD_READY_TIMEOUT_SECONDS:-60}
+      TAROAI_SANDBOX_CONTROLLER_KUBERNETES_MEMORY_LIMIT: ${TAROAI_SANDBOX_CONTROLLER_KUBERNETES_MEMORY_LIMIT:-1Gi}
+      TAROAI_SANDBOX_CONTROLLER_KUBERNETES_CPU_LIMIT: ${TAROAI_SANDBOX_CONTROLLER_KUBERNETES_CPU_LIMIT:-1000m}
+      TAROAI_SANDBOX_CONTROLLER_KUBERNETES_EPHEMERAL_STORAGE_LIMIT: ${TAROAI_SANDBOX_CONTROLLER_KUBERNETES_EPHEMERAL_STORAGE_LIMIT:-2Gi}
+      TAROAI_SANDBOX_CONTROLLER_KUBERNETES_RUN_AS_USER: ${TAROAI_SANDBOX_CONTROLLER_KUBERNETES_RUN_AS_USER:-65532}
+      TAROAI_SANDBOX_CONTROLLER_KUBERNETES_RUN_AS_GROUP: ${TAROAI_SANDBOX_CONTROLLER_KUBERNETES_RUN_AS_GROUP:-65532}
+    ports:
+      - "${TAROAI_SANDBOX_CONTROLLER_PORT:-8002}:8002"
+    volumes:
+      - sandbox-controller-data:/data/taroai
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/healthz', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 12
+
+  browser-controller:
+    build:
+      context: ../apps/api
+      dockerfile: Dockerfile.browser
+      network: host
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        ALL_PROXY: ${ALL_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
+    environment:
+      TAROAI_BROWSER_CONTROLLER_API_KEY: ${TAROAI_BROWSER_CONTROLLER_API_KEY:-local_browser_controller_key_2026_dev_only}
+      TAROAI_BROWSER_CONTROLLER_SESSION_TTL_SECONDS: ${TAROAI_BROWSER_CONTROLLER_SESSION_TTL_SECONDS:-1800}
+      TAROAI_BROWSER_CONTROLLER_MAX_SESSIONS: ${TAROAI_BROWSER_CONTROLLER_MAX_SESSIONS:-50}
+      TAROAI_BROWSER_CONTROLLER_MAX_SESSIONS_PER_TENANT: ${TAROAI_BROWSER_CONTROLLER_MAX_SESSIONS_PER_TENANT:-20}
+      TAROAI_BROWSER_CONTROLLER_MAX_SESSIONS_PER_RUN: ${TAROAI_BROWSER_CONTROLLER_MAX_SESSIONS_PER_RUN:-3}
+      TAROAI_BROWSER_CONTROLLER_NAVIGATION_ALLOWED_HOSTS: '${TAROAI_BROWSER_CONTROLLER_NAVIGATION_ALLOWED_HOSTS:-[]}'
+    ports:
+      - "${TAROAI_BROWSER_CONTROLLER_PORT:-8001}:8001"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/healthz', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 12
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-taroai}
+      POSTGRES_USER: ${POSTGRES_USER:-taroai_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-taroai_admin}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/001_taroai_app.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio:RELEASE.2025-06-13T11-33-47Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${TAROAI_OBJECT_STORAGE_ACCESS_KEY_ID:-taroai_minio}
+      MINIO_ROOT_PASSWORD: ${TAROAI_OBJECT_STORAGE_SECRET_ACCESS_KEY:-taroai_minio_password}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:9000/minio/health/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${TAROAI_OBJECT_STORAGE_ACCESS_KEY_ID:-taroai_minio}
+      MINIO_ROOT_PASSWORD: ${TAROAI_OBJECT_STORAGE_SECRET_ACCESS_KEY:-taroai_minio_password}
+      TAROAI_OBJECT_STORAGE_BUCKET: ${TAROAI_OBJECT_STORAGE_BUCKET:-taroai-artifacts}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"
+        mc mb --ignore-existing "local/$${TAROAI_OBJECT_STORAGE_BUCKET}"
+        mc anonymous set none "local/$${TAROAI_OBJECT_STORAGE_BUCKET}"
+
+volumes:
+  api-data:
+  sandbox-controller-data:
+  postgres-data:
+  redis-data:
+  minio-data:

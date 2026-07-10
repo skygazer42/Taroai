@@ -53,7 +53,7 @@ Storage and identity are product boundaries, not implementation details:
 - Long-term memory stores approved user/team/company/agent learnings and must be scoped by tenant, workspace, role, and sensitivity.
 - PostgreSQL is the source of truth for tenants, users, roles, runs, approvals, billing, audit, memory metadata, and storage metadata.
 - S3/MinIO object storage holds large artifacts, uploads, sandbox outputs, and snapshots.
-- User accounts must store password hashes only; enterprise deployments should later support SSO/OIDC/SAML.
+- User accounts must store password hashes only; enterprise deployments should support SSO provider configuration and later OIDC/SAML protocol login.
 - Permissions start with RBAC and expand into ABAC for document sensitivity, tool risk, workspace membership, and approval policies.
 
 ## 3. Client Surfaces
@@ -307,7 +307,9 @@ Meter types:
 
 - `model_tokens_input`
 - `model_tokens_output`
+- `model_tokens_cached_input`
 - `model_call_count`
+- `model_latency_ms`
 - `sandbox_minutes`
 - `browser_action_count`
 - `tool_call_count`
@@ -316,6 +318,8 @@ Meter types:
 - `egress_bytes`
 - `run_count`
 - `skill_call_count`
+- `trigger_invocation_count`
+- `connector_invocation_count`
 
 Billing dimensions:
 

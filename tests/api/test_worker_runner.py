@@ -2,13 +2,37 @@ from pathlib import Path
 
 import pytest
 
+import taroai.workers.runner as runner_module
 from taroai.agent import AgentRuntime
 from taroai.audit import AuditService
+from taroai.billing import BillingPricingRuleUpsert, SqlBillingPricingRuleStore
 from taroai.config import Settings
+from taroai.connectors import (
+    ConnectorAclMapping,
+    ConnectorAclMappingRule,
+    ConnectorSyncDocument,
+    ConnectorSyncJob,
+    SqlConnectorRegistry,
+    SourceAclPrincipal,
+)
 from taroai.db import DatabaseConfig, MigrationRunner, SqlControlPlaneRepository
-from taroai.domain import RunCreate, RunStatus
+from taroai.domain import RunCreate, RunMode, RunStatus
 from taroai.guardrails import InMemoryGuardrailService
-from taroai.lifecycle import SqlLifecyclePolicyStore
+from taroai.knowledge import (
+    InMemoryKnowledgeService,
+    KnowledgeBaseCreate,
+    SqlKnowledgeService,
+)
+from taroai.lifecycle import (
+    InMemoryRestoreDrillScheduleStore,
+    RestoreDrillRunRecord,
+    RestoreDrillRunStatus,
+    RestoreDrillScheduleCreate,
+    SqlLifecyclePolicyStore,
+    SqlRestoreDrillScheduleStore,
+)
+from taroai.deployment import RestoreDrillVerificationConfig
+from taroai.deployment_evidence import RestoreDrillVerificationResult
 from taroai.model_gateway import (
     ModelGatewayRequest,
     ModelMessage,
@@ -18,13 +42,55 @@ from taroai.model_gateway import (
     PlannedToolCall,
     SqlModelPolicyStore,
 )
+from taroai.identity import InMemoryIdentityService
+from taroai.policy import IdentityPolicyService
+from taroai.sandbox import BrowserController, HttpBrowserController
 from taroai.storage import SqlStorageCatalog
+from taroai.storage import InMemoryStorageCatalog, StorageDownloadResult
 from taroai.store import InMemoryControlPlaneStore
-from taroai.workers import AgentWorker, InMemoryJobQueue, JobStatus, JobType, RunExecutionJob
+from taroai.triggers import (
+    InMemoryTriggerStore,
+    SqlTriggerStore,
+    TriggerDefinitionCreate,
+    TriggerScheduleConfig,
+    TriggerService,
+    TriggerType,
+)
+from taroai.workers import (
+    AgentWorker,
+    ConnectorSyncWorker,
+    InMemoryJobQueue,
+    JobStatus,
+    JobType,
+    RestoreDrillDueJob,
+    RestoreDrillDueWorker,
+    RestoreDrillDueWorkerRunner,
+    RestoreDrillEvidenceCollectionJob,
+    RestoreDrillEvidenceWorker,
+    RestoreDrillEvidenceWorkerRunner,
+    RestoreDrillExecutionJob,
+    RestoreDrillExecutionWorker,
+    RestoreDrillExecutionWorkerRunner,
+    RestoreDrillSchedulerWorker,
+    RunExecutionJob,
+    TriggerDueJob,
+    TriggerDueWorker,
+    TriggerSchedulerWorker,
+)
 from taroai.workers.runner import (
     AgentWorkerRunner,
+    TriggerDueWorkerRunner,
+    TriggerSchedulerWorkerRunner,
+    build_restore_drill_due_worker_runner,
+    build_restore_drill_evidence_worker_runner,
+    build_restore_drill_execution_worker_runner,
     build_agent_worker_runner,
     build_cleanup_worker_runner,
+    build_connector_sync_worker_runner,
+    build_trigger_scheduler_worker_runner,
+    build_trigger_due_worker_runner,
+    build_restore_drill_scheduler_worker_runner,
+    WorkerProcessConfig,
 )
 from tests.api.adapters import DeterministicModelGateway, DeterministicToolGateway
 
@@ -79,6 +145,399 @@ def test_agent_worker_runner_processes_one_queued_run():
     assert store.get_run("tenant_acme", run.id).status == RunStatus.SUCCEEDED
 
 
+def test_trigger_due_worker_runner_processes_one_queued_trigger():
+    store = InMemoryControlPlaneStore()
+    trigger_service = TriggerService(store=InMemoryTriggerStore())
+    trigger = trigger_service.create_trigger(
+        TriggerDefinitionCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            agent_id="agent_sla",
+            created_by_user_id=None,
+            service_account_id="svc_scheduler",
+            type=TriggerType.SCHEDULE,
+            name="Daily SLA sweep",
+            input_template={"message": "Check open SLA risk."},
+            schedule=TriggerScheduleConfig(
+                cron_expression="0 9 * * *",
+                timezone="UTC",
+            ),
+        )
+    )
+    queue = InMemoryJobQueue()
+    queue.enqueue(
+        JobType.TRIGGER_DUE,
+        TriggerDueJob(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            trigger_id=trigger.id,
+            trigger_type="schedule",
+            scheduled_for=trigger.created_at,
+            requested_by_user_id="svc_scheduler",
+        ),
+    )
+    runner = TriggerDueWorkerRunner(
+        worker=TriggerDueWorker(
+            store=store,
+            trigger_service=trigger_service,
+            queue=queue,
+        ),
+        stop_after_empty_polls=1,
+    )
+
+    result = runner.run_once()
+
+    assert result.processed_jobs == 1
+    assert queue.jobs[0].status == JobStatus.SUCCEEDED
+    assert store.list_runs("tenant_acme")[0].status == RunStatus.QUEUED
+
+
+def test_trigger_scheduler_worker_runner_enqueues_due_schedule_trigger():
+    trigger_service = TriggerService(store=InMemoryTriggerStore())
+    trigger = trigger_service.create_trigger(
+        TriggerDefinitionCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            agent_id="agent_sla",
+            created_by_user_id=None,
+            service_account_id="svc_scheduler",
+            type=TriggerType.SCHEDULE,
+            name="Daily SLA sweep",
+            input_template={"message": "Check open SLA risk."},
+            schedule=TriggerScheduleConfig(
+                cron_expression="0 9 * * *",
+                timezone="UTC",
+            ),
+            next_run_at=trigger_scheduler_now(),
+        )
+    )
+    queue = InMemoryJobQueue()
+    runner = TriggerSchedulerWorkerRunner(
+        worker=TriggerSchedulerWorker(
+            trigger_service=trigger_service,
+            queue=queue,
+        ),
+        stop_after_empty_polls=1,
+    )
+
+    result = runner.run_once(now=trigger_scheduler_now())
+
+    assert result.processed_jobs == 1
+    assert queue.jobs[0].type == JobType.TRIGGER_DUE
+    assert queue.jobs[0].payload["trigger_id"] == trigger.id
+    assert (
+        trigger_service.get_trigger("tenant_acme", trigger.id).next_run_at is not None
+    )
+
+
+def test_restore_drill_due_worker_runner_processes_one_queued_drill():
+    from datetime import datetime, timezone
+
+    schedule_store = InMemoryRestoreDrillScheduleStore()
+    schedule = schedule_store.create_schedule(
+        RestoreDrillScheduleCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            name="Monthly private restore drill",
+            service_account_id="svc_restore_drill",
+            interval_days=30,
+            runbook_ref="docs/operations/disaster-recovery.md",
+        )
+    )
+    queue = InMemoryJobQueue()
+    queued_job = queue.enqueue(
+        JobType.RESTORE_DRILL_DUE,
+        RestoreDrillDueJob(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            schedule_id=schedule.id,
+            scheduled_for=datetime(2026, 7, 1, 2, 0, tzinfo=timezone.utc),
+            requested_by_user_id="svc_restore_drill",
+            runbook_ref="docs/operations/disaster-recovery.md",
+        ),
+    )
+    runner = RestoreDrillDueWorkerRunner(
+        worker=RestoreDrillDueWorker(
+            schedule_store=schedule_store,
+            queue=queue,
+        ),
+        stop_after_empty_polls=1,
+    )
+
+    result = runner.run_once()
+
+    assert result.processed_jobs == 1
+    assert result.last_job_id == queued_job.id
+    assert queue.jobs[0].status == JobStatus.SUCCEEDED
+    records = schedule_store.list_run_records("tenant_acme", schedule.id)
+    assert len(records) == 1
+    assert records[0].runbook_ref == "docs/operations/disaster-recovery.md"
+
+
+class RecordingRestoreDrillObjectStorage:
+    def __init__(self):
+        self.contents: dict[str, bytes] = {}
+
+    def upload(self, storage_object, content: bytes):
+        self.contents[storage_object.id] = content
+        return {
+            "storage_object_id": storage_object.id,
+            "uri": storage_object.uri,
+            "etag": "etag_restore_drill",
+        }
+
+    def download(self, storage_object) -> StorageDownloadResult:
+        return StorageDownloadResult(
+            storage_object_id=storage_object.id,
+            uri=storage_object.uri,
+            content=self.contents[storage_object.id],
+            content_type=storage_object.content_type,
+        )
+
+
+def restore_drill_verification_result() -> RestoreDrillVerificationResult:
+    return RestoreDrillVerificationResult(
+        drill_id="restore_drill_runner",
+        backup_manifest_generated=True,
+        restore_order_executed=True,
+        database_restore_verified=True,
+        object_storage_restore_verified=True,
+        redis_restore_or_rebuild_verified=True,
+        config_restore_verified=True,
+        post_restore_validation_passed=True,
+        rpo_minutes=4,
+        rto_minutes=18,
+    )
+
+
+def restore_drill_verification_config() -> RestoreDrillVerificationConfig:
+    return RestoreDrillVerificationConfig(
+        drill_id="restore_drill_runner",
+        backup_manifest_path=Path("/restore/evidence/backup-manifest.json"),
+        executed_restore_order=["postgres", "object_storage", "redis"],
+        migration_plan_path=Path("/restore/evidence/migration-plan.json"),
+        object_storage_verification_path=Path(
+            "/restore/evidence/object-storage-verification.json"
+        ),
+        redis_queue_verification_path=Path("/restore/evidence/redis-verification.json"),
+        config_restored=True,
+        post_restore_checks_passed=True,
+        rpo_minutes=4,
+        rto_minutes=18,
+    )
+
+
+def test_restore_drill_execution_worker_runner_processes_one_queued_execution():
+    from datetime import datetime, timezone
+
+    schedule_store = InMemoryRestoreDrillScheduleStore()
+    schedule = schedule_store.create_schedule(
+        RestoreDrillScheduleCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            name="Monthly private restore drill",
+            service_account_id="svc_restore_drill",
+            interval_days=30,
+            runbook_ref="docs/operations/disaster-recovery.md",
+        )
+    )
+    run_record = schedule_store.create_run_record(
+        RestoreDrillRunRecord(
+            tenant_id=schedule.tenant_id,
+            workspace_id=schedule.workspace_id,
+            schedule_id=schedule.id,
+            scheduled_for=datetime(2026, 7, 1, 2, 0, tzinfo=timezone.utc),
+            requested_by_user_id="svc_restore_drill",
+            runbook_ref=schedule.runbook_ref,
+        )
+    )
+    queue = InMemoryJobQueue()
+    queued_job = queue.enqueue(
+        JobType.RESTORE_DRILL_EXECUTION,
+        RestoreDrillExecutionJob(
+            tenant_id=schedule.tenant_id,
+            workspace_id=schedule.workspace_id,
+            schedule_id=schedule.id,
+            run_record_id=run_record.id,
+            requested_by_user_id="svc_restore_drill",
+            verification_config=restore_drill_verification_config(),
+        ),
+        now=datetime(2026, 7, 4, 0, 0, tzinfo=timezone.utc),
+    )
+    runner = RestoreDrillExecutionWorkerRunner(
+        worker=RestoreDrillExecutionWorker(
+            schedule_store=schedule_store,
+            queue=queue,
+            verifier=lambda config: restore_drill_verification_result(),
+        ),
+        stop_after_empty_polls=1,
+    )
+
+    result = runner.run_once()
+
+    assert result.processed_jobs == 1
+    assert result.last_job_id == queued_job.id
+    assert queue.jobs[0].status == JobStatus.SUCCEEDED
+    assert queue.jobs[1].type == JobType.RESTORE_DRILL_EVIDENCE
+    evidence_payload = RestoreDrillEvidenceCollectionJob.model_validate(
+        queue.jobs[1].payload
+    )
+    assert evidence_payload.run_record_id == run_record.id
+
+
+def test_restore_drill_evidence_worker_runner_processes_one_queued_evidence():
+    from datetime import datetime, timezone
+
+    schedule_store = InMemoryRestoreDrillScheduleStore()
+    schedule = schedule_store.create_schedule(
+        RestoreDrillScheduleCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            name="Monthly private restore drill",
+            service_account_id="svc_restore_drill",
+            interval_days=30,
+            runbook_ref="docs/operations/disaster-recovery.md",
+        )
+    )
+    run_record = schedule_store.create_run_record(
+        RestoreDrillRunRecord(
+            tenant_id=schedule.tenant_id,
+            workspace_id=schedule.workspace_id,
+            schedule_id=schedule.id,
+            scheduled_for=datetime(2026, 7, 1, 2, 0, tzinfo=timezone.utc),
+            requested_by_user_id="svc_restore_drill",
+            runbook_ref=schedule.runbook_ref,
+        )
+    )
+    queue = InMemoryJobQueue()
+    storage_catalog = InMemoryStorageCatalog(bucket="taroai-artifacts")
+    object_storage = RecordingRestoreDrillObjectStorage()
+    queued_job = queue.enqueue(
+        JobType.RESTORE_DRILL_EVIDENCE,
+        RestoreDrillEvidenceCollectionJob(
+            tenant_id=schedule.tenant_id,
+            workspace_id=schedule.workspace_id,
+            schedule_id=schedule.id,
+            run_record_id=run_record.id,
+            requested_by_user_id="svc_restore_drill",
+            verification=restore_drill_verification_result(),
+        ),
+        now=datetime(2026, 7, 4, 0, 0, tzinfo=timezone.utc),
+    )
+    runner = RestoreDrillEvidenceWorkerRunner(
+        worker=RestoreDrillEvidenceWorker(
+            schedule_store=schedule_store,
+            queue=queue,
+            storage_catalog=storage_catalog,
+            object_storage=object_storage,
+        ),
+        stop_after_empty_polls=1,
+    )
+
+    result = runner.run_once()
+
+    assert result.processed_jobs == 1
+    assert result.last_job_id == queued_job.id
+    assert queue.jobs[0].status == JobStatus.SUCCEEDED
+    updated = schedule_store.get_run_record(schedule.tenant_id, run_record.id)
+    assert updated.status == RestoreDrillRunStatus.EVIDENCE_READY
+    assert updated.evidence_object_id is not None
+
+
+def test_connector_sync_worker_runner_processes_one_queued_sync_job():
+    store = InMemoryControlPlaneStore()
+    queue = InMemoryJobQueue()
+    knowledge_service = InMemoryKnowledgeService()
+    knowledge_base = knowledge_service.create_base(
+        tenant_id="tenant_acme",
+        user_id="svc_connector_sync",
+        request=KnowledgeBaseCreate(
+            workspace_id="workspace_sales",
+            name="Sales Knowledge",
+        ),
+    )
+    run = store.create_run(
+        tenant_id="tenant_acme",
+        user_id="svc_connector_sync",
+        payload=RunCreate(
+            workspace_id="workspace_sales",
+            agent_id="connector_sync",
+            message="Sync connector connector_crm into knowledge base.",
+            mode=RunMode.AUTONOMOUS,
+        ),
+    )
+    queued_job = queue.enqueue(
+        JobType.CONNECTOR_SYNC,
+        ConnectorSyncJob(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_sales",
+            connector_id="connector_crm",
+            run_id=run.id,
+            knowledge_base_id=knowledge_base.id,
+            requested_by_user_id="svc_connector_sync",
+            cursor="cursor_001",
+            acl_mapping=ConnectorAclMapping(
+                rules=[
+                    ConnectorAclMappingRule(
+                        source_principal_id="group:sales",
+                        acl_subject="team:sales",
+                    )
+                ]
+            ),
+            documents=[
+                ConnectorSyncDocument(
+                    tenant_id="tenant_acme",
+                    workspace_id="workspace_sales",
+                    connector_id="connector_crm",
+                    source_uri="crm://accounts/acme",
+                    source_document_id="crm_account_123",
+                    title="Acme Account",
+                    document_version="v3",
+                    content_hash="sha256:connector-sync-runner-acme",
+                    sensitivity_level=2,
+                    source_acl=[
+                        SourceAclPrincipal(
+                            source_principal_id="group:sales",
+                            principal_type="group",
+                        )
+                    ],
+                    chunks=[
+                        {
+                            "content": "Renewal is in legal review.",
+                            "citation": {"source": "crm"},
+                        }
+                    ],
+                )
+            ],
+        ),
+    )
+    runner = runner_module.ConnectorSyncWorkerRunner(
+        worker=ConnectorSyncWorker(
+            queue=queue,
+            knowledge_service=knowledge_service,
+            store=store,
+            audit_service=AuditService(store=store),
+        ),
+        stop_after_empty_polls=1,
+    )
+
+    result = runner.run_once()
+
+    assert result.processed_jobs == 1
+    assert result.last_job_id == queued_job.id
+    assert queue.jobs[0].status == JobStatus.SUCCEEDED
+    documents = knowledge_service.list_documents("tenant_acme", knowledge_base.id)
+    assert len(documents) == 1
+    assert documents[0].acl_subjects == ["team:sales"]
+    assert store.get_run("tenant_acme", run.id).status == RunStatus.SUCCEEDED
+
+
+def trigger_scheduler_now():
+    from datetime import datetime, timezone
+
+    return datetime(2026, 7, 2, 9, 5, tzinfo=timezone.utc)
+
+
 def test_agent_worker_records_job_audit_with_worker_actor():
     store = InMemoryControlPlaneStore()
     queue = InMemoryJobQueue()
@@ -124,7 +583,10 @@ def test_agent_worker_records_job_audit_with_worker_actor():
         "worker.job.started",
         "worker.job.succeeded",
     ]
-    assert [event.metadata["job_id"] for event in worker_events] == [queued_job.id, queued_job.id]
+    assert [event.metadata["job_id"] for event in worker_events] == [
+        queued_job.id,
+        queued_job.id,
+    ]
     assert [event.metadata["worker_id"] for event in worker_events] == [
         "agent_worker_1",
         "agent_worker_1",
@@ -218,7 +680,9 @@ def test_agent_worker_runner_stops_after_idle_poll_limit():
     assert result.idle_polls == 2
 
 
-def test_build_agent_worker_runner_uses_sql_control_plane_store_from_settings(tmp_path: Path):
+def test_build_agent_worker_runner_uses_sql_control_plane_store_from_settings(
+    tmp_path: Path,
+):
     settings = Settings(
         database_url=f"sqlite:///{tmp_path / 'worker.sqlite3'}",
         control_plane_store_backend="sql",
@@ -231,6 +695,23 @@ def test_build_agent_worker_runner_uses_sql_control_plane_store_from_settings(tm
     )
 
     assert isinstance(runner.worker.runtime.store, SqlControlPlaneRepository)
+
+
+def test_build_agent_worker_runner_wires_model_budget_window_from_settings():
+    settings = Settings(
+        model_gateway_workspace_call_limit=3,
+        model_gateway_budget_window_seconds=3600,
+        _env_file=None,
+    )
+
+    runner = build_agent_worker_runner(
+        settings,
+        queue=InMemoryJobQueue(),
+    )
+
+    policy = runner.worker.runtime.model_budget_guard.policy
+    assert policy.max_model_calls_per_workspace == 3
+    assert policy.budget_window_seconds == 3600
 
 
 def test_build_agent_worker_runner_loads_sql_model_policy_store(tmp_path: Path):
@@ -247,11 +728,13 @@ def test_build_agent_worker_runner_loads_sql_model_policy_store(tmp_path: Path):
             default_model="consumer-free",
             allowed_models=["enterprise-approved"],
             denied_models=["consumer-free"],
+            model_sensitivity_limits={"enterprise-approved": 3},
             updated_by_user_id="admin_1",
         )
     )
     settings = Settings(
         database_url=database_url,
+        model_gateway_sensitivity_limits={"global-default": 1},
         model_gateway_policy_store_backend="sql",
         _env_file=None,
     )
@@ -271,6 +754,84 @@ def test_build_agent_worker_runner_loads_sql_model_policy_store(tmp_path: Path):
                 messages=[ModelMessage(role="user", content="Plan this run.")],
             )
         )
+    assert runner.worker.runtime.model_policy.model_sensitivity_limits == {
+        "global-default": 1
+    }
+    assert runner.worker.runtime.model_policy.scoped_policies[
+        0
+    ].model_sensitivity_limits == {"enterprise-approved": 3}
+
+
+def test_build_agent_worker_runner_loads_sql_billing_pricing_rule_store(tmp_path: Path):
+    database_url = f"sqlite:///{tmp_path / 'worker-billing-pricing.sqlite3'}"
+    MigrationRunner(
+        config=DatabaseConfig(url=database_url),
+        migrations_path=Path("apps/api/migrations"),
+    ).apply()
+    pricing_store = SqlBillingPricingRuleStore(config=DatabaseConfig(url=database_url))
+    pricing_store.upsert_rule(
+        BillingPricingRuleUpsert(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_sales",
+            meter_type="model_tokens_input",
+            unit="token",
+            provider="openai_compatible",
+            model="gpt-enterprise",
+            price_per_unit=0.003,
+            pricing_unit_quantity=1000,
+            updated_by_user_id="admin_1",
+        )
+    )
+    settings = Settings(
+        database_url=database_url,
+        billing_pricing_rule_store_backend="sql",
+        _env_file=None,
+    )
+
+    runner = build_agent_worker_runner(
+        settings,
+        queue=InMemoryJobQueue(),
+    )
+
+    assert (
+        runner.worker.runtime.billing_pricing_service.estimate_cost(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_sales",
+            meter_type="model_tokens_input",
+            quantity=2000,
+            unit="token",
+            provider="openai_compatible",
+            model="gpt-enterprise",
+        )
+        == 0.006
+    )
+
+
+def test_build_agent_worker_runner_wires_model_gateway_secret_ref_from_settings():
+    settings = Settings(
+        model_gateway_api_key_secret_ref_id="secret_model_key",
+        model_gateway_secret_lease_ttl_seconds=45,
+        model_gateway_model="gpt-enterprise",
+        model_gateway_chat_request_options={
+            "response_format": {"type": "json_object"},
+            "thinking": {"type": "disabled"},
+        },
+        _env_file=None,
+    )
+
+    runner = build_agent_worker_runner(
+        settings,
+        queue=InMemoryJobQueue(),
+    )
+
+    gateway = runner.worker.runtime.model_gateway
+    assert gateway.api_key_secret_ref_id == "secret_model_key"
+    assert gateway.secret_lease_ttl_seconds == 45
+    assert gateway.chat_request_options == {
+        "response_format": {"type": "json_object"},
+        "thinking": {"type": "disabled"},
+    }
+    assert gateway.secret_service is not None
 
 
 def test_build_agent_worker_runner_registers_runtime_tool_handlers():
@@ -285,6 +846,18 @@ def test_build_agent_worker_runner_registers_runtime_tool_handlers():
     assert "browser.action" in tool_names
 
 
+def test_build_agent_worker_runner_wires_runtime_policy_service():
+    runner = build_agent_worker_runner(
+        Settings(_env_file=None),
+        queue=InMemoryJobQueue(),
+    )
+
+    policy_service = runner.worker.runtime.policy_service
+
+    assert isinstance(policy_service, IdentityPolicyService)
+    assert isinstance(policy_service.identity_service, InMemoryIdentityService)
+
+
 def test_build_agent_worker_runner_injects_worker_audit_service():
     runner = build_agent_worker_runner(
         Settings(_env_file=None),
@@ -292,6 +865,22 @@ def test_build_agent_worker_runner_injects_worker_audit_service():
     )
 
     assert runner.worker.audit_service is not None
+
+
+def test_build_agent_worker_runner_wires_license_service_into_worker_audit_service():
+    store = InMemoryControlPlaneStore()
+    runner = build_agent_worker_runner(
+        Settings(license_runtime_enforcement_enabled=True, _env_file=None),
+        store=store,
+        queue=InMemoryJobQueue(),
+    )
+
+    assert runner.worker.audit_service.license_service is not None
+    assert (
+        runner.worker.audit_service.license_service.runtime_enforcement_enabled is True
+    )
+    assert runner.worker.audit_service.license_service.validation_store is store
+    assert runner.worker.runtime.license_service is runner.worker.audit_service.license_service
 
 
 def test_build_agent_worker_runner_injects_worker_guardrail_service():
@@ -304,10 +893,44 @@ def test_build_agent_worker_runner_injects_worker_guardrail_service():
         runner.worker.runtime.tool_gateway.guardrail_service,
         InMemoryGuardrailService,
     )
-    assert runner.worker.runtime.guardrail_service is runner.worker.runtime.tool_gateway.guardrail_service
+    assert (
+        runner.worker.runtime.guardrail_service
+        is runner.worker.runtime.tool_gateway.guardrail_service
+    )
 
 
-def test_build_cleanup_worker_runner_uses_sql_storage_catalog_from_settings(tmp_path: Path):
+@pytest.mark.parametrize("provider", ["playwright", "browserbase"])
+def test_build_worker_browser_controller_uses_http_adapter_for_remote_providers(
+    provider: str,
+):
+    controller = runner_module.build_worker_browser_controller(
+        Settings(
+            browser_provider=provider,
+            browser_controller_base_url="http://browser-controller.internal",
+            browser_controller_api_key="browser_key",
+            browser_controller_timeout_seconds=12,
+            _env_file=None,
+        )
+    )
+
+    assert isinstance(controller, HttpBrowserController)
+    assert controller.provider == provider
+    assert controller.base_url == "http://browser-controller.internal"
+    assert controller.api_key == "browser_key"
+    assert controller.timeout_seconds == 12
+
+
+def test_build_worker_browser_controller_keeps_disabled_provider_local():
+    controller = runner_module.build_worker_browser_controller(Settings(_env_file=None))
+
+    assert isinstance(controller, BrowserController)
+    assert not isinstance(controller, HttpBrowserController)
+    assert controller.provider == "disabled"
+
+
+def test_build_cleanup_worker_runner_uses_sql_storage_catalog_from_settings(
+    tmp_path: Path,
+):
     settings = Settings(
         database_url=f"sqlite:///{tmp_path / 'cleanup-worker.sqlite3'}",
         control_plane_store_backend="sql",
@@ -321,7 +944,204 @@ def test_build_cleanup_worker_runner_uses_sql_storage_catalog_from_settings(tmp_
         queue=InMemoryJobQueue(),
     )
 
-    assert isinstance(runner.worker.storage_lifecycle_service.storage_catalog, SqlStorageCatalog)
-    assert isinstance(runner.worker.storage_lifecycle_service.lifecycle_policy_store, SqlLifecyclePolicyStore)
+    assert isinstance(
+        runner.worker.storage_lifecycle_service.storage_catalog, SqlStorageCatalog
+    )
+    assert isinstance(
+        runner.worker.storage_lifecycle_service.lifecycle_policy_store,
+        SqlLifecyclePolicyStore,
+    )
     assert runner.worker.storage_lifecycle_service.audit_service is not None
     assert runner.worker.audit_service is not None
+
+
+def test_build_trigger_due_worker_runner_uses_sql_trigger_store_from_settings(
+    tmp_path: Path,
+):
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'trigger-worker.sqlite3'}",
+        trigger_store_backend="sql",
+        _env_file=None,
+    )
+
+    runner = build_trigger_due_worker_runner(
+        settings,
+        store=InMemoryControlPlaneStore(),
+        queue=InMemoryJobQueue(),
+    )
+
+    assert isinstance(runner.worker.trigger_service.store, SqlTriggerStore)
+
+
+def test_build_trigger_scheduler_worker_runner_uses_sql_trigger_store_from_settings(
+    tmp_path: Path,
+):
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'trigger-scheduler.sqlite3'}",
+        trigger_store_backend="sql",
+        _env_file=None,
+    )
+
+    runner = build_trigger_scheduler_worker_runner(
+        settings,
+        store=InMemoryControlPlaneStore(),
+        queue=InMemoryJobQueue(),
+    )
+
+    assert isinstance(runner.worker.trigger_service.store, SqlTriggerStore)
+
+
+def test_worker_process_config_accepts_connector_sync_kind():
+    config = WorkerProcessConfig(worker_kind="connector_sync")
+
+    assert config.worker_kind == "connector_sync"
+
+
+@pytest.mark.parametrize(
+    "worker_kind",
+    [
+        "restore_drill_due",
+        "restore_drill_execution",
+        "restore_drill_scheduler",
+        "restore_drill_evidence",
+    ],
+)
+def test_worker_process_config_accepts_restore_drill_kinds(worker_kind: str):
+    config = WorkerProcessConfig(worker_kind=worker_kind)
+
+    assert config.worker_kind == worker_kind
+
+
+def test_build_restore_drill_due_worker_runner_uses_provided_schedule_store():
+    schedule_store = InMemoryRestoreDrillScheduleStore()
+
+    runner = build_restore_drill_due_worker_runner(
+        Settings(_env_file=None),
+        queue=InMemoryJobQueue(),
+        schedule_store=schedule_store,
+    )
+
+    assert runner.worker.schedule_store is schedule_store
+
+
+def test_build_restore_drill_evidence_worker_runner_uses_provided_dependencies():
+    queue = InMemoryJobQueue()
+    schedule_store = InMemoryRestoreDrillScheduleStore()
+    storage_catalog = InMemoryStorageCatalog(bucket="taroai-artifacts")
+    object_storage = RecordingRestoreDrillObjectStorage()
+
+    runner = build_restore_drill_evidence_worker_runner(
+        Settings(job_queue_backend="redis", _env_file=None),
+        queue=queue,
+        schedule_store=schedule_store,
+        storage_catalog=storage_catalog,
+        object_storage=object_storage,
+    )
+
+    assert runner.worker.queue is queue
+    assert runner.worker.schedule_store is schedule_store
+    assert runner.worker.storage_catalog is storage_catalog
+    assert runner.worker.object_storage is object_storage
+
+
+def test_build_restore_drill_execution_worker_runner_uses_provided_dependencies():
+    queue = InMemoryJobQueue()
+    schedule_store = InMemoryRestoreDrillScheduleStore()
+
+    runner = build_restore_drill_execution_worker_runner(
+        Settings(job_queue_backend="redis", _env_file=None),
+        queue=queue,
+        schedule_store=schedule_store,
+        verifier=lambda config: restore_drill_verification_result(),
+    )
+
+    assert runner.worker.queue is queue
+    assert runner.worker.schedule_store is schedule_store
+
+
+def test_build_restore_drill_due_worker_runner_uses_sql_schedule_store_from_settings(
+    tmp_path: Path,
+):
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'restore-drill-due.sqlite3'}",
+        restore_drill_schedule_backend="sql",
+        _env_file=None,
+    )
+
+    runner = build_restore_drill_due_worker_runner(
+        settings,
+        queue=InMemoryJobQueue(),
+    )
+
+    assert isinstance(runner.worker.schedule_store, SqlRestoreDrillScheduleStore)
+
+
+def test_build_restore_drill_execution_worker_runner_uses_sql_schedule_store_from_settings(
+    tmp_path: Path,
+):
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'restore-drill-execution.sqlite3'}",
+        restore_drill_schedule_backend="sql",
+        _env_file=None,
+    )
+
+    runner = build_restore_drill_execution_worker_runner(
+        settings,
+        queue=InMemoryJobQueue(),
+    )
+
+    assert isinstance(runner.worker.schedule_store, SqlRestoreDrillScheduleStore)
+
+
+def test_build_restore_drill_scheduler_worker_runner_uses_sql_schedule_store_from_settings(
+    tmp_path: Path,
+):
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'restore-drill-scheduler.sqlite3'}",
+        restore_drill_schedule_backend="sql",
+        _env_file=None,
+    )
+
+    runner = build_restore_drill_scheduler_worker_runner(
+        settings,
+        queue=InMemoryJobQueue(),
+    )
+
+    assert isinstance(runner.worker.schedule_store, SqlRestoreDrillScheduleStore)
+
+
+def test_build_connector_sync_worker_runner_uses_sql_knowledge_service_from_settings(
+    tmp_path: Path,
+):
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'connector-sync-worker.sqlite3'}",
+        knowledge_service_backend="sql",
+        _env_file=None,
+    )
+
+    runner = build_connector_sync_worker_runner(
+        settings,
+        store=InMemoryControlPlaneStore(),
+        queue=InMemoryJobQueue(),
+    )
+
+    assert isinstance(runner.worker.knowledge_service, SqlKnowledgeService)
+
+
+def test_build_connector_sync_worker_runner_uses_sql_connector_registry_from_settings(
+    tmp_path: Path,
+):
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'connector-sync-registry.sqlite3'}",
+        connector_registry_backend="sql",
+        _env_file=None,
+    )
+
+    runner = build_connector_sync_worker_runner(
+        settings,
+        store=InMemoryControlPlaneStore(),
+        queue=InMemoryJobQueue(),
+        knowledge_service=InMemoryKnowledgeService(),
+    )
+
+    assert isinstance(runner.worker.connector_registry, SqlConnectorRegistry)

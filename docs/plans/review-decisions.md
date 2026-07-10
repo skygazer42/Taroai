@@ -103,13 +103,13 @@ Decision status values:
 
 **Impacted Plans:** 02, 06, 11, 17, 24, 26
 
-**Implementation Impact:** Current runtime planning now uses an OpenAI-compatible Model Gateway boundary with basic planning usage meters, Settings-backed global and tenant/workspace-scoped model policy, API/SQL-managed policy storage, and run/tenant/workspace/user/agent model budget guards. Remaining MVP work adds provider references, sensitivity constraints, budget windows, rate limits, richer provider/cached-token/latency metering, and reviewed provider adapters behind that boundary.
+**Implementation Impact:** Current runtime planning now uses an OpenAI-compatible Model Gateway boundary with planning call/token/cached-token/latency meters, Settings-backed global and tenant/workspace-scoped model policy, API/SQL-managed policy storage, staged model policy change-request approval APIs backed by memory or SQL records, model policy version history, model sensitivity limits, model API-key secret-ref lease resolution, run/tenant/workspace/user/agent model budget guards with an optional Settings-managed rolling budget window, safe provider listing, first-pass tenant-scoped provider write/enable/disable/credential-rotation/version/rollback APIs, staged provider change-request approval APIs backed by memory or SQL records, SQL-backed tenant/provider rate-limit samples shared by API and worker router instances, Redis-backed request and `max_output_tokens` token reservations, safe provider fallback attempt summaries, and typed provider fallback policy for response errors and rate-limit skips. Remaining MVP work adds broader distributed budget governance and reviewed provider adapters behind that boundary.
 
 **Owner:** backend/platform engineering
 
 ## 2026-07-01: Defer Frontend Implementation to Final Managed Phase
 
-**Status:** accepted
+**Status:** superseded
 
 **Decision:** Frontend implementation is deferred. The current MVP milestone should not scaffold or implement a web app; it should only define backend API contracts, event stream contracts, and CREAO-compatible UI acceptance requirements for the final user-managed frontend phase.
 
@@ -117,6 +117,18 @@ Decision status values:
 
 **Impacted Plans:** 08, 11, 14, 25, 26, 27
 
-**Implementation Impact:** Remove direct frontend build tasks from the current MVP path. Keep future UI requirements as contract documents and backend tests. Require explicit human approval before creating frontend app files.
+**Implementation Impact:** Superseded by the later decision to implement a narrow static workspace slice for the local PoC. Full portal, admin console, skill marketplace, app builder, and production frontend packaging remain later phases.
+
+## 2026-07-03: Implement Minimal Static Workspace for Local PoC
+
+**Status:** accepted
+
+**Decision:** Implement the first frontend slice under `apps/web` so the local cloud PoC can demonstrate chat-driven run creation, timeline events, sandbox terminal output, artifact display, and approval actions.
+
+**Context:** The execution loop now has runtime-created sandbox sessions and storage-backed artifacts. A minimal workspace is needed to turn the backend PoC into a visible Agent Workspace MVP.
+
+**Impacted Plans:** 08, 09, 14, 16, 26
+
+**Implementation Impact:** The first frontend slice must call real `/api/runs`, `/execute`, `/events`, `/artifacts`, and approval routes. It must preserve the CREAO-compatible `data-testid="chat-column"` selector, composer hint, and Enter/Shift+Enter behavior. It must not add product-flow fixtures or broaden into the full client portal.
 
 **Owner:** product/engineering

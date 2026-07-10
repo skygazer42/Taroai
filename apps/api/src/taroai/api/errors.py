@@ -4,7 +4,19 @@ from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from taroai.api.idempotency import IdempotencyConflictError
+from taroai.api.pagination import InvalidPageCursorError
 from taroai.auth import AuthInvalidCredentialsError, AuthRequiredError
+from taroai.connectors import (
+    ConnectorAccessDeniedError,
+    ConnectorDispatchError,
+    ConnectorNotFoundError,
+    ConnectorOAuthError,
+)
+from taroai.embeddings import (
+    EmbeddingGatewayConfigurationError,
+    EmbeddingGatewayResponseError,
+)
 from taroai.memory import MemoryWriteRejectedError
 from taroai.model_gateway import (
     ModelGatewayConfigurationError,
@@ -16,10 +28,17 @@ from taroai.sandbox import (
     SandboxExecutionError,
     SandboxProviderUnavailableError,
 )
+from taroai.secrets import (
+    SecretAccessDeniedError,
+    SecretLeaseExpiredError,
+    SecretNotFoundError,
+)
 from taroai.lifecycle import TenantOffboardingTransitionError
+from taroai.licensing import LicenseEntitlementDeniedError
 from taroai.storage import ObjectStorageConfigurationError, StorageContentRejectedError
-from taroai.store import NotFoundError, TenantAccessError
+from taroai.store import NotFoundError, RunTransitionError, TenantAccessError
 from taroai.tool_gateway import ToolApprovalRequiredError, ToolExecutionError
+from taroai.triggers import AgentHandoffDeniedError, TriggerWebhookSignatureError
 from taroai.workers import RedisQueueConfigurationError
 
 
@@ -81,6 +100,30 @@ def default_exception_rules() -> list[ApiExceptionRule]:
             message="not found",
         ),
         ApiExceptionRule(
+            exception_type=ConnectorAccessDeniedError,
+            status_code=status.HTTP_403_FORBIDDEN,
+            code="tenant_access_denied",
+            message="tenant access denied",
+        ),
+        ApiExceptionRule(
+            exception_type=ConnectorNotFoundError,
+            status_code=status.HTTP_404_NOT_FOUND,
+            code="not_found",
+            message="not found",
+        ),
+        ApiExceptionRule(
+            exception_type=ConnectorDispatchError,
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            code="connector_dispatch_failed",
+            expose_message=True,
+        ),
+        ApiExceptionRule(
+            exception_type=ConnectorOAuthError,
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            code="connector_oauth_failed",
+            expose_message=True,
+        ),
+        ApiExceptionRule(
             exception_type=ModelGatewayConfigurationError,
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             code="model_gateway_unavailable",
@@ -99,6 +142,20 @@ def default_exception_rules() -> list[ApiExceptionRule]:
             status_code=status.HTTP_403_FORBIDDEN,
             code="model_policy_denied",
             expose_message=True,
+        ),
+        ApiExceptionRule(
+            exception_type=EmbeddingGatewayConfigurationError,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            code="embedding_gateway_unavailable",
+            expose_message=True,
+            retryable=True,
+        ),
+        ApiExceptionRule(
+            exception_type=EmbeddingGatewayResponseError,
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            code="embedding_gateway_error",
+            expose_message=True,
+            retryable=True,
         ),
         ApiExceptionRule(
             exception_type=MemoryWriteRejectedError,
@@ -139,6 +196,24 @@ def default_exception_rules() -> list[ApiExceptionRule]:
             expose_message=True,
         ),
         ApiExceptionRule(
+            exception_type=SecretAccessDeniedError,
+            status_code=status.HTTP_403_FORBIDDEN,
+            code="secret_access_denied",
+            message="secret access denied",
+        ),
+        ApiExceptionRule(
+            exception_type=SecretLeaseExpiredError,
+            status_code=status.HTTP_403_FORBIDDEN,
+            code="secret_lease_expired",
+            message="secret lease expired",
+        ),
+        ApiExceptionRule(
+            exception_type=SecretNotFoundError,
+            status_code=status.HTTP_404_NOT_FOUND,
+            code="not_found",
+            message="not found",
+        ),
+        ApiExceptionRule(
             exception_type=RedisQueueConfigurationError,
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             code="job_queue_unavailable",
@@ -159,9 +234,45 @@ def default_exception_rules() -> list[ApiExceptionRule]:
             message="storage content rejected",
         ),
         ApiExceptionRule(
+            exception_type=TriggerWebhookSignatureError,
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            code="webhook_signature_invalid",
+            message="webhook signature invalid",
+        ),
+        ApiExceptionRule(
+            exception_type=AgentHandoffDeniedError,
+            status_code=status.HTTP_403_FORBIDDEN,
+            code="agent_handoff_denied",
+            expose_message=True,
+        ),
+        ApiExceptionRule(
+            exception_type=LicenseEntitlementDeniedError,
+            status_code=status.HTTP_403_FORBIDDEN,
+            code="license_entitlement_denied",
+            expose_message=True,
+        ),
+        ApiExceptionRule(
             exception_type=TenantOffboardingTransitionError,
             status_code=status.HTTP_409_CONFLICT,
             code="tenant_offboarding_transition_invalid",
+            expose_message=True,
+        ),
+        ApiExceptionRule(
+            exception_type=RunTransitionError,
+            status_code=status.HTTP_409_CONFLICT,
+            code="run_transition_conflict",
+            expose_message=True,
+        ),
+        ApiExceptionRule(
+            exception_type=IdempotencyConflictError,
+            status_code=status.HTTP_409_CONFLICT,
+            code="idempotency_key_conflict",
+            expose_message=True,
+        ),
+        ApiExceptionRule(
+            exception_type=InvalidPageCursorError,
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            code="invalid_page_cursor",
             expose_message=True,
         ),
         ApiExceptionRule(

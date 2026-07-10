@@ -111,6 +111,13 @@ class InMemorySandboxAdapter(SandboxAdapter):
     def get_session(self, tenant_id: str, session_id: str) -> SandboxSession:
         return self._get_session(tenant_id, session_id)
 
+    def list_sessions(self, tenant_id: str) -> list[SandboxSession]:
+        return [
+            session
+            for session in sorted(self.sessions.values(), key=lambda item: (item.created_at, item.id))
+            if session.tenant_id == tenant_id
+        ]
+
     def _get_active_session(self, tenant_id: str, session_id: str) -> SandboxSession:
         session = self._get_session(tenant_id, session_id)
         if session.status != SandboxSessionStatus.ACTIVE:
@@ -130,6 +137,7 @@ class InMemorySandboxAdapter(SandboxAdapter):
 class InMemoryBrowserController(BrowserController):
     provider: str = "in_memory"
     sessions: dict[str, BrowserSession] = Field(default_factory=dict)
+    deleted_sessions: list[str] = Field(default_factory=list)
 
     def open_session(
         self,
@@ -151,6 +159,12 @@ class InMemoryBrowserController(BrowserController):
         session = self.sessions.get(session_id)
         if session is None or session.tenant_id != tenant_id:
             raise NotFoundError(f"Browser session not found: {session_id}")
+        return session
+
+    def delete_session(self, tenant_id: str, session_id: str) -> BrowserSession:
+        session = self.get_session(tenant_id, session_id)
+        self.sessions.pop(session_id, None)
+        self.deleted_sessions.append(session_id)
         return session
 
     def apply(self, action: BrowserAction) -> BrowserObservation:

@@ -1,0 +1,10 @@
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'taroai_app') THEN
+        CREATE ROLE taroai_app LOGIN PASSWORD 'taroai_app' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
+    END IF;
+END
+$$;
+
+GRANT CONNECT, CREATE, TEMPORARY ON DATABASE taroai TO taroai_app;
+GRANT USAGE, CREATE ON SCHEMA public TO taroai_app;

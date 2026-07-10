@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: taroai
+resources:
+  - sandbox-runtime-policy.yaml
+  - configmap.yaml
+  - secrets.example.yaml
+  - postgres.yaml
+  - redis.yaml
+  - minio.yaml
+  - api.yaml
+  - sandbox-controller.yaml
+  - browser-controller.yaml
+  - web.yaml
+  - worker.yaml
+  - network-policy.yaml

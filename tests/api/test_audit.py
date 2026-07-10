@@ -1,6 +1,7 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from taroai.agent import AgentRuntime
@@ -22,6 +23,13 @@ from taroai.identity import (
     Role,
     SqlIdentityService,
     UserAccountCreate,
+)
+from taroai.licensing import (
+    Entitlement,
+    LicenseEntitlementDeniedError,
+    LicenseKey,
+    LicenseService,
+    LicensedFeature,
 )
 from taroai.model_gateway import PlannedToolCall
 from taroai.onboarding import TenantBootstrapRequest, TenantBootstrapService, TenantReadinessService
@@ -141,6 +149,76 @@ def test_audit_service_adds_policy_retention_metadata():
     assert expires_at - recorded.created_at <= timedelta(days=31)
 
 
+def test_audit_service_enforces_license_retention_limit():
+    store = InMemoryControlPlaneStore()
+    license_service = LicenseService(runtime_enforcement_enabled=True)
+    validation = license_service.validate_license(
+        LicenseKey(
+            id="license_acme_limited_audit",
+            tenant_id="tenant_acme",
+            customer_name="Acme Inc",
+            issued_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            expires_at=datetime(2027, 1, 1, tzinfo=timezone.utc),
+            deployment_modes=["private"],
+            offline_validation_allowed=True,
+            entitlements=[
+                Entitlement(
+                    feature=LicensedFeature.AUDIT_RETENTION_DAYS,
+                    limit=90,
+                )
+            ],
+        ),
+        deployment_mode="private",
+        now=datetime(2026, 6, 1, tzinfo=timezone.utc),
+    )
+    license_service.activate_validation(validation)
+    service = AuditService(
+        store=store,
+        retention_days=365,
+        license_service=license_service,
+    )
+
+    with pytest.raises(
+        LicenseEntitlementDeniedError,
+        match="audit_retention_days entitlement limit exceeded",
+    ):
+        service.record(
+            AuditEventCreate(
+                tenant_id="tenant_acme",
+                workspace_id="workspace_sales",
+                user_id="user_1",
+                event_type="memory.candidate_created",
+                metadata={"memory_id": "memory_1"},
+            )
+        )
+
+    assert store.list_audit_events("tenant_acme") == []
+
+
+def test_audit_service_allows_license_events_before_active_license():
+    store = InMemoryControlPlaneStore()
+    service = AuditService(
+        store=store,
+        retention_days=365,
+        license_service=LicenseService(runtime_enforcement_enabled=True),
+    )
+
+    recorded = service.record(
+        AuditEventCreate(
+            tenant_id="tenant_acme",
+            event_type="license.status_changed",
+            metadata={
+                "license_id": "license_acme_enterprise",
+                "status": "active",
+                "deployment_mode": "private",
+            },
+        )
+    )
+
+    assert recorded.event_type == "license.status_changed"
+    assert service.list_for_tenant("tenant_acme")[0].event_type == "license.status_changed"
+
+
 def test_audit_service_reports_required_event_coverage_by_metadata_keys():
     store = InMemoryControlPlaneStore()
     service = AuditService(store=store)
@@ -217,9 +295,11 @@ def test_default_audit_coverage_matrix_names_enterprise_sensitive_actions():
         "identity.user.created",
         "identity.user.disabled",
         "run.cancelled",
+        "run.retry_requested",
         "identity.role.created",
         "identity.role.assigned",
         "knowledge.query.executed",
+        "embedding.gateway.called",
         "memory.candidate_created",
         "tool.executed",
         "tool.approval_required",
@@ -231,6 +311,8 @@ def test_default_audit_coverage_matrix_names_enterprise_sensitive_actions():
         "browser.action.performed",
         "billing.metered",
         "skill.published",
+        "license.status_changed",
+        "license.imported",
     }
 
     assert expected_event_types.issubset(requirements_by_event)
@@ -239,6 +321,15 @@ def test_default_audit_coverage_matrix_names_enterprise_sensitive_actions():
     assert requirements_by_event["identity.role.assigned"].area == "rbac"
     assert "assigned_user_id" in requirements_by_event["identity.role.assigned"].required_metadata_keys
     assert requirements_by_event["tool.executed"].area == "tool"
+    assert requirements_by_event["embedding.gateway.called"].area == "embedding"
+    assert "purpose" in requirements_by_event["embedding.gateway.called"].required_metadata_keys
+    assert "input_count" in requirements_by_event["embedding.gateway.called"].required_metadata_keys
+    assert requirements_by_event["license.status_changed"].area == "license"
+    assert "license_id" in requirements_by_event["license.status_changed"].required_metadata_keys
+    assert "status" in requirements_by_event["license.status_changed"].required_metadata_keys
+    assert requirements_by_event["license.imported"].area == "license"
+    assert "license_id" in requirements_by_event["license.imported"].required_metadata_keys
+    assert "status" in requirements_by_event["license.imported"].required_metadata_keys
 
 
 class RecordingAuditService:

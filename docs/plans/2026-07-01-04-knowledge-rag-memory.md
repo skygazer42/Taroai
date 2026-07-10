@@ -21,7 +21,7 @@ This plan covers the layer that feeds Agent Runtime with enterprise context:
 - Long-term memory read/write flow.
 - Memory write review before activation.
 
-Current state has an initial `taroai/knowledge` package with Pydantic knowledge base, document, chunk, retrieval request, and retrieval result models; in-memory and SQLite-compatible SQL metadata/chunk persistence; knowledge document source-content upload into `knowledge-documents` object storage with `storage_object_id` metadata; ACL-aware query-time retrieval; citations; API endpoints for base creation, document registration, and query behind `knowledge.write`/`knowledge.read`; safe audit events for base/document/query operations; and Agent Runtime context loading.
+Current state has an initial `taroai/knowledge` package with Pydantic knowledge base, document, chunk, retrieval request, and retrieval result models; in-memory and SQLite-compatible SQL metadata/chunk persistence; knowledge document source-content upload into `knowledge-documents` object storage with `storage_object_id` metadata; configurable automatic chunking of uploaded UTF-8 content when callers omit explicit chunks; OpenAI-compatible Embedding Gateway boundary with secret-ref credential resolution; chunk embedding metadata persistence; safe embedding usage audit records without raw text or vectors; operation-level embedding usage meters for standalone knowledge APIs; run-scoped embedding usage meters for Agent Runtime retrieval; ACL-aware query-time retrieval with vector scoring when embeddings are available; citations; API endpoints for base creation, document registration, and query behind `knowledge.write`/`knowledge.read`; safe audit events for base/document/query operations; and Agent Runtime context loading.
 
 ## Task 1: Knowledge Package Structure
 
@@ -73,7 +73,8 @@ Current state has an initial `taroai/knowledge` package with Pydantic knowledge 
 - `SqlKnowledgeService` persists knowledge bases, documents, and chunks through `TAROAI_KNOWLEDGE_SERVICE_BACKEND=sql`.
 - SQLite-compatible migration tables exist for `knowledge_bases`, `knowledge_documents`, and `knowledge_chunks`; `knowledge_documents.storage_object_id` links document metadata to the managed source object.
 - SQL retrieval reuses the internal ACL/sensitivity-aware retrieval contract.
-- Document registration writes source content through the object storage adapter under `knowledge-documents` and returns the document `storage_object_id`; embeddings, vector backend, and connector ingestion remain implementation work.
+- Document registration writes source content through the object storage adapter under `knowledge-documents` and returns the document `storage_object_id`; when explicit chunks are omitted, the API derives retrievable chunks from uploaded content using Pydantic settings for max characters and overlap.
+- When `TAROAI_EMBEDDING_GATEWAY_ENABLED=true`, API document registration sends chunk text through an OpenAI-compatible `/embeddings` boundary, stores vector/model/provider metadata on chunks, and query/runtime retrieval sends query text through the same boundary before service-side ACL/sensitivity filtering and vector scoring. Embedding calls emit `embedding.gateway.called` audit metadata with purpose, counts, model, and provider usage only; both standalone knowledge API calls and Agent Runtime calls emit `embedding_call_count` and `embedding_tokens` meters when provider usage is returned. Durable vector backend selection, richer parser policy, and broader connector ingestion policy remain implementation work.
 
 ## Task 3: ACL-Aware Retrieval
 
@@ -172,7 +173,8 @@ Current state has an initial `taroai/knowledge` package with Pydantic knowledge 
 - Model Gateway planning requests receive allowed context in a system message.
 - `context.loaded` run events include only counts and source IDs, not knowledge excerpts or memory content.
 - SQL runtime state persistence includes `retrieved_context`.
-- Durable knowledge ingestion, embeddings/vector backend, connector sync, advanced context policy, and context quality evaluation remain implementation work.
+- Runtime knowledge context can use an injected Embedding Gateway for query vectors before retrieval guardrails and model planning, with safe embedding audit records and usage meters when provider usage is returned.
+- Advanced durable ingestion policy, durable vector backend, broader connector sync policy, advanced context policy, and context quality evaluation remain implementation work.
 
 ## Verification
 

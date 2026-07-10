@@ -1,15 +1,70 @@
 from pathlib import Path
+from datetime import datetime, timezone
+import os
+import subprocess
+import sys
 
 import pytest
 
 from taroai.agent import AgentRuntimeState, PlanStep
+from taroai.db.migration_cli import parse_args as parse_migration_args
+from taroai.db.migration_cli import run_migration_command
 from taroai.db import DatabaseConfig, MigrationRunner, SqlControlPlaneRepository
-from taroai.domain import ApprovalStatus, RunCreate, RunStatus
-from taroai.store import TenantAccessError
+from taroai.domain import (
+    ApprovalStatus,
+    IdempotencyRecord,
+    Run,
+    RunCreate,
+    RunMode,
+    RunStatus,
+    utc_now,
+)
+from taroai.licensing import (
+    Entitlement,
+    LicenseKey,
+    LicenseStatus,
+    LicenseValidationResult,
+    LicensedFeature,
+)
+from taroai.store import NotFoundError
 
 
 def test_migration_runner_applies_pending_schema_and_records_versions(tmp_path: Path):
     database_path = tmp_path / "taroai.sqlite3"
+    expected_versions = [
+        "001_initial.sql",
+        "002_short_term_memory_reviews.sql",
+        "003_model_policy_scopes.sql",
+        "004_run_event_sequence.sql",
+        "005_idempotency_records.sql",
+        "006_postgresql_tenant_rls.sql",
+        "007_trigger_connector_event_config.sql",
+        "008_trigger_agent_handoff_config.sql",
+        "009_connector_definitions.sql",
+        "010_connector_sync_state.sql",
+        "011_license_validations.sql",
+        "012_solution_packs.sql",
+        "013_sso_provider_configs.sql",
+        "014_scim_provisioning.sql",
+        "015_model_policy_sensitivity_limits.sql",
+        "016_knowledge_chunk_embeddings.sql",
+        "017_operation_level_billing_meters.sql",
+        "018_billing_pricing_rules.sql",
+        "019_billing_invoices.sql",
+        "020_billing_pricing_rule_skill_scope.sql",
+        "021_share_grants.sql",
+        "022_runtime_browser_session_state.sql",
+        "023_restore_drill_schedule_store.sql",
+        "024_model_provider_records.sql",
+        "025_model_provider_versions.sql",
+        "026_model_provider_change_requests.sql",
+        "027_model_policy_change_requests.sql",
+        "028_model_provider_rate_limit_samples.sql",
+        "029_model_policy_versions.sql",
+        "030_customer_feedback_records.sql",
+        "031_solution_pack_publication_draft_application.sql",
+        "032_solution_pack_publication_draft_multi_manifest.sql",
+    ]
     runner = MigrationRunner(
         config=DatabaseConfig(url=f"sqlite:///{database_path}"),
         migrations_path=Path("apps/api/migrations"),
@@ -17,11 +72,7 @@ def test_migration_runner_applies_pending_schema_and_records_versions(tmp_path: 
 
     result = runner.apply()
 
-    assert result.applied_versions == [
-        "001_initial.sql",
-        "002_short_term_memory_reviews.sql",
-        "003_model_policy_scopes.sql",
-    ]
+    assert result.applied_versions == expected_versions
     with runner.connect() as connection:
         tables = {
             row[0]
@@ -40,14 +91,222 @@ def test_migration_runner_applies_pending_schema_and_records_versions(tmp_path: 
     assert "runtime_states" in tables
     assert "short_term_memory_reviews" in tables
     assert "model_policy_scopes" in tables
-    assert versions == [
-        "001_initial.sql",
-        "002_short_term_memory_reviews.sql",
-        "003_model_policy_scopes.sql",
-    ]
+    assert "model_policy_change_requests" in tables
+    assert "model_policy_versions" in tables
+    assert "model_provider_versions" in tables
+    assert "model_provider_change_requests" in tables
+    assert "model_provider_rate_limit_samples" in tables
+    assert "license_validations" in tables
+    assert "sso_provider_configs" in tables
+    assert "scim_provider_configs" in tables
+    assert "scim_group_role_mappings" in tables
+    assert "scim_user_links" in tables
+    assert "scim_import_records" in tables
+    assert "billing_pricing_rules" in tables
+    assert "billing_invoices" in tables
+    assert "share_grants" in tables
+    assert versions == expected_versions
 
 
-def test_sql_repository_persists_run_events_and_runtime_state_across_instances(tmp_path: Path):
+def test_migration_runner_plans_pending_and_unknown_versions(tmp_path: Path):
+    database_path = tmp_path / "taroai.sqlite3"
+    migrations_path = tmp_path / "migrations"
+    migrations_path.mkdir()
+    (migrations_path / "001_initial.sql").write_text(
+        "CREATE TABLE IF NOT EXISTS alpha(id TEXT PRIMARY KEY);\n"
+    )
+    (migrations_path / "002_next.sql").write_text(
+        "CREATE TABLE IF NOT EXISTS beta(id TEXT PRIMARY KEY);\n"
+    )
+    runner = MigrationRunner(
+        config=DatabaseConfig(url=f"sqlite:///{database_path}"),
+        migrations_path=migrations_path,
+    )
+    with runner.connect() as connection:
+        connection.execute(
+            """
+            CREATE TABLE schema_migrations (
+                version TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO schema_migrations (version) VALUES (?)",
+            ("001_initial.sql",),
+        )
+        connection.execute(
+            "INSERT INTO schema_migrations (version) VALUES (?)",
+            ("999_outside_package.sql",),
+        )
+
+    plan = runner.plan()
+
+    assert plan.available_versions == ["001_initial.sql", "002_next.sql"]
+    assert plan.applied_versions == ["001_initial.sql"]
+    assert plan.pending_versions == ["002_next.sql"]
+    assert plan.unknown_applied_versions == ["999_outside_package.sql"]
+    assert plan.up_to_date is False
+    with runner.connect() as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+
+    assert "beta" not in tables
+
+
+def test_migration_runner_plan_does_not_create_migration_table(tmp_path: Path):
+    database_path = tmp_path / "taroai.sqlite3"
+    migrations_path = tmp_path / "migrations"
+    migrations_path.mkdir()
+    (migrations_path / "001_initial.sql").write_text(
+        "CREATE TABLE IF NOT EXISTS alpha(id TEXT PRIMARY KEY);\n"
+    )
+    runner = MigrationRunner(
+        config=DatabaseConfig(url=f"sqlite:///{database_path}"),
+        migrations_path=migrations_path,
+    )
+
+    plan = runner.plan()
+
+    assert plan.available_versions == ["001_initial.sql"]
+    assert plan.applied_versions == []
+    assert plan.pending_versions == ["001_initial.sql"]
+    assert plan.unknown_applied_versions == []
+    assert plan.up_to_date is False
+    with runner.connect() as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+
+    assert "schema_migrations" not in tables
+    assert "alpha" not in tables
+
+
+def test_migration_tooling_defaults_to_plan_mode(tmp_path: Path):
+    config = parse_migration_args(
+        [
+            "--database-url",
+            f"sqlite:///{tmp_path / 'taroai.sqlite3'}",
+            "--migrations-path",
+            str(tmp_path),
+        ]
+    )
+
+    assert config.database_url == f"sqlite:///{tmp_path / 'taroai.sqlite3'}"
+    assert config.migrations_path == tmp_path
+    assert config.mode == "plan"
+
+
+def test_migration_tooling_runs_plan_without_applying(tmp_path: Path):
+    database_path = tmp_path / "taroai.sqlite3"
+    migrations_path = tmp_path / "migrations"
+    migrations_path.mkdir()
+    (migrations_path / "001_initial.sql").write_text(
+        "CREATE TABLE IF NOT EXISTS alpha(id TEXT PRIMARY KEY);\n"
+    )
+    config = parse_migration_args(
+        [
+            "--database-url",
+            f"sqlite:///{database_path}",
+            "--migrations-path",
+            str(migrations_path),
+        ]
+    )
+
+    result = run_migration_command(config)
+
+    assert result.pending_versions == ["001_initial.sql"]
+    with MigrationRunner(
+        config=DatabaseConfig(url=f"sqlite:///{database_path}"),
+        migrations_path=migrations_path,
+    ).connect() as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+
+    assert "alpha" not in tables
+
+
+def test_migration_tooling_applies_only_when_requested(tmp_path: Path):
+    database_path = tmp_path / "taroai.sqlite3"
+    migrations_path = tmp_path / "migrations"
+    migrations_path.mkdir()
+    (migrations_path / "001_initial.sql").write_text(
+        "CREATE TABLE IF NOT EXISTS alpha(id TEXT PRIMARY KEY);\n"
+    )
+    config = parse_migration_args(
+        [
+            "--database-url",
+            f"sqlite:///{database_path}",
+            "--migrations-path",
+            str(migrations_path),
+            "--apply",
+        ]
+    )
+
+    result = run_migration_command(config)
+
+    assert result.applied_versions == ["001_initial.sql"]
+    with MigrationRunner(
+        config=DatabaseConfig(url=f"sqlite:///{database_path}"),
+        migrations_path=migrations_path,
+    ).connect() as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+
+    assert "alpha" in tables
+
+
+def test_migration_cli_module_outputs_clean_json_without_runtime_warning(
+    tmp_path: Path,
+):
+    database_path = tmp_path / "taroai.sqlite3"
+    migrations_path = tmp_path / "migrations"
+    migrations_path.mkdir()
+    (migrations_path / "001_initial.sql").write_text(
+        "CREATE TABLE IF NOT EXISTS alpha(id TEXT PRIMARY KEY);\n"
+    )
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = "apps/api/src"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "taroai.db.migration_cli",
+            "--database-url",
+            f"sqlite:///{database_path}",
+            "--migrations-path",
+            str(migrations_path),
+        ],
+        cwd=Path("."),
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert "RuntimeWarning" not in completed.stderr
+    assert '"pending_versions"' in completed.stdout
+
+
+def test_sql_repository_persists_run_events_and_runtime_state_across_instances(
+    tmp_path: Path,
+):
     database_url = f"sqlite:///{tmp_path / 'taroai.sqlite3'}"
     repository = SqlControlPlaneRepository(config=DatabaseConfig(url=database_url))
     repository.initialize_schema(Path("apps/api/migrations"))
@@ -82,6 +341,8 @@ def test_sql_repository_persists_run_events_and_runtime_state_across_instances(t
         approved_guardrail_keys=["model_request:rule_1"],
         pending_guardrail_approval_key="model_request:rule_2",
         pending_guardrail_approval_stage="model_request",
+        sandbox_session_id="sandbox_session_1",
+        browser_session_id="browser_session_1",
     )
     repository.save_runtime_state(runtime_state)
 
@@ -98,14 +359,205 @@ def test_sql_repository_persists_run_events_and_runtime_state_across_instances(t
         "audit.recorded",
         "audit.recorded",
     ]
+    assert [event.sequence for event in events] == [1, 2, 3, 4]
+    assert [
+        event.sequence
+        for event in restarted.list_run_events("tenant_acme", run.id, after_sequence=2)
+    ] == [3, 4]
     assert snapshot.status == RunStatus.RUNNING
     assert snapshot.plan[0]["tool_name"] == "research.lookup"
     assert snapshot.approved_guardrail_keys == ["model_request:rule_1"]
     assert snapshot.pending_guardrail_approval_key == "model_request:rule_2"
     assert snapshot.pending_guardrail_approval_stage == "model_request"
+    assert snapshot.sandbox_session_id == "sandbox_session_1"
+    assert snapshot.browser_session_id == "browser_session_1"
 
-    with pytest.raises(TenantAccessError):
+    with pytest.raises(NotFoundError):
         restarted.get_run("tenant_other", run.id)
+
+
+def test_sql_repository_hydrates_postgresql_native_json_and_datetime_values():
+    repository = SqlControlPlaneRepository(config=DatabaseConfig(url="postgresql://example"))
+    now = datetime(2026, 7, 3, 13, 40, tzinfo=timezone.utc)
+
+    event = repository._audit_event_from_row(
+        {
+            "id": "audit_1",
+            "tenant_id": "tenant_acme",
+            "workspace_id": None,
+            "user_id": "user_owner",
+            "run_id": None,
+            "event_type": "tenant.bootstrap.completed",
+            "metadata": {"owner_user_id": "user_owner"},
+            "created_at": now,
+        }
+    )
+
+    assert event.metadata == {"owner_user_id": "user_owner"}
+    assert event.created_at == now
+
+
+def test_sql_repository_get_run_uses_tenant_scoped_lookup(monkeypatch):
+    executed_sql: list[str] = []
+    now = datetime(2026, 7, 3, 13, 50, tzinfo=timezone.utc)
+
+    class Result:
+        def fetchone(self):
+            return {
+                "id": "run_1",
+                "tenant_id": "tenant_acme",
+                "workspace_id": "workspace_acme",
+                "user_id": "user_owner",
+                "agent_id": None,
+                "message": "Generate report.",
+                "attachments": [],
+                "mode": "workflow",
+                "status": "created",
+                "created_at": now,
+                "updated_at": now,
+            }
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, error_type, error, traceback):
+            return None
+
+        def execute(self, sql, params):
+            executed_sql.append(" ".join(sql.split()))
+            return Result()
+
+    monkeypatch.setattr("taroai.db.repository.connect_database", lambda _config: Connection())
+
+    repository = SqlControlPlaneRepository(config=DatabaseConfig(url="postgresql://example"))
+
+    repository.get_run("tenant_acme", "run_1")
+
+    assert executed_sql == ["SELECT * FROM runs WHERE tenant_id = ? AND id = ?"]
+
+
+def test_sql_repository_append_run_event_sequence_lookup_is_tenant_scoped():
+    executed: list[tuple[str, tuple]] = []
+    now = datetime(2026, 7, 4, 0, 20, tzinfo=timezone.utc)
+
+    class SelectResult:
+        def fetchone(self):
+            return {"next_sequence": 7}
+
+    class InsertResult:
+        def fetchone(self):
+            return None
+
+    class Connection:
+        def execute(self, sql, params):
+            executed.append((" ".join(sql.split()), tuple(params)))
+            if sql.strip().upper().startswith("SELECT"):
+                return SelectResult()
+            return InsertResult()
+
+    repository = SqlControlPlaneRepository(config=DatabaseConfig(url="postgresql://example"))
+    run = Run(
+        id="run_1",
+        tenant_id="tenant_acme",
+        workspace_id="workspace_sales",
+        user_id="user_1",
+        agent_id=None,
+        message="Generate report.",
+        attachments=[],
+        mode=RunMode.AUTONOMOUS,
+        status=RunStatus.RUNNING,
+        created_at=now,
+        updated_at=now,
+    )
+
+    event = repository._append_run_event(Connection(), run, "run.succeeded", {})
+
+    assert event.sequence == 7
+    assert executed[0] == (
+        "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence "
+        "FROM run_events WHERE tenant_id = ? AND run_id = ?",
+        ("tenant_acme", "run_1"),
+    )
+
+
+def test_sql_repository_persists_idempotency_records_across_instances(tmp_path: Path):
+    database_url = f"sqlite:///{tmp_path / 'taroai.sqlite3'}"
+    repository = SqlControlPlaneRepository(config=DatabaseConfig(url=database_url))
+    repository.initialize_schema(Path("apps/api/migrations"))
+    record = IdempotencyRecord(
+        tenant_id="tenant_acme",
+        key="run-create-001",
+        method="POST",
+        path="/api/runs",
+        request_hash="hash_1",
+        status_code=201,
+        response_body={
+            "run_id": "run_1",
+            "status": "created",
+            "events_url": "/api/runs/run_1/events",
+        },
+        created_at=utc_now(),
+    )
+
+    repository.save_idempotency_record(record)
+    restarted = SqlControlPlaneRepository(config=DatabaseConfig(url=database_url))
+
+    persisted = restarted.get_idempotency_record(
+        tenant_id="tenant_acme",
+        key="run-create-001",
+        method="POST",
+        path="/api/runs",
+    )
+
+    assert persisted == record
+    assert (
+        restarted.get_idempotency_record(
+            tenant_id="tenant_other",
+            key="run-create-001",
+            method="POST",
+            path="/api/runs",
+        )
+        is None
+    )
+
+
+def test_sql_repository_persists_active_license_validation_across_instances(
+    tmp_path: Path,
+):
+    database_url = f"sqlite:///{tmp_path / 'taroai.sqlite3'}"
+    repository = SqlControlPlaneRepository(config=DatabaseConfig(url=database_url))
+    repository.initialize_schema(Path("apps/api/migrations"))
+    issued_at = utc_now()
+    expires_at = issued_at.replace(year=issued_at.year + 1)
+    validation = LicenseValidationResult(
+        license=LicenseKey(
+            id="license_acme_private",
+            tenant_id="tenant_acme",
+            customer_name="Acme Inc",
+            issued_at=issued_at,
+            expires_at=expires_at,
+            deployment_modes=["private"],
+            entitlements=[
+                Entitlement(
+                    feature=LicensedFeature.PRIVATE_CONNECTOR_COUNT,
+                    limit=3,
+                )
+            ],
+            offline_validation_allowed=True,
+        ),
+        status=LicenseStatus.ACTIVE,
+        deployment_mode="private",
+        source="signed_offline_file",
+    )
+
+    repository.save_license_validation(validation)
+    restarted = SqlControlPlaneRepository(config=DatabaseConfig(url=database_url))
+
+    persisted = restarted.get_active_license_validation("tenant_acme")
+
+    assert persisted == validation
+    assert restarted.get_active_license_validation("tenant_other") is None
 
 
 def test_sql_repository_persists_status_artifacts_approvals_and_reads(tmp_path: Path):
@@ -160,7 +612,10 @@ def test_sql_repository_persists_status_artifacts_approvals_and_reads(tmp_path: 
         approved_by_user_id="manager_1",
     )
     assert resolved.status == ApprovalStatus.APPROVED
-    assert restarted.list_approval_requests("tenant_acme", run.id)[0].status == ApprovalStatus.APPROVED
+    assert (
+        restarted.list_approval_requests("tenant_acme", run.id)[0].status
+        == ApprovalStatus.APPROVED
+    )
     approval_audits = [
         event
         for event in restarted.list_audit_events("tenant_acme")
@@ -263,7 +718,9 @@ def test_sql_repository_persists_run_cancellation_and_pending_approval_cancellat
     assert persisted_approval.resolved_by_user_id == "manager_1"
     audits = restarted.list_audit_events("tenant_acme")
     run_audits = [event for event in audits if event.event_type == "run.cancelled"]
-    approval_audits = [event for event in audits if event.event_type == "approval.cancelled"]
+    approval_audits = [
+        event for event in audits if event.event_type == "approval.cancelled"
+    ]
     assert run_audits[0].metadata == {
         "cancelled_by_user_id": "manager_1",
         "reason_code": "user_requested",
@@ -273,6 +730,45 @@ def test_sql_repository_persists_run_cancellation_and_pending_approval_cancellat
         "approval_id": approval.id,
         "resolved_by_user_id": "manager_1",
         "status": "cancelled",
+    }
+
+
+def test_sql_repository_persists_run_retry_request(tmp_path: Path):
+    database_url = f"sqlite:///{tmp_path / 'taroai.sqlite3'}"
+    repository = SqlControlPlaneRepository(config=DatabaseConfig(url=database_url))
+    repository.initialize_schema(Path("apps/api/migrations"))
+    run = repository.create_run(
+        tenant_id="tenant_acme",
+        user_id="user_1",
+        payload=RunCreate(
+            workspace_id="workspace_sales",
+            message="Create a prospect brief.",
+            mode="autonomous",
+        ),
+    )
+    repository.update_run_status("tenant_acme", run.id, RunStatus.FAILED)
+
+    retrying_run = repository.request_run_retry(
+        tenant_id="tenant_acme",
+        run_id=run.id,
+        requested_by_user_id="manager_1",
+        reason_code="operator_retry",
+    )
+    restarted = SqlControlPlaneRepository(config=DatabaseConfig(url=database_url))
+    persisted_run = restarted.get_run("tenant_acme", run.id)
+    retry_audits = [
+        event
+        for event in restarted.list_audit_events("tenant_acme")
+        if event.event_type == "run.retry_requested"
+    ]
+
+    assert retrying_run.status == RunStatus.RETRYING
+    assert persisted_run.status == RunStatus.RETRYING
+    assert retry_audits[0].metadata == {
+        "requested_by_user_id": "manager_1",
+        "reason_code": "operator_retry",
+        "previous_status": "failed",
+        "status": "retrying",
     }
 
 
@@ -310,14 +806,116 @@ def test_sql_repository_records_tool_call_audit_and_billing(tmp_path: Path):
     restarted = SqlControlPlaneRepository(config=DatabaseConfig(url=database_url))
     meters = restarted.list_billing_meters("tenant_acme")
     audits = restarted.list_audit_events("tenant_acme")
-    event_types = [event.type for event in restarted.list_run_events("tenant_acme", run.id)]
+    event_types = [
+        event.type for event in restarted.list_run_events("tenant_acme", run.id)
+    ]
 
     assert meter in meters
     assert audit in audits
     assert event_types.count("billing.metered") == 2
     assert event_types.count("audit.recorded") == 4
     assert [
-        event.event_type
-        for event in audits
-        if event.event_type == "billing.metered"
+        event.event_type for event in audits if event.event_type == "billing.metered"
     ] == ["billing.metered", "billing.metered"]
+
+
+def test_sql_repository_persists_embedding_billing_meter_types(tmp_path: Path):
+    database_url = f"sqlite:///{tmp_path / 'taroai.sqlite3'}"
+    repository = SqlControlPlaneRepository(config=DatabaseConfig(url=database_url))
+    repository.initialize_schema(Path("apps/api/migrations"))
+    run = repository.create_run(
+        tenant_id="tenant_acme",
+        user_id="user_1",
+        payload=RunCreate(
+            workspace_id="workspace_sales",
+            message="Create an executive escalation plan.",
+            mode="autonomous",
+        ),
+    )
+
+    repository.record_billing_meter(
+        tenant_id="tenant_acme",
+        run_id=run.id,
+        meter_type="embedding_call_count",
+        quantity=1,
+        unit="call",
+        provider="openai_compatible",
+        model="text-embedding-3-small",
+        metadata={"purpose": "knowledge_query", "input_count": 1},
+    )
+    repository.record_billing_meter(
+        tenant_id="tenant_acme",
+        run_id=run.id,
+        meter_type="embedding_tokens",
+        quantity=5,
+        unit="token",
+        provider="openai_compatible",
+        model="text-embedding-3-small",
+        metadata={"purpose": "knowledge_query", "input_count": 1},
+    )
+
+    restarted = SqlControlPlaneRepository(config=DatabaseConfig(url=database_url))
+    embedding_meters = [
+        meter
+        for meter in restarted.list_billing_meters("tenant_acme")
+        if meter.meter_type.startswith("embedding")
+    ]
+
+    assert [
+        (meter.meter_type, meter.quantity, meter.unit) for meter in embedding_meters
+    ] == [
+        ("embedding_call_count", 1, "call"),
+        ("embedding_tokens", 5, "token"),
+    ]
+    assert {meter.provider for meter in embedding_meters} == {"openai_compatible"}
+    assert {meter.model for meter in embedding_meters} == {"text-embedding-3-small"}
+
+
+def test_sql_repository_persists_operation_level_billing_meters(tmp_path: Path):
+    database_url = f"sqlite:///{tmp_path / 'taroai.sqlite3'}"
+    repository = SqlControlPlaneRepository(config=DatabaseConfig(url=database_url))
+    repository.initialize_schema(Path("apps/api/migrations"))
+    run = repository.create_run(
+        tenant_id="tenant_acme",
+        user_id="user_1",
+        payload=RunCreate(
+            workspace_id="workspace_sales",
+            message="Create an executive escalation plan.",
+            mode="autonomous",
+        ),
+    )
+    original_run_events = repository.list_run_events("tenant_acme", run.id)
+
+    repository.record_billing_meter(
+        tenant_id="tenant_acme",
+        run_id=None,
+        workspace_id=run.workspace_id,
+        user_id=run.user_id,
+        meter_type="embedding_call_count",
+        quantity=1,
+        unit="call",
+        provider="openai_compatible",
+        model="text-embedding-3-small",
+        metadata={"purpose": "knowledge_index", "input_count": 2},
+    )
+
+    restarted = SqlControlPlaneRepository(config=DatabaseConfig(url=database_url))
+    operation_meters = [
+        meter
+        for meter in restarted.list_billing_meters("tenant_acme")
+        if meter.run_id is None and meter.meter_type == "embedding_call_count"
+    ]
+
+    assert len(operation_meters) == 1
+
+    billing_audits = [
+        event
+        for event in restarted.list_audit_events("tenant_acme")
+        if event.metadata.get("meter_id") == operation_meters[0].id
+    ]
+
+    assert operation_meters[0].workspace_id == run.workspace_id
+    assert operation_meters[0].user_id == run.user_id
+    assert restarted.list_run_events("tenant_acme", run.id) == original_run_events
+    assert billing_audits[0].run_id is None
+    assert billing_audits[0].event_type == "billing.metered"

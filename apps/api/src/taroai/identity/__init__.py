@@ -5,6 +5,7 @@ from taroai.identity.models import (
     RoleAssignment,
     UserAccount,
     UserAccountCreate,
+    UserAccountStatus,
 )
 from taroai.identity.repository import SqlIdentityService
 from taroai.identity.service import InMemoryIdentityService
@@ -18,4 +19,5 @@ __all__ = [
     "SqlIdentityService",
     "UserAccount",
     "UserAccountCreate",
+    "UserAccountStatus",
 ]

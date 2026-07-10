@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 from typing import Any
 
@@ -9,6 +10,7 @@ from taroai.domain import (
     ApprovalRequest,
     ApprovalStatus,
     BillingMeterEvent,
+    IdempotencyRecord,
     Run,
     RunCreate,
     RunEvent,
@@ -16,22 +18,18 @@ from taroai.domain import (
     new_id,
     utc_now,
 )
-
-
-class TenantAccessError(PermissionError):
-    """Raised when a caller tries to access data outside its tenant."""
-
-
-class NotFoundError(LookupError):
-    """Raised when a requested entity does not exist."""
-
-
-class RunTransitionError(ValueError):
-    """Raised when a run status transition is not allowed."""
+from taroai.errors import NotFoundError, RunTransitionError, TenantAccessError
+from taroai.licensing.models import LicenseValidationResult
 
 
 TERMINAL_RUN_STATUSES = {
     RunStatus.SUCCEEDED,
+    RunStatus.FAILED,
+    RunStatus.CANCELLED,
+    RunStatus.TIMED_OUT,
+}
+
+RETRYABLE_RUN_STATUSES = {
     RunStatus.FAILED,
     RunStatus.CANCELLED,
     RunStatus.TIMED_OUT,
@@ -54,6 +52,8 @@ class RunStateSnapshot(BaseModel):
     pending_guardrail_approval_stage: str | None = None
     tool_results: list[dict[str, Any]] = Field(default_factory=list)
     retrieved_context: dict[str, Any] = Field(default_factory=dict)
+    sandbox_session_id: str | None = None
+    browser_session_id: str | None = None
     approval_id: str | None = None
     failure_reason: str | None = None
     updated_at: datetime
@@ -77,6 +77,8 @@ class InMemoryControlPlaneStore(BaseModel):
     audit_events: dict[str, list[AuditEvent]] = Field(default_factory=dict)
     approval_requests: dict[str, list[ApprovalRequest]] = Field(default_factory=dict)
     runtime_states: dict[str, RunStateSnapshot] = Field(default_factory=dict)
+    idempotency_records: dict[str, IdempotencyRecord] = Field(default_factory=dict)
+    license_validations: dict[str, LicenseValidationResult] = Field(default_factory=dict)
 
     def create_run(self, tenant_id: str, user_id: str, payload: RunCreate) -> Run:
         now = utc_now()
@@ -98,8 +100,8 @@ class InMemoryControlPlaneStore(BaseModel):
             run,
             "run.created",
             {
-                "status": run.status,
-                "mode": run.mode,
+                "status": run.status.value,
+                "mode": run.mode.value,
                 "agent_id": run.agent_id,
             },
         )
@@ -110,7 +112,7 @@ class InMemoryControlPlaneStore(BaseModel):
             user_id=user_id,
             run_id=run.id,
             event_type="run.created",
-            metadata={"mode": run.mode, "agent_id": run.agent_id},
+            metadata={"mode": run.mode.value, "agent_id": run.agent_id},
         )
         return run
 
@@ -122,9 +124,69 @@ class InMemoryControlPlaneStore(BaseModel):
             raise TenantAccessError(f"Run {run_id} is not in tenant {tenant_id}")
         return run
 
-    def list_run_events(self, tenant_id: str, run_id: str) -> list[RunEvent]:
+    def get_idempotency_record(
+        self,
+        tenant_id: str,
+        key: str,
+        method: str,
+        path: str,
+    ) -> IdempotencyRecord | None:
+        return self.idempotency_records.get(
+            self._idempotency_record_key(tenant_id, key, method, path)
+        )
+
+    def save_idempotency_record(self, record: IdempotencyRecord) -> IdempotencyRecord:
+        self.idempotency_records[
+            self._idempotency_record_key(
+                record.tenant_id,
+                record.key,
+                record.method,
+                record.path,
+            )
+        ] = record
+        return record
+
+    def save_license_validation(
+        self,
+        validation: LicenseValidationResult,
+    ) -> LicenseValidationResult:
+        self.license_validations[validation.license.tenant_id] = validation.model_copy(deep=True)
+        return validation
+
+    def get_active_license_validation(
+        self,
+        tenant_id: str,
+    ) -> LicenseValidationResult | None:
+        validation = self.license_validations.get(tenant_id)
+        if validation is None:
+            return None
+        return validation.model_copy(deep=True)
+
+    def list_runs(
+        self,
+        tenant_id: str,
+        workspace_id: str | None = None,
+        status: RunStatus | None = None,
+    ) -> list[Run]:
+        return [
+            run
+            for run in self.runs.values()
+            if run.tenant_id == tenant_id
+            and (workspace_id is None or run.workspace_id == workspace_id)
+            and (status is None or run.status == status)
+        ]
+
+    def list_run_events(
+        self,
+        tenant_id: str,
+        run_id: str,
+        after_sequence: int | None = None,
+    ) -> list[RunEvent]:
         self.get_run(tenant_id, run_id)
-        return list(self.run_events.get(run_id, []))
+        events = list(self.run_events.get(run_id, []))
+        if after_sequence is None:
+            return events
+        return [event for event in events if event.sequence > after_sequence]
 
     def update_run_status(
         self,
@@ -137,7 +199,11 @@ class InMemoryControlPlaneStore(BaseModel):
         updated_run = run.model_copy(update={"status": status, "updated_at": utc_now()})
         self.runs[run_id] = updated_run
         if emit_status_event:
-            self.append_run_event(updated_run, "run.status_changed", {"status": status})
+            self.append_run_event(
+                updated_run,
+                "run.status_changed",
+                {"status": status.value},
+            )
         return updated_run
 
     def cancel_run(
@@ -169,6 +235,37 @@ class InMemoryControlPlaneStore(BaseModel):
         )
         self._append_run_event(cancelled_run, "run.cancelled", metadata)
         return cancelled_run
+
+    def request_run_retry(
+        self,
+        tenant_id: str,
+        run_id: str,
+        requested_by_user_id: str,
+        reason_code: str,
+    ) -> Run:
+        run = self.get_run(tenant_id, run_id)
+        if run.status not in RETRYABLE_RUN_STATUSES:
+            raise RunTransitionError(f"Run {run_id} cannot be retried from {run.status.value}")
+        retrying_run = run.model_copy(
+            update={"status": RunStatus.RETRYING, "updated_at": utc_now()}
+        )
+        self.runs[run_id] = retrying_run
+        metadata = {
+            "requested_by_user_id": requested_by_user_id,
+            "reason_code": reason_code,
+            "previous_status": run.status.value,
+            "status": RunStatus.RETRYING.value,
+        }
+        self._record_audit_event(
+            tenant_id=tenant_id,
+            workspace_id=run.workspace_id,
+            user_id=requested_by_user_id,
+            run_id=run_id,
+            event_type="run.retry_requested",
+            metadata=metadata,
+        )
+        self._append_run_event(retrying_run, "run.retry_requested", metadata)
+        return retrying_run
 
     def append_run_event(self, run: Run, event_type: str, payload: dict) -> RunEvent:
         return self._append_run_event(run, event_type, payload)
@@ -370,7 +467,7 @@ class InMemoryControlPlaneStore(BaseModel):
     def record_billing_meter(
         self,
         tenant_id: str,
-        run_id: str,
+        run_id: str | None,
         meter_type: str,
         quantity: float,
         unit: str,
@@ -379,15 +476,23 @@ class InMemoryControlPlaneStore(BaseModel):
         provider: str | None = None,
         model: str | None = None,
         cost_estimate: float | None = None,
+        workspace_id: str | None = None,
+        user_id: str | None = None,
+        agent_id: str | None = None,
     ) -> BillingMeterEvent:
-        run = self.get_run(tenant_id, run_id)
+        run = self.get_run(tenant_id, run_id) if run_id is not None else None
+        resolved_workspace_id = run.workspace_id if run is not None else workspace_id
+        resolved_user_id = run.user_id if run is not None else user_id
+        resolved_agent_id = run.agent_id if run is not None else agent_id
+        if resolved_workspace_id is None or resolved_user_id is None:
+            raise ValueError("workspace_id and user_id are required when run_id is not provided")
         meter = BillingMeterEvent(
             id=new_id("meter"),
-            tenant_id=run.tenant_id,
-            workspace_id=run.workspace_id,
-            user_id=run.user_id,
-            run_id=run.id,
-            agent_id=run.agent_id,
+            tenant_id=tenant_id,
+            workspace_id=resolved_workspace_id,
+            user_id=resolved_user_id,
+            run_id=run.id if run is not None else None,
+            agent_id=resolved_agent_id,
             skill_id=skill_id,
             meter_type=meter_type,
             quantity=quantity,
@@ -398,13 +503,14 @@ class InMemoryControlPlaneStore(BaseModel):
             metadata=metadata or {},
             created_at=utc_now(),
         )
-        self.billing_meters.setdefault(run.tenant_id, []).append(meter)
-        self._append_run_event(
-            run,
-            "billing.metered",
-            {"meter_id": meter.id, "type": meter.meter_type},
-        )
-        self._record_billing_audit_event(run, meter)
+        self.billing_meters.setdefault(meter.tenant_id, []).append(meter)
+        if run is not None:
+            self._append_run_event(
+                run,
+                "billing.metered",
+                {"meter_id": meter.id, "type": meter.meter_type},
+            )
+        self._record_billing_audit_event(meter)
         return meter
 
     def record_audit_event(
@@ -428,8 +534,10 @@ class InMemoryControlPlaneStore(BaseModel):
         )
 
     def _append_run_event(self, run: Run, event_type: str, payload: dict) -> RunEvent:
+        sequence = len(self.run_events.get(run.id, [])) + 1
         event = RunEvent(
             id=new_id("event"),
+            sequence=sequence,
             tenant_id=run.tenant_id,
             workspace_id=run.workspace_id,
             run_id=run.id,
@@ -439,6 +547,15 @@ class InMemoryControlPlaneStore(BaseModel):
         )
         self.run_events.setdefault(run.id, []).append(event)
         return event
+
+    def _idempotency_record_key(
+        self,
+        tenant_id: str,
+        key: str,
+        method: str,
+        path: str,
+    ) -> str:
+        return json.dumps([tenant_id, key, method, path], separators=(",", ":"))
 
     def _record_run_meter(self, run: Run) -> BillingMeterEvent:
         meter = BillingMeterEvent(
@@ -451,20 +568,20 @@ class InMemoryControlPlaneStore(BaseModel):
             meter_type="run_count",
             quantity=1,
             unit="run",
-            metadata={"mode": run.mode},
+            metadata={"mode": run.mode.value},
             created_at=utc_now(),
         )
         self.billing_meters.setdefault(run.tenant_id, []).append(meter)
         self._append_run_event(run, "billing.metered", {"meter_id": meter.id, "type": meter.meter_type})
-        self._record_billing_audit_event(run, meter)
+        self._record_billing_audit_event(meter)
         return meter
 
-    def _record_billing_audit_event(self, run: Run, meter: BillingMeterEvent) -> AuditEvent:
+    def _record_billing_audit_event(self, meter: BillingMeterEvent) -> AuditEvent:
         return self._record_audit_event(
-            tenant_id=run.tenant_id,
-            workspace_id=run.workspace_id,
-            user_id=run.user_id,
-            run_id=run.id,
+            tenant_id=meter.tenant_id,
+            workspace_id=meter.workspace_id,
+            user_id=meter.user_id,
+            run_id=meter.run_id,
             event_type="billing.metered",
             metadata=self._billing_audit_metadata(meter),
         )

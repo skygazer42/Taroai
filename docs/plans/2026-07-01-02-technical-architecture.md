@@ -315,7 +315,7 @@ created_by_user_id
 
 Every business table must include `tenant_id`. Workspace-bound tables must include `workspace_id`. Runtime-scoped tables should include `run_id`.
 
-For PoC, enforce tenant isolation in service code and prepare for PostgreSQL RLS. For enterprise production, enable RLS for critical tables such as runs, artifacts, knowledge documents, memory records, audit events, and billing meters.
+For PoC, enforce tenant isolation in service code. PostgreSQL RLS migration blocks, tenant session context setting, and live RLS verification against a non-superuser app role are started for critical tables such as runs, artifacts, knowledge documents, memory records, audit events, and billing meters; CI/private-deployment release gates remain required before production rollout.
 
 ## 5.1 Storage, Memory, and Identity Placement
 
@@ -330,11 +330,11 @@ Use separate storage layers by lifetime and risk:
 | Knowledge chunks and embeddings | PostgreSQL metadata plus candidate vector backend | pgvector is the recommended durable PoC candidate, but Q-003 must be answered before treating it as selected. |
 | Artifacts, uploads, sandbox files, snapshots | S3/MinIO object storage | Metadata lives in `storage_objects`; access through signed URLs. |
 | Secrets and connector credentials | Secret manager | Never place long-lived secrets inside sandbox or plain DB fields. |
-| Sessions and access tokens | Redis or signed JWT plus revocation list | Enterprise SSO/OIDC/SAML can replace password login later. |
+| Sessions and access tokens | Redis or signed JWT plus revocation list | SSO provider configuration already controls password fallback; enterprise OIDC/SAML login can later replace password login. |
 
 Identity and permission baseline:
 
-- Password login is acceptable for local/dev and early PoC; enterprise tenants should support SSO/OIDC/SAML later.
+- Password login is acceptable for local/dev and early PoC; enterprise tenants can disable password fallback for SSO-controlled domains, and OIDC/SAML login flows remain planned.
 - Passwords must be hashed with configurable algorithm and iterations. Production should use per-user salt or a proven password hashing library.
 - RBAC is the baseline: users receive roles; roles contain permissions as action/resource pairs.
 - ABAC should be added for document sensitivity, workspace membership, network policy, model policy, and high-risk tool approvals.
@@ -574,7 +574,9 @@ Meters:
 
 - `model_tokens_input`
 - `model_tokens_output`
+- `model_tokens_cached_input`
 - `model_call_count`
+- `model_latency_ms`
 - `sandbox_minutes`
 - `browser_action_count`
 - `tool_call_count`
@@ -583,6 +585,8 @@ Meters:
 - `egress_bytes`
 - `run_count`
 - `skill_call_count`
+- `trigger_invocation_count`
+- `connector_invocation_count`
 
 Do not hard-code pricing in runtime. Use a pricing config table or service so enterprise contracts can override price.
 
@@ -748,24 +752,27 @@ Verification:
 - Contract tests may use tests-only fixture adapters that are never used in product flow.
 - Smoke test runs against configured real adapter when credentials exist.
 
-### Phase 6: Client Portal Contract
+### Phase 6: Client Portal Slice
 
-Do not implement frontend in the current milestone. Define contracts for the final user-managed phase:
+Implement the minimal local PoC workspace slice and keep the full portal as a later phase:
 
 - Employee workspace.
 - Run timeline.
 - Artifact panel.
-- Admin console.
-- Skill marketplace.
+- Sandbox terminal output.
+- Approval controls.
+- Later admin console.
+- Later skill marketplace.
 
-Verification for the future frontend phase:
+Verification for the current and future frontend phases:
 
 - Contract tests with typed API fixtures.
 - Run event stream updates UI states.
 - Permission-limited views hide forbidden data.
-- Playwright/component test verifies `data-testid="chat-column"`.
-- Playwright/component test verifies Enter sends and Shift+Enter creates a new line.
-- Playwright/component test verifies the lower composer/help-text area remains reachable through `[data-testid="chat-column"] > div:nth-of-type(4) > div:nth-of-type(2)`.
+- Static contract test verifies `data-testid="chat-column"`.
+- Static contract test verifies Enter sends and Shift+Enter creates a new line.
+- Static contract test verifies the lower composer/help-text area remains reachable through `[data-testid="chat-column"] > div:nth-of-type(4) > div:nth-of-type(2)`.
+- Later Playwright/component tests verify rendered desktop/mobile behavior.
 
 ## 16. Test Strategy
 
@@ -779,7 +786,7 @@ Required test categories:
 - RAG tests for source filtering and citations.
 - Billing tests for meter event completeness.
 - Audit tests for sensitive event coverage.
-- Frontend contract tests after the final frontend phase is approved.
+- Frontend contract tests for the static workspace slice, with browser tests added when the frontend test stack is approved.
 
 ## 17. Acceptance Criteria
 

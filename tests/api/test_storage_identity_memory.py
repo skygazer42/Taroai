@@ -1,4 +1,8 @@
+import hashlib
 from datetime import timedelta
+
+import pytest
+from pydantic import ValidationError
 
 from taroai.domain import utc_now
 from taroai.identity import (
@@ -6,6 +10,7 @@ from taroai.identity import (
     PasswordHasher,
     Permission,
     Role,
+    UserAccount,
     UserAccountCreate,
 )
 from taroai.memory import (
@@ -510,6 +515,53 @@ def test_identity_service_hashes_passwords_and_verifies_login():
     assert not service.verify_password("tenant_acme", "luke@example.com", "wrong password")
 
 
+def test_user_account_models_normalize_email_addresses():
+    request = UserAccountCreate(
+        tenant_id="tenant_acme",
+        email="  Luke@Example.COM  ",
+        display_name="Luke",
+        password="correct horse battery staple",
+    )
+    account = UserAccount(
+        tenant_id="tenant_acme",
+        email="  Luke@Example.COM  ",
+        display_name="Luke",
+        password_hash="hash",
+    )
+
+    assert request.email == "luke@example.com"
+    assert account.email == "luke@example.com"
+
+
+def test_password_hasher_uses_unique_salt_for_each_new_hash():
+    hasher = PasswordHasher(salt="pepper_secret")
+
+    first_hash = hasher.hash_password("correct horse battery staple")
+    second_hash = hasher.hash_password("correct horse battery staple")
+
+    assert first_hash != second_hash
+    assert hasher.verify_password("correct horse battery staple", first_hash)
+    assert hasher.verify_password("correct horse battery staple", second_hash)
+    assert not hasher.verify_password("wrong password", first_hash)
+
+
+def test_password_hasher_verifies_legacy_static_salt_hashes():
+    legacy_salt = "test_salt"
+    password = "correct horse battery staple"
+    iterations = 600000
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        legacy_salt.encode("utf-8"),
+        iterations,
+    ).hex()
+    legacy_hash = f"pbkdf2_sha256${iterations}${legacy_salt}${digest}"
+
+    hasher = PasswordHasher(salt=legacy_salt)
+
+    assert hasher.verify_password(password, legacy_hash)
+
+
 def test_rbac_grants_permissions_through_roles():
     service = InMemoryIdentityService(password_hasher=PasswordHasher(salt="test_salt"))
     account = service.create_user(
@@ -536,3 +588,49 @@ def test_rbac_grants_permissions_through_roles():
     assert service.has_permission("tenant_acme", account.id, "runs.read", "workspace:workspace_sales")
     assert service.has_permission("tenant_acme", account.id, "skills.publish", "tenant:tenant_acme")
     assert not service.has_permission("tenant_acme", account.id, "billing.admin", "tenant:tenant_acme")
+
+
+def test_user_account_rejects_unknown_status_values():
+    with pytest.raises(ValidationError):
+        UserAccount(
+            tenant_id="tenant_acme",
+            email="luke@example.com",
+            display_name="Luke",
+            password_hash="hash",
+            status="suspended",
+        )
+
+
+def test_identity_service_denies_permissions_for_inactive_users():
+    service = InMemoryIdentityService(password_hasher=PasswordHasher(salt="test_salt"))
+    account = service.create_user(
+        UserAccountCreate(
+            tenant_id="tenant_acme",
+            email="admin@example.com",
+            display_name="Admin",
+            password="admin password",
+        )
+    )
+    service.create_role(
+        Role(
+            tenant_id="tenant_acme",
+            id="role_admin",
+            name="Admin",
+            permissions=[Permission(action="runs.read", resource="workspace:*")],
+        )
+    )
+    service.assign_role("tenant_acme", account.id, "role_admin")
+
+    assert service.has_permission("tenant_acme", account.id, "runs.read", "workspace:workspace_sales")
+
+    pending = service.mark_user_pending("tenant_acme", account.id)
+    assert pending.status == "pending"
+    assert not service.has_permission("tenant_acme", account.id, "runs.read", "workspace:workspace_sales")
+
+    active = service.activate_user("tenant_acme", account.id)
+    assert active.status == "active"
+    assert service.has_permission("tenant_acme", account.id, "runs.read", "workspace:workspace_sales")
+
+    deleted = service.delete_user("tenant_acme", account.id)
+    assert deleted.status == "deleted"
+    assert not service.has_permission("tenant_acme", account.id, "runs.read", "workspace:workspace_sales")

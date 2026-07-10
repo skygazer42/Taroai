@@ -6,13 +6,36 @@
 
 **Architecture:** A Solution Pack is a versioned bundle that can seed a tenant with workspaces, agent templates, skills, connectors, knowledge spaces, evaluation cases, prompts, training assets, and success metrics. Packs are installed through onboarding or admin APIs, but all resources remain governed by tenant policy, approval, audit, and versioning.
 
-**Tech Stack:** FastAPI, Pydantic, pytest, PostgreSQL later, object storage for training/demo assets, existing builder/skills/connectors/onboarding services.
+**Tech Stack:** FastAPI, Pydantic, pytest, SQLite/PostgreSQL-compatible SQL persistence, object storage for training/demo assets, existing builder/skills/connectors/onboarding services.
 
 ---
 
 ## Summary
 
 The product is an enterprise service, so implementation plans should cover repeatable delivery, not only platform primitives. This plan turns custom work into reusable packs that reduce cold start for each new customer.
+
+## Current Implementation Notes
+
+- `apps/api/src/taroai/solution_packs/` now defines Pydantic solution pack manifests, entries, install requests, installation records, in-memory registry, SQLite/PostgreSQL-compatible SQL registry, and an installation service.
+- Solution pack manifests can bundle versioned `SkillManifest` resources with industry/use-case metadata, success metrics, and rollout checklist text. The first installer registers missing skills, publishes them, and installs them into selected workspaces through the existing skill registry rather than executing arbitrary pack code.
+- FastAPI exposes `POST /api/solution-packs`, `GET /api/solution-packs`, version history, publish/disable, install, and installation listing endpoints behind `solution_packs.read`/`solution_packs.manage`/`solution_packs.install`.
+- Runtime install enforcement checks the active tenant license for `solution_packs` when license runtime enforcement is enabled, and install audit metadata records pack id, version, workspace count, and installed skill count without raw skill schemas or business payloads.
+- `TAROAI_SOLUTION_PACK_REGISTRY_BACKEND` selects memory or SQL persistence; new install and private/BYOC env profiles use SQL. Migrations and PostgreSQL RLS include solution pack tables.
+- Solution pack installation now has service/API dry-run preview, workspace skill conflict reporting, selected-resource skips, high-risk skill installation as disabled by default, and rollback that disables installed workspace skills while recording safe rollback audit metadata.
+- `apps/api/src/taroai/customer_success/` now defines Pydantic adoption metrics, solution-pack outcome metrics, tenant success health bands, and an in-memory customer success summary service that aggregates tenant-scoped runs, artifact downloads, skill usage meters, approvals, feedback counts, repeated workflows, and installed pack outcome values without exposing prompts, artifact URIs, or raw feedback.
+- `apps/api/src/taroai/customer_success/feedback.py` now captures structured customer feedback types and target links, writes safe `customer.feedback.submitted` audit metadata without raw comments or metadata values, creates human-reviewed low-rated-run evaluation candidates, and creates repeated missing-skill solution-pack improvement candidates without mutating production packs, skills, or runs.
+- `apps/api/src/taroai/customer_success/repository.py` now provides `SqlCustomerFeedbackService`, backed by SQLite/PostgreSQL-compatible migrations for feedback records, review candidates, evaluation case records, solution-pack publication draft records, and draft application fields. `TAROAI_CUSTOMER_FEEDBACK_SERVICE_BACKEND` selects memory or SQL, and durable deployment profiles require SQL.
+- Feedback candidates now have an accept/reject review workflow: accepted low-rated-run candidates create evaluation-case IDs and tenant-scoped evaluation case records, accepted missing-skill candidates create solution-pack publication draft IDs and draft records, rejected candidates create no downstream artifact, and neither path mutates production runs, skills, or published packs.
+- FastAPI exposes customer success summary, feedback submission/listing, low-rated-run evaluation candidate creation/list/review, and solution-pack improvement candidate creation/list/review routes behind `customer_success.read`, `customer_success.feedback`, and `customer_success.manage`; feedback API responses avoid returning raw comments or metadata values.
+- FastAPI also exposes `GET /api/customer-success/evaluation-cases` and `GET /api/customer-success/solution-pack-drafts` behind `customer_success.manage`, so reviewed feedback can be inspected as explicit downstream work records before any production evaluation or pack publication change.
+- Solution-pack publication drafts now support guarded backend edit, submit-for-review, approve/reject, and apply endpoints. Applying a draft requires `customer_success.manage` plus `solution_packs.manage`, a proposed pack version, and one or more complete `SkillManifest` records; it publishes a new solution-pack version, marks the source candidate applied, and records audit metadata without raw schemas or approval notes.
+- Tenant bootstrap now accepts `starter_solution_pack_ids`, installs requested published solution packs into the starter workspace through the solution pack service, returns installed pack/skill IDs, records safe bootstrap metadata with pack IDs and skill counts, and grants tenant owners solution pack plus customer success permissions.
+- The static workspace now includes a Customer Success panel that loads tenant success health, run completion, feedback count, evaluation/solution-pack candidate queue counts, and solution-pack publication drafts from the real API while preserving the existing CREAO-compatible chat selector contract.
+- Customer Success operators can select a solution-pack publication draft in the static workspace, edit its requested skill, change summary, target pack version, and skill manifest JSON object or array while it is editable, submit it for review, approve/reject it, and apply approved drafts through the guarded backend workflow.
+- `docs/solution-packs/` now contains ecommerce, sales, support, and operations baseline pack docs that map business outcomes and named use cases to Taroai resources, required connectors, knowledge spaces, approval gates, sample inputs, artifacts, and success metrics.
+- `docs/customer-success/` now contains rollout, tenant admin training, employee training, and solution engineer checklist docs that cover discovery, sandbox tenant, data and connector setup, pilot, training, production, expansion, go-live readiness, safe use, and custom skill delivery.
+- Release package verification now treats the baseline solution pack docs and customer success playbooks as required archive entries so private/BYOC delivery packages include the business rollout materials.
+- Non-skill resource publication drafts beyond proposed `SkillManifest` records remain planned.
 
 ## Task 1: Solution Pack Domain Model
 
@@ -21,7 +44,7 @@ The product is an enterprise service, so implementation plans should cover repea
 - Create: `apps/api/src/taroai/solution_packs/__init__.py`
 - Create: `apps/api/src/taroai/solution_packs/models.py`
 - Create: `apps/api/src/taroai/solution_packs/registry.py`
-- Test: `tests/api/test_solution_pack_models.py`
+- Test: `tests/api/test_solution_packs.py`
 
 **Steps:**
 
@@ -40,9 +63,9 @@ The product is an enterprise service, so implementation plans should cover repea
 
 **Files:**
 
-- Create: `apps/api/src/taroai/solution_packs/installer.py`
+- Create: `apps/api/src/taroai/solution_packs/service.py`
 - Modify: `apps/api/src/taroai/onboarding/starter_packs.py`
-- Test: `tests/api/test_solution_pack_installation.py`
+- Test: `tests/api/test_solution_packs.py`
 
 **Steps:**
 
@@ -151,8 +174,7 @@ The product is an enterprise service, so implementation plans should cover repea
 Run after implementation:
 
 ```bash
-python -m pytest tests/api/test_solution_pack_models.py -q
-python -m pytest tests/api/test_solution_pack_installation.py -q
+python -m pytest tests/api/test_solution_packs.py -q
 python -m pytest tests/api/test_customer_success_metrics.py -q
 python -m pytest tests/api/test_customer_feedback_loop.py -q
 python -m pytest -q

@@ -1,0 +1,97 @@
+{{- if .Values.web.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "taroai.fullname" . }}-web
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-web
+    app.kubernetes.io/component: web
+spec:
+  replicas: {{ .Values.web.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "taroai.fullname" . }}-web
+  template:
+    metadata:
+      labels:
+        {{- include "taroai.labels" . | nindent 8 }}
+        app.kubernetes.io/name: {{ include "taroai.fullname" . }}-web
+        app.kubernetes.io/component: web
+    spec:
+      serviceAccountName: {{ include "taroai.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: web
+          image: "{{ .Values.web.image.repository }}:{{ .Values.web.image.tag }}"
+          imagePullPolicy: {{ .Values.web.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.web.service.containerPort }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.web.readinessProbe.path }}
+              port: http
+            periodSeconds: {{ .Values.web.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.web.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.web.readinessProbe.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.web.livenessProbe.path }}
+              port: http
+            periodSeconds: {{ .Values.web.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.web.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.web.livenessProbe.failureThreshold }}
+          resources:
+            {{- toYaml .Values.web.resources | nindent 12 }}
+          volumeMounts:
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+            - name: nginx-run
+              mountPath: /var/run
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+      volumes:
+        - name: nginx-cache
+          emptyDir: {}
+        - name: nginx-run
+          emptyDir: {}
+      {{- with .Values.web.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.web.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.web.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "taroai.fullname" . }}-web
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-web
+    app.kubernetes.io/component: web
+spec:
+  type: {{ .Values.web.service.type }}
+  selector:
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-web
+  ports:
+    - name: http
+      port: {{ .Values.web.service.port }}
+      targetPort: http
+{{- end }}

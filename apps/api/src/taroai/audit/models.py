@@ -69,6 +69,23 @@ DEFAULT_AUDIT_COVERAGE_REQUIREMENTS = [
         description="User disablement must be traceable for access reviews.",
     ),
     AuditCoverageRequirement(
+        area="run",
+        event_type="run.cancelled",
+        required_metadata_keys={"cancelled_by_user_id", "reason_code", "status"},
+        description="Run cancellation must identify actor and structured reason.",
+    ),
+    AuditCoverageRequirement(
+        area="run",
+        event_type="run.retry_requested",
+        required_metadata_keys={
+            "requested_by_user_id",
+            "reason_code",
+            "previous_status",
+            "status",
+        },
+        description="Run retry must identify actor, structured reason, and prior state.",
+    ),
+    AuditCoverageRequirement(
         area="rbac",
         event_type="identity.role.created",
         required_metadata_keys={"role_id", "permissions_count"},
@@ -85,6 +102,12 @@ DEFAULT_AUDIT_COVERAGE_REQUIREMENTS = [
         event_type="knowledge.query.executed",
         required_metadata_keys={"query_length", "result_count", "document_ids"},
         description="Knowledge reads must record query shape and result IDs without raw excerpts.",
+    ),
+    AuditCoverageRequirement(
+        area="embedding",
+        event_type="embedding.gateway.called",
+        required_metadata_keys={"purpose", "input_count", "embedding_count", "model"},
+        description="Embedding gateway calls must record provider usage without raw text or vectors.",
     ),
     AuditCoverageRequirement(
         area="memory",
@@ -151,5 +174,17 @@ DEFAULT_AUDIT_COVERAGE_REQUIREMENTS = [
         event_type="skill.published",
         required_metadata_keys={"skill_id", "version"},
         description="Skill publication must identify package and version.",
+    ),
+    AuditCoverageRequirement(
+        area="license",
+        event_type="license.status_changed",
+        required_metadata_keys={"license_id", "status", "deployment_mode"},
+        description="License status changes must identify license, status, and deployment mode.",
+    ),
+    AuditCoverageRequirement(
+        area="license",
+        event_type="license.imported",
+        required_metadata_keys={"license_id", "status", "deployment_mode"},
+        description="License imports must identify license, status, and deployment mode without signature material.",
     ),
 ]

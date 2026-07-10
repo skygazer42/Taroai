@@ -1,0 +1,160 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taroai-api
+  labels:
+    app.kubernetes.io/name: taroai-api
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: taroai
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: taroai-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: taroai-api
+        app.kubernetes.io/component: api
+        app.kubernetes.io/part-of: taroai
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          image: ghcr.io/creao-ai/taroai-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: taroai-runtime-config
+            - secretRef:
+                name: taroai-runtime-secrets
+          env:
+            - name: TAROAI_RUN_MIGRATIONS
+              value: "false"
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: taroai-data
+              mountPath: /data/taroai
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: taroai-data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: taroai-api
+  labels:
+    app.kubernetes.io/name: taroai-api
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: taroai
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: taroai-api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: taroai-db-migrate
+  labels:
+    app.kubernetes.io/name: taroai-db-migrate
+    app.kubernetes.io/component: migration
+    app.kubernetes.io/part-of: taroai
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: taroai-db-migrate
+        app.kubernetes.io/component: migration
+        app.kubernetes.io/part-of: taroai
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: ghcr.io/creao-ai/taroai-api:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /app/entrypoint.sh
+          args:
+            - python
+            - -m
+            - taroai.db.migration_cli
+            - --database-url
+            - $(TAROAI_DATABASE_URL)
+            - --migrations-path
+            - /app/migrations
+            - --apply
+          envFrom:
+            - configMapRef:
+                name: taroai-runtime-config
+            - secretRef:
+                name: taroai-runtime-secrets
+          env:
+            - name: TAROAI_RUN_MIGRATIONS
+              value: "false"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: taroai-data
+              mountPath: /data/taroai
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: taroai-data
+          emptyDir: {}

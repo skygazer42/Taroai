@@ -1,5 +1,7 @@
+import base64
 import json
 import re
+import time
 from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError
@@ -8,7 +10,15 @@ from taroai.agent.graph import build_runtime_graph
 from taroai.agent.planning import PlanStep
 from taroai.agent.state import AgentRetrievedContext, AgentRuntimeState
 from taroai.audit import AuditActor, AuditEventCreate, AuditService
+from taroai.billing import BillingPricingService
 from taroai.db import SqlControlPlaneRepository
+from taroai.embeddings import (
+    EmbeddingGateway,
+    EmbeddingGatewayRequest,
+    EmbeddingGatewayResponse,
+    EmbeddingUsageRecord,
+    EmbeddingUsageRecorder,
+)
 from taroai.guardrails.models import (
     GuardrailAction,
     GuardrailDecision,
@@ -16,9 +26,15 @@ from taroai.guardrails.models import (
     GuardrailStage,
 )
 from taroai.knowledge import RetrievalRequest, RetrievalResult
+from taroai.licensing import LicenseEntitlementDeniedError, LicensedFeature
 from taroai.memory import MemoryScopeType
-from taroai.tool_gateway import ToolApprovalRequiredError, ToolExecutionError, ToolGateway
-from taroai.domain import Run, RunStatus
+from taroai.tool_gateway import (
+    ToolApprovalRequiredError,
+    ToolExecutionError,
+    ToolGateway,
+    ToolResult,
+)
+from taroai.domain import Run, RunStatus, new_id, utc_now
 from taroai.model_gateway import (
     ModelBudgetExceededError,
     ModelBudgetGuard,
@@ -32,6 +48,19 @@ from taroai.model_gateway import (
     OpenAICompatibleModelGateway,
     PlannedToolCall,
 )
+from taroai.policy import PolicyDecision, PolicyRequest, PolicyService
+from taroai.sandbox import (
+    BrowserController,
+    BrowserProviderUnavailableError,
+    SandboxAdapter,
+    SandboxCreateRequest,
+    SandboxExecutionError,
+    SandboxNetworkMode,
+    SandboxProviderUnavailableError,
+    SandboxSessionStatus,
+)
+from taroai.storage import ObjectStorageAdapter, StorageObjectCreate, StoragePurpose
+from taroai.storage import StorageContentScanner, StorageContentScanRequest
 from taroai.store import InMemoryControlPlaneStore, NotFoundError
 
 
@@ -60,18 +89,49 @@ class _RuntimeGuardrailApprovalRequired(RuntimeError):
         self.metadata = metadata
 
 
+class _RuntimeStorageContentRejected(RuntimeError):
+    def __init__(self, metadata: dict[str, Any]):
+        super().__init__("storage content rejected by scan policy")
+        self.metadata = metadata
+
+
+class _RuntimeSandboxArtifactPathRejected(RuntimeError):
+    def __init__(self, metadata: dict[str, Any]):
+        super().__init__("sandbox artifact path must be under /workspace/artifacts/")
+        self.metadata = metadata
+
+
 class AgentRuntime(BaseModel):
     store: InMemoryControlPlaneStore | SqlControlPlaneRepository
     model_gateway: ModelGateway = Field(default_factory=OpenAICompatibleModelGateway)
     model_policy: ModelPolicy = Field(default_factory=ModelPolicy)
     model_budget_guard: ModelBudgetGuard = Field(default_factory=ModelBudgetGuard)
     tool_gateway: ToolGateway = Field(default_factory=ToolGateway)
+    policy_service: PolicyService | None = None
     audit_service: Any | None = None
+    license_service: Any | None = None
     knowledge_service: Any | None = None
+    sandbox_adapter: SandboxAdapter | None = None
+    browser_controller: BrowserController | None = None
+    storage_catalog: Any | None = None
+    object_storage: ObjectStorageAdapter | None = None
+    storage_content_scanner: StorageContentScanner | None = None
+    sandbox_runtime_image: str = "python:3.12-slim"
+    sandbox_network_mode: SandboxNetworkMode = SandboxNetworkMode.DISABLED
+    sandbox_timeout_seconds: int = 300
+    sandbox_destroy_on_success: bool = True
+    embedding_gateway: EmbeddingGateway | None = None
+    billing_pricing_service: BillingPricingService = Field(
+        default_factory=BillingPricingService
+    )
     long_term_memory_service: Any | None = None
     guardrail_service: Any | None = None
     max_step_retries: int = 0
     pending_states: dict[str, AgentRuntimeState] = Field(default_factory=dict)
+    model_plan_metadata: dict[str, dict[str, Any]] = Field(
+        default_factory=dict,
+        exclude=True,
+    )
 
     def build_graph(self):
         return build_runtime_graph()
@@ -80,6 +140,9 @@ class AgentRuntime(BaseModel):
         run = self.store.update_run_status(tenant_id, run_id, RunStatus.RUNNING)
         state = self._initial_state(run)
         self._save_state(state)
+        runtime_policy_decision = self._decide_runtime_execution(run)
+        if not runtime_policy_decision.allowed:
+            return self._pause_for_policy_block(state, run, runtime_policy_decision)
         state.retrieved_context = self._load_context(run)
         self._save_state(state)
         self.store.append_run_event(
@@ -109,7 +172,7 @@ class AgentRuntime(BaseModel):
         self.store.append_run_event(
             run,
             "plan.created",
-            {"steps": [step.model_dump(mode="json") for step in state.plan]},
+            self._plan_created_event_payload(state),
         )
         self.store.append_run_event(run, "policy.checked", {"decision": "allowed"})
         return self._execute_planned_steps(state)
@@ -130,13 +193,23 @@ class AgentRuntime(BaseModel):
             approval_id=approval_id,
             approved_by_user_id=approved_by_user_id,
         )
-        self.store.update_run_status(tenant_id, run_id, RunStatus.RUNNING, emit_status_event=False)
+        self.store.update_run_status(
+            tenant_id, run_id, RunStatus.RUNNING, emit_status_event=False
+        )
         state.status = RunStatus.RUNNING
-        if state.current_step_id is not None and state.current_step_id not in state.approved_step_ids:
+        if (
+            state.current_step_id is not None
+            and state.current_step_id not in state.approved_step_ids
+        ):
             state.approved_step_ids.append(state.current_step_id)
         if state.pending_guardrail_approval_key is not None:
-            if state.pending_guardrail_approval_key not in state.approved_guardrail_keys:
-                state.approved_guardrail_keys.append(state.pending_guardrail_approval_key)
+            if (
+                state.pending_guardrail_approval_key
+                not in state.approved_guardrail_keys
+            ):
+                state.approved_guardrail_keys.append(
+                    state.pending_guardrail_approval_key
+                )
             pending_guardrail_stage = state.pending_guardrail_approval_stage
             state.pending_guardrail_approval_key = None
             state.pending_guardrail_approval_stage = None
@@ -148,6 +221,10 @@ class AgentRuntime(BaseModel):
             }:
                 return self._resume_planning_after_guardrail_approval(state)
             if pending_guardrail_stage == GuardrailStage.ARTIFACT.value:
+                if self._has_pending_sandbox_artifact_promotion(state):
+                    return self._resume_sandbox_artifact_promotion_after_guardrail_approval(
+                        state
+                    )
                 return self._finalize_success(state)
         state.approval_id = None
         self._save_state(state)
@@ -190,6 +267,12 @@ class AgentRuntime(BaseModel):
         state.pending_guardrail_approval_stage = None
         state.failure_reason = "Approval rejected"
         self._save_state(state)
+        self._destroy_runtime_sandbox_session(
+            state,
+            reason="approval_rejected",
+            force=True,
+        )
+        self._destroy_runtime_browser_session(state, reason="approval_rejected")
         return state
 
     def cancel_run(
@@ -224,7 +307,34 @@ class AgentRuntime(BaseModel):
             state.pending_guardrail_approval_stage = None
             state.failure_reason = "Run cancelled"
             self._save_state(state)
+            self._destroy_runtime_sandbox_session(
+                state,
+                reason="cancelled",
+                force=True,
+            )
+            self._destroy_runtime_browser_session(state, reason="cancelled")
         return run
+
+    def retry_run(
+        self,
+        tenant_id: str,
+        run_id: str,
+        requested_by_user_id: str,
+        reason_code: str,
+    ) -> AgentRuntimeState:
+        self.pending_states.pop(run_id, None)
+        self.store.request_run_retry(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            requested_by_user_id=requested_by_user_id,
+            reason_code=reason_code,
+        )
+        self.store.cancel_pending_approval_requests(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            cancelled_by_user_id=requested_by_user_id,
+        )
+        return self.execute_run(tenant_id, run_id)
 
     def _initial_state(self, run: Run) -> AgentRuntimeState:
         return AgentRuntimeState(
@@ -234,6 +344,53 @@ class AgentRuntime(BaseModel):
             run_id=run.id,
             goal=run.message,
             status=run.status,
+        )
+
+    def _decide_runtime_execution(self, run: Run) -> PolicyDecision:
+        if self.policy_service is None:
+            return PolicyDecision.allow()
+        return self.policy_service.decide_runtime_execution(
+            PolicyRequest(
+                tenant_id=run.tenant_id,
+                workspace_id=run.workspace_id,
+                user_id=run.user_id,
+                run_id=run.id,
+                action="runs.execute",
+                resource=f"run:{run.id}",
+                context={"agent_id": run.agent_id},
+            )
+        )
+
+    def _decide_runtime_step(
+        self,
+        state: AgentRuntimeState,
+        run: Run,
+        step: PlanStep,
+    ) -> PolicyDecision:
+        if self.policy_service is None:
+            return PolicyDecision.allow()
+        tool_policy = self.tool_gateway.policies.get(step.tool_name)
+        risk_level = tool_policy.risk_level.value if tool_policy is not None else None
+        return self.policy_service.decide_runtime_step(
+            PolicyRequest(
+                tenant_id=state.tenant_id,
+                workspace_id=state.workspace_id,
+                user_id=state.user_id,
+                run_id=state.run_id,
+                action="runtime.step.execute",
+                resource=f"tool:{step.tool_name}",
+                risk_level=risk_level,
+                context={
+                    "agent_id": run.agent_id,
+                    "tool_name": step.tool_name,
+                    "skill_id": step.skill_id,
+                    "connector_id": step.tool_input.get("connector_id"),
+                    "external_write": step.tool_input.get("external_write") is True,
+                    "risk_level": risk_level,
+                    "trigger_id": step.tool_input.get("trigger_id"),
+                    "step_id": step.id,
+                },
+            )
         )
 
     def _create_plan(
@@ -248,7 +405,17 @@ class AgentRuntime(BaseModel):
                 content=(
                     "You are Taroai's enterprise agent planner. Return strict JSON with "
                     "a top-level steps array. Each step must include id, title, tool_name, "
-                    "tool_input, and approval_required."
+                    "tool_input, and approval_required. Available built-in tools include "
+                    "sandbox.command for shell or Python work in the run workspace and "
+                    "browser.action for browser navigation, extraction, typing, clicking, "
+                    "and screenshots. Do not invent session_id values for sandbox.command "
+                    "or browser.action; the runtime injects them. When the user asks for a "
+                    "deliverable, create it with sandbox.command under /workspace/artifacts/ "
+                    "and include artifact_path or artifact_paths in tool_input, for example "
+                    '"/workspace/artifacts/report.md". The command must create the '
+                    "directory before writing files, for example "
+                    "'mkdir -p /workspace/artifacts && ...'. Files outside "
+                    "/workspace/artifacts/ are rejected for artifact publication."
                 ),
             )
         ]
@@ -256,11 +423,13 @@ class AgentRuntime(BaseModel):
         if context_message is not None:
             messages.append(context_message)
         messages.append(ModelMessage(role="user", content=run.message))
+        context_sensitivity_level = self._context_sensitivity_level(context)
         request = ModelGatewayRequest(
             tenant_id=run.tenant_id,
             workspace_id=run.workspace_id,
             user_id=run.user_id,
             run_id=run.id,
+            sensitivity_level=context_sensitivity_level,
             messages=messages,
             input=run.message,
             tool_choice="auto",
@@ -270,6 +439,7 @@ class AgentRuntime(BaseModel):
                 "mode": run.mode,
                 "knowledge_result_count": len(context.knowledge_results),
                 "memory_record_count": len(context.memory_records),
+                "context_sensitivity_level": context_sensitivity_level,
             },
         )
         request = self._apply_model_request_guardrails(
@@ -277,20 +447,29 @@ class AgentRuntime(BaseModel):
             request,
             approved_guardrail_keys or [],
         )
-        self.model_policy.assert_request_allowed(request)
+        resolved_model = self.model_policy.assert_request_allowed(request)
+        if resolved_model is not None and request.model != resolved_model:
+            request = request.model_copy(update={"model": resolved_model})
         self.model_budget_guard.assert_plan_allowed(self.store, run.tenant_id, run.id)
+        plan_started_at = time.perf_counter()
         response = self.model_gateway.create_plan(request)
+        latency_ms = max(0, round((time.perf_counter() - plan_started_at) * 1000))
         response = self._apply_model_response_guardrails(
             run,
             response,
             approved_guardrail_keys or [],
         )
-        self._record_model_plan(run, response)
+        self.model_plan_metadata[run.id] = self._record_model_plan(
+            run,
+            response,
+            latency_ms,
+        )
         return [
             PlanStep(
                 id=step.id,
                 title=step.title,
                 tool_name=step.tool_name,
+                skill_id=step.skill_id,
                 tool_input=step.tool_input,
                 approval_required=step.approval_required,
             )
@@ -350,6 +529,12 @@ class AgentRuntime(BaseModel):
         state.status = RunStatus.FAILED
         state.failure_reason = str(error)
         self._save_state(state)
+        self._destroy_runtime_sandbox_session(
+            state,
+            reason="failure",
+            force=True,
+        )
+        self._destroy_runtime_browser_session(state, reason="failure")
         return state
 
     def _pause_for_guardrail_approval(
@@ -371,13 +556,112 @@ class AgentRuntime(BaseModel):
             emit_status_event=False,
         )
         state.status = RunStatus.AWAITING_APPROVAL
-        state.current_step_id = None
+        if not self._should_preserve_current_step_for_guardrail_pause(state, error):
+            state.current_step_id = None
         state.pending_guardrail_approval_key = error.guardrail_key
         state.pending_guardrail_approval_stage = error.stage.value
         state.approval_id = approval.id
         self.pending_states[state.run_id] = state
         self._save_state(state)
         return state
+
+    def _pause_for_policy_block(
+        self,
+        state: AgentRuntimeState,
+        run: Run,
+        decision: PolicyDecision,
+        current_step_id: str | None = None,
+    ) -> AgentRuntimeState:
+        reason = decision.reason or "runtime execution denied by policy"
+        payload = {
+            "decision": "denied",
+            "reason": reason,
+            **decision.metadata,
+        }
+        if current_step_id is not None:
+            state.current_step_id = current_step_id
+        self._destroy_runtime_sandbox_session(
+            state,
+            reason="policy_blocked",
+            force=True,
+        )
+        self._destroy_runtime_browser_session(state, reason="policy_blocked")
+        self.store.update_run_status(
+            run.tenant_id,
+            run.id,
+            RunStatus.AWAITING_POLICY,
+            emit_status_event=False,
+        )
+        self.store.append_run_event(run, "policy.blocked", payload)
+        state.status = RunStatus.AWAITING_POLICY
+        state.failure_reason = reason
+        self.pending_states[state.run_id] = state
+        self._save_state(state)
+        return state
+
+    def _should_preserve_current_step_for_guardrail_pause(
+        self,
+        state: AgentRuntimeState,
+        error: _RuntimeGuardrailApprovalRequired,
+    ) -> bool:
+        if error.stage != GuardrailStage.ARTIFACT:
+            return False
+        return self._has_pending_sandbox_artifact_promotion(state)
+
+    def _has_pending_sandbox_artifact_promotion(
+        self,
+        state: AgentRuntimeState,
+    ) -> bool:
+        if state.current_step_id is None or state.sandbox_session_id is None:
+            return False
+        if state.current_step_id in state.completed_step_ids:
+            return False
+        step = self._planned_step_by_id(state, state.current_step_id)
+        return step is not None and step.tool_name == "sandbox.command"
+
+    def _planned_step_by_id(
+        self,
+        state: AgentRuntimeState,
+        step_id: str,
+    ) -> PlanStep | None:
+        for step in state.plan:
+            if step.id == step_id:
+                return step
+        return None
+
+    def _resume_sandbox_artifact_promotion_after_guardrail_approval(
+        self,
+        state: AgentRuntimeState,
+    ) -> AgentRuntimeState:
+        step = self._planned_step_by_id(state, state.current_step_id or "")
+        if step is None:
+            return self._finalize_success(state)
+        run = self.store.get_run(state.tenant_id, state.run_id)
+        try:
+            self._promote_sandbox_artifacts(state, step)
+        except _RuntimeSandboxArtifactPathRejected as error:
+            return self._fail_for_sandbox_artifact_path_rejection(
+                state,
+                run,
+                step,
+                error,
+            )
+        except _RuntimeStorageContentRejected as error:
+            return self._fail_for_storage_content_rejection(
+                state,
+                run,
+                step,
+                error,
+            )
+        except _RuntimeGuardrailApprovalRequired as error:
+            return self._pause_for_guardrail_approval(state, run, error)
+        except _RuntimeGuardrailViolation as error:
+            return self._fail_for_guardrail(state, run, error)
+        if step.id not in state.completed_step_ids:
+            self._record_tool_execution(state, step)
+            state.completed_step_ids.append(step.id)
+        self._save_state(state)
+        return self._execute_planned_steps(state)
 
     def _record_model_policy_denial(
         self,
@@ -467,31 +751,52 @@ class AgentRuntime(BaseModel):
         self.store.append_run_event(
             run,
             "plan.created",
-            {"steps": [step.model_dump(mode="json") for step in state.plan]},
+            self._plan_created_event_payload(state),
         )
         self.store.append_run_event(run, "policy.checked", {"decision": "allowed"})
         return self._execute_planned_steps(state)
 
-    def _record_model_plan(self, run: Run, response: ModelGatewayResponse) -> None:
+    def _record_model_plan(
+        self,
+        run: Run,
+        response: ModelGatewayResponse,
+        latency_ms: int,
+    ) -> dict[str, Any]:
         metadata = {
             "response_id": response.id,
+            "provider": response.provider,
             "model": response.model,
             "planned_step_count": len(response.planned_steps),
+            "latency_ms": latency_ms,
             "usage": (
                 response.usage.model_dump(mode="json")
                 if response.usage is not None
                 else None
             ),
         }
+        if response.provider_attempts:
+            metadata["provider_attempts"] = [
+                attempt.model_dump(mode="json") for attempt in response.provider_attempts
+            ]
         self.store.record_billing_meter(
             tenant_id=run.tenant_id,
             run_id=run.id,
             meter_type="model_call_count",
             quantity=1,
             unit="call",
+            provider=response.provider,
             model=response.model,
-            metadata=metadata,
-        )
+            cost_estimate=self._estimate_billing_cost(
+                meter_type="model_call_count",
+                quantity=1,
+                unit="call",
+                provider=response.provider,
+                model=response.model,
+                tenant_id=run.tenant_id,
+                workspace_id=run.workspace_id,
+            ),
+                metadata=metadata,
+            )
         if response.usage is not None:
             self.store.record_billing_meter(
                 tenant_id=run.tenant_id,
@@ -499,7 +804,17 @@ class AgentRuntime(BaseModel):
                 meter_type="model_tokens_input",
                 quantity=response.usage.input_tokens,
                 unit="token",
+                provider=response.provider,
                 model=response.model,
+                cost_estimate=self._estimate_billing_cost(
+                    meter_type="model_tokens_input",
+                    quantity=response.usage.input_tokens,
+                    unit="token",
+                    provider=response.provider,
+                    model=response.model,
+                    tenant_id=run.tenant_id,
+                    workspace_id=run.workspace_id,
+                ),
                 metadata=metadata,
             )
             self.store.record_billing_meter(
@@ -508,9 +823,58 @@ class AgentRuntime(BaseModel):
                 meter_type="model_tokens_output",
                 quantity=response.usage.output_tokens,
                 unit="token",
+                provider=response.provider,
                 model=response.model,
+                cost_estimate=self._estimate_billing_cost(
+                    meter_type="model_tokens_output",
+                    quantity=response.usage.output_tokens,
+                    unit="token",
+                    provider=response.provider,
+                    model=response.model,
+                    tenant_id=run.tenant_id,
+                    workspace_id=run.workspace_id,
+                ),
                 metadata=metadata,
             )
+            if response.usage.cached_input_tokens > 0:
+                self.store.record_billing_meter(
+                    tenant_id=run.tenant_id,
+                    run_id=run.id,
+                    meter_type="model_tokens_cached_input",
+                    quantity=response.usage.cached_input_tokens,
+                    unit="token",
+                    provider=response.provider,
+                    model=response.model,
+                    cost_estimate=self._estimate_billing_cost(
+                        meter_type="model_tokens_cached_input",
+                        quantity=response.usage.cached_input_tokens,
+                        unit="token",
+                        provider=response.provider,
+                        model=response.model,
+                        tenant_id=run.tenant_id,
+                        workspace_id=run.workspace_id,
+                    ),
+                    metadata=metadata,
+                )
+        self.store.record_billing_meter(
+            tenant_id=run.tenant_id,
+            run_id=run.id,
+            meter_type="model_latency_ms",
+            quantity=latency_ms,
+            unit="millisecond",
+            provider=response.provider,
+            model=response.model,
+            cost_estimate=self._estimate_billing_cost(
+                meter_type="model_latency_ms",
+                quantity=latency_ms,
+                unit="millisecond",
+                provider=response.provider,
+                model=response.model,
+                tenant_id=run.tenant_id,
+                workspace_id=run.workspace_id,
+            ),
+            metadata=metadata,
+        )
         self._record_audit_event(
             tenant_id=run.tenant_id,
             workspace_id=run.workspace_id,
@@ -518,6 +882,41 @@ class AgentRuntime(BaseModel):
             run_id=run.id,
             event_type="model.plan.created",
             metadata=metadata,
+        )
+        return metadata
+
+    def _plan_created_event_payload(
+        self,
+        state: AgentRuntimeState,
+    ) -> dict[str, Any]:
+        payload = {
+            "steps": [step.model_dump(mode="json") for step in state.plan],
+        }
+        metadata = self.model_plan_metadata.pop(state.run_id, None)
+        if metadata:
+            payload.update(metadata)
+        return payload
+
+    def _estimate_billing_cost(
+        self,
+        meter_type: str,
+        quantity: float,
+        unit: str,
+        provider: str | None = None,
+        model: str | None = None,
+        tenant_id: str | None = None,
+        workspace_id: str | None = None,
+        skill_id: str | None = None,
+    ) -> float | None:
+        return self.billing_pricing_service.estimate_cost(
+            meter_type=meter_type,
+            quantity=quantity,
+            unit=unit,
+            provider=provider,
+            model=model,
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            skill_id=skill_id,
         )
 
     def _apply_model_request_guardrails(
@@ -577,7 +976,9 @@ class AgentRuntime(BaseModel):
                 metadata=metadata,
             )
         if decision.approval_required:
-            guardrail_key = self._guardrail_approval_key(GuardrailStage.MODEL_REQUEST, decision)
+            guardrail_key = self._guardrail_approval_key(
+                GuardrailStage.MODEL_REQUEST, decision
+            )
             if guardrail_key in approved_guardrail_keys:
                 return request
             metadata = self._record_model_guardrail_audit(
@@ -656,7 +1057,9 @@ class AgentRuntime(BaseModel):
     ) -> ModelGatewayResponse:
         if self.guardrail_service is None:
             return response
-        content = response.output_text or self._model_response_guardrail_content(response)
+        content = response.output_text or self._model_response_guardrail_content(
+            response
+        )
         decision = self.guardrail_service.evaluate(
             GuardrailEvaluationRequest(
                 tenant_id=run.tenant_id,
@@ -690,7 +1093,9 @@ class AgentRuntime(BaseModel):
                 metadata=metadata,
             )
         if decision.approval_required:
-            guardrail_key = self._guardrail_approval_key(GuardrailStage.MODEL_RESPONSE, decision)
+            guardrail_key = self._guardrail_approval_key(
+                GuardrailStage.MODEL_RESPONSE, decision
+            )
             if guardrail_key in approved_guardrail_keys:
                 return response
             metadata = self._record_model_guardrail_audit(
@@ -749,7 +1154,11 @@ class AgentRuntime(BaseModel):
 
     def _model_response_guardrail_content(self, response: ModelGatewayResponse) -> str:
         return json.dumps(
-            {"steps": [step.model_dump(mode="json") for step in response.planned_steps]},
+            {
+                "steps": [
+                    step.model_dump(mode="json") for step in response.planned_steps
+                ]
+            },
             sort_keys=True,
         )
 
@@ -758,7 +1167,9 @@ class AgentRuntime(BaseModel):
         response: ModelGatewayResponse,
         decision: GuardrailDecision,
     ) -> ModelGatewayResponse:
-        source_content = response.output_text or self._model_response_guardrail_content(response)
+        source_content = response.output_text or self._model_response_guardrail_content(
+            response
+        )
         redacted_content = self._apply_guardrail_redactions(source_content, decision)
         parsed_steps = self._parse_redacted_planned_steps(redacted_content)
         if parsed_steps is None:
@@ -773,7 +1184,9 @@ class AgentRuntime(BaseModel):
             }
         )
 
-    def _parse_redacted_planned_steps(self, content: str) -> list[PlannedToolCall] | None:
+    def _parse_redacted_planned_steps(
+        self, content: str
+    ) -> list[PlannedToolCall] | None:
         try:
             parsed = json.loads(content)
         except json.JSONDecodeError:
@@ -812,7 +1225,9 @@ class AgentRuntime(BaseModel):
             return [self._redact_guarded_value(item, decision) for item in value]
         return value
 
-    def _apply_guardrail_redactions(self, value: str, decision: GuardrailDecision) -> str:
+    def _apply_guardrail_redactions(
+        self, value: str, decision: GuardrailDecision
+    ) -> str:
         redacted = value
         for redaction in decision.redactions:
             flags = 0 if redaction.case_sensitive else re.IGNORECASE
@@ -845,7 +1260,9 @@ class AgentRuntime(BaseModel):
             "guardrail_action": decision.action.value,
             "guardrail_rule_ids": decision.matched_rule_ids,
             "guardrail_detector_finding_ids": decision.detector_finding_ids,
-            "severity": decision.severity.value if decision.severity is not None else None,
+            "severity": (
+                decision.severity.value if decision.severity is not None else None
+            ),
             "message": decision.message,
             **metadata,
         }
@@ -864,6 +1281,7 @@ class AgentRuntime(BaseModel):
         run: Run,
         artifact: dict[str, str],
         approved_guardrail_keys: list[str],
+        content: str | None = None,
     ) -> dict[str, str]:
         if self.guardrail_service is None:
             return artifact
@@ -872,11 +1290,12 @@ class AgentRuntime(BaseModel):
                 tenant_id=run.tenant_id,
                 workspace_id=run.workspace_id,
                 stage=GuardrailStage.ARTIFACT,
-                content=self._artifact_guardrail_content(artifact),
+                content=self._artifact_guardrail_content(artifact, content),
                 attributes={
                     "artifact_type": artifact["artifact_type"],
                     "name_length": len(artifact["name"]),
                     "uri_scheme": artifact["uri"].split(":", 1)[0],
+                    "content_length": len(content or ""),
                 },
             )
         )
@@ -893,7 +1312,9 @@ class AgentRuntime(BaseModel):
                 metadata=metadata,
             )
         if decision.approval_required:
-            guardrail_key = self._guardrail_approval_key(GuardrailStage.ARTIFACT, decision)
+            guardrail_key = self._guardrail_approval_key(
+                GuardrailStage.ARTIFACT, decision
+            )
             if guardrail_key in approved_guardrail_keys:
                 return artifact
             metadata = self._record_artifact_guardrail_audit(
@@ -906,7 +1327,8 @@ class AgentRuntime(BaseModel):
                 event_type="guardrail.artifact_approval_required",
                 stage=GuardrailStage.ARTIFACT,
                 guardrail_key=guardrail_key,
-                reason=decision.message or "Artifact publication requires guardrail approval",
+                reason=decision.message
+                or "Artifact publication requires guardrail approval",
                 metadata=metadata,
             )
         if decision.action == GuardrailAction.REDACT and decision.redactions:
@@ -930,12 +1352,17 @@ class AgentRuntime(BaseModel):
             )
         return artifact
 
-    def _artifact_guardrail_content(self, artifact: dict[str, str]) -> str:
+    def _artifact_guardrail_content(
+        self,
+        artifact: dict[str, str],
+        content: str | None = None,
+    ) -> str:
         return json.dumps(
             {
                 "name": artifact["name"],
                 "artifact_type": artifact["artifact_type"],
                 "uri": artifact["uri"],
+                "content": content or "",
             },
             sort_keys=True,
         )
@@ -951,7 +1378,9 @@ class AgentRuntime(BaseModel):
             "guardrail_action": decision.action.value,
             "guardrail_rule_ids": decision.matched_rule_ids,
             "guardrail_detector_finding_ids": decision.detector_finding_ids,
-            "severity": decision.severity.value if decision.severity is not None else None,
+            "severity": (
+                decision.severity.value if decision.severity is not None else None
+            ),
             "message": decision.message,
             "artifact_type": artifact["artifact_type"],
             "artifact_name_length": len(artifact["name"]),
@@ -976,10 +1405,12 @@ class AgentRuntime(BaseModel):
     def _load_knowledge_context(self, run: Run):
         if self.knowledge_service is None:
             return []
+        query_embedding = self._load_query_embedding(run)
         results = self.knowledge_service.retrieve(
             RetrievalRequest(
                 tenant_id=run.tenant_id,
                 query=run.message,
+                query_embedding=query_embedding,
                 allowed_workspace_ids=[run.workspace_id],
                 acl_subjects=[
                     run.user_id,
@@ -991,6 +1422,49 @@ class AgentRuntime(BaseModel):
             )
         )
         return self._apply_retrieval_guardrails(run, results)
+
+    def _load_query_embedding(self, run: Run) -> list[float]:
+        if self.embedding_gateway is None:
+            return []
+        response = self.embedding_gateway.embed(
+            EmbeddingGatewayRequest(
+                tenant_id=run.tenant_id,
+                workspace_id=run.workspace_id,
+                user_id=run.user_id,
+                run_id=run.id,
+                purpose="knowledge_query",
+                input=[run.message],
+            )
+        )
+        self._record_embedding_usage(run, response)
+        if not response.embeddings:
+            return []
+        return response.embeddings[0].embedding
+
+    def _record_embedding_usage(
+        self,
+        run: Run,
+        response: EmbeddingGatewayResponse,
+    ) -> None:
+        EmbeddingUsageRecorder(
+            store=self.store,
+            audit_service=self.audit_service,
+            billing_pricing_service=self.billing_pricing_service,
+        ).record(
+            EmbeddingUsageRecord(
+                tenant_id=run.tenant_id,
+                workspace_id=run.workspace_id,
+                user_id=run.user_id,
+                run_id=run.id,
+                purpose="knowledge_query",
+                response=response,
+                input_count=1,
+                metadata={
+                    "allowed_workspace_count": 1,
+                    "clearance_level": 0,
+                },
+            )
+        )
 
     def _apply_retrieval_guardrails(
         self,
@@ -1031,8 +1505,13 @@ class AgentRuntime(BaseModel):
                     "guardrail.retrieval_approval_required",
                 )
                 continue
-            if decision.action == GuardrailAction.REDACT and decision.redacted_content is not None:
-                accepted_results.append(result.model_copy(update={"excerpt": decision.redacted_content}))
+            if (
+                decision.action == GuardrailAction.REDACT
+                and decision.redacted_content is not None
+            ):
+                accepted_results.append(
+                    result.model_copy(update={"excerpt": decision.redacted_content})
+                )
                 continue
             accepted_results.append(result)
         return accepted_results
@@ -1054,7 +1533,9 @@ class AgentRuntime(BaseModel):
                 "guardrail_action": decision.action.value,
                 "guardrail_rule_ids": decision.matched_rule_ids,
                 "guardrail_detector_finding_ids": decision.detector_finding_ids,
-                "severity": decision.severity.value if decision.severity is not None else None,
+                "severity": (
+                    decision.severity.value if decision.severity is not None else None
+                ),
                 "message": decision.message,
                 "document_id": result.document_id,
                 "chunk_id": result.chunk_id,
@@ -1091,6 +1572,7 @@ class AgentRuntime(BaseModel):
         return {
             "knowledge_result_count": len(context.knowledge_results),
             "memory_record_count": len(context.memory_records),
+            "context_sensitivity_level": self._context_sensitivity_level(context),
             "knowledge_document_ids": [
                 result.document_id for result in context.knowledge_results
             ],
@@ -1100,7 +1582,9 @@ class AgentRuntime(BaseModel):
             "memory_ids": [record.id for record in context.memory_records],
         }
 
-    def _context_model_message(self, context: AgentRetrievedContext) -> ModelMessage | None:
+    def _context_model_message(
+        self, context: AgentRetrievedContext
+    ) -> ModelMessage | None:
         lines: list[str] = []
         if context.knowledge_results:
             lines.append("Retrieved knowledge context:")
@@ -1120,79 +1604,782 @@ class AgentRuntime(BaseModel):
             return None
         return ModelMessage(role="system", content="\n".join(lines))
 
+    def _context_sensitivity_level(self, context: AgentRetrievedContext) -> int:
+        levels = [result.sensitivity_level for result in context.knowledge_results] + [
+            record.sensitivity_level for record in context.memory_records
+        ]
+        if not levels:
+            return 0
+        return max(levels)
+
     def _execute_planned_steps(self, state: AgentRuntimeState) -> AgentRuntimeState:
         for step in state.plan:
             if step.id in state.completed_step_ids:
                 continue
             if step.approval_required and step.id not in state.approved_step_ids:
-                return self._pause_for_approval(state, step, f"Step requires approval: {step.title}")
+                return self._pause_for_approval(
+                    state, step, f"Step requires approval: {step.title}"
+                )
             step_result = self._execute_step(state, step)
-            if step_result.status in {RunStatus.FAILED, RunStatus.AWAITING_APPROVAL}:
+            if step_result.status in {
+                RunStatus.FAILED,
+                RunStatus.AWAITING_APPROVAL,
+                RunStatus.AWAITING_POLICY,
+            }:
                 return step_result
             state = step_result
         return self._finalize_success(state)
 
-    def _execute_step(self, state: AgentRuntimeState, step: PlanStep) -> AgentRuntimeState:
+    def _execute_step(
+        self, state: AgentRuntimeState, step: PlanStep
+    ) -> AgentRuntimeState:
         run = self.store.get_run(state.tenant_id, state.run_id)
-        self.store.append_run_event(run, "step.started", {"step_id": step.id, "title": step.title})
+        step_policy_decision = self._decide_runtime_step(state, run, step)
+        if not step_policy_decision.allowed:
+            return self._pause_for_policy_block(
+                state,
+                run,
+                step_policy_decision,
+                current_step_id=step.id,
+            )
+        try:
+            step = self._prepare_step_for_execution(state, step)
+        except ToolExecutionError as error:
+            self.store.append_run_event(
+                run, "step.started", {"step_id": step.id, "title": step.title}
+            )
+            state.current_step_id = step.id
+            self._save_state(state)
+            return self._fail_for_tool_execution_error(
+                state,
+                run,
+                step,
+                error,
+                attempt=1,
+            )
+        self.store.append_run_event(
+            run, "step.started", {"step_id": step.id, "title": step.title}
+        )
         state.current_step_id = step.id
         self._save_state(state)
         for attempt in range(self.max_step_retries + 1):
             self.store.append_run_event(
                 run,
                 "tool_call.started",
-                {"step_id": step.id, "tool_name": step.tool_name, "attempt": attempt + 1},
+                {
+                    "step_id": step.id,
+                    "tool_name": step.tool_name,
+                    "attempt": attempt + 1,
+                },
             )
             try:
-                result = self.tool_gateway.execute_for_run(state, step)
+                result = self.tool_gateway.execute_for_run(
+                    state,
+                    step,
+                    granted_scopes=self._resolve_tool_granted_scopes(state, step),
+                )
             except ToolApprovalRequiredError as error:
                 self.store.append_run_event(
                     run,
                     "tool_call.approval_required",
-                    {"step_id": step.id, "tool_name": step.tool_name, "reason": str(error)},
+                    {
+                        "step_id": step.id,
+                        "tool_name": step.tool_name,
+                        "reason": str(error),
+                    },
                 )
                 self._record_tool_policy_pause(state, step, str(error))
                 return self._pause_for_approval(state, step, str(error))
             except ToolExecutionError as error:
-                self.store.append_run_event(
-                    run,
-                    "tool_call.failed",
-                    {"step_id": step.id, "tool_name": step.tool_name, "error": str(error)},
-                )
-                self._record_tool_failure(state, step, str(error), attempt + 1)
                 if attempt < self.max_step_retries:
+                    self._record_tool_execution_error(
+                        state,
+                        run,
+                        step,
+                        error,
+                        attempt + 1,
+                    )
                     self.store.append_run_event(
                         run,
                         "step.retrying",
-                        {"step_id": step.id, "tool_name": step.tool_name, "next_attempt": attempt + 2},
+                        {
+                            "step_id": step.id,
+                            "tool_name": step.tool_name,
+                            "next_attempt": attempt + 2,
+                        },
                     )
                     continue
-                self.store.update_run_status(
-                    state.tenant_id,
-                    state.run_id,
-                    RunStatus.FAILED,
-                    emit_status_event=False,
-                )
-                self.store.append_run_event(
+                return self._fail_for_tool_execution_error(
+                    state,
                     run,
-                    "run.failed",
-                    {"step_id": step.id, "error": str(error)},
+                    step,
+                    error,
+                    attempt + 1,
                 )
-                state.status = RunStatus.FAILED
-                state.failure_reason = str(error)
-                self._save_state(state)
-                return state
+            if step.tool_name == "browser.action":
+                result = self._promote_browser_screenshot(state, result)
             self.store.append_run_event(
                 run,
                 "tool_call.completed",
-                {"step_id": step.id, "tool_name": step.tool_name, "result": result.model_dump(mode="json")},
+                {
+                    "step_id": step.id,
+                    "tool_name": step.tool_name,
+                    "result": self._safe_tool_result_payload(step, result),
+                },
             )
+            if step.tool_name == "sandbox.command":
+                self._record_sandbox_command_event(run, step, result)
+                failed_exit_code = self._sandbox_command_failed_exit_code(result)
+                if failed_exit_code is not None:
+                    return self._fail_for_sandbox_command_failure(
+                        state,
+                        run,
+                        step,
+                        failed_exit_code,
+                    )
+                try:
+                    self._promote_sandbox_artifacts(state, step)
+                except _RuntimeSandboxArtifactPathRejected as error:
+                    return self._fail_for_sandbox_artifact_path_rejection(
+                        state,
+                        run,
+                        step,
+                        error,
+                    )
+                except _RuntimeStorageContentRejected as error:
+                    return self._fail_for_storage_content_rejection(
+                        state,
+                        run,
+                        step,
+                        error,
+                    )
+                except _RuntimeGuardrailApprovalRequired as error:
+                    return self._pause_for_guardrail_approval(state, run, error)
+                except _RuntimeGuardrailViolation as error:
+                    return self._fail_for_guardrail(state, run, error)
+            if step.tool_name == "browser.action":
+                self._record_browser_action_event(run, step, result)
             self._record_tool_execution(state, step)
             state.tool_results.append(result)
             state.completed_step_ids.append(step.id)
             self._save_state(state)
             return state
         return state
+
+    def _record_tool_execution_error(
+        self,
+        state: AgentRuntimeState,
+        run: Run,
+        step: PlanStep,
+        error: ToolExecutionError,
+        attempt: int,
+    ) -> None:
+        self.store.append_run_event(
+            run,
+            "tool_call.failed",
+            {
+                "step_id": step.id,
+                "tool_name": step.tool_name,
+                "error": str(error),
+            },
+        )
+        self._record_tool_failure(state, step, str(error), attempt)
+
+    def _fail_for_tool_execution_error(
+        self,
+        state: AgentRuntimeState,
+        run: Run,
+        step: PlanStep,
+        error: ToolExecutionError,
+        attempt: int,
+    ) -> AgentRuntimeState:
+        self._record_tool_execution_error(state, run, step, error, attempt)
+        self.store.update_run_status(
+            state.tenant_id,
+            state.run_id,
+            RunStatus.FAILED,
+            emit_status_event=False,
+        )
+        self.store.append_run_event(
+            run,
+            "run.failed",
+            {"step_id": step.id, "error": str(error)},
+        )
+        state.status = RunStatus.FAILED
+        state.failure_reason = str(error)
+        self._save_state(state)
+        self._destroy_runtime_sandbox_session(
+            state,
+            reason="failure",
+            force=True,
+        )
+        self._destroy_runtime_browser_session(state, reason="failure")
+        return state
+
+    def _prepare_step_for_execution(
+        self,
+        state: AgentRuntimeState,
+        step: PlanStep,
+    ) -> PlanStep:
+        if str(step.tool_input.get("session_id", "")).strip():
+            return step
+        if step.tool_name == "sandbox.command" and self.sandbox_adapter is not None:
+            session_id = self._ensure_sandbox_session(state).id
+        elif step.tool_name == "browser.action" and self.browser_controller is not None:
+            session_id = self._ensure_browser_session(state).session_id
+        else:
+            return step
+        updated_input = dict(step.tool_input)
+        updated_input["session_id"] = session_id
+        updated_step = step.model_copy(update={"tool_input": updated_input})
+        state.plan = [
+            updated_step if existing.id == step.id else existing
+            for existing in state.plan
+        ]
+        self._save_state(state)
+        return updated_step
+
+    def _ensure_sandbox_session(self, state: AgentRuntimeState):
+        if self.sandbox_adapter is None:
+            raise ToolExecutionError(
+                "runtime sandbox adapter is not configured for automatic sandbox sessions"
+            )
+        if state.sandbox_session_id is not None:
+            return self.sandbox_adapter.get_session(
+                state.tenant_id,
+                state.sandbox_session_id,
+            )
+        self._enforce_sandbox_concurrency_license(state)
+        session = self.sandbox_adapter.create(
+            SandboxCreateRequest(
+                tenant_id=state.tenant_id,
+                workspace_id=state.workspace_id,
+                run_id=state.run_id,
+                image=self.sandbox_runtime_image,
+                network_mode=self.sandbox_network_mode,
+                timeout_seconds=self.sandbox_timeout_seconds,
+                metadata={"created_by": "agent_runtime"},
+            )
+        )
+        state.sandbox_session_id = session.id
+        run = self.store.get_run(state.tenant_id, state.run_id)
+        self.store.append_run_event(
+            run,
+            "sandbox.session.created",
+            {
+                "session_id": session.id,
+                "provider": session.provider,
+                "network_mode": session.network_mode.value,
+            },
+        )
+        self._save_state(state)
+        return session
+
+    def _enforce_sandbox_concurrency_license(
+        self,
+        state: AgentRuntimeState,
+    ) -> None:
+        if self.license_service is None or self.sandbox_adapter is None:
+            return
+        active_session_count = len(
+            [
+                session
+                for session in self.sandbox_adapter.list_sessions(state.tenant_id)
+                if session.status == SandboxSessionStatus.ACTIVE
+            ]
+        )
+        try:
+            self.license_service.require_entitlement(
+                tenant_id=state.tenant_id,
+                feature=LicensedFeature.SANDBOX_CONCURRENCY,
+                requested_amount=active_session_count + 1,
+            )
+        except LicenseEntitlementDeniedError as error:
+            raise ToolExecutionError(str(error)) from error
+
+    def _ensure_browser_session(self, state: AgentRuntimeState):
+        if self.browser_controller is None:
+            raise ToolExecutionError(
+                "runtime browser controller is not configured for automatic browser sessions"
+            )
+        if state.browser_session_id is not None:
+            return self.browser_controller.get_session(
+                state.tenant_id,
+                state.browser_session_id,
+            )
+        session = self.browser_controller.open_session(
+            tenant_id=state.tenant_id,
+            workspace_id=state.workspace_id,
+            run_id=state.run_id,
+            session_id=new_id("browser"),
+        )
+        state.browser_session_id = session.session_id
+        run = self.store.get_run(state.tenant_id, state.run_id)
+        self.store.append_run_event(
+            run,
+            "browser.session.created",
+            {
+                "session_id": session.session_id,
+                "current_url": session.current_url,
+            },
+        )
+        self._save_state(state)
+        return session
+
+    def _record_sandbox_command_event(
+        self,
+        run: Run,
+        step: PlanStep,
+        result: ToolResult,
+    ) -> None:
+        output = result.output if isinstance(result.output, dict) else {}
+        self.store.append_run_event(
+            run,
+            "sandbox.command.executed",
+            {
+                "step_id": step.id,
+                "session_id": output.get("session_id"),
+                "exit_code": output.get("exit_code"),
+                "stdout_length": len(str(output.get("stdout", ""))),
+                "stderr_length": len(str(output.get("stderr", ""))),
+            },
+        )
+
+    def _sandbox_command_failed_exit_code(self, result: ToolResult) -> int | None:
+        output = result.output if isinstance(result.output, dict) else {}
+        exit_code = output.get("exit_code")
+        if exit_code is None:
+            return None
+        try:
+            normalized_exit_code = int(str(exit_code))
+        except (TypeError, ValueError):
+            return None
+        if normalized_exit_code == 0:
+            return None
+        return normalized_exit_code
+
+    def _safe_tool_result_payload(
+        self,
+        step: PlanStep,
+        result: ToolResult,
+    ) -> dict[str, Any]:
+        output = result.output if isinstance(result.output, dict) else {}
+        if step.tool_name == "sandbox.command":
+            return {
+                "tool_name": result.tool_name,
+                "output": {
+                    "session_id": output.get("session_id"),
+                    "exit_code": output.get("exit_code"),
+                    "stdout_length": len(str(output.get("stdout", ""))),
+                    "stderr_length": len(str(output.get("stderr", ""))),
+                    "output_uri": output.get("output_uri"),
+                },
+            }
+        if step.tool_name == "browser.action":
+            return {
+                "tool_name": result.tool_name,
+                "output": {
+                    "session_id": output.get("session_id"),
+                    "action_type": output.get("action_type"),
+                    "current_url": output.get("current_url"),
+                    "screenshot_uri": output.get("screenshot_uri"),
+                    "storage_object_id": output.get("storage_object_id"),
+                    "text_length": len(str(output.get("text", ""))),
+                },
+            }
+        return {
+            "tool_name": result.tool_name,
+            "output_keys": sorted(str(key) for key in output.keys()),
+            "output_field_count": len(output),
+        }
+
+    def _record_browser_action_event(
+        self,
+        run: Run,
+        step: PlanStep,
+        result: ToolResult,
+    ) -> None:
+        output = result.output if isinstance(result.output, dict) else {}
+        self.store.append_run_event(
+            run,
+            "browser.action.performed",
+            {
+                "step_id": step.id,
+                "session_id": output.get("session_id"),
+                "action_type": output.get("action_type"),
+                "current_url": output.get("current_url"),
+                "screenshot_uri": output.get("screenshot_uri"),
+                "storage_object_id": output.get("storage_object_id"),
+                "text_length": len(str(output.get("text", ""))),
+            },
+        )
+
+    def _promote_browser_screenshot(
+        self,
+        state: AgentRuntimeState,
+        result: ToolResult,
+    ) -> ToolResult:
+        if not isinstance(result.output, dict):
+            return result
+        output = dict(result.output)
+        encoded_content = output.pop("screenshot_content_base64", None)
+        if not encoded_content:
+            return result.model_copy(update={"output": output})
+        if self.storage_catalog is None or self.object_storage is None:
+            return result.model_copy(update={"output": output})
+        try:
+            content = base64.b64decode(str(encoded_content), validate=True)
+        except ValueError:
+            return result.model_copy(update={"output": output})
+        session_id = str(
+            output.get("session_id") or state.browser_session_id or "browser"
+        )
+        storage_object = self.storage_catalog.register(
+            StorageObjectCreate(
+                tenant_id=state.tenant_id,
+                workspace_id=state.workspace_id,
+                run_id=state.run_id,
+                purpose=StoragePurpose.BROWSER_SCREENSHOT,
+                filename=f"{session_id}.png",
+                content_type="image/png",
+                size_bytes=len(content),
+            )
+        )
+        self.object_storage.upload(storage_object, content)
+        output["screenshot_uri"] = storage_object.uri
+        output["storage_object_id"] = storage_object.id
+        run = self.store.get_run(state.tenant_id, state.run_id)
+        self.store.append_run_event(
+            run,
+            "browser.screenshot.uploaded",
+            {
+                "session_id": session_id,
+                "storage_object_id": storage_object.id,
+                "screenshot_uri": storage_object.uri,
+                "size_bytes": len(content),
+            },
+        )
+        return result.model_copy(update={"output": output})
+
+    def _promote_sandbox_artifacts(
+        self,
+        state: AgentRuntimeState,
+        step: PlanStep,
+    ) -> None:
+        if (
+            self.sandbox_adapter is None
+            or self.storage_catalog is None
+            or self.object_storage is None
+            or state.sandbox_session_id is None
+        ):
+            return
+        run = self.store.get_run(state.tenant_id, state.run_id)
+        explicit_paths = self._sandbox_artifact_paths(step)
+        paths = explicit_paths or self._discover_sandbox_artifact_paths(state)
+        if paths and not explicit_paths:
+            self.store.append_run_event(
+                run,
+                "sandbox.artifacts.discovered",
+                {"paths": paths},
+            )
+        for path in paths:
+            if not self._is_publishable_sandbox_artifact_path(path):
+                metadata = {
+                    "path": path,
+                    "allowed_prefix": "/workspace/artifacts/",
+                }
+                self.store.append_run_event(
+                    run,
+                    "sandbox.artifact.rejected",
+                    metadata,
+                )
+                raise _RuntimeSandboxArtifactPathRejected(metadata)
+            if path in state.promoted_sandbox_artifact_paths:
+                continue
+            file_ref = self.sandbox_adapter.download_file(
+                state.tenant_id,
+                state.sandbox_session_id,
+                path,
+            )
+            filename = self._sandbox_artifact_filename(file_ref.path)
+            content = (file_ref.content or "").encode("utf-8")
+            storage_object = self.storage_catalog.register(
+                StorageObjectCreate(
+                    tenant_id=state.tenant_id,
+                    workspace_id=state.workspace_id,
+                    run_id=state.run_id,
+                    purpose=StoragePurpose.ARTIFACT,
+                    filename=filename,
+                    content_type=file_ref.content_type,
+                    size_bytes=len(content),
+                )
+            )
+            try:
+                artifact = self._apply_artifact_guardrails(
+                    run,
+                    {
+                        "name": filename,
+                        "artifact_type": self._sandbox_artifact_type(
+                            filename,
+                            file_ref.content_type,
+                        ),
+                        "uri": storage_object.uri,
+                    },
+                    state.approved_guardrail_keys,
+                    content=content.decode("utf-8", errors="replace"),
+                )
+            except (
+                _RuntimeGuardrailApprovalRequired,
+                _RuntimeGuardrailViolation,
+            ):
+                self._mark_storage_object_deleted(run.tenant_id, storage_object)
+                raise
+            self._scan_sandbox_artifact_content(run, storage_object, content)
+            self.object_storage.upload(storage_object, content)
+            self.store.create_artifact(
+                tenant_id=state.tenant_id,
+                run_id=state.run_id,
+                name=artifact["name"],
+                artifact_type=artifact["artifact_type"],
+                uri=artifact["uri"],
+            )
+            state.promoted_sandbox_artifact_paths.append(path)
+            self.store.append_run_event(
+                run,
+                "sandbox.artifact.promoted",
+                {
+                    "path": path,
+                    "artifact_name": artifact["name"],
+                    "storage_object_id": storage_object.id,
+                },
+            )
+        self._save_state(state)
+
+    def _mark_storage_object_deleted(self, tenant_id: str, storage_object) -> None:
+        if hasattr(self.storage_catalog, "mark_deleted"):
+            self.storage_catalog.mark_deleted(
+                tenant_id,
+                storage_object.id,
+                utc_now(),
+            )
+
+    def _discover_sandbox_artifact_paths(self, state: AgentRuntimeState) -> list[str]:
+        if self.sandbox_adapter is None or state.sandbox_session_id is None:
+            return []
+        paths: list[str] = []
+        for file_ref in self.sandbox_adapter.list_files(
+            state.tenant_id,
+            state.sandbox_session_id,
+        ):
+            if file_ref.path in state.promoted_sandbox_artifact_paths:
+                continue
+            if not self._is_auto_discoverable_sandbox_artifact_path(file_ref.path):
+                continue
+            if file_ref.path not in paths:
+                paths.append(file_ref.path)
+        return paths
+
+    def _is_publishable_sandbox_artifact_path(self, path: str) -> bool:
+        return path.startswith("/workspace/artifacts/") and not path.endswith("/")
+
+    def _is_auto_discoverable_sandbox_artifact_path(self, path: str) -> bool:
+        return self._is_publishable_sandbox_artifact_path(path)
+
+    def _sandbox_artifact_paths(self, step: PlanStep) -> list[str]:
+        values: list[Any] = []
+        if "artifact_path" in step.tool_input:
+            values.append(step.tool_input["artifact_path"])
+        artifact_paths = step.tool_input.get("artifact_paths", [])
+        if isinstance(artifact_paths, list):
+            values.extend(artifact_paths)
+        elif artifact_paths:
+            values.append(artifact_paths)
+        paths: list[str] = []
+        for value in values:
+            path = str(value).strip()
+            if path and path not in paths:
+                paths.append(path)
+        return paths
+
+    def _sandbox_artifact_filename(self, path: str) -> str:
+        filename = path.rstrip("/").rsplit("/", 1)[-1].strip()
+        return filename or "sandbox-artifact"
+
+    def _sandbox_artifact_type(self, filename: str, content_type: str) -> str:
+        if filename.endswith((".md", ".txt")) or content_type.startswith("text/"):
+            return "document"
+        return "file"
+
+    def _scan_sandbox_artifact_content(
+        self,
+        run: Run,
+        storage_object,
+        content: bytes,
+    ) -> None:
+        if self.storage_content_scanner is None:
+            return
+        scan_result = self.storage_content_scanner.scan(
+            StorageContentScanRequest(
+                storage_object=storage_object,
+                content=content,
+            )
+        )
+        if scan_result.allowed:
+            return
+        metadata = {
+            "storage_object_id": storage_object.id,
+            "filename": storage_object.filename,
+            "content_type": storage_object.content_type,
+            "size_bytes": len(content),
+            "matched_term_count": scan_result.matched_term_count,
+        }
+        self.store.append_run_event(
+            run,
+            "storage.content_rejected",
+            metadata,
+        )
+        self._record_audit_event(
+            tenant_id=run.tenant_id,
+            workspace_id=run.workspace_id,
+            user_id=run.user_id,
+            run_id=run.id,
+            event_type="storage.content_rejected",
+            metadata=metadata,
+        )
+        if hasattr(self.storage_catalog, "mark_deleted"):
+            self.storage_catalog.mark_deleted(
+                run.tenant_id,
+                storage_object.id,
+                utc_now(),
+            )
+        raise _RuntimeStorageContentRejected(metadata)
+
+    def _fail_for_storage_content_rejection(
+        self,
+        state: AgentRuntimeState,
+        run: Run,
+        step: PlanStep,
+        error: _RuntimeStorageContentRejected,
+    ) -> AgentRuntimeState:
+        self.store.update_run_status(
+            run.tenant_id,
+            run.id,
+            RunStatus.FAILED,
+            emit_status_event=False,
+        )
+        self.store.append_run_event(
+            run,
+            "run.failed",
+            {
+                "reason": "storage_content_rejected",
+                "step_id": step.id,
+            },
+        )
+        state.status = RunStatus.FAILED
+        state.failure_reason = str(error)
+        self._save_state(state)
+        self._destroy_runtime_sandbox_session(
+            state,
+            reason="failure",
+            force=True,
+        )
+        self._destroy_runtime_browser_session(state, reason="failure")
+        return state
+
+    def _fail_for_sandbox_artifact_path_rejection(
+        self,
+        state: AgentRuntimeState,
+        run: Run,
+        step: PlanStep,
+        error: _RuntimeSandboxArtifactPathRejected,
+    ) -> AgentRuntimeState:
+        self.store.update_run_status(
+            run.tenant_id,
+            run.id,
+            RunStatus.FAILED,
+            emit_status_event=False,
+        )
+        self.store.append_run_event(
+            run,
+            "run.failed",
+            {
+                "reason": "sandbox_artifact_path_rejected",
+                "step_id": step.id,
+            },
+        )
+        state.status = RunStatus.FAILED
+        state.failure_reason = str(error)
+        self._save_state(state)
+        self._destroy_runtime_sandbox_session(
+            state,
+            reason="failure",
+            force=True,
+        )
+        self._destroy_runtime_browser_session(state, reason="failure")
+        return state
+
+    def _fail_for_sandbox_command_failure(
+        self,
+        state: AgentRuntimeState,
+        run: Run,
+        step: PlanStep,
+        exit_code: int,
+    ) -> AgentRuntimeState:
+        self.store.update_run_status(
+            run.tenant_id,
+            run.id,
+            RunStatus.FAILED,
+            emit_status_event=False,
+        )
+        self.store.append_run_event(
+            run,
+            "run.failed",
+            {
+                "reason": "sandbox_command_failed",
+                "step_id": step.id,
+                "exit_code": exit_code,
+            },
+        )
+        state.status = RunStatus.FAILED
+        state.failure_reason = f"sandbox.command failed with exit code {exit_code}"
+        self._save_state(state)
+        self._destroy_runtime_sandbox_session(
+            state,
+            reason="failure",
+            force=True,
+        )
+        self._destroy_runtime_browser_session(state, reason="failure")
+        return state
+
+    def _resolve_tool_granted_scopes(
+        self,
+        state: AgentRuntimeState,
+        step: PlanStep,
+    ) -> list[str]:
+        policy = self.tool_gateway.policies.get(step.tool_name)
+        if policy is None or self.policy_service is None:
+            return []
+        resource = f"tenant:{state.tenant_id}"
+        granted_scopes: list[str] = []
+        for scope in policy.required_scopes:
+            decision = self.policy_service.decide(
+                PolicyRequest(
+                    tenant_id=state.tenant_id,
+                    workspace_id=state.workspace_id,
+                    user_id=state.user_id,
+                    run_id=state.run_id,
+                    action=scope,
+                    resource=resource,
+                    context={
+                        "tool_name": step.tool_name,
+                        "skill_id": step.skill_id,
+                        "step_id": step.id,
+                    },
+                )
+            )
+            if decision.allowed:
+                granted_scopes.append(scope)
+        return granted_scopes
 
     def _pause_for_approval(
         self,
@@ -1221,39 +2408,136 @@ class AgentRuntime(BaseModel):
 
     def _finalize_success(self, state: AgentRuntimeState) -> AgentRuntimeState:
         run = self.store.get_run(state.tenant_id, state.run_id)
-        artifact = {
-            "name": "agent-result.md",
-            "artifact_type": "document",
-            "uri": f"s3://{state.tenant_id}/runs/{state.run_id}/agent-result.md",
-        }
-        try:
-            artifact = self._apply_artifact_guardrails(
-                run,
-                artifact,
-                state.approved_guardrail_keys,
+        artifacts = self.store.list_artifacts(state.tenant_id, state.run_id)
+        if artifacts:
+            artifact = {
+                "name": artifacts[-1].name,
+                "artifact_type": artifacts[-1].artifact_type,
+                "uri": artifacts[-1].uri,
+            }
+        else:
+            artifact = {
+                "name": "agent-result.md",
+                "artifact_type": "document",
+                "uri": f"s3://{state.tenant_id}/runs/{state.run_id}/agent-result.md",
+            }
+            try:
+                artifact = self._apply_artifact_guardrails(
+                    run,
+                    artifact,
+                    state.approved_guardrail_keys,
+                )
+            except _RuntimeGuardrailApprovalRequired as error:
+                return self._pause_for_guardrail_approval(state, run, error)
+            except _RuntimeGuardrailViolation as error:
+                return self._fail_for_guardrail(state, run, error)
+            self.store.create_artifact(
+                tenant_id=state.tenant_id,
+                run_id=state.run_id,
+                name=artifact["name"],
+                artifact_type=artifact["artifact_type"],
+                uri=artifact["uri"],
             )
-        except _RuntimeGuardrailApprovalRequired as error:
-            return self._pause_for_guardrail_approval(state, run, error)
-        except _RuntimeGuardrailViolation as error:
-            return self._fail_for_guardrail(state, run, error)
-        self.store.create_artifact(
-            tenant_id=state.tenant_id,
-            run_id=state.run_id,
-            name=artifact["name"],
-            artifact_type=artifact["artifact_type"],
-            uri=artifact["uri"],
-        )
+        self._destroy_runtime_sandbox_session(state, reason="success")
+        self._destroy_runtime_browser_session(state, reason="success")
         run = self.store.update_run_status(
             state.tenant_id,
             state.run_id,
             RunStatus.SUCCEEDED,
             emit_status_event=False,
         )
-        self.store.append_run_event(run, "run.succeeded", {"artifact_name": artifact["name"]})
+        self.store.append_run_event(
+            run, "run.succeeded", {"artifact_name": artifact["name"]}
+        )
         state.status = RunStatus.SUCCEEDED
         state.current_step_id = None
         self._save_state(state)
         return state
+
+    def _destroy_runtime_sandbox_session(
+        self,
+        state: AgentRuntimeState,
+        reason: str,
+        force: bool = False,
+    ) -> None:
+        if self.sandbox_adapter is None or state.sandbox_session_id is None:
+            return
+        if not force and not self.sandbox_destroy_on_success:
+            return
+        try:
+            session = self.sandbox_adapter.get_session(
+                state.tenant_id,
+                state.sandbox_session_id,
+            )
+        except NotFoundError:
+            return
+        if getattr(session.status, "value", session.status) == "destroyed":
+            return
+        run = self.store.get_run(state.tenant_id, state.run_id)
+        try:
+            destroyed = self.sandbox_adapter.destroy(
+                state.tenant_id,
+                state.sandbox_session_id,
+            )
+        except (SandboxExecutionError, SandboxProviderUnavailableError) as error:
+            self.store.append_run_event(
+                run,
+                "sandbox.session.destroy_failed",
+                {
+                    "session_id": state.sandbox_session_id,
+                    "provider": session.provider,
+                    "reason": reason,
+                    "error_type": error.__class__.__name__,
+                },
+            )
+            return
+        self.store.append_run_event(
+            run,
+            "sandbox.session.destroyed",
+            {
+                "session_id": destroyed.id,
+                "provider": destroyed.provider,
+                "reason": reason,
+            },
+        )
+
+    def _destroy_runtime_browser_session(
+        self,
+        state: AgentRuntimeState,
+        reason: str,
+    ) -> None:
+        if self.browser_controller is None or state.browser_session_id is None:
+            return
+        try:
+            destroyed = self.browser_controller.delete_session(
+                state.tenant_id,
+                state.browser_session_id,
+            )
+        except NotFoundError:
+            return
+        except BrowserProviderUnavailableError as error:
+            run = self.store.get_run(state.tenant_id, state.run_id)
+            self.store.append_run_event(
+                run,
+                "browser.session.destroy_failed",
+                {
+                    "session_id": state.browser_session_id,
+                    "provider": self.browser_controller.provider,
+                    "reason": reason,
+                    "error_type": error.__class__.__name__,
+                },
+            )
+            return
+        run = self.store.get_run(state.tenant_id, state.run_id)
+        self.store.append_run_event(
+            run,
+            "browser.session.destroyed",
+            {
+                "session_id": destroyed.session_id,
+                "current_url": destroyed.current_url,
+                "reason": reason,
+            },
+        )
 
     def _save_state(self, state: AgentRuntimeState) -> None:
         self.store.save_runtime_state(state)
@@ -1267,14 +2551,35 @@ class AgentRuntime(BaseModel):
             "step_id": step.id,
             "tool_name": step.tool_name,
         }
+        if step.skill_id is not None:
+            metadata["skill_id"] = step.skill_id
         self.store.record_billing_meter(
             tenant_id=state.tenant_id,
             run_id=state.run_id,
             meter_type="tool_call_count",
             quantity=1,
             unit="call",
+            skill_id=step.skill_id,
             metadata=metadata,
         )
+        if step.skill_id is not None:
+            self.store.record_billing_meter(
+                tenant_id=state.tenant_id,
+                run_id=state.run_id,
+                meter_type="skill_call_count",
+                quantity=1,
+                unit="call",
+                skill_id=step.skill_id,
+                cost_estimate=self._estimate_billing_cost(
+                    meter_type="skill_call_count",
+                    quantity=1,
+                    unit="call",
+                    tenant_id=state.tenant_id,
+                    workspace_id=state.workspace_id,
+                    skill_id=step.skill_id,
+                ),
+                metadata=metadata,
+            )
         self._record_audit_event(
             tenant_id=state.tenant_id,
             workspace_id=state.workspace_id,
@@ -1341,7 +2646,14 @@ class AgentRuntime(BaseModel):
 
     def _is_sensitive_key(self, key: str) -> bool:
         normalized = key.lower().replace("-", "_")
-        if normalized in {"secret", "token", "password", "api_key", "apikey", "credential"}:
+        if normalized in {
+            "secret",
+            "token",
+            "password",
+            "api_key",
+            "apikey",
+            "credential",
+        }:
             return True
         return normalized.endswith(
             (

@@ -4,15 +4,17 @@
 
 **Goal:** Build the cloud deployment and operations foundation for Taroai so the enterprise Agent Workspace can run reliably in a PoC cloud environment and later support private deployment.
 
-**Architecture:** Use Docker Compose for local development, Kubernetes for cloud PoC, and keep all service configuration in Pydantic settings and environment variables. Runtime workers, API, Redis, PostgreSQL, object storage, and observability should be deployed as separate components with health checks and clear secrets boundaries. Frontend deployment is deferred to the final user-managed phase.
+**Architecture:** Use Docker Compose for local development, Kubernetes for cloud PoC, and keep all service configuration in Pydantic settings and environment variables. Runtime workers, API, Redis, PostgreSQL, object storage, Web Workspace, and observability should be deployed as separate components with health checks and clear secrets boundaries. Full portal, admin, SSO/MFA, skill marketplace, and browser live-view frontend packaging remain later phases.
 
-**Tech Stack:** Docker, Docker Compose, Kubernetes, FastAPI, PostgreSQL, Redis, MinIO/S3, OpenTelemetry, pytest, future frontend deployment only after explicit approval.
+**Tech Stack:** Docker, Docker Compose, Kubernetes, FastAPI, PostgreSQL, Redis, MinIO/S3, static HTML/CSS/JavaScript workspace, OpenTelemetry, pytest.
 
 ---
 
 ## Summary
 
 This plan turns the current local Python foundation into a deployable system. It does not implement production microVM isolation yet; it prepares the infrastructure path for cloud PoC and later BYOC/private delivery.
+
+Current implementation has started the local PoC path with `infra/docker-compose.yml`, `apps/web/Dockerfile`, `apps/api/Dockerfile`, `apps/api/entrypoint.sh`, API `/healthz` and `/readyz` endpoints, MinIO bucket initialization, `.env.example` configured through Pydantic settings, configurable host ports, Web Workspace static asset serving, `local_process` sandbox execution inside the API container for local validation, a first-pass Docker sandbox provider for Settings-hardened disabled-network container execution when a Docker daemon is explicitly available, `docs/operations/mvp-local-cloud-poc.md`, and `docs/operations/triggers-runbook.md`. The SQL repositories now use a shared SQLite/PostgreSQL connection factory with psycopg-backed PostgreSQL URL support, process-level pool settings, a non-superuser PostgreSQL app role initialized through `infra/postgres/init.sql`, a live PostgreSQL migration/RLS verifier, and a first-pass Pydantic migration CLI that can plan pending/unknown migrations before explicit apply.
 
 ## Task 1: Local Docker Compose
 
@@ -61,6 +63,13 @@ This plan turns the current local Python foundation into a deployable system. It
 - Health endpoints are tested.
 - Container does not bake secrets.
 
+**Current Implementation Notes:**
+
+- `apps/api/Dockerfile` builds the FastAPI API image from `apps/api/requirements.txt`, copies `src` and `migrations`, sets `PYTHONPATH=/app/src`, exposes port `8000`, and runs `uvicorn taroai.app:app`.
+- `apps/api/entrypoint.sh` can run the existing `MigrationRunner` during container startup when `TAROAI_RUN_MIGRATIONS=true`.
+- `GET /healthz` and `GET /readyz` are available without requiring live database calls, so container health checks can verify the process and configuration wiring.
+- `.env.example` enables `TAROAI_SANDBOX_PROVIDER=local_process` and `TAROAI_SANDBOX_ROOT_DIR=/data/taroai/sandboxes` for local cloud PoC validation. `TAROAI_SANDBOX_PROVIDER=docker` is available for explicit disabled-network container execution where Docker access is provided, with Pydantic settings for memory, CPU, pids, read-only rootfs, dropped capabilities, security options, and tmpfs mounts. Shared enterprise execution still requires Kubernetes, E2B, or microVM-backed isolation.
+
 ## Task 3: Migration Runner
 
 **Files:**
@@ -93,14 +102,19 @@ This plan turns the current local Python foundation into a deployable system. It
 - Create: `infra/k8s/minio.yaml`
 - Create: `infra/k8s/configmap.yaml`
 - Create: `infra/k8s/secrets.example.yaml`
+- Create: `infra/k8s/kustomization.yaml`
+- Create: `infra/k8s/network-policy.yaml`
 
 **Steps:**
 
-1. Add deployment manifests for API, agent worker, and tool/sandbox workers.
-2. Add services and health probes.
-3. Put non-secret config in ConfigMap.
-4. Put secret placeholders in `secrets.example.yaml`; do not commit real secrets.
-5. Add resource requests and limits.
+1. Worker process manifests are started with independent agent and cleanup worker Deployments in `infra/k8s/worker.yaml`.
+2. Runtime non-secret config is in `infra/k8s/configmap.yaml`.
+3. Runtime secret placeholders are in `infra/k8s/secrets.example.yaml`; real secrets are not committed.
+4. Worker and API manifests include resource requests/limits, non-root security context, and writable `/tmp` plus `/data/taroai` mounts under read-only root filesystems.
+5. API, PostgreSQL, Redis, and MinIO manifests are started with Services, probes, persistent volume claims for stateful backing services, an API migration Job, a PostgreSQL app-role init script, Redis password wiring, and a MinIO bucket-init Job.
+6. `infra/k8s/network-policy.yaml` starts namespace-scoped default-deny traffic policy with explicit DNS egress, internal API ingress, API/worker egress to PostgreSQL/Redis/MinIO, migration egress to PostgreSQL, bucket-init egress to MinIO, controlled HTTPS egress, and backend service ingress allowlists.
+7. `infra/k8s/kustomization.yaml` provides a single manifest entrypoint for the current cloud PoC stack.
+8. Release-grade Helm rendering validation, Ingress/TLS, cloud-managed database/cache/object-storage overlays, autoscaling policy, and live cluster startup verification remain deployment hardening work.
 
 **Acceptance Criteria:**
 
@@ -129,7 +143,9 @@ This plan turns the current local Python foundation into a deployable system. It
 6. Retry/dead-letter policy is covered by queue contract tests.
 7. Agent worker runner/entrypoint exists for processing queued run execution jobs, selects the configured control-plane store backend, and registers default runtime tool handlers.
 8. Cleanup worker runner exists for processing queued storage lifecycle cleanup jobs through the configured queue, store, storage catalog, and object storage adapter.
-9. Add worker deployment manifests and live Redis deployment verification.
+9. Live Redis worker queue verification exists for ping, enqueue, claim, ack, expired-lease recovery, dead-letter, and cleanup behavior.
+10. Worker deployment manifests exist for independently scalable agent and cleanup worker processes.
+11. Kubernetes manifests exist for the API, migration Job, PostgreSQL, Redis, and MinIO backing services with shared runtime ConfigMap/Secret boundaries.
 
 **Acceptance Criteria:**
 

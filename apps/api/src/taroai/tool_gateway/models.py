@@ -22,6 +22,7 @@ class ToolGatewayRequest(BaseModel):
     run_id: str = Field(min_length=1)
     step_id: str = Field(min_length=1)
     tool_name: str = Field(min_length=1)
+    skill_id: str | None = None
     tool_input: dict[str, Any] = Field(default_factory=dict)
     granted_scopes: list[str] = Field(default_factory=list)
     secret_leases: list[SecretLease] = Field(default_factory=list)
@@ -60,6 +61,7 @@ class ToolAuditRecord(BaseModel):
     run_id: str = Field(min_length=1)
     step_id: str = Field(min_length=1)
     tool_name: str = Field(min_length=1)
+    skill_id: str | None = None
     reason: str | None = None
     missing_scopes: list[str] = Field(default_factory=list)
     risk_level: ToolRiskLevel | None = None

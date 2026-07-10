@@ -1,4 +1,5 @@
 from pathlib import Path
+from datetime import datetime, timezone
 
 import pytest
 
@@ -46,6 +47,9 @@ def test_sql_knowledge_service_persists_documents_chunks_and_retrieves_by_acl(tm
                 DocumentChunkCreate(
                     content="Renewal playbook requires QBR and security review.",
                     citation={"page": 3},
+                    embedding=[0.1, 0.9],
+                    embedding_model="text-embedding-3-small",
+                    embedding_provider="openai_compatible",
                 )
             ],
         )
@@ -71,14 +75,62 @@ def test_sql_knowledge_service_persists_documents_chunks_and_retrieves_by_acl(tm
         )
     )
 
-    assert [chunk.id for chunk in restarted.list_chunks("tenant_acme", document.id)] == [
-        results[0].chunk_id
-    ]
+    persisted_chunks = restarted.list_chunks("tenant_acme", document.id)
+
+    assert [chunk.id for chunk in persisted_chunks] == [results[0].chunk_id]
+    assert persisted_chunks[0].embedding == [0.1, 0.9]
+    assert persisted_chunks[0].embedding_model == "text-embedding-3-small"
+    assert persisted_chunks[0].embedding_provider == "openai_compatible"
     assert results[0].document_id == document.id
     assert results[0].source_document_id == "doc_renewal"
     assert results[0].citation == {"page": 3}
     assert denied_results == []
     assert restarted.list_chunks("tenant_other", document.id) == []
+
+
+def test_sql_knowledge_service_hydrates_postgresql_native_json_and_datetime_values():
+    from taroai.knowledge.repository import SqlKnowledgeService
+
+    service = SqlKnowledgeService(config=DatabaseConfig(url="postgresql://example"))
+    now = datetime(2026, 7, 3, 13, 40, tzinfo=timezone.utc)
+
+    knowledge_base = service._base_from_row(
+        {
+            "id": "kb_1",
+            "tenant_id": "tenant_acme",
+            "workspace_id": "workspace_acme",
+            "name": "Company Knowledge",
+            "description": "Starter knowledge space.",
+            "created_by_user_id": "user_owner",
+            "created_at": now,
+        }
+    )
+    chunk = service._chunk_from_row(
+        {
+            "id": "chunk_1",
+            "tenant_id": "tenant_acme",
+            "workspace_id": "workspace_acme",
+            "knowledge_base_id": "kb_1",
+            "document_id": "doc_1",
+            "source_document_id": "source_1",
+            "source_uri": "s3://tenant/doc.md",
+            "content": "content",
+            "citation": {"page": 1},
+            "acl_subjects": ["user_owner"],
+            "sensitivity_level": 1,
+            "embedding_vector": [0.1, 0.2],
+            "embedding_model": "text-embedding-3-small",
+            "embedding_provider": "openai_compatible",
+            "embedded_at": now,
+            "created_at": now,
+        }
+    )
+
+    assert knowledge_base.created_at == now
+    assert chunk.citation == {"page": 1}
+    assert chunk.acl_subjects == ["user_owner"]
+    assert chunk.embedding == [0.1, 0.2]
+    assert chunk.embedded_at == now
 
 
 def test_sql_knowledge_service_delete_for_tenant_removes_bases_documents_and_chunks(

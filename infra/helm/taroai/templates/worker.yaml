@@ -1,0 +1,78 @@
+{{- $root := . }}
+{{- range $name, $worker := .Values.workers.kinds }}
+{{- if $worker.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "taroai.fullname" $root }}-{{ replace "_" "-" $worker.workerKind }}-worker
+  labels:
+    {{- include "taroai.labels" $root | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.fullname" $root }}-{{ replace "_" "-" $worker.workerKind }}-worker
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/worker-kind: {{ $worker.workerKind | quote }}
+spec:
+  replicas: {{ $worker.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "taroai.fullname" $root }}-{{ replace "_" "-" $worker.workerKind }}-worker
+  template:
+    metadata:
+      labels:
+        {{- include "taroai.labels" $root | nindent 8 }}
+        app.kubernetes.io/name: {{ include "taroai.fullname" $root }}-{{ replace "_" "-" $worker.workerKind }}-worker
+        app.kubernetes.io/component: worker
+        app.kubernetes.io/worker-kind: {{ $worker.workerKind | quote }}
+    spec:
+      serviceAccountName: {{ include "taroai.serviceAccountName" $root }}
+      securityContext:
+        {{- toYaml $root.Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ replace "_" "-" $worker.workerKind }}-worker
+          image: {{ include "taroai.image" $root | quote }}
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          command:
+            - python
+            - -m
+            - taroai.workers.runner
+          args:
+            - --worker-kind
+            - {{ $worker.workerKind | quote }}
+            - --loop-forever
+            - --poll-interval-seconds
+            - {{ $worker.args.pollIntervalSeconds | quote }}
+            - --stop-after-empty-polls
+            - {{ $worker.args.stopAfterEmptyPolls | quote }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "taroai.fullname" $root }}-runtime-config
+            - secretRef:
+                name: {{ $root.Values.secrets.existingSecret | quote }}
+          resources:
+            {{- toYaml $worker.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: {{ $root.Values.persistence.tmp.mountPath }}
+            - name: taroai-data
+              mountPath: {{ $root.Values.persistence.runtimeData.mountPath }}
+          securityContext:
+            {{- toYaml $root.Values.securityContext | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: taroai-data
+          emptyDir: {}
+      {{- with $root.Values.workers.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $root.Values.workers.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $root.Values.workers.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+{{- end }}

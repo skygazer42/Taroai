@@ -5,8 +5,14 @@ from taroai.sandbox.adapter import (
 )
 from taroai.sandbox.browser import (
     BrowserController,
+    BrowserControllerCapabilities,
     BrowserProviderUnavailableError,
+    HttpBrowserController,
+    PlaywrightBrowserController,
 )
+from taroai.sandbox.factory import build_sandbox_adapter
+from taroai.sandbox.http import HttpSandboxAdapter
+from taroai.sandbox.kubernetes import KubernetesSandboxAdapter
 from taroai.sandbox.models import (
     BrowserAction,
     BrowserActionRequest,
@@ -16,6 +22,7 @@ from taroai.sandbox.models import (
     SandboxCommand,
     SandboxCommandRequest,
     SandboxCommandResult,
+    SandboxControllerCapabilities,
     SandboxCreateRequest,
     SandboxFileRef,
     SandboxFileWrite,
@@ -26,20 +33,42 @@ from taroai.sandbox.models import (
     SandboxSessionStatus,
     SandboxSnapshot,
 )
-from taroai.sandbox.tools import register_browser_tool_handlers, register_sandbox_tool_handlers
+from taroai.sandbox.docker import DockerSandboxAdapter
+from taroai.sandbox.process import LocalProcessSandboxAdapter
+
+
+def register_sandbox_tool_handlers(*args, **kwargs):
+    from taroai.sandbox.tools import register_sandbox_tool_handlers as register
+
+    return register(*args, **kwargs)
+
+
+def register_browser_tool_handlers(*args, **kwargs):
+    from taroai.sandbox.tools import register_browser_tool_handlers as register
+
+    return register(*args, **kwargs)
+
 
 __all__ = [
     "BrowserAction",
     "BrowserActionRequest",
     "BrowserActionType",
     "BrowserController",
+    "BrowserControllerCapabilities",
     "BrowserObservation",
     "BrowserProviderUnavailableError",
     "BrowserSession",
+    "DockerSandboxAdapter",
+    "HttpBrowserController",
+    "HttpSandboxAdapter",
+    "KubernetesSandboxAdapter",
+    "LocalProcessSandboxAdapter",
+    "PlaywrightBrowserController",
     "SandboxAdapter",
     "SandboxCommand",
     "SandboxCommandRequest",
     "SandboxCommandResult",
+    "SandboxControllerCapabilities",
     "SandboxCreateRequest",
     "SandboxExecutionError",
     "SandboxFileRef",
@@ -51,6 +80,7 @@ __all__ = [
     "SandboxSessionCreateRequest",
     "SandboxSessionStatus",
     "SandboxSnapshot",
+    "build_sandbox_adapter",
     "register_sandbox_tool_handlers",
     "register_browser_tool_handlers",
 ]

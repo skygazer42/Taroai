@@ -1,0 +1,289 @@
+{
+  "$defs": {
+    "ConfigKeySource": {
+      "enum": [
+        "config",
+        "secret"
+      ],
+      "title": "ConfigKeySource",
+      "type": "string"
+    },
+    "DeploymentCompatibilityRule": {
+      "additionalProperties": false,
+      "properties": {
+        "component": {
+          "minLength": 1,
+          "pattern": "^[a-z0-9_.-]+$",
+          "title": "Component",
+          "type": "string"
+        },
+        "max_version": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Version"
+        },
+        "min_version": {
+          "minLength": 1,
+          "title": "Min Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "component",
+        "min_version"
+      ],
+      "title": "DeploymentCompatibilityRule",
+      "type": "object"
+    },
+    "DeploymentConfigKey": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "default": "",
+          "title": "Description",
+          "type": "string"
+        },
+        "name": {
+          "minLength": 1,
+          "pattern": "^[A-Z][A-Z0-9_]*$",
+          "title": "Name",
+          "type": "string"
+        },
+        "required": {
+          "default": true,
+          "title": "Required",
+          "type": "boolean"
+        },
+        "source": {
+          "$ref": "#/$defs/ConfigKeySource"
+        }
+      },
+      "required": [
+        "name",
+        "source"
+      ],
+      "title": "DeploymentConfigKey",
+      "type": "object"
+    },
+    "DeploymentDependencyVersion": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "pattern": "^[a-z0-9_.-]+$",
+          "title": "Name",
+          "type": "string"
+        },
+        "version": {
+          "minLength": 1,
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "version"
+      ],
+      "title": "DeploymentDependencyVersion",
+      "type": "object"
+    },
+    "DeploymentImage": {
+      "additionalProperties": false,
+      "properties": {
+        "digest": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Digest"
+        },
+        "name": {
+          "minLength": 1,
+          "pattern": "^[a-z0-9_.-]+$",
+          "title": "Name",
+          "type": "string"
+        },
+        "repository": {
+          "minLength": 1,
+          "title": "Repository",
+          "type": "string"
+        },
+        "tag": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tag"
+        }
+      },
+      "required": [
+        "name",
+        "repository"
+      ],
+      "title": "DeploymentImage",
+      "type": "object"
+    },
+    "DeploymentMigration": {
+      "additionalProperties": false,
+      "properties": {
+        "checksum_sha256": {
+          "pattern": "^[a-fA-F0-9]{64}$",
+          "title": "Checksum Sha256",
+          "type": "string"
+        },
+        "from_app_version": {
+          "minLength": 1,
+          "title": "From App Version",
+          "type": "string"
+        },
+        "id": {
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.-]+$",
+          "title": "Id",
+          "type": "string"
+        },
+        "path": {
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "to_app_version": {
+          "minLength": 1,
+          "title": "To App Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "path",
+        "checksum_sha256",
+        "from_app_version",
+        "to_app_version"
+      ],
+      "title": "DeploymentMigration",
+      "type": "object"
+    },
+    "DeploymentTarget": {
+      "enum": [
+        "cloud",
+        "byoc",
+        "vpc",
+        "private",
+        "air_gapped"
+      ],
+      "title": "DeploymentTarget",
+      "type": "string"
+    },
+    "RequiredDeploymentService": {
+      "enum": [
+        "api",
+        "worker",
+        "database",
+        "redis",
+        "object_storage",
+        "sandbox_provider",
+        "browser_controller",
+        "web_workspace",
+        "model_gateway",
+        "secrets_manager"
+      ],
+      "title": "RequiredDeploymentService",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "app_version": {
+      "minLength": 1,
+      "title": "App Version",
+      "type": "string"
+    },
+    "compatibility_matrix": {
+      "items": {
+        "$ref": "#/$defs/DeploymentCompatibilityRule"
+      },
+      "title": "Compatibility Matrix",
+      "type": "array"
+    },
+    "config_keys": {
+      "items": {
+        "$ref": "#/$defs/DeploymentConfigKey"
+      },
+      "title": "Config Keys",
+      "type": "array"
+    },
+    "dependency_versions": {
+      "items": {
+        "$ref": "#/$defs/DeploymentDependencyVersion"
+      },
+      "title": "Dependency Versions",
+      "type": "array"
+    },
+    "images": {
+      "items": {
+        "$ref": "#/$defs/DeploymentImage"
+      },
+      "minItems": 1,
+      "title": "Images",
+      "type": "array"
+    },
+    "migrations": {
+      "items": {
+        "$ref": "#/$defs/DeploymentMigration"
+      },
+      "title": "Migrations",
+      "type": "array"
+    },
+    "package_version": {
+      "minLength": 1,
+      "title": "Package Version",
+      "type": "string"
+    },
+    "required_services": {
+      "items": {
+        "$ref": "#/$defs/RequiredDeploymentService"
+      },
+      "minItems": 1,
+      "title": "Required Services",
+      "type": "array"
+    },
+    "targets": {
+      "items": {
+        "$ref": "#/$defs/DeploymentTarget"
+      },
+      "minItems": 1,
+      "title": "Targets",
+      "type": "array"
+    }
+  },
+  "required": [
+    "package_version",
+    "app_version",
+    "targets",
+    "images",
+    "required_services"
+  ],
+  "title": "DeploymentPackageManifest",
+  "type": "object"
+}

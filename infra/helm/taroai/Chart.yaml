@@ -1,0 +1,14 @@
+apiVersion: v2
+name: taroai
+description: Taroai enterprise agent control plane and worker runtime.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.26.0-0"
+keywords:
+  - agent
+  - enterprise
+  - control-plane
+home: https://creao.ai
+maintainers:
+  - name: Taroai Platform Team

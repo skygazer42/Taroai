@@ -1,11 +1,11 @@
 import json
-import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
 
+from taroai.db.connection import connect_database
 from taroai.db.migrations import MigrationRunner
 from taroai.db.models import DatabaseConfig
 from taroai.domain import (
@@ -14,6 +14,7 @@ from taroai.domain import (
     Artifact,
     AuditEvent,
     BillingMeterEvent,
+    IdempotencyRecord,
     Run,
     RunCreate,
     RunEvent,
@@ -21,8 +22,10 @@ from taroai.domain import (
     new_id,
     utc_now,
 )
+from taroai.licensing.models import LicenseValidationResult
 from taroai.store import (
     NotFoundError,
+    RETRYABLE_RUN_STATUSES,
     RunStateSnapshot,
     RunTransitionError,
     TERMINAL_RUN_STATUSES,
@@ -89,23 +92,159 @@ class SqlControlPlaneRepository(BaseModel):
 
     def get_run(self, tenant_id: str, run_id: str) -> Run:
         with self._connect() as connection:
-            row = connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+            row = connection.execute(
+                "SELECT * FROM runs WHERE tenant_id = ? AND id = ?",
+                (tenant_id, run_id),
+            ).fetchone()
         if row is None:
             raise NotFoundError(f"Run not found: {run_id}")
         if row["tenant_id"] != tenant_id:
             raise TenantAccessError(f"Run {run_id} is not in tenant {tenant_id}")
         return self._run_from_row(row)
 
-    def list_run_events(self, tenant_id: str, run_id: str) -> list[RunEvent]:
-        self.get_run(tenant_id, run_id)
+    def get_idempotency_record(
+        self,
+        tenant_id: str,
+        key: str,
+        method: str,
+        path: str,
+    ) -> IdempotencyRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM idempotency_records
+                WHERE tenant_id = ? AND key = ? AND method = ? AND path = ?
+                """,
+                (tenant_id, key, method, path),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._idempotency_record_from_row(row)
+
+    def save_idempotency_record(self, record: IdempotencyRecord) -> IdempotencyRecord:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO idempotency_records (
+                    tenant_id, key, method, path, request_hash, status_code,
+                    response_body, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.tenant_id,
+                    record.key,
+                    record.method,
+                    record.path,
+                    record.request_hash,
+                    record.status_code,
+                    self._json(record.response_body),
+                    self._dt(record.created_at),
+                ),
+            )
+        return record
+
+    def save_license_validation(
+        self,
+        validation: LicenseValidationResult,
+    ) -> LicenseValidationResult:
+        tenant_id = validation.license.tenant_id
+        with self._connect() as connection:
+            self._ensure_tenant(connection, tenant_id)
+            connection.execute(
+                """
+                INSERT INTO license_validations (
+                    tenant_id, license_id, status, validation, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(tenant_id) DO UPDATE SET
+                    license_id = excluded.license_id,
+                    status = excluded.status,
+                    validation = excluded.validation,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    tenant_id,
+                    validation.license.id,
+                    validation.status.value,
+                    self._json(validation.model_dump(mode="json")),
+                    self._dt(utc_now()),
+                ),
+            )
+        return validation
+
+    def get_active_license_validation(
+        self,
+        tenant_id: str,
+    ) -> LicenseValidationResult | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT validation
+                FROM license_validations
+                WHERE tenant_id = ? AND status = ?
+                """,
+                (tenant_id, "active"),
+            ).fetchone()
+        if row is None:
+            return None
+        return LicenseValidationResult.model_validate(self._loads(row["validation"]))
+
+    def list_runs(
+        self,
+        tenant_id: str,
+        workspace_id: str | None = None,
+        status: RunStatus | None = None,
+    ) -> list[Run]:
+        clauses = ["tenant_id = ?"]
+        params: list[Any] = [tenant_id]
+        if workspace_id is not None:
+            clauses.append("workspace_id = ?")
+            params.append(workspace_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status.value)
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM run_events WHERE tenant_id = ? AND run_id = ? ORDER BY created_at, id",
-                (tenant_id, run_id),
+                f"""
+                SELECT * FROM runs
+                WHERE {' AND '.join(clauses)}
+                ORDER BY created_at, id
+                """,
+                params,
             ).fetchall()
+        return [self._run_from_row(row) for row in rows]
+
+    def list_run_events(
+        self,
+        tenant_id: str,
+        run_id: str,
+        after_sequence: int | None = None,
+    ) -> list[RunEvent]:
+        self.get_run(tenant_id, run_id)
+        with self._connect() as connection:
+            if after_sequence is None:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM run_events
+                    WHERE tenant_id = ? AND run_id = ?
+                    ORDER BY sequence, created_at, id
+                    """,
+                    (tenant_id, run_id),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM run_events
+                    WHERE tenant_id = ? AND run_id = ? AND sequence > ?
+                    ORDER BY sequence, created_at, id
+                    """,
+                    (tenant_id, run_id, after_sequence),
+                ).fetchall()
         return [
             RunEvent(
                 id=row["id"],
+                sequence=int(row["sequence"]),
                 tenant_id=row["tenant_id"],
                 workspace_id=row["workspace_id"],
                 run_id=row["run_id"],
@@ -127,8 +266,13 @@ class SqlControlPlaneRepository(BaseModel):
         updated_run = run.model_copy(update={"status": status, "updated_at": utc_now()})
         with self._connect() as connection:
             connection.execute(
-                "UPDATE runs SET status = ?, updated_at = ? WHERE id = ?",
-                (updated_run.status.value, self._dt(updated_run.updated_at), run_id),
+                "UPDATE runs SET status = ?, updated_at = ? WHERE tenant_id = ? AND id = ?",
+                (
+                    updated_run.status.value,
+                    self._dt(updated_run.updated_at),
+                    tenant_id,
+                    run_id,
+                ),
             )
             if emit_status_event:
                 self._append_run_event(
@@ -159,10 +303,11 @@ class SqlControlPlaneRepository(BaseModel):
         }
         with self._connect() as connection:
             connection.execute(
-                "UPDATE runs SET status = ?, updated_at = ? WHERE id = ?",
+                "UPDATE runs SET status = ?, updated_at = ? WHERE tenant_id = ? AND id = ?",
                 (
                     cancelled_run.status.value,
                     self._dt(cancelled_run.updated_at),
+                    tenant_id,
                     run_id,
                 ),
             )
@@ -182,6 +327,52 @@ class SqlControlPlaneRepository(BaseModel):
             )
             self._append_run_event(connection, cancelled_run, "run.cancelled", metadata)
         return cancelled_run
+
+    def request_run_retry(
+        self,
+        tenant_id: str,
+        run_id: str,
+        requested_by_user_id: str,
+        reason_code: str,
+    ) -> Run:
+        run = self.get_run(tenant_id, run_id)
+        if run.status not in RETRYABLE_RUN_STATUSES:
+            raise RunTransitionError(f"Run {run_id} cannot be retried from {run.status.value}")
+        retrying_run = run.model_copy(
+            update={"status": RunStatus.RETRYING, "updated_at": utc_now()}
+        )
+        metadata = {
+            "requested_by_user_id": requested_by_user_id,
+            "reason_code": reason_code,
+            "previous_status": run.status.value,
+            "status": RunStatus.RETRYING.value,
+        }
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE runs SET status = ?, updated_at = ? WHERE tenant_id = ? AND id = ?",
+                (
+                    retrying_run.status.value,
+                    self._dt(retrying_run.updated_at),
+                    tenant_id,
+                    run_id,
+                ),
+            )
+            self._insert_audit_event(
+                connection,
+                retrying_run,
+                AuditEvent(
+                    id=new_id("audit"),
+                    tenant_id=tenant_id,
+                    workspace_id=run.workspace_id,
+                    user_id=requested_by_user_id,
+                    run_id=run_id,
+                    event_type="run.retry_requested",
+                    metadata=metadata,
+                    created_at=utc_now(),
+                ),
+            )
+            self._append_run_event(connection, retrying_run, "run.retry_requested", metadata)
+        return retrying_run
 
     def append_run_event(self, run: Run, event_type: str, payload: dict) -> RunEvent:
         self.get_run(run.tenant_id, run.id)
@@ -354,12 +545,13 @@ class SqlControlPlaneRepository(BaseModel):
                     """
                     UPDATE approval_requests
                     SET status = ?, resolved_by_user_id = ?, resolved_at = ?
-                    WHERE id = ?
+                    WHERE tenant_id = ? AND id = ?
                     """,
                     (
                         ApprovalStatus.CANCELLED.value,
                         cancelled_by_user_id,
                         self._dt(resolved_at),
+                        tenant_id,
                         row["id"],
                     ),
                 )
@@ -412,8 +604,8 @@ class SqlControlPlaneRepository(BaseModel):
         run = self.get_run(tenant_id, run_id)
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT * FROM approval_requests WHERE id = ? AND run_id = ?",
-                (approval_id, run_id),
+                "SELECT * FROM approval_requests WHERE tenant_id = ? AND id = ? AND run_id = ?",
+                (tenant_id, approval_id, run_id),
             ).fetchone()
             if row is None:
                 raise NotFoundError(f"Approval request not found: {approval_id}")
@@ -426,12 +618,13 @@ class SqlControlPlaneRepository(BaseModel):
                 """
                 UPDATE approval_requests
                 SET status = ?, resolved_by_user_id = ?, resolved_at = ?
-                WHERE id = ?
+                WHERE tenant_id = ? AND id = ?
                 """,
                 (
                     status.value,
                     resolved_by_user_id,
                     self._dt(resolved_at),
+                    tenant_id,
                     approval_id,
                 ),
             )
@@ -501,9 +694,10 @@ class SqlControlPlaneRepository(BaseModel):
                     plan, current_step_id, completed_step_ids, approved_step_ids,
                     approved_guardrail_keys, pending_guardrail_approval_key,
                     pending_guardrail_approval_stage, tool_results, retrieved_context,
-                    approval_id, failure_reason, updated_at
+                    sandbox_session_id, browser_session_id, approval_id,
+                    failure_reason, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id) DO UPDATE SET
                     tenant_id = excluded.tenant_id,
                     workspace_id = excluded.workspace_id,
@@ -519,6 +713,8 @@ class SqlControlPlaneRepository(BaseModel):
                     pending_guardrail_approval_stage = excluded.pending_guardrail_approval_stage,
                     tool_results = excluded.tool_results,
                     retrieved_context = excluded.retrieved_context,
+                    sandbox_session_id = excluded.sandbox_session_id,
+                    browser_session_id = excluded.browser_session_id,
                     approval_id = excluded.approval_id,
                     failure_reason = excluded.failure_reason,
                     updated_at = excluded.updated_at
@@ -539,6 +735,8 @@ class SqlControlPlaneRepository(BaseModel):
                     snapshot.pending_guardrail_approval_stage,
                     self._json(snapshot.tool_results),
                     self._json(snapshot.retrieved_context),
+                    snapshot.sandbox_session_id,
+                    snapshot.browser_session_id,
                     snapshot.approval_id,
                     snapshot.failure_reason,
                     self._dt(snapshot.updated_at),
@@ -571,6 +769,8 @@ class SqlControlPlaneRepository(BaseModel):
             pending_guardrail_approval_stage=row["pending_guardrail_approval_stage"],
             tool_results=self._loads(row["tool_results"]),
             retrieved_context=self._loads(row["retrieved_context"]),
+            sandbox_session_id=row["sandbox_session_id"],
+            browser_session_id=row["browser_session_id"],
             approval_id=row["approval_id"],
             failure_reason=row["failure_reason"],
             updated_at=self._parse_dt(row["updated_at"]),
@@ -603,7 +803,7 @@ class SqlControlPlaneRepository(BaseModel):
     def record_billing_meter(
         self,
         tenant_id: str,
-        run_id: str,
+        run_id: str | None,
         meter_type: str,
         quantity: float,
         unit: str,
@@ -612,15 +812,23 @@ class SqlControlPlaneRepository(BaseModel):
         provider: str | None = None,
         model: str | None = None,
         cost_estimate: float | None = None,
+        workspace_id: str | None = None,
+        user_id: str | None = None,
+        agent_id: str | None = None,
     ) -> BillingMeterEvent:
-        run = self.get_run(tenant_id, run_id)
+        run = self.get_run(tenant_id, run_id) if run_id is not None else None
+        resolved_workspace_id = run.workspace_id if run is not None else workspace_id
+        resolved_user_id = run.user_id if run is not None else user_id
+        resolved_agent_id = run.agent_id if run is not None else agent_id
+        if resolved_workspace_id is None or resolved_user_id is None:
+            raise ValueError("workspace_id and user_id are required when run_id is not provided")
         meter = BillingMeterEvent(
             id=new_id("meter"),
-            tenant_id=run.tenant_id,
-            workspace_id=run.workspace_id,
-            user_id=run.user_id,
-            run_id=run.id,
-            agent_id=run.agent_id,
+            tenant_id=tenant_id,
+            workspace_id=resolved_workspace_id,
+            user_id=resolved_user_id,
+            run_id=run.id if run is not None else None,
+            agent_id=resolved_agent_id,
             skill_id=skill_id,
             meter_type=meter_type,
             quantity=quantity,
@@ -660,18 +868,11 @@ class SqlControlPlaneRepository(BaseModel):
         return audit_event
 
     def _connect(self):
-        path = self.config.sqlite_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(path)
-        connection.row_factory = sqlite3.Row
-        return connection
+        return connect_database(self.config)
 
     def _ensure_context(self, connection, tenant_id: str, workspace_id: str, user_id: str) -> None:
+        self._ensure_tenant(connection, tenant_id)
         now = self._dt(utc_now())
-        connection.execute(
-            "INSERT OR IGNORE INTO tenants (id, name, created_at) VALUES (?, ?, ?)",
-            (tenant_id, tenant_id, now),
-        )
         connection.execute(
             "INSERT OR IGNORE INTO workspaces (id, tenant_id, name, created_at) VALUES (?, ?, ?, ?)",
             (workspace_id, tenant_id, workspace_id, now),
@@ -686,9 +887,25 @@ class SqlControlPlaneRepository(BaseModel):
             (user_id, tenant_id, f"{user_id}@local", user_id, "not_used_for_dev_context", "active", now),
         )
 
+    def _ensure_tenant(self, connection, tenant_id: str) -> None:
+        connection.execute(
+            "INSERT OR IGNORE INTO tenants (id, name, created_at) VALUES (?, ?, ?)",
+            (tenant_id, tenant_id, self._dt(utc_now())),
+        )
+
     def _append_run_event(self, connection, run: Run, event_type: str, payload: dict[str, Any]) -> RunEvent:
+        sequence_row = connection.execute(
+            """
+            SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence
+            FROM run_events
+            WHERE tenant_id = ? AND run_id = ?
+            """,
+            (run.tenant_id, run.id),
+        ).fetchone()
+        sequence = int(sequence_row["next_sequence"]) if sequence_row is not None else 1
         event = RunEvent(
             id=new_id("event"),
+            sequence=sequence,
             tenant_id=run.tenant_id,
             workspace_id=run.workspace_id,
             run_id=run.id,
@@ -699,12 +916,13 @@ class SqlControlPlaneRepository(BaseModel):
         connection.execute(
             """
             INSERT INTO run_events (
-                id, tenant_id, workspace_id, run_id, type, payload, created_at
+                id, sequence, tenant_id, workspace_id, run_id, type, payload, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event.id,
+                event.sequence,
                 event.tenant_id,
                 event.workspace_id,
                 event.run_id,
@@ -735,7 +953,7 @@ class SqlControlPlaneRepository(BaseModel):
     def _insert_billing_meter(
         self,
         connection,
-        run: Run,
+        run: Run | None,
         meter: BillingMeterEvent,
     ) -> None:
         connection.execute(
@@ -765,10 +983,11 @@ class SqlControlPlaneRepository(BaseModel):
                 self._dt(meter.created_at),
             ),
         )
-        self._append_run_event(run=run, connection=connection, event_type="billing.metered", payload={
-            "meter_id": meter.id,
-            "type": meter.meter_type,
-        })
+        if run is not None:
+            self._append_run_event(run=run, connection=connection, event_type="billing.metered", payload={
+                "meter_id": meter.id,
+                "type": meter.meter_type,
+            })
         self._insert_audit_event(
             connection,
             run,
@@ -911,16 +1130,32 @@ class SqlControlPlaneRepository(BaseModel):
             updated_at=self._parse_dt(row["updated_at"]),
         )
 
+    def _idempotency_record_from_row(self, row) -> IdempotencyRecord:
+        return IdempotencyRecord(
+            tenant_id=row["tenant_id"],
+            key=row["key"],
+            method=row["method"],
+            path=row["path"],
+            request_hash=row["request_hash"],
+            status_code=row["status_code"],
+            response_body=self._loads(row["response_body"]),
+            created_at=self._parse_dt(row["created_at"]),
+        )
+
     def _json(self, value: Any) -> str:
         return json.dumps(value, separators=(",", ":"))
 
     def _loads(self, value: str | None) -> Any:
         if value is None:
             return None
+        if not isinstance(value, str):
+            return value
         return json.loads(value)
 
     def _dt(self, value: datetime) -> str:
         return value.isoformat()
 
-    def _parse_dt(self, value: str) -> datetime:
+    def _parse_dt(self, value: datetime | str) -> datetime:
+        if isinstance(value, datetime):
+            return value
         return datetime.fromisoformat(value)

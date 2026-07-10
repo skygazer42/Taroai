@@ -1,10 +1,10 @@
 import json
-import sqlite3
 from datetime import datetime
 
 from pydantic import BaseModel
 
 from taroai.db import DatabaseConfig
+from taroai.db.connection import connect_database
 from taroai.domain import utc_now
 from taroai.skills.manifest import SkillManifest
 from taroai.skills.registry import (
@@ -362,11 +362,7 @@ class SqlSkillRegistry(BaseModel):
         return updated
 
     def _connect(self):
-        path = self.config.sqlite_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(path)
-        connection.row_factory = sqlite3.Row
-        return connection
+        return connect_database(self.config)
 
     def _ensure_tenant(self, connection, tenant_id: str) -> None:
         connection.execute(
@@ -383,7 +379,7 @@ class SqlSkillRegistry(BaseModel):
     def _entry_from_row(self, row) -> SkillRegistryEntry:
         return SkillRegistryEntry(
             tenant_id=row["tenant_id"],
-            manifest=SkillManifest.model_validate(json.loads(row["manifest"])),
+            manifest=SkillManifest.model_validate(self._loads(row["manifest"])),
             status=SkillStatus(row["status"]),
             created_by_user_id=row["created_by_user_id"],
             created_at=self._parse_dt(row["created_at"]),
@@ -407,5 +403,12 @@ class SqlSkillRegistry(BaseModel):
     def _dt(self, value: datetime) -> str:
         return value.isoformat()
 
-    def _parse_dt(self, value: str) -> datetime:
+    def _loads(self, value):
+        if not isinstance(value, str):
+            return value
+        return json.loads(value)
+
+    def _parse_dt(self, value: datetime | str) -> datetime:
+        if isinstance(value, datetime):
+            return value
         return datetime.fromisoformat(value)

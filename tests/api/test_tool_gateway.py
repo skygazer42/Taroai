@@ -140,6 +140,9 @@ def test_tool_gateway_injects_scoped_secret_leases_before_handler_runs():
     assert request.tool_input == {"account_id": "acct_1"}
     assert lease.secret_ref_id == secret.id
     assert lease.tool_name == "crm.lookup"
+    assert lease.run_id == "run_1"
+    assert lease.step_id == "step_crm"
+    assert lease.session_id is None
     assert "super-secret-api-key" not in str(request.model_dump(mode="json"))
     assert "super-secret-api-key" not in str(audit_metadata)
     assert lease.lease_token not in str(audit_metadata)

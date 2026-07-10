@@ -1,0 +1,542 @@
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: ghcr.io/creao-ai/taroai-api
+  tag: latest
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+persistence:
+  runtimeData:
+    type: emptyDir
+    mountPath: /data/taroai
+  tmp:
+    type: emptyDir
+    mountPath: /tmp
+
+config:
+  TAROAI_ENVIRONMENT: private
+  TAROAI_CONTROL_PLANE_STORE_BACKEND: sql
+  TAROAI_IDENTITY_SERVICE_BACKEND: sql
+  TAROAI_CONNECTOR_REGISTRY_BACKEND: sql
+  TAROAI_SKILL_REGISTRY_BACKEND: sql
+  TAROAI_KNOWLEDGE_SERVICE_BACKEND: sql
+  TAROAI_KNOWLEDGE_CHUNK_MAX_CHARACTERS: "1200"
+  TAROAI_KNOWLEDGE_CHUNK_OVERLAP_CHARACTERS: "120"
+  TAROAI_LONG_TERM_MEMORY_BACKEND: sql
+  TAROAI_TRIGGER_STORE_BACKEND: sql
+  TAROAI_SHORT_TERM_MEMORY_BACKEND: redis
+  TAROAI_STORAGE_CATALOG_BACKEND: sql
+  TAROAI_LIFECYCLE_POLICY_BACKEND: sql
+  TAROAI_RESTORE_DRILL_SCHEDULE_BACKEND: sql
+  TAROAI_JOB_QUEUE_BACKEND: redis
+  TAROAI_RUN_EXECUTION_DISPATCH_MODE: queue
+  TAROAI_OBJECT_STORAGE_ENDPOINT: http://minio:9000
+  TAROAI_OBJECT_STORAGE_BUCKET: taroai-artifacts
+  TAROAI_OBJECT_STORAGE_REGION: us-east-1
+  TAROAI_OBJECT_STORAGE_SIGNED_URL_TTL_SECONDS: "3600"
+  TAROAI_OBJECT_STORAGE_CONTENT_SCAN_BLOCKED_TERMS: "[]"
+  TAROAI_SECRET_SERVICE_BACKEND: aws_secrets_manager
+  TAROAI_SECRET_SERVICE_REGION: us-east-1
+  TAROAI_SECRET_SERVICE_ENDPOINT_URL: ""
+  TAROAI_SECRET_SERVICE_NAME_PREFIX: taroai/private
+  TAROAI_SECRET_SERVICE_KMS_KEY_ID: ""
+  TAROAI_DATA_RESIDENCY_PRIMARY_REGION: us-east-1
+  TAROAI_DATA_RESIDENCY_ALLOWED_REGIONS: "[\"us-east-1\"]"
+  TAROAI_DATA_RESIDENCY_CROSS_REGION_REPLICATION_MODE: disabled
+  TAROAI_VECTOR_INDEX_REGION: us-east-1
+  TAROAI_SANDBOX_PROVIDER: disabled
+  TAROAI_SANDBOX_PROVIDER_REGION: us-east-1
+  TAROAI_SANDBOX_ROOT_DIR: /data/taroai/sandboxes
+  TAROAI_SANDBOX_TIMEOUT_SECONDS: "300"
+  TAROAI_SANDBOX_NETWORK_MODE: disabled
+  TAROAI_SANDBOX_DOCKER_MEMORY_LIMIT: 1g
+  TAROAI_SANDBOX_DOCKER_CPUS: "1.0"
+  TAROAI_SANDBOX_DOCKER_PIDS_LIMIT: "256"
+  TAROAI_SANDBOX_DOCKER_USER: "65532:65532"
+  TAROAI_SANDBOX_DOCKER_READ_ONLY_ROOTFS: "true"
+  TAROAI_SANDBOX_DOCKER_DROP_ALL_CAPABILITIES: "true"
+  TAROAI_SANDBOX_DOCKER_SECURITY_OPTS: "[\"no-new-privileges:true\"]"
+  TAROAI_SANDBOX_DOCKER_TMPFS_MOUNTS: "[\"/tmp:rw,noexec,nosuid,size=256m\"]"
+  TAROAI_SANDBOX_CONTROLLER_BASE_URL: http://taroai-sandbox-controller:8002
+  TAROAI_SANDBOX_CONTROLLER_TIMEOUT_SECONDS: "30"
+  TAROAI_SANDBOX_CONTROLLER_PROVIDER: kubernetes
+  TAROAI_SANDBOX_CONTROLLER_SESSION_TTL_SECONDS: "1800"
+  TAROAI_SANDBOX_CONTROLLER_MAX_SESSIONS: "50"
+  TAROAI_SANDBOX_CONTROLLER_MAX_SESSIONS_PER_TENANT: "20"
+  TAROAI_SANDBOX_CONTROLLER_MAX_SESSIONS_PER_RUN: "3"
+  TAROAI_SANDBOX_CONTROLLER_DOCKER_MEMORY_LIMIT: 1g
+  TAROAI_SANDBOX_CONTROLLER_DOCKER_CPUS: "1.0"
+  TAROAI_SANDBOX_CONTROLLER_DOCKER_PIDS_LIMIT: "256"
+  TAROAI_SANDBOX_CONTROLLER_DOCKER_USER: "65532:65532"
+  TAROAI_SANDBOX_CONTROLLER_DOCKER_READ_ONLY_ROOTFS: "true"
+  TAROAI_SANDBOX_CONTROLLER_DOCKER_DROP_ALL_CAPABILITIES: "true"
+  TAROAI_SANDBOX_CONTROLLER_DOCKER_SECURITY_OPTS: "[\"no-new-privileges:true\"]"
+  TAROAI_SANDBOX_CONTROLLER_DOCKER_TMPFS_MOUNTS: "[\"/tmp:rw,noexec,nosuid,size=256m\"]"
+  TAROAI_SANDBOX_CONTROLLER_KUBERNETES_NAMESPACE: default
+  TAROAI_SANDBOX_CONTROLLER_KUBERNETES_KUBECTL_BINARY: kubectl
+  TAROAI_SANDBOX_CONTROLLER_KUBERNETES_SERVICE_ACCOUNT_NAME: sandbox-runner
+  TAROAI_SANDBOX_CONTROLLER_KUBERNETES_RUNTIME_CLASS_NAME: gvisor
+  TAROAI_SANDBOX_CONTROLLER_KUBERNETES_RUNTIME_CLASS_REQUIRED: "true"
+  TAROAI_SANDBOX_CONTROLLER_KUBERNETES_ALLOWED_IMAGES: "[\"ghcr.io/customer/sandbox-runtime@sha256:*\"]"
+  TAROAI_SANDBOX_CONTROLLER_KUBERNETES_ORPHAN_CLEANUP_ENABLED: "false"
+  TAROAI_SANDBOX_CONTROLLER_KUBERNETES_IMAGE_PULL_POLICY: IfNotPresent
+  TAROAI_SANDBOX_CONTROLLER_KUBERNETES_POD_READY_TIMEOUT_SECONDS: "60"
+  TAROAI_SANDBOX_CONTROLLER_KUBERNETES_MEMORY_LIMIT: 1Gi
+  TAROAI_SANDBOX_CONTROLLER_KUBERNETES_CPU_LIMIT: 1000m
+  TAROAI_SANDBOX_CONTROLLER_KUBERNETES_EPHEMERAL_STORAGE_LIMIT: 2Gi
+  TAROAI_SANDBOX_CONTROLLER_KUBERNETES_RUN_AS_USER: "65532"
+  TAROAI_SANDBOX_CONTROLLER_KUBERNETES_RUN_AS_GROUP: "65532"
+  TAROAI_BROWSER_PROVIDER: disabled
+  TAROAI_BROWSER_CONTROLLER_BASE_URL: http://taroai-browser-controller:8001
+  TAROAI_BROWSER_CONTROLLER_TIMEOUT_SECONDS: "30"
+  TAROAI_BROWSER_CONTROLLER_SESSION_TTL_SECONDS: "1800"
+  TAROAI_BROWSER_CONTROLLER_MAX_SESSIONS: "50"
+  TAROAI_BROWSER_CONTROLLER_MAX_SESSIONS_PER_TENANT: "20"
+  TAROAI_BROWSER_CONTROLLER_MAX_SESSIONS_PER_RUN: "3"
+  TAROAI_BROWSER_CONTROLLER_NAVIGATION_ALLOWED_HOSTS: "[]"
+  TAROAI_MODEL_GATEWAY_BASE_URL: https://api.openai.com/v1
+  TAROAI_MODEL_GATEWAY_API_KEY_SECRET_REF_ID: ""
+  TAROAI_MODEL_GATEWAY_SECRET_LEASE_TTL_SECONDS: "60"
+  TAROAI_MODEL_GATEWAY_TIMEOUT_SECONDS: "30"
+  TAROAI_MODEL_GATEWAY_PROVIDERS: "[]"
+  TAROAI_EMBEDDING_GATEWAY_ENABLED: "false"
+  TAROAI_EMBEDDING_GATEWAY_BASE_URL: https://api.openai.com/v1
+  TAROAI_EMBEDDING_GATEWAY_API_KEY_SECRET_REF_ID: ""
+  TAROAI_EMBEDDING_GATEWAY_SECRET_LEASE_TTL_SECONDS: "60"
+  TAROAI_EMBEDDING_GATEWAY_MODEL: ""
+  TAROAI_EMBEDDING_GATEWAY_DIMENSIONS: ""
+  TAROAI_EMBEDDING_GATEWAY_TIMEOUT_SECONDS: "30"
+  TAROAI_MODEL_GATEWAY_ALLOWED_MODELS: "[]"
+  TAROAI_MODEL_GATEWAY_DENIED_MODELS: "[]"
+  TAROAI_MODEL_GATEWAY_SENSITIVITY_LIMITS: "{}"
+  TAROAI_MODEL_GATEWAY_POLICY_SCOPES: "[]"
+  TAROAI_MODEL_GATEWAY_POLICY_STORE_BACKEND: sql
+  TAROAI_BILLING_PRICING_RULES: "[]"
+  TAROAI_AUTH_SESSION_BACKEND: auto
+  TAROAI_AUDIT_RETENTION_DAYS: "365"
+  TAROAI_TRACE_EXPORTER_BACKEND: disabled
+  TAROAI_DEV_REQUEST_HEADERS_ENABLED: "false"
+  TAROAI_RUN_EXECUTION_QUEUE_NAME: runs.execute
+  TAROAI_BILLING_QUEUE_NAME: billing.aggregate
+  TAROAI_CLEANUP_QUEUE_NAME: system.cleanup
+  TAROAI_TRIGGER_QUEUE_NAME: triggers.due
+  TAROAI_TRIGGER_WEBHOOK_SIGNATURE_TOLERANCE_SECONDS: "300"
+  TAROAI_TRIGGER_WEBHOOK_ALLOW_UNSIGNED: "false"
+  TAROAI_TRIGGER_OPERATIONS_STUCK_AFTER_SECONDS: "900"
+  TAROAI_WORKER_JOB_LEASE_SECONDS: "300"
+  TAROAI_WORKER_JOB_RETRY_DELAY_SECONDS: "30"
+  TAROAI_WORKER_JOB_MAX_ATTEMPTS: "3"
+
+secrets:
+  create: false
+  existingSecret: taroai-runtime-secrets
+  secretKeys:
+    databaseUrl: TAROAI_DATABASE_URL
+    redisUrl: TAROAI_REDIS_URL
+    objectStorageAccessKeyId: TAROAI_OBJECT_STORAGE_ACCESS_KEY_ID
+    objectStorageSecretAccessKey: TAROAI_OBJECT_STORAGE_SECRET_ACCESS_KEY
+    modelGatewayApiKey: TAROAI_MODEL_GATEWAY_API_KEY
+    sandboxControllerApiKey: TAROAI_SANDBOX_CONTROLLER_API_KEY
+    sandboxSecretResolverToken: TAROAI_SANDBOX_SECRET_RESOLVER_TOKEN
+    browserControllerApiKey: TAROAI_BROWSER_CONTROLLER_API_KEY
+    accessTokenSecret: TAROAI_ACCESS_TOKEN_SECRET
+    passwordHashSalt: TAROAI_PASSWORD_HASH_SALT
+    tenantBootstrapToken: TAROAI_TENANT_BOOTSTRAP_TOKEN
+    triggerWebhookSigningSecrets: TAROAI_TRIGGER_WEBHOOK_SIGNING_SECRETS
+
+api:
+  replicas: 2
+  service:
+    type: ClusterIP
+    port: 8000
+  readinessProbe:
+    path: /readyz
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 6
+  livenessProbe:
+    path: /healthz
+    periodSeconds: 20
+    timeoutSeconds: 3
+    failureThreshold: 6
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+sandboxController:
+  enabled: false
+  image:
+    repository: ghcr.io/creao-ai/taroai-sandbox-controller
+    tag: latest
+    pullPolicy: IfNotPresent
+  replicas: 1
+  service:
+    type: ClusterIP
+    port: 8002
+  readinessProbe:
+    path: /healthz
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 6
+  livenessProbe:
+    path: /healthz
+    periodSeconds: 20
+    timeoutSeconds: 3
+    failureThreshold: 6
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    capabilities:
+      drop:
+        - ALL
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+browserController:
+  enabled: false
+  image:
+    repository: ghcr.io/creao-ai/taroai-browser-controller
+    tag: latest
+    pullPolicy: IfNotPresent
+  replicas: 1
+  service:
+    type: ClusterIP
+    port: 8001
+  readinessProbe:
+    path: /healthz
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 6
+  livenessProbe:
+    path: /healthz
+    periodSeconds: 20
+    timeoutSeconds: 3
+    failureThreshold: 6
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+web:
+  enabled: true
+  image:
+    repository: ghcr.io/creao-ai/taroai-web
+    tag: latest
+    pullPolicy: IfNotPresent
+  replicas: 2
+  service:
+    type: ClusterIP
+    port: 80
+    containerPort: 8080
+  readinessProbe:
+    path: /
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 6
+  livenessProbe:
+    path: /
+    periodSeconds: 20
+    timeoutSeconds: 3
+    failureThreshold: 6
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 128Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+migration:
+  enabled: true
+  backoffLimit: 3
+  runMigrations: "false"
+  command:
+    - /app/entrypoint.sh
+  args:
+    - python
+    - -m
+    - taroai.db.migration_cli
+    - --database-url
+    - $(TAROAI_DATABASE_URL)
+    - --migrations-path
+    - /app/migrations
+    - --apply
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+workers:
+  kinds:
+    agent:
+      enabled: true
+      replicas: 2
+      workerKind: agent
+      args:
+        pollIntervalSeconds: 1
+        stopAfterEmptyPolls: 1
+      resources:
+        requests:
+          cpu: 250m
+          memory: 512Mi
+        limits:
+          cpu: "1"
+          memory: 1Gi
+    cleanup:
+      enabled: true
+      replicas: 1
+      workerKind: cleanup
+      args:
+        pollIntervalSeconds: 5
+        stopAfterEmptyPolls: 1
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+    connectorSync:
+      enabled: true
+      replicas: 1
+      workerKind: connector_sync
+      args:
+        pollIntervalSeconds: 1
+        stopAfterEmptyPolls: 1
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+    restoreDrillDue:
+      enabled: true
+      replicas: 1
+      workerKind: restore_drill_due
+      args:
+        pollIntervalSeconds: 5
+        stopAfterEmptyPolls: 1
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+    restoreDrillExecution:
+      enabled: true
+      replicas: 1
+      workerKind: restore_drill_execution
+      args:
+        pollIntervalSeconds: 5
+        stopAfterEmptyPolls: 1
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+    restoreDrillEvidence:
+      enabled: true
+      replicas: 1
+      workerKind: restore_drill_evidence
+      args:
+        pollIntervalSeconds: 5
+        stopAfterEmptyPolls: 1
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+    restoreDrillScheduler:
+      enabled: true
+      replicas: 1
+      workerKind: restore_drill_scheduler
+      args:
+        pollIntervalSeconds: 300
+        stopAfterEmptyPolls: 1
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+    triggerDue:
+      enabled: true
+      replicas: 1
+      workerKind: trigger_due
+      args:
+        pollIntervalSeconds: 1
+        stopAfterEmptyPolls: 1
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+    triggerScheduler:
+      enabled: true
+      replicas: 1
+      workerKind: trigger_scheduler
+      args:
+        pollIntervalSeconds: 30
+        stopAfterEmptyPolls: 1
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts: []
+  tls: []
+
+networkPolicy:
+  enabled: true
+  allowExternalHttps: true
+  dns:
+    namespaceLabel: kube-system
+    podLabelKey: k8s-app
+    podLabelValue: kube-dns
+
+sandboxRuntimePolicy:
+  enabled: true
+  namespaceLabels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+  podSecurity:
+    enforce: restricted
+    audit: restricted
+    warn: restricted
+  resourceQuota:
+    pods: "50"
+    requestsCpu: "20"
+    requestsMemory: 40Gi
+    limitsCpu: "40"
+    limitsMemory: 80Gi
+    requestsEphemeralStorage: 100Gi
+    limitsEphemeralStorage: 200Gi
+  limitRange:
+    default:
+      cpu: 1000m
+      memory: 1Gi
+      ephemeral-storage: 2Gi
+    defaultRequest:
+      cpu: 500m
+      memory: 512Mi
+      ephemeral-storage: 1Gi
+    max:
+      cpu: 2000m
+      memory: 4Gi
+      ephemeral-storage: 8Gi
+    min:
+      cpu: 100m
+      memory: 128Mi
+      ephemeral-storage: 256Mi
+  networkPolicy:
+    name: sandbox-runtime-default-deny
+    podSelector:
+      app.kubernetes.io/name: taroai-sandbox-session
+
+autoscaling:
+  api:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+  workers:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 5
+    targetCPUUtilizationPercentage: 70
+
+postgresql:
+  mode: external
+  serviceName: postgres
+  port: 5432
+
+redis:
+  mode: external
+  serviceName: redis
+  port: 6379
+
+objectStorage:
+  mode: external
+  serviceName: minio
+  port: 9000
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

@@ -34,12 +34,13 @@ Question status values:
 
 **Options:**
 
-- A: Sandbox adapter contract now; tests-only adapter fixture only for tests.
+- A: Keep `local_process` for local PoC and use the first-pass Docker provider for disabled-network container execution.
 - B: E2B-first cloud sandbox.
-- C: Kubernetes Docker adapter.
-- D: Another managed sandbox provider.
+- C: Kubernetes-managed container sandbox.
+- D: MicroVM-backed sandbox.
+- E: Another managed sandbox provider.
 
-**Recommended Default:** A for implementation sequencing, then B if cloud PoC needs real browser/filesystem execution quickly. Test adapters must not appear in product flow.
+**Recommended Default:** A for implementation sequencing; choose B, C, or D before broad shared-enterprise execution. Test adapters must not appear in product flow.
 
 **Decision Needed Before:** MVP milestone approval
 
@@ -104,14 +105,14 @@ Question status values:
 
 **Options:**
 
-- A: Defer frontend implementation to the final user-managed phase; write backend/API/event contracts now.
+- A: Implement a minimal static workspace slice now; defer full portal implementation.
 - B: Defer frontend until backend MVP API contract tests are written.
 - C: Defer frontend until typed API fixtures are ready.
 - D: Defer frontend until backend end-to-end tests pass.
 
-**Decision:** A. Frontend implementation is not part of the current MVP milestone. Current work should only preserve API, event, and CREAO UI contracts for a later final phase.
+**Decision:** A. The local cloud PoC now includes a minimal static workspace for chat, run timeline, terminal output, artifacts, and approvals. Full portal work remains later.
 
-**Decision Source:** User instruction: "前端 不要实现 我们最后管理"
+**Decision Source:** Active MVP execution objective: make the runtime/sandbox/artifact loop visible in a frontend workspace.
 
 ## Q-007: Is BYOC/private deployment sales-critical for the first customer?
 
@@ -129,16 +130,16 @@ Question status values:
 
 **Decision Needed Before:** private deployment
 
-## Q-008: Should the API migrate to `/api/v1` before the final frontend phase?
+## Q-008: Should the API migrate to `/api/v1` before generated SDKs or the full portal?
 
 **Status:** open
 
-**Why It Matters:** API versioning affects future frontend client paths, OpenAPI contracts, SDKs, and backward compatibility.
+**Why It Matters:** API versioning affects frontend client paths, OpenAPI contracts, SDKs, and backward compatibility.
 
 **Options:**
 
 - A: Keep current `/api/*` for MVP and plan `/api/v1` later.
-- B: Migrate to `/api/v1` before the final frontend phase.
+- B: Migrate to `/api/v1` before generated SDKs or the full portal.
 - C: Support both during MVP.
 
 **Recommended Default:** A for speed; record versioning migration in plan 14 before external SDK release.

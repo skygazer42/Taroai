@@ -1,0 +1,99 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "taroai.fullname" . }}-api
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-api
+    app.kubernetes.io/component: api
+spec:
+  replicas: {{ .Values.api.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "taroai.fullname" . }}-api
+  template:
+    metadata:
+      labels:
+        {{- include "taroai.labels" . | nindent 8 }}
+        app.kubernetes.io/name: {{ include "taroai.fullname" . }}-api
+        app.kubernetes.io/component: api
+    spec:
+      serviceAccountName: {{ include "taroai.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: api
+          image: {{ include "taroai.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.api.service.port }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "taroai.fullname" . }}-runtime-config
+            - secretRef:
+                name: {{ .Values.secrets.existingSecret | quote }}
+          env:
+            - name: TAROAI_RUN_MIGRATIONS
+              value: "false"
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.api.readinessProbe.path }}
+              port: http
+            periodSeconds: {{ .Values.api.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.api.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.api.readinessProbe.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.api.livenessProbe.path }}
+              port: http
+            periodSeconds: {{ .Values.api.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.api.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.api.livenessProbe.failureThreshold }}
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: {{ .Values.persistence.tmp.mountPath }}
+            - name: taroai-data
+              mountPath: {{ .Values.persistence.runtimeData.mountPath }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: taroai-data
+          emptyDir: {}
+      {{- with .Values.api.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.api.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.api.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "taroai.fullname" . }}-api
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-api
+    app.kubernetes.io/component: api
+spec:
+  type: {{ .Values.api.service.type }}
+  selector:
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-api
+  ports:
+    - name: http
+      port: {{ .Values.api.service.port }}
+      targetPort: http

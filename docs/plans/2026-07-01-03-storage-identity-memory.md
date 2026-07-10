@@ -17,7 +17,7 @@ Current state already has Pydantic in-memory services for:
 - `taroai/storage`: tenant-scoped object metadata catalog, SQLite-compatible SQL metadata catalog, S3/MinIO-compatible object storage adapter boundary, upload/download/delete/signed URL contracts, FastAPI metadata/signed URL/upload/download/delete endpoints, `storage.read`/`storage.write` permission checks, object ACL/sensitivity checks, configurable content scanning, retention-aware metadata tombstones, storage lifecycle cleanup service, `storage_bytes` billing meter recording, `storage.uploaded` audit metadata, `storage.content_rejected` audit metadata, `storage.downloaded` audit metadata, `storage.signed_url.created` audit metadata, and `storage.deleted` audit metadata.
 - `taroai/identity`: user account, password hash, roles, permissions.
 - `taroai/memory`: short-term TTL memory, Redis-backed short-term put/get/list/delete with TTL, long-term scoped memory, and SQLite-compatible SQL long-term memory persistence selectable through settings.
-- `taroai/db`: Pydantic database config, migration runner, runtime state table, and SQLite-compatible SQL repository tests for run/event/meter/audit/runtime-state persistence.
+- `taroai/db`: Pydantic database config, migration runner, runtime state table, shared SQLite/PostgreSQL connection factory, psycopg-backed PostgreSQL URL support, process-level PostgreSQL connection pools configured through Pydantic min/max/timeout settings, and SQL repository tests for run/event/meter/audit/runtime-state persistence.
 
 This plan turns those foundations into real backend infrastructure while keeping the same public service interfaces.
 
@@ -34,7 +34,8 @@ Current short-term memory implementation notes:
 - Guarded short-term memory writes that require approval are held in a review queue and stay out of active run memory until approved or rejected.
 - `SqlShortTermMemoryReviewStore` persists short-term review state in `short_term_memory_reviews` when the SQL control-plane backend is selected.
 - Long-term memory candidate creation, approve/reject review, active scoped reads, API endpoints, and audit metadata emission are started.
-- Live Redis deployment verification, production PostgreSQL hardening for review storage, richer memory review policy, and runtime memory context loading remain implementation work.
+- Live Redis-backed short-term memory verification and Redis worker queue verification exist for the local cloud PoC.
+- CI/private-deployment release gates for PostgreSQL migration/RLS verification, richer memory review policy, and runtime memory context loading remain implementation work.
 
 ## Task 1: Storage Service Contract
 
@@ -68,7 +69,8 @@ Current short-term memory implementation notes:
 - Storage objects carry `acl_subjects` and `sensitivity_level`; read signed URLs and content downloads enforce object ACL/sensitivity after `storage.read`, and audit metadata records ACL counts and sensitivity without raw content.
 - Uploads route through a configurable content scanner using `TAROAI_OBJECT_STORAGE_CONTENT_SCAN_BLOCKED_TERMS`; rejected content emits `storage.content_rejected` audit metadata with hit counts, not raw content or rule text.
 - First-pass retention cleanup lists expired active storage objects by tenant/workspace, deletes through the object storage adapter, writes metadata tombstones, can preview would-delete IDs without deletion, emits system audit metadata, and is reachable through the cleanup worker job path.
-- Live MinIO/S3 deployment verification, IdP/SCIM-backed subject mapping, multipart upload, production DLP/AV scanning adapters, non-storage lifecycle cleanup categories, and broader read-side billing coverage remain implementation work.
+- Live MinIO/S3-compatible object storage verification exists for bucket access, upload, download byte comparison, signed URL generation, delete, and post-delete visibility checks.
+- IdP/SCIM-backed subject mapping, multipart upload, production DLP/AV scanning adapters, non-storage lifecycle cleanup categories, and broader read-side billing coverage remain implementation work.
 
 **Acceptance Criteria:**
 
@@ -146,8 +148,11 @@ Current short-term memory implementation notes:
 **Current Implementation Notes:**
 
 - In-memory identity service supports password hashing, password verification, `disable_user`, and role lookup.
+- Password hashing now uses a per-password random salt for new hashes, keeps the Settings-managed `password_hash_salt` as a server-side pepper, verifies legacy static-salt hashes for existing PoC data, and the Settings profile gate rejects production/customer-operated deployments with `password_hash_iterations` below `600000`.
+- `UserAccount.status` is constrained to `active`, `disabled`, `pending`, or `deleted` at the Pydantic model and initial database migration boundary; in-memory and SQL identity services support pending, activation, disable, and soft-delete transitions, and permission checks plus existing-token validation require the user to remain `active`.
+- Identity models normalize emails with trim/lower semantics, and SQL identity storage enforces tenant-scoped uniqueness with a `lower(trim(email))` unique index, matching the login lookup semantics and preventing duplicate principal records for the same mailbox.
 - `taroai/auth` provides signed PoC access tokens with session IDs, `/api/auth/login`, `/api/auth/logout`, and server-side session revocation.
-- SQLite-compatible SQL identity repository is started for users, roles, and role assignments; SQL-backed auth session persistence/revocation is used when SQL identity is configured. Full account-status lifecycle, production PostgreSQL rollout, SSO handoff, MFA, and support-access controls remain implementation work.
+- SQL identity repository is started for users, roles, role assignments, and account status transitions with SQLite and PostgreSQL URL support through the shared connection factory; SQL-backed auth session persistence/revocation is used when SQL identity is configured. Invite orchestration, CI/private-deployment PostgreSQL verification gates, SSO handoff, MFA, and support-access controls remain implementation work.
 
 **Acceptance Criteria:**
 

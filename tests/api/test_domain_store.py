@@ -1,7 +1,7 @@
 import pytest
 
 from taroai.agent import AgentRuntimeState, PlanStep, ToolResult
-from taroai.domain import ApprovalStatus, RunCreate, RunStatus
+from taroai.domain import ApprovalStatus, IdempotencyRecord, RunCreate, RunStatus, utc_now
 from taroai.store import InMemoryControlPlaneStore, TenantAccessError
 
 
@@ -33,6 +33,8 @@ def test_create_run_records_initial_events_and_meter():
         "audit.recorded",
         "audit.recorded",
     ]
+    assert [event.sequence for event in events] == [1, 2, 3, 4]
+    assert [event.sequence for event in store.list_run_events("tenant_acme", run.id, after_sequence=2)] == [3, 4]
 
     meters = store.list_billing_meters("tenant_acme")
     assert len(meters) == 1
@@ -49,6 +51,78 @@ def test_create_run_records_initial_events_and_meter():
     assert audit_events[0].metadata["meter_type"] == "run_count"
     assert audit_events[0].metadata["meter_id"] == meters[0].id
     assert audit_events[1].run_id == run.id
+
+
+def test_operation_level_billing_meter_does_not_require_run_event():
+    store = InMemoryControlPlaneStore()
+    run = store.create_run(
+        tenant_id="tenant_acme",
+        user_id="user_1",
+        payload=RunCreate(
+            workspace_id="workspace_sales",
+            message="Create a prospect brief.",
+            mode="workflow",
+        ),
+    )
+    original_run_events = store.list_run_events("tenant_acme", run.id)
+
+    meter = store.record_billing_meter(
+        tenant_id="tenant_acme",
+        run_id=None,
+        workspace_id=run.workspace_id,
+        user_id=run.user_id,
+        meter_type="embedding_call_count",
+        quantity=1,
+        unit="call",
+        provider="openai_compatible",
+        model="text-embedding-3-small",
+        metadata={"purpose": "knowledge_index", "input_count": 2},
+    )
+
+    billing_audit = [
+        event
+        for event in store.list_audit_events("tenant_acme")
+        if event.metadata.get("meter_id") == meter.id
+    ][0]
+
+    assert meter.run_id is None
+    assert meter.workspace_id == run.workspace_id
+    assert meter.user_id == run.user_id
+    assert store.list_run_events("tenant_acme", run.id) == original_run_events
+    assert billing_audit.run_id is None
+    assert billing_audit.workspace_id == run.workspace_id
+    assert billing_audit.user_id == run.user_id
+    assert billing_audit.event_type == "billing.metered"
+
+
+def test_store_persists_idempotency_records_by_tenant_method_path_and_key():
+    store = InMemoryControlPlaneStore()
+    record = IdempotencyRecord(
+        tenant_id="tenant_acme",
+        key="run-create-001",
+        method="POST",
+        path="/api/runs",
+        request_hash="hash_1",
+        status_code=201,
+        response_body={"run_id": "run_1", "status": "created"},
+        created_at=utc_now(),
+    )
+
+    saved = store.save_idempotency_record(record)
+
+    assert saved == record
+    assert store.get_idempotency_record(
+        tenant_id="tenant_acme",
+        key="run-create-001",
+        method="POST",
+        path="/api/runs",
+    ) == record
+    assert store.get_idempotency_record(
+        tenant_id="tenant_other",
+        key="run-create-001",
+        method="POST",
+        path="/api/runs",
+    ) is None
 
 
 def test_approval_resolution_records_audit_event():

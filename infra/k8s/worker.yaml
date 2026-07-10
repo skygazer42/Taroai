@@ -1,0 +1,584 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taroai-agent-worker
+  labels:
+    app.kubernetes.io/name: taroai-agent-worker
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/part-of: taroai
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: taroai-agent-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: taroai-agent-worker
+        app.kubernetes.io/component: worker
+        app.kubernetes.io/part-of: taroai
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agent-worker
+          image: ghcr.io/creao-ai/taroai-api:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "taroai.workers.runner"]
+          args:
+            - "--worker-kind"
+            - "agent"
+            - "--loop-forever"
+            - "--poll-interval-seconds"
+            - "1"
+            - "--stop-after-empty-polls"
+            - "1"
+          envFrom:
+            - configMapRef:
+                name: taroai-runtime-config
+            - secretRef:
+                name: taroai-runtime-secrets
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: taroai-data
+              mountPath: /data/taroai
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: taroai-data
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taroai-connector-sync-worker
+  labels:
+    app.kubernetes.io/name: taroai-connector-sync-worker
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/part-of: taroai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: taroai-connector-sync-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: taroai-connector-sync-worker
+        app.kubernetes.io/component: worker
+        app.kubernetes.io/part-of: taroai
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: connector-sync-worker
+          image: ghcr.io/creao-ai/taroai-api:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "taroai.workers.runner"]
+          args:
+            - "--worker-kind"
+            - "connector_sync"
+            - "--loop-forever"
+            - "--poll-interval-seconds"
+            - "1"
+            - "--stop-after-empty-polls"
+            - "1"
+          envFrom:
+            - configMapRef:
+                name: taroai-runtime-config
+            - secretRef:
+                name: taroai-runtime-secrets
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: taroai-data
+              mountPath: /data/taroai
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: taroai-data
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taroai-restore-drill-due-worker
+  labels:
+    app.kubernetes.io/name: taroai-restore-drill-due-worker
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/part-of: taroai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: taroai-restore-drill-due-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: taroai-restore-drill-due-worker
+        app.kubernetes.io/component: worker
+        app.kubernetes.io/part-of: taroai
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: restore-drill-due-worker
+          image: ghcr.io/creao-ai/taroai-api:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "taroai.workers.runner"]
+          args:
+            - "--worker-kind"
+            - "restore_drill_due"
+            - "--loop-forever"
+            - "--poll-interval-seconds"
+            - "5"
+            - "--stop-after-empty-polls"
+            - "1"
+          envFrom:
+            - configMapRef:
+                name: taroai-runtime-config
+            - secretRef:
+                name: taroai-runtime-secrets
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: taroai-data
+              mountPath: /data/taroai
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: taroai-data
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taroai-restore-drill-execution-worker
+  labels:
+    app.kubernetes.io/name: taroai-restore-drill-execution-worker
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/part-of: taroai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: taroai-restore-drill-execution-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: taroai-restore-drill-execution-worker
+        app.kubernetes.io/component: worker
+        app.kubernetes.io/part-of: taroai
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: restore-drill-execution-worker
+          image: ghcr.io/creao-ai/taroai-api:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "taroai.workers.runner"]
+          args:
+            - "--worker-kind"
+            - "restore_drill_execution"
+            - "--loop-forever"
+            - "--poll-interval-seconds"
+            - "5"
+            - "--stop-after-empty-polls"
+            - "1"
+          envFrom:
+            - configMapRef:
+                name: taroai-runtime-config
+            - secretRef:
+                name: taroai-runtime-secrets
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: taroai-data
+              mountPath: /data/taroai
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: taroai-data
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taroai-restore-drill-evidence-worker
+  labels:
+    app.kubernetes.io/name: taroai-restore-drill-evidence-worker
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/part-of: taroai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: taroai-restore-drill-evidence-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: taroai-restore-drill-evidence-worker
+        app.kubernetes.io/component: worker
+        app.kubernetes.io/part-of: taroai
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: restore-drill-evidence-worker
+          image: ghcr.io/creao-ai/taroai-api:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "taroai.workers.runner"]
+          args:
+            - "--worker-kind"
+            - "restore_drill_evidence"
+            - "--loop-forever"
+            - "--poll-interval-seconds"
+            - "5"
+            - "--stop-after-empty-polls"
+            - "1"
+          envFrom:
+            - configMapRef:
+                name: taroai-runtime-config
+            - secretRef:
+                name: taroai-runtime-secrets
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: taroai-data
+              mountPath: /data/taroai
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: taroai-data
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taroai-restore-drill-scheduler
+  labels:
+    app.kubernetes.io/name: taroai-restore-drill-scheduler
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/part-of: taroai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: taroai-restore-drill-scheduler
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: taroai-restore-drill-scheduler
+        app.kubernetes.io/component: worker
+        app.kubernetes.io/part-of: taroai
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: restore-drill-scheduler
+          image: ghcr.io/creao-ai/taroai-api:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "taroai.workers.runner"]
+          args:
+            - "--worker-kind"
+            - "restore_drill_scheduler"
+            - "--loop-forever"
+            - "--poll-interval-seconds"
+            - "300"
+            - "--stop-after-empty-polls"
+            - "1"
+          envFrom:
+            - configMapRef:
+                name: taroai-runtime-config
+            - secretRef:
+                name: taroai-runtime-secrets
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: taroai-data
+              mountPath: /data/taroai
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: taroai-data
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taroai-trigger-due-worker
+  labels:
+    app.kubernetes.io/name: taroai-trigger-due-worker
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/part-of: taroai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: taroai-trigger-due-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: taroai-trigger-due-worker
+        app.kubernetes.io/component: worker
+        app.kubernetes.io/part-of: taroai
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: trigger-due-worker
+          image: ghcr.io/creao-ai/taroai-api:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "taroai.workers.runner"]
+          args:
+            - "--worker-kind"
+            - "trigger_due"
+            - "--loop-forever"
+            - "--poll-interval-seconds"
+            - "1"
+            - "--stop-after-empty-polls"
+            - "1"
+          envFrom:
+            - configMapRef:
+                name: taroai-runtime-config
+            - secretRef:
+                name: taroai-runtime-secrets
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: taroai-data
+              mountPath: /data/taroai
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: taroai-data
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taroai-trigger-scheduler
+  labels:
+    app.kubernetes.io/name: taroai-trigger-scheduler
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/part-of: taroai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: taroai-trigger-scheduler
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: taroai-trigger-scheduler
+        app.kubernetes.io/component: worker
+        app.kubernetes.io/part-of: taroai
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: trigger-scheduler
+          image: ghcr.io/creao-ai/taroai-api:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "taroai.workers.runner"]
+          args:
+            - "--worker-kind"
+            - "trigger_scheduler"
+            - "--loop-forever"
+            - "--poll-interval-seconds"
+            - "30"
+            - "--stop-after-empty-polls"
+            - "1"
+          envFrom:
+            - configMapRef:
+                name: taroai-runtime-config
+            - secretRef:
+                name: taroai-runtime-secrets
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: taroai-data
+              mountPath: /data/taroai
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: taroai-data
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taroai-cleanup-worker
+  labels:
+    app.kubernetes.io/name: taroai-cleanup-worker
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/part-of: taroai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: taroai-cleanup-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: taroai-cleanup-worker
+        app.kubernetes.io/component: worker
+        app.kubernetes.io/part-of: taroai
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: cleanup-worker
+          image: ghcr.io/creao-ai/taroai-api:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "taroai.workers.runner"]
+          args:
+            - "--worker-kind"
+            - "cleanup"
+            - "--loop-forever"
+            - "--poll-interval-seconds"
+            - "5"
+            - "--stop-after-empty-polls"
+            - "1"
+          envFrom:
+            - configMapRef:
+                name: taroai-runtime-config
+            - secretRef:
+                name: taroai-runtime-secrets
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: taroai-data
+              mountPath: /data/taroai
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: taroai-data
+          emptyDir: {}

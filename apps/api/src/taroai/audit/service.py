@@ -11,6 +11,7 @@ from taroai.audit.models import (
     AuditEventCreate,
 )
 from taroai.domain import utc_now
+from taroai.licensing.models import LicensedFeature
 
 
 DEFAULT_SENSITIVE_METADATA_KEYS = {
@@ -34,12 +35,14 @@ DEFAULT_SENSITIVE_METADATA_KEYS = {
 class AuditService(BaseModel):
     store: Any
     retention_days: int = Field(default=365, ge=1)
+    license_service: Any | None = Field(default=None, exclude=True, repr=False)
     redaction_value: str = "[REDACTED]"
     sensitive_metadata_keys: set[str] = Field(default_factory=lambda: set(DEFAULT_SENSITIVE_METADATA_KEYS))
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def record(self, event: AuditEventCreate) -> AuditEvent:
+        self._enforce_retention_entitlement(event)
         metadata = self.redact_metadata(event.metadata)
         metadata["audit_retention_days"] = self.retention_days
         metadata["audit_retention_expires_at"] = (
@@ -56,6 +59,17 @@ class AuditService(BaseModel):
             metadata=metadata,
         )
         return recorded.model_copy(deep=True)
+
+    def _enforce_retention_entitlement(self, event: AuditEventCreate) -> None:
+        if self.license_service is None:
+            return
+        if event.event_type.startswith("license."):
+            return
+        self.license_service.require_entitlement(
+            tenant_id=event.tenant_id,
+            feature=LicensedFeature.AUDIT_RETENTION_DAYS,
+            requested_amount=self.retention_days,
+        )
 
     def list_for_tenant(self, tenant_id: str) -> list[AuditEvent]:
         return [

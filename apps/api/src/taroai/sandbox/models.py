@@ -120,6 +120,22 @@ class SandboxSnapshot(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class SandboxControllerCapabilities(BaseModel):
+    provider: str = Field(min_length=1)
+    network_isolation: bool = False
+    filesystem_isolation: bool = False
+    resource_limits: bool = False
+    destroy_supported: bool = False
+    session_ttl_enforced: bool = False
+    runtime_isolation: bool = False
+    image_policy_enforced: bool = False
+    allowed_image_count: int | None = Field(default=None, ge=0)
+    max_session_ttl_seconds: int | None = Field(default=None, ge=1)
+    max_sessions: int | None = Field(default=None, ge=1)
+    max_sessions_per_tenant: int | None = Field(default=None, ge=1)
+    max_sessions_per_run: int | None = Field(default=None, ge=1)
+
+
 class BrowserActionType(str, Enum):
     NAVIGATE = "navigate"
     CLICK = "click"

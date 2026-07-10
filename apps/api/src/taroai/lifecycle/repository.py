@@ -1,10 +1,10 @@
 import json
-import sqlite3
 from datetime import datetime
 
 from pydantic import BaseModel
 
 from taroai.db import DatabaseConfig
+from taroai.db.connection import connect_database
 from taroai.domain import utc_now
 from taroai.lifecycle.models import (
     DataCategory,
@@ -221,11 +221,7 @@ class SqlLifecyclePolicyStore(BaseModel):
         return self._policy_from_row(row)
 
     def _connect(self):
-        path = self.config.sqlite_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(path)
-        connection.row_factory = sqlite3.Row
-        return connection
+        return connect_database(self.config)
 
     def _ensure_tenant(self, connection, tenant_id: str) -> None:
         connection.execute(
@@ -419,11 +415,7 @@ class SqlTenantOffboardingStore(BaseModel):
         )
 
     def _connect(self):
-        path = self.config.sqlite_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(path)
-        connection.row_factory = sqlite3.Row
-        return connection
+        return connect_database(self.config)
 
     def _ensure_tenant(self, connection, tenant_id: str) -> None:
         connection.execute(

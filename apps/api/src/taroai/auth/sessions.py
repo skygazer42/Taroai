@@ -1,9 +1,9 @@
-import sqlite3
 from datetime import datetime
 
 from pydantic import BaseModel, Field
 
 from taroai.db import DatabaseConfig
+from taroai.db.connection import connect_database
 from taroai.domain import new_id
 
 
@@ -126,11 +126,7 @@ class SqlAuthSessionStore(AuthSessionStore):
         return cursor.rowcount > 0
 
     def _connect(self):
-        path = self.config.sqlite_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(path)
-        connection.row_factory = sqlite3.Row
-        return connection
+        return connect_database(self.config)
 
     def _session_from_row(self, row) -> AuthSession:
         return AuthSession(
@@ -145,5 +141,7 @@ class SqlAuthSessionStore(AuthSessionStore):
     def _dt(self, value: datetime) -> str:
         return value.isoformat()
 
-    def _parse_dt(self, value: str) -> datetime:
+    def _parse_dt(self, value: datetime | str) -> datetime:
+        if isinstance(value, datetime):
+            return value
         return datetime.fromisoformat(value)

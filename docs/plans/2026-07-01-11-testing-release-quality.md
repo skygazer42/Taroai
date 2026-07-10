@@ -6,7 +6,7 @@
 
 **Architecture:** Tests should match service boundaries. Backend uses pytest with Pydantic contract tests; frontend uses component and Playwright tests; deployment uses Docker/Kubernetes validation; release gates run in CI before merge/deploy.
 
-**Tech Stack:** pytest, FastAPI TestClient, Docker, GitHub Actions or equivalent CI, optional coverage tooling, future Playwright/Next.js test runner only after final frontend approval.
+**Tech Stack:** pytest, FastAPI TestClient, Docker, GitHub Actions or equivalent CI, optional coverage tooling, static frontend contract tests now, and Playwright/Next.js test runner later if the full portal moves to that stack.
 
 ---
 
@@ -83,17 +83,17 @@ Current backend has pytest coverage for API foundation, agent runtime, storage, 
 
 **Steps:**
 
-1. Document final-phase tests for `data-testid="chat-column"`.
-2. Document final-phase tests for Enter sends and Shift+Enter inserts newline.
-3. Document final-phase tests for run event stream timeline updates.
-4. Document final-phase tests for approval controls.
-5. Document final-phase mobile and desktop layout screenshot requirements.
-6. Do not create frontend test files until the user approves the final frontend phase.
+1. Add static contract tests for `data-testid="chat-column"`.
+2. Add static contract tests for Enter sends and Shift+Enter inserts newline.
+3. Add static contract tests for run event stream endpoint usage.
+4. Add static contract tests for approval controls.
+5. Document later mobile and desktop layout screenshot requirements.
+6. Add Playwright only when the frontend test stack is approved.
 
 **Acceptance Criteria:**
 
-- CREAO-compatible chat column requirements are protected by a contract.
-- Frontend implementation remains deferred until final-phase approval.
+- CREAO-compatible chat column requirements are protected by a contract test.
+- The static workspace slice has lightweight tests; full browser automation remains later.
 
 ## Task 5: CI Pipeline
 
@@ -144,7 +144,7 @@ python -m pytest -q
 python -m pytest -m "not requires_external" -q
 ```
 
-When the final frontend phase is explicitly approved and a web app exists:
+When the full frontend stack is approved:
 
 ```bash
 cd apps/web

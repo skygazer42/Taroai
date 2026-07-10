@@ -1,10 +1,10 @@
 import json
-import sqlite3
 from datetime import datetime
 
 from pydantic import BaseModel
 
 from taroai.db import DatabaseConfig
+from taroai.db.connection import connect_database
 from taroai.domain import utc_now
 from taroai.knowledge.models import (
     DocumentChunk,
@@ -59,6 +59,55 @@ class SqlKnowledgeService(BaseModel):
             )
         return knowledge_base
 
+    def list_bases_for_tenant(self, tenant_id: str) -> list[KnowledgeBase]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM knowledge_bases
+                WHERE tenant_id = ?
+                ORDER BY created_at, id
+                """,
+                (tenant_id,),
+            ).fetchall()
+        return [self._base_from_row(row) for row in rows]
+
+    def list_bases_for_workspace(self, tenant_id: str, workspace_id: str) -> list[KnowledgeBase]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM knowledge_bases
+                WHERE tenant_id = ? AND workspace_id = ?
+                ORDER BY created_at, id
+                """,
+                (tenant_id, workspace_id),
+            ).fetchall()
+        return [self._base_from_row(row) for row in rows]
+
+    def list_documents(
+        self,
+        tenant_id: str,
+        knowledge_base_id: str | None = None,
+        workspace_id: str | None = None,
+    ) -> list[KnowledgeDocument]:
+        clauses = ["tenant_id = ?"]
+        params = [tenant_id]
+        if knowledge_base_id is not None:
+            clauses.append("knowledge_base_id = ?")
+            params.append(knowledge_base_id)
+        if workspace_id is not None:
+            clauses.append("workspace_id = ?")
+            params.append(workspace_id)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM knowledge_documents
+                WHERE {' AND '.join(clauses)}
+                ORDER BY created_at, id
+                """,
+                params,
+            ).fetchall()
+        return [self._document_from_row(row) for row in rows]
+
     def register_document(self, request: KnowledgeDocumentCreate) -> KnowledgeDocument:
         knowledge_base = self._get_base(request.tenant_id, request.knowledge_base_id)
         if knowledge_base.workspace_id != request.workspace_id:
@@ -76,6 +125,10 @@ class SqlKnowledgeService(BaseModel):
                 citation=chunk.citation,
                 acl_subjects=document.acl_subjects,
                 sensitivity_level=document.sensitivity_level,
+                embedding=chunk.embedding,
+                embedding_model=chunk.embedding_model,
+                embedding_provider=chunk.embedding_provider,
+                embedded_at=chunk.embedded_at,
             )
             for chunk in request.chunks
         ]
@@ -122,9 +175,10 @@ class SqlKnowledgeService(BaseModel):
                     INSERT INTO knowledge_chunks (
                         id, tenant_id, workspace_id, knowledge_base_id, document_id,
                         source_document_id, source_uri, content, citation,
-                        acl_subjects, sensitivity_level, created_at
+                        acl_subjects, sensitivity_level, embedding_vector,
+                        embedding_model, embedding_provider, embedded_at, created_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         chunk.id,
@@ -138,6 +192,10 @@ class SqlKnowledgeService(BaseModel):
                         self._json(chunk.citation),
                         self._json(chunk.acl_subjects),
                         chunk.sensitivity_level,
+                        self._json(chunk.embedding),
+                        chunk.embedding_model,
+                        chunk.embedding_provider,
+                        self._dt(chunk.embedded_at) if chunk.embedded_at is not None else None,
                         self._dt(chunk.created_at),
                     ),
                 )
@@ -230,11 +288,7 @@ class SqlKnowledgeService(BaseModel):
         return self._document_from_row(row)
 
     def _connect(self):
-        path = self.config.sqlite_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(path)
-        connection.row_factory = sqlite3.Row
-        return connection
+        return connect_database(self.config)
 
     def _ensure_tenant(self, connection, tenant_id: str) -> None:
         connection.execute(
@@ -290,19 +344,29 @@ class SqlKnowledgeService(BaseModel):
             citation=self._loads(row["citation"]),
             acl_subjects=self._loads(row["acl_subjects"]),
             sensitivity_level=row["sensitivity_level"],
+            embedding=self._loads(row["embedding_vector"]),
+            embedding_model=row["embedding_model"],
+            embedding_provider=row["embedding_provider"],
+            embedded_at=(
+                self._parse_dt(row["embedded_at"]) if row["embedded_at"] is not None else None
+            ),
             created_at=self._parse_dt(row["created_at"]),
         )
 
     def _json(self, value) -> str:
         return json.dumps(value, separators=(",", ":"))
 
-    def _loads(self, value: str | None):
+    def _loads(self, value):
         if value is None:
             return []
+        if not isinstance(value, str):
+            return value
         return json.loads(value)
 
     def _dt(self, value: datetime) -> str:
         return value.isoformat()
 
-    def _parse_dt(self, value: str) -> datetime:
+    def _parse_dt(self, value: datetime | str) -> datetime:
+        if isinstance(value, datetime):
+            return value
         return datetime.fromisoformat(value)

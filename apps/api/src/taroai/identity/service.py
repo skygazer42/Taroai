@@ -9,6 +9,8 @@ from taroai.identity.models import (
     RoleAssignment,
     UserAccount,
     UserAccountCreate,
+    UserAccountStatus,
+    normalize_email,
 )
 from taroai.store import NotFoundError, TenantAccessError
 
@@ -51,19 +53,57 @@ class InMemoryIdentityService(BaseModel):
         return self.password_hasher.verify_password(password, account.password_hash)
 
     def disable_user(self, tenant_id: str, user_id: str) -> UserAccount:
+        return self._set_user_status(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            status="disabled",
+            event_type="identity.user.disabled",
+        )
+
+    def mark_user_pending(self, tenant_id: str, user_id: str) -> UserAccount:
+        return self._set_user_status(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            status="pending",
+            event_type="identity.user.pending",
+        )
+
+    def activate_user(self, tenant_id: str, user_id: str) -> UserAccount:
+        return self._set_user_status(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            status="active",
+            event_type="identity.user.activated",
+        )
+
+    def delete_user(self, tenant_id: str, user_id: str) -> UserAccount:
+        return self._set_user_status(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            status="deleted",
+            event_type="identity.user.deleted",
+        )
+
+    def _set_user_status(
+        self,
+        tenant_id: str,
+        user_id: str,
+        status: UserAccountStatus,
+        event_type: str,
+    ) -> UserAccount:
         account = self.get_user(tenant_id, user_id)
-        disabled = account.model_copy(update={"status": "disabled"})
-        self.users[user_id] = disabled
+        updated = account.model_copy(update={"status": status})
+        self.users[user_id] = updated
         self._record_audit_event(
             tenant_id=tenant_id,
             user_id=user_id,
-            event_type="identity.user.disabled",
+            event_type=event_type,
             metadata={
                 "user_id": user_id,
-                "status": disabled.status,
+                "status": updated.status,
             },
         )
-        return disabled
+        return updated
 
     def get_user_by_email(self, tenant_id: str, email: str) -> UserAccount:
         user_id = self.user_ids_by_tenant_email.get(self._tenant_email_key(tenant_id, email))
@@ -116,7 +156,9 @@ class InMemoryIdentityService(BaseModel):
         return role
 
     def has_permission(self, tenant_id: str, user_id: str, action: str, resource: str) -> bool:
-        self.get_user(tenant_id, user_id)
+        account = self.get_user(tenant_id, user_id)
+        if account.status != "active":
+            return False
         assigned_role_ids = self.list_role_ids_for_user(tenant_id, user_id)
         roles = [self.get_role(tenant_id, role_id) for role_id in assigned_role_ids]
         return any(
@@ -134,7 +176,7 @@ class InMemoryIdentityService(BaseModel):
         ]
 
     def _tenant_email_key(self, tenant_id: str, email: str) -> str:
-        return f"{tenant_id}:{email.lower()}"
+        return f"{tenant_id}:{normalize_email(email)}"
 
     def _tenant_role_key(self, tenant_id: str, role_id: str) -> str:
         return f"{tenant_id}:{role_id}"

@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 from taroai.api.errors import ApiExceptionManager, ApiExceptionRule
 from taroai.app import create_app
+from taroai.connectors import ConnectorAccessDeniedError, ConnectorNotFoundError
 from taroai.store import TenantAccessError
 from taroai.tool_gateway import ToolApprovalRequiredError, ToolExecutionError
 
@@ -67,6 +68,28 @@ def test_exception_manager_maps_tool_gateway_errors_to_one_response_shape():
     assert json.loads(approval_response.body) == {
         "code": "tool_approval_required",
         "message": "approval required",
+        "retryable": False,
+        "details": {},
+    }
+
+
+def test_exception_manager_maps_connector_errors_to_one_response_shape():
+    manager = ApiExceptionManager()
+
+    denied_response = manager.to_response(ConnectorAccessDeniedError("connector is not in tenant"))
+    missing_response = manager.to_response(ConnectorNotFoundError("connector not found"))
+
+    assert denied_response.status_code == 403
+    assert json.loads(denied_response.body) == {
+        "code": "tenant_access_denied",
+        "message": "tenant access denied",
+        "retryable": False,
+        "details": {},
+    }
+    assert missing_response.status_code == 404
+    assert json.loads(missing_response.body) == {
+        "code": "not_found",
+        "message": "not found",
         "retryable": False,
         "details": {},
     }

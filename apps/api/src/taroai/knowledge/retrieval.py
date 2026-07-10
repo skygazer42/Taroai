@@ -1,4 +1,5 @@
 import re
+from math import sqrt
 
 from taroai.knowledge.models import DocumentChunk, RetrievalRequest, RetrievalResult
 
@@ -9,7 +10,7 @@ def retrieve_chunks(chunks: list[DocumentChunk], request: RetrievalRequest) -> l
     for chunk in chunks:
         if not _can_read(chunk, request):
             continue
-        score = _score(query_terms, chunk.content)
+        score = _score_chunk(request, query_terms, chunk)
         if score <= 0:
             continue
         results.append(
@@ -21,6 +22,7 @@ def retrieve_chunks(chunks: list[DocumentChunk], request: RetrievalRequest) -> l
                 excerpt=chunk.content[:240],
                 score=score,
                 citation=chunk.citation,
+                sensitivity_level=chunk.sensitivity_level,
             )
         )
     return sorted(results, key=lambda result: result.score, reverse=True)[: request.limit]
@@ -38,12 +40,36 @@ def _can_read(chunk: DocumentChunk, request: RetrievalRequest) -> bool:
     return bool(set(chunk.acl_subjects) & set(request.acl_subjects))
 
 
-def _score(query_terms: set[str], content: str) -> float:
+def _score_chunk(
+    request: RetrievalRequest,
+    query_terms: set[str],
+    chunk: DocumentChunk,
+) -> float:
+    if request.query_embedding and chunk.embedding:
+        return _cosine_similarity(request.query_embedding, chunk.embedding)
+    return _term_score(query_terms, chunk.content)
+
+
+def _term_score(query_terms: set[str], content: str) -> float:
     if not query_terms:
         return 0
     content_terms = _terms(content)
     matches = query_terms & content_terms
     return len(matches) / len(query_terms)
+
+
+def _cosine_similarity(query_embedding: list[float], chunk_embedding: list[float]) -> float:
+    if len(query_embedding) != len(chunk_embedding):
+        return 0
+    query_norm = sqrt(sum(value * value for value in query_embedding))
+    chunk_norm = sqrt(sum(value * value for value in chunk_embedding))
+    if query_norm == 0 or chunk_norm == 0:
+        return 0
+    score = sum(
+        query_value * chunk_value
+        for query_value, chunk_value in zip(query_embedding, chunk_embedding)
+    ) / (query_norm * chunk_norm)
+    return max(0, score)
 
 
 def _terms(value: str) -> set[str]:

@@ -1,7 +1,10 @@
 from fastapi.testclient import TestClient
 
+from taroai.agent import AgentRuntime
 from taroai.app import create_app
 from taroai.config import Settings
+from taroai.model_gateway import PlannedToolCall
+from taroai.store import InMemoryControlPlaneStore
 from taroai.identity import (
     InMemoryIdentityService,
     PasswordHasher,
@@ -10,6 +13,8 @@ from taroai.identity import (
     UserAccountCreate,
 )
 from taroai.skills import InMemorySkillRegistry, SkillManifest
+from taroai.tool_gateway import ToolPolicy, ToolResult
+from tests.api.adapters import DeterministicModelGateway, DeterministicToolGateway
 
 
 def create_skill_admin_identity():
@@ -31,7 +36,10 @@ def create_skill_admin_identity():
                 Permission(action="skills.read", resource="tenant:tenant_acme"),
                 Permission(action="skills.publish", resource="tenant:tenant_acme"),
                 Permission(action="skills.install", resource="tenant:tenant_acme"),
+                Permission(action="skills.invoke", resource="tenant:tenant_acme"),
+                Permission(action="crm.read", resource="tenant:tenant_acme"),
                 Permission(action="audit.read", resource="tenant:tenant_acme"),
+                Permission(action="billing.read", resource="tenant:tenant_acme"),
             ],
         )
     )
@@ -61,6 +69,46 @@ def skill_manifest_payload() -> dict:
         "runtime": {"sandbox": "api", "timeout_seconds": 60},
         "billing_meters": ["tool_call_count"],
     }
+
+
+def workflow_skill_manifest_payload() -> dict:
+    return {
+        "id": "sales.renewal_brief",
+        "version": "1.0.0",
+        "name": "Renewal Brief",
+        "description": "Prepare a renewal brief from account context.",
+        "type": "workflow_skill",
+        "owner": "solutions/sales",
+        "input_schema": {
+            "type": "object",
+            "required": ["account_id"],
+            "properties": {"account_id": {"type": "string"}},
+        },
+        "output_schema": {
+            "type": "object",
+            "required": ["run_id", "status"],
+            "properties": {
+                "run_id": {"type": "string"},
+                "status": {"type": "string"},
+            },
+        },
+        "required_scopes": ["crm.read"],
+        "runtime": {"sandbox": "workflow", "timeout_seconds": 120},
+        "billing_meters": ["skill_call_count"],
+    }
+
+
+def login_skill_admin(client: TestClient) -> dict[str, str]:
+    login = client.post(
+        "/api/auth/login",
+        json={
+            "tenant_id": "tenant_acme",
+            "email": "admin@example.com",
+            "password": "correct horse battery staple",
+        },
+    )
+    assert login.status_code == 200
+    return {"Authorization": f"Bearer {login.json()['access_token']}"}
 
 
 def create_skill_admin_with_user(
@@ -537,3 +585,308 @@ def test_skill_api_installs_and_toggles_workspace_skill():
     assert enabled.json()["status"] == "enabled"
     assert [item["skill_id"] for item in listed.json()] == ["sales.crm_lookup"]
     assert listed.json()[0]["workspace_id"] == "workspace_sales"
+
+
+def test_workspace_skill_invoke_executes_installed_enabled_skill_through_tool_gateway():
+    identity, account = create_skill_admin_identity()
+    app = create_app(
+        identity_service=identity,
+        skill_registry=InMemorySkillRegistry(),
+        settings=Settings(_env_file=None),
+    )
+    app.state.runtime.tool_gateway.register_tool(
+        ToolPolicy(
+            tool_name="sales.crm_lookup",
+            required_scopes=[],
+            input_schema=skill_manifest_payload()["input_schema"],
+            output_schema=skill_manifest_payload()["output_schema"],
+        ),
+        handler=lambda request: ToolResult(
+            tool_name=request.tool_name,
+            output={
+                "account": {
+                    "id": request.tool_input["account_id"],
+                    "name": "Acme",
+                }
+            },
+        ),
+    )
+    client = TestClient(app)
+    headers = {"X-Tenant-ID": "tenant_acme", "X-User-ID": account.id}
+    client.post("/api/skills", headers=headers, json=skill_manifest_payload())
+    client.post("/api/skills/sales.crm_lookup/publish", headers=headers)
+    client.post(
+        "/api/workspaces/workspace_sales/skills/sales.crm_lookup/install",
+        headers=headers,
+    )
+
+    response = client.post(
+        "/api/workspaces/workspace_sales/skills/sales.crm_lookup/invoke",
+        headers=headers,
+        json={"input": {"account_id": "acct_123"}},
+    )
+    audit_events = client.get(
+        "/api/audit-events?event_type=skill.invoked",
+        headers=headers,
+    )
+    meters = client.get("/api/billing/meters", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "skill_id": "sales.crm_lookup",
+        "tool_name": "sales.crm_lookup",
+        "output": {"account": {"id": "acct_123", "name": "Acme"}},
+    }
+    assert [event["event_type"] for event in audit_events.json()] == ["skill.invoked"]
+    audit_metadata = audit_events.json()[0]["metadata"]
+    assert audit_metadata["skill_id"] == "sales.crm_lookup"
+    assert audit_metadata["tool_name"] == "sales.crm_lookup"
+    assert audit_metadata["workspace_id"] == "workspace_sales"
+    assert audit_metadata["input_keys"] == ["account_id"]
+    assert audit_metadata["output_keys"] == ["account"]
+    assert audit_metadata["actor"]["actor_type"] == "user"
+    assert audit_metadata["actor"]["user_id"] == account.id
+    skill_meters = [
+        meter for meter in meters.json() if meter["meter_type"] == "skill_call_count"
+    ]
+    assert len(skill_meters) == 1
+    assert skill_meters[0]["skill_id"] == "sales.crm_lookup"
+    assert skill_meters[0]["metadata"]["tool_name"] == "sales.crm_lookup"
+
+
+def test_skill_invoke_accepts_bearer_auth_when_dev_headers_are_disabled():
+    identity, _account = create_skill_admin_identity()
+    app = create_app(
+        identity_service=identity,
+        skill_registry=InMemorySkillRegistry(),
+        settings=Settings(
+            dev_request_headers_enabled=False,
+            access_token_secret="unit_test_secret",
+            _env_file=None,
+        ),
+    )
+    app.state.runtime.tool_gateway.register_tool(
+        ToolPolicy(
+            tool_name="sales.crm_lookup",
+            required_scopes=[],
+            input_schema=skill_manifest_payload()["input_schema"],
+            output_schema=skill_manifest_payload()["output_schema"],
+        ),
+        handler=lambda request: ToolResult(
+            tool_name=request.tool_name,
+            output={
+                "account": {
+                    "id": request.tool_input["account_id"],
+                    "name": "Acme",
+                }
+            },
+        ),
+    )
+    client = TestClient(app)
+    headers = login_skill_admin(client)
+    client.post("/api/skills", headers=headers, json=skill_manifest_payload())
+    client.post("/api/skills/sales.crm_lookup/publish", headers=headers)
+    client.post(
+        "/api/workspaces/workspace_sales/skills/sales.crm_lookup/install",
+        headers=headers,
+    )
+
+    response = client.post(
+        "/api/workspaces/workspace_sales/skills/sales.crm_lookup/invoke",
+        headers=headers,
+        json={"input": {"account_id": "acct_123"}},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["output"] == {
+        "account": {
+            "id": "acct_123",
+            "name": "Acme",
+        }
+    }
+
+
+def test_workflow_skill_invoke_starts_agent_run_without_registered_tool_handler():
+    identity, _account = create_skill_admin_identity()
+    store = InMemoryControlPlaneStore()
+    runtime = AgentRuntime(
+        store=store,
+        model_gateway=DeterministicModelGateway(
+            plan=[
+                PlannedToolCall(
+                    id="step_prepare_brief",
+                    title="Prepare renewal brief",
+                    tool_name="workspace.note",
+                    tool_input={"account_id": "acct_123"},
+                )
+            ]
+        ),
+        tool_gateway=DeterministicToolGateway(),
+    )
+    client = TestClient(
+        create_app(
+            store=store,
+            runtime=runtime,
+            identity_service=identity,
+            skill_registry=InMemorySkillRegistry(),
+            settings=Settings(
+                dev_request_headers_enabled=False,
+                access_token_secret="unit_test_secret",
+                _env_file=None,
+            ),
+        )
+    )
+    headers = login_skill_admin(client)
+    client.post("/api/skills", headers=headers, json=workflow_skill_manifest_payload())
+    client.post("/api/skills/sales.renewal_brief/publish", headers=headers)
+    client.post(
+        "/api/workspaces/workspace_sales/skills/sales.renewal_brief/install",
+        headers=headers,
+    )
+    listed = client.get(
+        "/api/workspaces/workspace_sales/skills",
+        headers=headers,
+    )
+
+    response = client.post(
+        "/api/workspaces/workspace_sales/skills/sales.renewal_brief/invoke",
+        headers=headers,
+        json={"input": {"account_id": "acct_123"}},
+    )
+
+    skill_installation = listed.json()[0]
+    assert skill_installation["invocation_mode"] == "agent_workflow"
+    assert skill_installation["invocation_ready"] is True
+    assert skill_installation["missing_required_scopes"] == []
+    assert response.status_code == 200
+    body = response.json()
+    assert body["skill_id"] == "sales.renewal_brief"
+    assert body["tool_name"] == "agent.workflow"
+    assert body["output"]["run_id"].startswith("run_")
+    assert body["output"]["status"] == "succeeded"
+    assert body["run_id"] == body["output"]["run_id"]
+    events = store.list_run_events("tenant_acme", body["run_id"])
+    assert "skill.workflow_invoked" in [event.type for event in events]
+
+
+def test_workspace_skill_invoke_rejects_disabled_or_missing_workspace_installation():
+    identity, account = create_skill_admin_identity()
+    app = create_app(
+        identity_service=identity,
+        skill_registry=InMemorySkillRegistry(),
+        settings=Settings(_env_file=None),
+    )
+    app.state.runtime.tool_gateway.register_tool(
+        ToolPolicy(
+            tool_name="sales.crm_lookup",
+            required_scopes=[],
+            input_schema=skill_manifest_payload()["input_schema"],
+            output_schema=skill_manifest_payload()["output_schema"],
+        ),
+        handler=lambda request: ToolResult(
+            tool_name=request.tool_name,
+            output={"account": {"id": request.tool_input["account_id"]}},
+        ),
+    )
+    client = TestClient(app)
+    headers = {"X-Tenant-ID": "tenant_acme", "X-User-ID": account.id}
+    client.post("/api/skills", headers=headers, json=skill_manifest_payload())
+    client.post("/api/skills/sales.crm_lookup/publish", headers=headers)
+
+    missing_installation = client.post(
+        "/api/workspaces/workspace_sales/skills/sales.crm_lookup/invoke",
+        headers=headers,
+        json={"input": {"account_id": "acct_123"}},
+    )
+    client.post(
+        "/api/workspaces/workspace_sales/skills/sales.crm_lookup/install",
+        headers=headers,
+    )
+    client.post(
+        "/api/workspaces/workspace_sales/skills/sales.crm_lookup/disable",
+        headers=headers,
+    )
+    disabled_installation = client.post(
+        "/api/workspaces/workspace_sales/skills/sales.crm_lookup/invoke",
+        headers=headers,
+        json={"input": {"account_id": "acct_123"}},
+    )
+
+    assert missing_installation.status_code == 404
+    assert missing_installation.json()["code"] == "not_found"
+    assert disabled_installation.status_code == 403
+    assert disabled_installation.json()["code"] == "tenant_access_denied"
+
+
+def test_workspace_skill_invoke_enforces_manifest_required_scopes():
+    identity, account = create_skill_admin_identity()
+    identity.roles["tenant_acme:role_skill_admin"] = identity.roles[
+        "tenant_acme:role_skill_admin"
+    ].model_copy(
+        update={
+            "permissions": [
+                permission
+                for permission in identity.roles[
+                    "tenant_acme:role_skill_admin"
+                ].permissions
+                if permission.action != "crm.read"
+            ]
+        }
+    )
+    app = create_app(
+        identity_service=identity,
+        skill_registry=InMemorySkillRegistry(),
+        settings=Settings(_env_file=None),
+    )
+    app.state.runtime.tool_gateway.register_tool(
+        ToolPolicy(
+            tool_name="sales.crm_lookup",
+            required_scopes=[],
+            input_schema=skill_manifest_payload()["input_schema"],
+            output_schema=skill_manifest_payload()["output_schema"],
+        ),
+        handler=lambda request: ToolResult(
+            tool_name=request.tool_name,
+            output={"account": {"id": request.tool_input["account_id"]}},
+        ),
+    )
+    client = TestClient(app)
+    headers = {"X-Tenant-ID": "tenant_acme", "X-User-ID": account.id}
+    client.post("/api/skills", headers=headers, json=skill_manifest_payload())
+    client.post("/api/skills/sales.crm_lookup/publish", headers=headers)
+    client.post(
+        "/api/workspaces/workspace_sales/skills/sales.crm_lookup/install",
+        headers=headers,
+    )
+
+    response = client.post(
+        "/api/workspaces/workspace_sales/skills/sales.crm_lookup/invoke",
+        headers=headers,
+        json={"input": {"account_id": "acct_123"}},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "tenant_access_denied"
+
+
+def test_workspace_skill_invoke_requires_auth_when_dev_request_headers_are_disabled():
+    identity, account = create_skill_admin_identity()
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            skill_registry=InMemorySkillRegistry(),
+            settings=Settings(
+                dev_request_headers_enabled=False,
+                _env_file=None,
+            ),
+        )
+    )
+
+    response = client.post(
+        "/api/workspaces/workspace_sales/skills/sales.crm_lookup/invoke",
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": account.id},
+        json={"input": {"account_id": "acct_123"}},
+    )
+
+    assert response.status_code == 401
+    assert response.json()["code"] == "auth_required"

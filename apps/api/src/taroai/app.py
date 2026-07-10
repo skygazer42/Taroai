@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import json
 from collections.abc import Iterator
 from datetime import datetime, timezone
@@ -5,11 +7,22 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Body, Depends, FastAPI, Header, Query, Request, Response, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from taroai.agent import AgentRuntime
 from taroai.api import ApiExceptionManager
+from taroai.api.idempotency import (
+    build_idempotency_request,
+    find_idempotent_replay,
+    save_idempotent_response,
+)
+from taroai.api.pagination import (
+    PageRequest,
+    SortDirection,
+    paginate_created_at_records,
+)
 from taroai.auth import (
     AuthLoginRequest,
     AuthRequiredError,
@@ -26,13 +39,69 @@ from taroai.audit import (
 )
 from taroai.billing import (
     BillingAnalyticsService,
+    BillingInvoiceGroupBy,
+    BillingInvoiceQuery,
+    BillingInvoiceRecord,
+    BillingInvoiceService,
+    BillingInvoiceStore,
     BillingMeterQuery,
+    BillingPricingRule,
+    BillingPricingRuleApiUpsert,
+    BillingPricingRuleStore,
+    BillingPricingService,
     BillingSummaryGroupBy,
     BillingSummaryQuery,
+    InMemoryBillingInvoiceStore,
+    InMemoryBillingPricingRuleStore,
+    SqlBillingInvoiceStore,
+    SqlBillingPricingRuleStore,
 )
-from taroai.config import Settings, load_settings
-from taroai.db import DatabaseConfig, MigrationRunner, SqlControlPlaneRepository
-from taroai.domain import RunCreate, RunStatus, utc_now
+from taroai.config import ENTERPRISE_SANDBOX_PROVIDERS, Settings, load_settings
+from taroai.connectors import (
+    ConnectorCreateRequest,
+    ConnectorDefinition,
+    ConnectorDispatchError,
+    ConnectorDispatchResult,
+    ConnectorDispatchService,
+    ConnectorInvocationCreate,
+    ConnectorInvocationDecision,
+    ConnectorInvocationService,
+    ConnectorInvocationStatus,
+    ConnectorOAuthCallbackRequest,
+    ConnectorOAuthService,
+    ConnectorStatus,
+    ConnectorSyncJob,
+    ConnectorSyncJobCreate,
+    ConnectorSyncStateUpdate,
+    ConnectorSyncStatus,
+    ConnectorUpdateRequest,
+    InMemoryConnectorRegistry,
+    SqlConnectorRegistry,
+)
+from taroai.customer_success import (
+    CustomerFeedbackCreate,
+    FeedbackCandidateStatus,
+    InMemoryCustomerFeedbackService,
+    InMemoryCustomerSuccessService,
+    SqlCustomerFeedbackService,
+)
+from taroai.db import MigrationRunner, SqlControlPlaneRepository, close_database_pools
+from taroai.domain import (
+    ApprovalRequest,
+    ApprovalStatus,
+    RunCreate,
+    RunMode,
+    RunStatus,
+    new_id,
+    utc_now,
+)
+from taroai.embeddings import (
+    EmbeddingGateway,
+    EmbeddingGatewayRequest,
+    EmbeddingUsageRecord,
+    EmbeddingUsageRecorder,
+    OpenAICompatibleEmbeddingGateway,
+)
 from taroai.guardrails import (
     GuardrailAction,
     GuardrailHttpDetector,
@@ -42,8 +111,10 @@ from taroai.guardrails import (
     InMemoryGuardrailService,
 )
 from taroai.knowledge import (
+    DocumentChunkCreate,
     InMemoryKnowledgeService,
     KnowledgeBaseCreate,
+    chunk_text_content,
     KnowledgeDocumentApiCreate,
     KnowledgeDocumentCreate,
     KnowledgeQueryRequest,
@@ -62,12 +133,23 @@ from taroai.lifecycle import (
     DataResidencyReportRequest,
     DataResidencyService,
     InMemoryLifecyclePolicyStore,
+    InMemoryRestoreDrillScheduleStore,
     InMemoryTenantOffboardingStore,
     LegalHoldApiCreate,
     LegalHoldCreate,
     LegalHoldScopeType,
     LifecyclePolicyApiUpsert,
     LifecyclePolicyCreate,
+    RestoreDrillEvidenceValidationRequest,
+    RestoreDrillRunEvidenceApiCreate,
+    RestoreDrillRunExecutionApiCreate,
+    RestoreDrillRunRecordApiUpdate,
+    RestoreDrillRunStatus,
+    RestoreDrillScheduleApiCreate,
+    RestoreDrillScheduleApiUpdate,
+    RestoreDrillScheduleCreate,
+    RestoreDrillScheduleStore,
+    SqlRestoreDrillScheduleStore,
     SqlLifecyclePolicyStore,
     SqlTenantOffboardingStore,
     TenantOffboardingApprovalRequest,
@@ -79,6 +161,17 @@ from taroai.lifecycle import (
     TenantOffboardingService,
     TenantOffboardingState,
     TenantOffboardingTransitionError,
+    require_restore_drill_verification_result_ready,
+    restore_drill_evidence_content,
+    restore_drill_evidence_filename,
+    validate_restore_drill_evidence_object,
+)
+from taroai.licensing import (
+    LicenseImportRequest,
+    LicenseImportResponse,
+    LicenseService,
+    LicenseStatus,
+    LicensedFeature,
 )
 from taroai.memory import (
     GuardedLongTermMemoryService,
@@ -98,13 +191,32 @@ from taroai.memory import (
     SqlShortTermMemoryReviewStore,
 )
 from taroai.model_gateway import (
+    InMemoryModelProviderStore,
     InMemoryModelPolicyStore,
     ModelBudgetGuard,
     ModelBudgetPolicy,
+    ModelGateway,
+    ModelGatewayRouter,
+    ModelProviderApiUpsert,
+    ModelProviderChangeRequestApiCreate,
+    ModelProviderChangeRequestRecord,
+    ModelPolicyChangeRequestApiCreate,
+    ModelPolicyChangeRequestRecord,
     ModelPolicyScopeApiUpsert,
     ModelPolicyStore,
     ModelPolicy,
+    ModelPolicyVersionRecord,
+    ModelProviderCredentialRotateRequest,
+    ModelProviderConfig,
+    ModelProviderRateLimiter,
+    ModelProviderRecord,
+    ModelProviderRegistry,
+    ModelProviderStore,
+    ModelProviderVersionRecord,
     OpenAICompatibleModelGateway,
+    RedisModelProviderRateLimitStore,
+    SqlModelProviderRateLimitStore,
+    SqlModelProviderStore,
     SqlModelPolicyStore,
 )
 from taroai.observability import OtlpHttpTraceExporter, RunTraceService
@@ -119,6 +231,8 @@ from taroai.sandbox import (
     BrowserAction,
     BrowserActionRequest,
     BrowserController,
+    HttpBrowserController,
+    LocalProcessSandboxAdapter,
     SandboxAdapter,
     SandboxCommand,
     SandboxCommandRequest,
@@ -129,10 +243,52 @@ from taroai.sandbox import (
     SandboxNetworkMode,
     SandboxSessionCreateRequest,
     SandboxSessionStatus,
-    register_browser_tool_handlers,
-    register_sandbox_tool_handlers,
+    build_sandbox_adapter,
 )
-from taroai.skills import InMemorySkillRegistry, SkillManifest, SqlSkillRegistry
+from taroai.sandbox.tools import register_browser_tool_handlers, register_sandbox_tool_handlers
+from taroai.scim import (
+    InMemoryScimProvisioningStore,
+    ScimGroupRoleMapping,
+    ScimImportRequest,
+    ScimProviderCreate,
+    ScimProvisioningService,
+    SqlScimProvisioningStore,
+)
+from taroai.secrets import (
+    SecretLeaseResolveRequest,
+    SecretService,
+    build_secret_service_from_settings,
+)
+from taroai.sharing import (
+    InMemoryShareGrantStore,
+    ShareGrantApiCreate,
+    ShareGrantRevokeRequest,
+    ShareGrantStore,
+    ShareResourceType,
+    ShareSubjectType,
+    SqlShareGrantStore,
+    share_grant_audit_metadata,
+)
+from taroai.skills import (
+    InMemorySkillRegistry,
+    SkillInstallationStatus,
+    SkillManifest,
+    SkillStatus,
+    SkillType,
+    SqlSkillRegistry,
+)
+from taroai.solution_packs import (
+    InMemorySolutionPackRegistry,
+    SolutionPackInstallRequest,
+    SolutionPackManifest,
+    SolutionPackService,
+    SqlSolutionPackRegistry,
+)
+from taroai.sso import (
+    InMemorySsoProviderRegistry,
+    SqlSsoProviderRegistry,
+    SsoProviderCreate,
+)
 from taroai.storage import (
     InMemoryStorageCatalog,
     ObjectStorageAdapter,
@@ -150,15 +306,41 @@ from taroai.storage import (
     StorageSignedUrlCreate,
     storage_object_audit_metadata,
 )
-from taroai.tool_gateway import ToolGateway
+from taroai.tool_gateway import ToolExecutionError, ToolGateway, ToolGatewayRequest
+from taroai.triggers import (
+    AgentHandoffRequest,
+    AgentHandoffResponse,
+    ConnectorEvent,
+    ConnectorEventIngestRequest,
+    ConnectorEventIngestResponse,
+    ConnectorEventIngestRun,
+    InMemoryTriggerStore,
+    SqlTriggerStore,
+    TriggerCreateRequest,
+    TriggerDefinitionCreate,
+    TriggerDisabledError,
+    TriggerInvokeRequest,
+    TriggerInvokeResponse,
+    TriggerOperationsService,
+    TriggerService,
+    TriggerType,
+    TriggerWebhookVerifier,
+    assert_agent_handoff_allowed,
+    match_connector_event_triggers,
+)
 from taroai.store import InMemoryControlPlaneStore, NotFoundError, TenantAccessError
 from taroai.workers import (
     JobQueue,
     JobType,
     RedisJobQueue,
     RedisQueueConfigurationError,
+    RestoreDrillExecutionJob,
     RunExecutionJob,
 )
+
+
+SANDBOX_SECRET_RESOLVER_TOKEN_HEADER = "X-Sandbox-Resolver-Token"
+AGENT_RUN_SKILL_TYPES = {SkillType.WORKFLOW, SkillType.AGENT_TEMPLATE}
 
 
 class RequestContext(BaseModel):
@@ -170,6 +352,12 @@ class RunExecutionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class SkillInvokeRequest(BaseModel):
+    input: dict[str, Any] = Field(default_factory=dict)
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class RunQueuedResponse(BaseModel):
     run_id: str
     job_id: str
@@ -177,9 +365,133 @@ class RunQueuedResponse(BaseModel):
     queue: str
 
 
+def is_agent_run_skill(manifest: SkillManifest) -> bool:
+    return manifest.type in AGENT_RUN_SKILL_TYPES
+
+
+def build_agent_run_skill_message(
+    manifest: SkillManifest,
+    tool_input: dict[str, Any],
+) -> str:
+    return (
+        "Run the installed enterprise skill below through the agent runtime.\n\n"
+        f"Skill ID: {manifest.id}\n"
+        f"Skill name: {manifest.name}\n"
+        f"Skill description: {manifest.description}\n"
+        f"Expected output schema: {json.dumps(manifest.output_schema, sort_keys=True)}\n"
+        f"Input JSON: {json.dumps(tool_input, sort_keys=True)}"
+    )
+
+
+def skill_invocation_mode(manifest: SkillManifest) -> str:
+    if is_agent_run_skill(manifest):
+        return "agent_workflow"
+    return "tool_gateway"
+
+
+class RestoreDrillExecutionQueuedResponse(BaseModel):
+    schedule_id: str
+    run_record_id: str
+    job_id: str
+    status: str = "queued"
+    queue: str
+
+
+class ModelGatewayReadiness(BaseModel):
+    configured: bool
+    gateway_type: str
+    base_url: str | None = None
+    model: str | None = None
+    provider_count: int = Field(default=0, ge=0)
+    configured_provider_count: int = Field(default=0, ge=0)
+    provider_ids: list[str] = Field(default_factory=list)
+    configured_provider_ids: list[str] = Field(default_factory=list)
+    missing: list[str] = Field(default_factory=list)
+    model_source: str = "none"
+    credential_source: str = "none"
+
+
+class SandboxReadiness(BaseModel):
+    configured: bool
+    provider: str
+    controller_required: bool
+    controller_configured: bool
+    controller_endpoint_configured: bool
+    controller_auth_configured: bool
+    missing: list[str] = Field(default_factory=list)
+    capabilities_checked: bool | None = None
+    network_isolation_declared: bool | None = None
+    filesystem_isolation_declared: bool | None = None
+    resource_limits_declared: bool | None = None
+    destroy_supported_declared: bool | None = None
+    session_ttl_enforced_declared: bool | None = None
+    runtime_isolation_declared: bool | None = None
+    image_policy_enforced_declared: bool | None = None
+    allowed_image_count: int | None = None
+    max_session_ttl_seconds: int | None = None
+    max_sessions: int | None = None
+    max_sessions_per_tenant: int | None = None
+    max_sessions_per_run: int | None = None
+
+
+class BrowserReadiness(BaseModel):
+    configured: bool
+    provider: str
+    controller_required: bool
+    controller_configured: bool
+    controller_endpoint_configured: bool
+    controller_auth_configured: bool
+    missing: list[str] = Field(default_factory=list)
+    capabilities_checked: bool | None = None
+    auth_required_declared: bool | None = None
+    session_ttl_enforced_declared: bool | None = None
+    max_session_ttl_seconds: int | None = None
+    max_sessions: int | None = None
+    max_sessions_per_tenant: int | None = None
+    max_sessions_per_run: int | None = None
+    navigation_allowlist_enforced_declared: bool | None = None
+    navigation_allowed_host_count: int | None = None
+
+
+RUN_CREATE_METHOD = "POST"
+RUN_CREATE_PATH = "/api/runs"
+RUN_APPROVAL_METHOD = "POST"
+TRIGGER_WEBHOOK_METHOD = "POST"
+RESTORE_DRILL_EXECUTION_METHOD = "POST"
+PAGE_QUERY_PARAMETERS = {"limit", "cursor", "sort_direction"}
+
+
+def run_approval_path(run_id: str) -> str:
+    return f"/api/runs/{run_id}/approvals"
+
+
+def run_approval_reject_path(run_id: str) -> str:
+    return f"/api/runs/{run_id}/approvals/reject"
+
+
+def trigger_webhook_path(trigger_id: str) -> str:
+    return f"/api/triggers/{trigger_id}/webhook"
+
+
+def restore_drill_execution_path(schedule_id: str, run_record_id: str) -> str:
+    return (
+        f"/api/lifecycle/restore-drill-schedules/{schedule_id}"
+        f"/runs/{run_record_id}/execute"
+    )
+
+
 class RunCancelRequest(BaseModel):
     reason_code: str = Field(
         default="user_requested",
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z0-9_.-]+$",
+    )
+
+
+class RunRetryRequest(BaseModel):
+    reason_code: str = Field(
+        default="operator_retry",
         min_length=1,
         max_length=64,
         pattern=r"^[a-z0-9_.-]+$",
@@ -192,6 +504,32 @@ class ApprovalResolveRequest(BaseModel):
 
 class ApprovalRejectRequest(BaseModel):
     approval_id: str = Field(min_length=1)
+
+
+class CustomerSuccessCandidateCreate(BaseModel):
+    minimum_repeated_feedback: int = Field(default=3, ge=1)
+
+
+class CustomerSuccessCandidateReview(BaseModel):
+    status: FeedbackCandidateStatus
+    review_note: str | None = None
+
+
+class CustomerSuccessSolutionPackDraftUpdate(BaseModel):
+    requested_skill_name: str | None = Field(default=None, min_length=1)
+    proposed_change_summary: str | None = Field(default=None, min_length=1)
+    proposed_pack_version: str | None = Field(default=None, min_length=1)
+    proposed_skill_manifest: SkillManifest | None = None
+    proposed_skill_manifests: list[SkillManifest] | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class CustomerSuccessSolutionPackDraftReview(BaseModel):
+    status: str = Field(pattern="^(approved|rejected)$")
+    review_note: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class AuditEventQuery(BaseModel):
@@ -264,6 +602,32 @@ def get_billing_summary_query(
     )
 
 
+def get_billing_invoice_query(
+    period_start: datetime | None = None,
+    period_end: datetime | None = None,
+    group_by: BillingInvoiceGroupBy = "meter_type",
+    run_id: str | None = None,
+    workspace_id: str | None = None,
+    user_id: str | None = None,
+    agent_id: str | None = None,
+    skill_id: str | None = None,
+    meter_type: str | None = None,
+    currency: str = "USD",
+) -> BillingInvoiceQuery:
+    return BillingInvoiceQuery(
+        period_start=period_start,
+        period_end=period_end,
+        group_by=group_by,
+        run_id=run_id,
+        workspace_id=workspace_id,
+        user_id=user_id,
+        agent_id=agent_id,
+        skill_id=skill_id,
+        meter_type=meter_type,
+        currency=currency,
+    )
+
+
 def get_audit_event_query(
     run_id: str | None = None,
     workspace_id: str | None = None,
@@ -280,6 +644,51 @@ def get_audit_event_query(
         created_after=created_after,
         created_before=created_before,
     )
+
+
+def get_page_request(
+    limit: int = Query(default=50, ge=1, le=100),
+    cursor: str | None = Query(default=None),
+    sort_direction: SortDirection = Query(default=SortDirection.DESC),
+) -> PageRequest:
+    return PageRequest(
+        limit=limit,
+        cursor=cursor,
+        sort_direction=sort_direction,
+    )
+
+
+def wants_page_response(request: Request) -> bool:
+    return any(parameter in request.query_params for parameter in PAGE_QUERY_PARAMETERS)
+
+
+def list_or_page_created_at_records(
+    records: list[Any],
+    request: Request,
+    page: PageRequest,
+) -> list[dict[str, Any]] | dict[str, Any]:
+    if wants_page_response(request):
+        return paginate_created_at_records(records, page).model_dump(mode="json")
+    return [record.model_dump(mode="json") for record in records]
+
+
+def parse_webhook_json_payload(body: bytes) -> dict[str, Any]:
+    if not body:
+        return {}
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError as error:
+        raise ValueError("webhook body must be valid JSON") from error
+    if not isinstance(parsed, dict):
+        raise ValueError("webhook body must be a JSON object")
+    return parsed
+
+
+def select_webhook_idempotency_key(
+    delivery_id: str | None,
+    idempotency_key: str | None,
+) -> str | None:
+    return delivery_id or idempotency_key
 
 
 def record_audit_event(
@@ -306,6 +715,140 @@ def record_audit_event(
                 request=request,
             ),
         )
+    )
+
+
+def record_embedding_gateway_usage(
+    app: FastAPI,
+    request: Request | None,
+    record: EmbeddingUsageRecord,
+) -> None:
+    EmbeddingUsageRecorder(
+        store=app.state.store,
+        audit_service=app.state.audit_service,
+        billing_pricing_service=app.state.billing_pricing_service,
+    ).record(
+        record=record,
+        actor=audit_actor_from_request(
+            tenant_id=record.tenant_id,
+            user_id=record.user_id,
+            request=request,
+        ),
+    )
+
+
+def sso_provider_audit_metadata(entry) -> dict[str, Any]:
+    provider = entry.provider
+    oidc = provider.oidc
+    saml = provider.saml
+    return {
+        "provider_id": provider.id,
+        "protocol": provider.protocol.value,
+        "status": entry.status.value,
+        "domain_count": len(provider.domains),
+        "password_fallback_enabled": provider.password_fallback_enabled,
+        "jit_provisioning_enabled": provider.jit_provisioning_enabled,
+        "default_role_count": len(provider.default_role_ids),
+        "oidc_secret_ref_present": (
+            oidc is not None and oidc.client_secret_ref_id is not None
+        ),
+        "saml_certificate_ref_present": saml is not None,
+    }
+
+
+def scim_provider_audit_metadata(entry) -> dict[str, Any]:
+    provider = entry.provider
+    return {
+        "provider_id": provider.id,
+        "status": entry.status.value,
+        "default_role_count": len(provider.default_role_ids),
+        "jit_create_users": provider.jit_create_users,
+        "scim_token_ref_present": provider.bearer_token_secret_ref_id is not None,
+    }
+
+
+def scim_group_role_mapping_audit_metadata(entry) -> dict[str, Any]:
+    return {
+        "provider_id": entry.provider_id,
+        "group_external_id": entry.mapping.group_external_id,
+        "role_count": len(entry.mapping.role_ids),
+    }
+
+
+def scim_import_audit_metadata(result) -> dict[str, Any]:
+    return {
+        "provider_id": result.provider_id,
+        "import_id": result.import_id,
+        "users_seen": result.users_seen,
+        "users_created": result.users_created,
+        "users_linked": result.users_linked,
+        "users_disabled": result.users_disabled,
+        "roles_assigned": result.roles_assigned,
+    }
+
+
+def model_provider_audit_metadata(record: ModelProviderRecord) -> dict[str, Any]:
+    provider = record.provider
+    return {
+        "provider_id": record.id,
+        "provider_type": provider.provider_type,
+        "status": record.status,
+        "current_version": record.current_version,
+        "workspace_id": provider.workspace_id,
+        "default_model": provider.default_model,
+        "model_count": len(provider.model_ids),
+        "credential_source": _model_provider_credential_source(provider),
+        "rate_limit_enabled": provider.rate_limit.enabled(),
+        "fallback_enabled": provider.fallback_enabled,
+    }
+
+
+def model_provider_change_audit_metadata(
+    record: ModelProviderChangeRequestRecord,
+) -> dict[str, Any]:
+    return {
+        "change_request_id": record.id,
+        "provider_id": record.provider_id,
+        "operation": record.operation,
+        "status": record.status,
+        "requested_by_user_id": record.requested_by_user_id,
+        "reviewed_by_user_id": record.reviewed_by_user_id,
+        "has_provider_payload": record.provider_upsert is not None,
+        "credential_source": "secret_ref" if record.api_key_secret_ref_id else "none",
+        "rollback_version": record.rollback_version,
+    }
+
+
+def model_policy_change_audit_metadata(
+    record: ModelPolicyChangeRequestRecord,
+) -> dict[str, Any]:
+    scope = record.scope_upsert
+    return {
+        "change_request_id": record.id,
+        "operation": record.operation,
+        "status": record.status,
+        "workspace_id": scope.workspace_id,
+        "default_model": scope.default_model,
+        "allowed_model_count": len(scope.allowed_models),
+        "denied_model_count": len(scope.denied_models),
+        "model_sensitivity_limit_count": len(scope.model_sensitivity_limits),
+        "requested_by_user_id": record.requested_by_user_id,
+        "reviewed_by_user_id": record.reviewed_by_user_id,
+    }
+
+
+def refresh_runtime_model_gateway(app: FastAPI) -> None:
+    app.state.runtime.model_gateway = build_model_gateway(
+        app.state.settings,
+        app.state.secret_service,
+        app.state.model_provider_store,
+    )
+
+
+def refresh_runtime_model_policy(app: FastAPI) -> None:
+    app.state.runtime.model_policy = build_model_policy(
+        app.state.settings,
+        app.state.model_policy_store,
     )
 
 
@@ -341,9 +884,15 @@ def get_request_context(
     user_id: str | None = Header(default=None, alias="X-User-ID"),
 ) -> RequestContext:
     if authorization is not None:
-        claims = request.app.state.auth_service.authenticate_authorization_header(authorization)
+        claims = request.app.state.auth_service.authenticate_authorization_header(
+            authorization
+        )
         return RequestContext(tenant_id=claims.tenant_id, user_id=claims.user_id)
-    if request.app.state.settings.dev_request_headers_enabled and tenant_id is not None and user_id is not None:
+    if (
+        request.app.state.settings.dev_request_headers_enabled
+        and tenant_id is not None
+        and user_id is not None
+    ):
         return RequestContext(tenant_id=tenant_id, user_id=user_id)
     raise AuthRequiredError("authentication required")
 
@@ -359,7 +908,41 @@ def require_permission(request: Request, context: RequestContext, action: str) -
         )
     )
     if not decision.allowed:
-        raise TenantAccessError(decision.reason or f"Permission denied: {action} on {resource}")
+        raise TenantAccessError(
+            decision.reason or f"Permission denied: {action} on {resource}"
+        )
+
+
+def resolve_granted_scopes(
+    request: Request,
+    context: RequestContext,
+    required_scopes: list[str],
+) -> list[str]:
+    resource = f"tenant:{context.tenant_id}"
+    granted_scopes = []
+    for scope in required_scopes:
+        decision = request.app.state.policy_service.decide(
+            PolicyRequest(
+                tenant_id=context.tenant_id,
+                user_id=context.user_id,
+                action=scope,
+                resource=resource,
+            )
+        )
+        if decision.allowed:
+            granted_scopes.append(scope)
+    return granted_scopes
+
+
+def require_sandbox_secret_resolver_token(request: Request) -> None:
+    expected_token = request.app.state.settings.sandbox_secret_resolver_token
+    if not expected_token:
+        return
+    provided_token = request.headers.get(SANDBOX_SECRET_RESOLVER_TOKEN_HEADER)
+    if provided_token is None or not hmac.compare_digest(
+        provided_token, expected_token
+    ):
+        raise TenantAccessError("sandbox secret resolver token is invalid")
 
 
 def require_storage_read_access(
@@ -369,24 +952,105 @@ def require_storage_read_access(
 ) -> None:
     clearance_level = storage_clearance_level(request)
     if clearance_level < storage_object.sensitivity_level:
-        raise TenantAccessError("Storage object sensitivity exceeds requester clearance")
+        raise TenantAccessError(
+            "Storage object sensitivity exceeds requester clearance"
+        )
     if not storage_object.acl_subjects:
         return
     request_subjects = set(storage_acl_subjects(request, context))
     allowed_subjects = set(storage_object.acl_subjects)
-    if request_subjects.isdisjoint(allowed_subjects):
-        raise TenantAccessError("Storage object ACL denied")
+    if not request_subjects.isdisjoint(allowed_subjects):
+        return
+    if storage_share_grant_allows_read(request, context, storage_object):
+        return
+    raise TenantAccessError("Storage object ACL denied")
 
 
 def storage_acl_subjects(request: Request, context: RequestContext) -> list[str]:
     raw_subjects = request.headers.get("X-ACL-Subjects", "")
     subjects = [
-        subject.strip()
-        for subject in raw_subjects.split(",")
-        if subject.strip()
+        subject.strip() for subject in raw_subjects.split(",") if subject.strip()
     ]
     subjects.extend([f"user:{context.user_id}", f"tenant:{context.tenant_id}"])
     return subjects
+
+
+def storage_share_grant_allows_read(
+    request: Request,
+    context: RequestContext,
+    storage_object,
+) -> bool:
+    if storage_object.purpose != StoragePurpose.ARTIFACT:
+        return False
+    return request.app.state.share_grant_store.authorize(
+        tenant_id=context.tenant_id,
+        resource_type=ShareResourceType.ARTIFACT,
+        resource_id=storage_object.id,
+        permission="view",
+        user_id=context.user_id,
+        workspace_id=storage_object.workspace_id,
+        group_ids=storage_share_group_ids(request),
+    )
+
+
+def require_external_share_links_enabled(request: Request) -> None:
+    if not request.app.state.settings.external_share_links_enabled:
+        raise TenantAccessError("External share links are disabled")
+
+
+def external_share_link_subject_id(
+    external_link_token: str,
+    tenant_id: str,
+    settings: Settings,
+) -> str:
+    hash_secret = (
+        settings.external_share_link_token_hash_secret or settings.access_token_secret
+    )
+    digest_message = f"{tenant_id}\0{external_link_token}"
+    digest = hmac.new(
+        hash_secret.encode("utf-8"),
+        digest_message.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"hmac-sha256:{digest}"
+
+
+def require_external_share_link_storage_read_access(
+    request: Request,
+    tenant_id: str,
+    external_link_id: str,
+    storage_object,
+) -> None:
+    require_external_share_links_enabled(request)
+    if storage_object.purpose != StoragePurpose.ARTIFACT:
+        raise TenantAccessError("External share links can only download artifacts")
+    if storage_object.sensitivity_level > 0:
+        raise TenantAccessError("External share link cannot access sensitive artifacts")
+    allowed = request.app.state.share_grant_store.authorize(
+        tenant_id=tenant_id,
+        resource_type=ShareResourceType.ARTIFACT,
+        resource_id=storage_object.id,
+        permission="view",
+        user_id="external_link",
+        workspace_id=storage_object.workspace_id,
+        external_link_id=external_share_link_subject_id(
+            external_link_id,
+            tenant_id,
+            request.app.state.settings,
+        ),
+    )
+    if not allowed:
+        raise TenantAccessError("External share link denied")
+
+
+def storage_share_group_ids(request: Request) -> list[str]:
+    raw_subjects = request.headers.get("X-ACL-Subjects", "")
+    group_ids: list[str] = []
+    for subject in [item.strip() for item in raw_subjects.split(",") if item.strip()]:
+        group_ids.append(subject)
+        if subject.startswith("group:"):
+            group_ids.append(subject.split(":", 1)[1])
+    return group_ids
 
 
 def storage_clearance_level(request: Request) -> int:
@@ -399,12 +1063,44 @@ def storage_clearance_level(request: Request) -> int:
         raise TenantAccessError("Invalid storage clearance level") from error
 
 
+def share_grant_response_body(grant) -> dict:
+    body = grant.model_dump(mode="json")
+    if grant.subject_type == ShareSubjectType.EXTERNAL_LINK:
+        body["subject_id"] = "[REDACTED]"
+        body["external_link_id_present"] = True
+    return body
+
+
+def customer_feedback_response_body(feedback) -> dict:
+    body = feedback.model_dump(mode="json", exclude={"comment", "metadata"})
+    body["comment_present"] = feedback.comment is not None
+    body["metadata_present"] = bool(feedback.metadata)
+    body["metadata_key_count"] = len(feedback.metadata)
+    return body
+
+
+def resolve_event_replay_sequence(
+    after_sequence: int | None,
+    last_event_id: str | None,
+) -> int | None:
+    if after_sequence is not None:
+        return after_sequence
+    if last_event_id is None or not last_event_id.strip():
+        return None
+    try:
+        return int(last_event_id)
+    except ValueError as error:
+        raise ValueError(
+            "Last-Event-ID must be an integer run event sequence"
+        ) from error
+
+
 def create_app(
     store: InMemoryControlPlaneStore | SqlControlPlaneRepository | None = None,
     settings: Settings | None = None,
     runtime: AgentRuntime | None = None,
     knowledge_service: InMemoryKnowledgeService | SqlKnowledgeService | None = None,
-    sandbox_adapter: SandboxAdapter | None = None,
+    sandbox_adapter: SandboxAdapter | LocalProcessSandboxAdapter | None = None,
     browser_controller: BrowserController | None = None,
     job_queue: JobQueue | None = None,
     storage_catalog: InMemoryStorageCatalog | SqlStorageCatalog | None = None,
@@ -414,35 +1110,131 @@ def create_app(
     audit_service: Any | None = None,
     auth_service: AuthService | None = None,
     billing_analytics_service: BillingAnalyticsService | None = None,
+    billing_invoice_service: BillingInvoiceService | None = None,
+    billing_invoice_store: BillingInvoiceStore | None = None,
+    billing_pricing_rule_store: BillingPricingRuleStore | None = None,
+    billing_pricing_service: BillingPricingService | None = None,
+    share_grant_store: ShareGrantStore | None = None,
     run_trace_service: RunTraceService | None = None,
+    license_service: LicenseService | None = None,
+    embedding_gateway: EmbeddingGateway | None = None,
     model_policy_store: ModelPolicyStore | None = None,
+    model_provider_store: ModelProviderStore | None = None,
     tenant_bootstrap_service: TenantBootstrapService | None = None,
     tenant_readiness_service: TenantReadinessService | None = None,
+    trigger_service: TriggerService | None = None,
+    connector_registry: InMemoryConnectorRegistry | SqlConnectorRegistry | None = None,
+    connector_dispatcher: ConnectorDispatchService | None = None,
+    connector_oauth_service: ConnectorOAuthService | None = None,
+    secret_service: SecretService | None = None,
     skill_registry: InMemorySkillRegistry | SqlSkillRegistry | None = None,
-    lifecycle_policy_store: InMemoryLifecyclePolicyStore | SqlLifecyclePolicyStore | None = None,
-    tenant_offboarding_store: InMemoryTenantOffboardingStore | SqlTenantOffboardingStore | None = None,
-    long_term_memory_service: InMemoryLongTermMemoryService | SqlLongTermMemoryService | GuardedLongTermMemoryService | None = None,
-    short_term_memory_service: InMemoryShortTermMemoryService | RedisShortTermMemoryService | GuardedShortTermMemoryService | None = None,
+    solution_pack_registry: (
+        InMemorySolutionPackRegistry | SqlSolutionPackRegistry | None
+    ) = None,
+    solution_pack_service: SolutionPackService | None = None,
+    customer_success_service: InMemoryCustomerSuccessService | None = None,
+    customer_feedback_service: (
+        InMemoryCustomerFeedbackService | SqlCustomerFeedbackService | None
+    ) = None,
+    sso_provider_registry: (
+        InMemorySsoProviderRegistry | SqlSsoProviderRegistry | None
+    ) = None,
+    scim_provisioning_store: (
+        InMemoryScimProvisioningStore | SqlScimProvisioningStore | None
+    ) = None,
+    scim_provisioning_service: ScimProvisioningService | None = None,
+    lifecycle_policy_store: (
+        InMemoryLifecyclePolicyStore | SqlLifecyclePolicyStore | None
+    ) = None,
+    restore_drill_schedule_store: RestoreDrillScheduleStore | None = None,
+    tenant_offboarding_store: (
+        InMemoryTenantOffboardingStore | SqlTenantOffboardingStore | None
+    ) = None,
+    long_term_memory_service: (
+        InMemoryLongTermMemoryService
+        | SqlLongTermMemoryService
+        | GuardedLongTermMemoryService
+        | None
+    ) = None,
+    short_term_memory_service: (
+        InMemoryShortTermMemoryService
+        | RedisShortTermMemoryService
+        | GuardedShortTermMemoryService
+        | None
+    ) = None,
     guardrail_service: InMemoryGuardrailService | None = None,
 ) -> FastAPI:
     resolved_settings = settings or load_settings()
     app = FastAPI(title=resolved_settings.api_title)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=resolved_settings.cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
     app.state.store = store or build_control_plane_store(resolved_settings)
-    app.state.knowledge_service = knowledge_service or build_knowledge_service(resolved_settings)
-    app.state.sandbox_adapter = sandbox_adapter or SandboxAdapter(provider=resolved_settings.sandbox_provider)
-    app.state.browser_controller = browser_controller or build_browser_controller(resolved_settings)
+    app.state.knowledge_service = knowledge_service or build_knowledge_service(
+        resolved_settings
+    )
+    app.state.sandbox_adapter = sandbox_adapter or build_sandbox_adapter(
+        resolved_settings
+    )
+    app.state.browser_controller = browser_controller or build_browser_controller(
+        resolved_settings
+    )
     app.state.job_queue = job_queue or build_job_queue(resolved_settings)
-    app.state.storage_catalog = storage_catalog or build_storage_catalog(resolved_settings)
-    app.state.object_storage = object_storage or S3CompatibleObjectStorage.from_settings(resolved_settings)
+    app.state.storage_catalog = storage_catalog or build_storage_catalog(
+        resolved_settings
+    )
+    app.state.object_storage = (
+        object_storage or S3CompatibleObjectStorage.from_settings(resolved_settings)
+    )
     app.state.storage_content_scanner = build_storage_content_scanner(resolved_settings)
     app.state.audit_service = audit_service or AuditService(
         store=app.state.store,
         retention_days=resolved_settings.audit_retention_days,
     )
-    app.state.guardrail_service = guardrail_service or build_guardrail_service(resolved_settings)
-    app.state.skill_registry = skill_registry or build_skill_registry(resolved_settings)
-    app.state.lifecycle_policy_store = lifecycle_policy_store or build_lifecycle_policy_store(
+    app.state.guardrail_service = guardrail_service or build_guardrail_service(
         resolved_settings
+    )
+    app.state.skill_registry = skill_registry or build_skill_registry(resolved_settings)
+    app.state.solution_pack_registry = (
+        solution_pack_registry or build_solution_pack_registry(resolved_settings)
+    )
+    app.state.solution_pack_service = solution_pack_service or SolutionPackService(
+        pack_registry=app.state.solution_pack_registry,
+        skill_registry=app.state.skill_registry,
+        audit_store=app.state.store,
+    )
+    app.state.customer_success_service = (
+        customer_success_service
+        or InMemoryCustomerSuccessService(
+            store=app.state.store,
+            solution_pack_registry=app.state.solution_pack_registry,
+            skill_registry=app.state.skill_registry,
+        )
+    )
+    app.state.customer_feedback_service = (
+        customer_feedback_service
+        or build_customer_feedback_service(
+            settings=resolved_settings,
+            audit_store=app.state.store,
+            solution_pack_registry=app.state.solution_pack_registry,
+        )
+    )
+    app.state.sso_provider_registry = (
+        sso_provider_registry or build_sso_provider_registry(resolved_settings)
+    )
+    app.state.scim_provisioning_store = (
+        scim_provisioning_store or build_scim_provisioning_store(resolved_settings)
+    )
+    app.state.lifecycle_policy_store = (
+        lifecycle_policy_store or build_lifecycle_policy_store(resolved_settings)
+    )
+    app.state.restore_drill_schedule_store = (
+        restore_drill_schedule_store
+        or build_restore_drill_schedule_store(resolved_settings)
     )
     app.state.tenant_offboarding_store = (
         tenant_offboarding_store or build_tenant_offboarding_store(resolved_settings)
@@ -470,48 +1262,202 @@ def create_app(
         session_store=build_auth_session_store(resolved_settings),
         access_token_secret=resolved_settings.access_token_secret,
         access_token_ttl_seconds=resolved_settings.access_token_ttl_seconds,
+        sso_provider_registry=app.state.sso_provider_registry,
     )
-    app.state.billing_analytics_service = billing_analytics_service or BillingAnalyticsService()
-    app.state.run_trace_service = run_trace_service or build_run_trace_service(resolved_settings)
-    app.state.model_policy_store = model_policy_store or build_model_policy_store(resolved_settings)
-    app.state.tenant_readiness_service = tenant_readiness_service or TenantReadinessService(
-        identity_service=app.state.identity_service,
-        store=app.state.store,
-        settings=resolved_settings,
-        job_queue=app.state.job_queue,
+    app.state.scim_provisioning_service = (
+        scim_provisioning_service
+        or ScimProvisioningService(
+            identity_service=app.state.identity_service,
+            store=app.state.scim_provisioning_store,
+        )
     )
-    app.state.tenant_bootstrap_service = tenant_bootstrap_service or TenantBootstrapService(
-        identity_service=app.state.identity_service,
-        store=app.state.store,
-        settings=resolved_settings,
-        readiness_service=app.state.tenant_readiness_service,
+    app.state.billing_analytics_service = (
+        billing_analytics_service or BillingAnalyticsService()
+    )
+    app.state.billing_invoice_service = (
+        billing_invoice_service or BillingInvoiceService()
+    )
+    app.state.billing_invoice_store = (
+        billing_invoice_store or build_billing_invoice_store(resolved_settings)
+    )
+    app.state.billing_pricing_rule_store = (
+        billing_pricing_rule_store
+        or build_billing_pricing_rule_store(resolved_settings)
+    )
+    app.state.billing_pricing_service = (
+        billing_pricing_service
+        or build_billing_pricing_service(
+            resolved_settings,
+            app.state.billing_pricing_rule_store,
+        )
+    )
+    app.state.share_grant_store = share_grant_store or build_share_grant_store(
+        resolved_settings
+    )
+    app.state.run_trace_service = run_trace_service or build_run_trace_service(
+        resolved_settings
+    )
+    app.state.license_service = license_service or LicenseService(
         audit_service=app.state.audit_service,
+        signature_verifier=resolved_settings.license_signature_verifier(),
+        runtime_enforcement_enabled=resolved_settings.license_runtime_enforcement_enabled,
+        validation_store=app.state.store,
+    )
+    if (
+        isinstance(app.state.license_service, LicenseService)
+        and app.state.license_service.audit_service is None
+    ):
+        app.state.license_service.audit_service = app.state.audit_service
+    if isinstance(app.state.audit_service, AuditService):
+        app.state.audit_service.license_service = app.state.license_service
+    app.state.model_policy_store = model_policy_store or build_model_policy_store(
+        resolved_settings
+    )
+    app.state.model_provider_store = (
+        model_provider_store or build_model_provider_store(resolved_settings)
+    )
+    app.state.secret_service = secret_service or build_secret_service_from_settings(
+        resolved_settings
+    )
+    app.state.embedding_gateway = embedding_gateway or build_embedding_gateway(
+        resolved_settings,
+        app.state.secret_service,
+    )
+    app.state.trigger_service = trigger_service or build_trigger_service(
+        resolved_settings
+    )
+    app.state.trigger_webhook_verifier = build_trigger_webhook_verifier(
+        resolved_settings
+    )
+    app.state.connector_registry = connector_registry or build_connector_registry(
+        resolved_settings
+    )
+    app.state.connector_invocation_service = ConnectorInvocationService()
+    if connector_oauth_service is None:
+        app.state.connector_oauth_service = ConnectorOAuthService(
+            secret_service=app.state.secret_service,
+        )
+    elif connector_oauth_service.secret_service is None:
+        app.state.connector_oauth_service = connector_oauth_service.model_copy(
+            update={"secret_service": app.state.secret_service}
+        )
+    else:
+        app.state.connector_oauth_service = connector_oauth_service
+    if connector_dispatcher is None:
+        app.state.connector_dispatcher = ConnectorDispatchService(
+            secret_service=app.state.secret_service,
+        )
+    elif connector_dispatcher.secret_service is None:
+        app.state.connector_dispatcher = connector_dispatcher.model_copy(
+            update={"secret_service": app.state.secret_service}
+        )
+    else:
+        app.state.connector_dispatcher = connector_dispatcher
+    app.state.tenant_readiness_service = (
+        tenant_readiness_service
+        or TenantReadinessService(
+            identity_service=app.state.identity_service,
+            store=app.state.store,
+            settings=resolved_settings,
+            job_queue=app.state.job_queue,
+            knowledge_service=app.state.knowledge_service,
+            skill_registry=app.state.skill_registry,
+        )
+    )
+    app.state.tenant_bootstrap_service = (
+        tenant_bootstrap_service
+        or TenantBootstrapService(
+            identity_service=app.state.identity_service,
+            store=app.state.store,
+            settings=resolved_settings,
+            readiness_service=app.state.tenant_readiness_service,
+            audit_service=app.state.audit_service,
+            knowledge_service=app.state.knowledge_service,
+            skill_registry=app.state.skill_registry,
+            solution_pack_service=app.state.solution_pack_service,
+        )
     )
     app.state.settings = resolved_settings
     tool_gateway = ToolGateway(
         audit_service=app.state.audit_service,
+        secret_service=app.state.secret_service,
         guardrail_service=app.state.guardrail_service,
     )
     register_sandbox_tool_handlers(tool_gateway, app.state.sandbox_adapter)
     register_browser_tool_handlers(tool_gateway, app.state.browser_controller)
     app.state.runtime = runtime or AgentRuntime(
         store=app.state.store,
-        model_gateway=OpenAICompatibleModelGateway(
-            base_url=resolved_settings.model_gateway_base_url,
-            api_key=resolved_settings.model_gateway_api_key,
-            default_model=resolved_settings.model_gateway_model,
-            timeout_seconds=resolved_settings.model_gateway_timeout_seconds,
+        model_gateway=build_model_gateway(
+            resolved_settings,
+            app.state.secret_service,
+            app.state.model_provider_store,
         ),
-        model_policy=build_model_policy(resolved_settings, app.state.model_policy_store),
+        model_policy=build_model_policy(
+            resolved_settings, app.state.model_policy_store
+        ),
         model_budget_guard=build_model_budget_guard(resolved_settings),
         tool_gateway=tool_gateway,
+        policy_service=app.state.policy_service,
         audit_service=app.state.audit_service,
+        license_service=app.state.license_service,
         knowledge_service=app.state.knowledge_service,
+        sandbox_adapter=app.state.sandbox_adapter,
+        browser_controller=app.state.browser_controller,
+        storage_catalog=app.state.storage_catalog,
+        object_storage=app.state.object_storage,
+        storage_content_scanner=app.state.storage_content_scanner,
+        sandbox_runtime_image=app.state.settings.sandbox_runtime_image,
+        sandbox_network_mode=SandboxNetworkMode(
+            app.state.settings.sandbox_network_mode
+        ),
+        sandbox_timeout_seconds=app.state.settings.sandbox_timeout_seconds,
+        embedding_gateway=app.state.embedding_gateway,
+        billing_pricing_service=app.state.billing_pricing_service,
         long_term_memory_service=app.state.long_term_memory_service,
         guardrail_service=app.state.guardrail_service,
     )
     app.state.exception_manager = ApiExceptionManager()
     app.state.exception_manager.register(app)
+    app.add_event_handler("shutdown", close_database_pools)
+
+    @app.get("/healthz")
+    def healthz() -> dict:
+        return {
+            "status": "ok",
+            "service": "taroai-api",
+            "environment": app.state.settings.environment,
+        }
+
+    @app.get("/readyz")
+    def readyz() -> dict:
+        return {
+            "ready": True,
+            "checks": {
+                "settings": "ok",
+                "control_plane_store_backend": app.state.settings.control_plane_store_backend,
+                "identity_service_backend": app.state.settings.identity_service_backend,
+                "storage_catalog_backend": app.state.settings.storage_catalog_backend,
+                "job_queue_backend": app.state.settings.job_queue_backend,
+                "secret_service_backend": app.state.settings.secret_service_backend,
+                "model_gateway": build_model_gateway_readiness(
+                    app.state.settings,
+                    app.state.model_provider_store,
+                ).model_dump(mode="json"),
+                "sandbox": build_sandbox_readiness(
+                    app.state.settings,
+                    app.state.sandbox_adapter,
+                ).model_dump(mode="json", exclude_none=True),
+                "sandbox_provider": app.state.settings.sandbox_provider,
+                "browser": build_browser_readiness(
+                    app.state.settings,
+                    app.state.browser_controller,
+                ).model_dump(
+                    mode="json",
+                    exclude_none=True,
+                ),
+                "browser_provider": app.state.settings.browser_provider,
+            },
+        }
 
     @app.post("/api/auth/login")
     def login(payload: AuthLoginRequest) -> dict:
@@ -540,43 +1486,1103 @@ def create_app(
         )
         return result.model_dump(mode="json")
 
+    @app.post("/api/licenses/import", status_code=status.HTTP_201_CREATED)
+    def import_license(
+        payload: LicenseImportRequest,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "licenses.manage")
+        license_key = app.state.license_service.verify_signed_offline_envelope(
+            payload.envelope
+        )
+        if license_key.tenant_id != context.tenant_id:
+            raise TenantAccessError("License tenant does not match request tenant")
+        validation = app.state.license_service.validate_signed_offline_license_key(
+            license_key,
+            deployment_mode=payload.deployment_mode,
+        )
+        if validation.status != LicenseStatus.ACTIVE:
+            raise ValueError(validation.reason or "license import rejected")
+        app.state.license_service.activate_validation(validation)
+        app.state.audit_service.record(
+            AuditEventCreate(
+                tenant_id=context.tenant_id,
+                workspace_id=None,
+                user_id=context.user_id,
+                run_id=None,
+                event_type="license.imported",
+                metadata={
+                    "license_id": validation.license.id,
+                    "customer_name": validation.license.customer_name,
+                    "status": validation.status.value,
+                    "deployment_mode": validation.deployment_mode,
+                    "source": validation.source,
+                    "entitlements_count": len(validation.license.entitlements),
+                },
+                actor=audit_actor_from_request(
+                    tenant_id=context.tenant_id,
+                    user_id=context.user_id,
+                    request=request,
+                ),
+            )
+        )
+        return LicenseImportResponse.from_validation(
+            validation,
+            activated=True,
+        ).model_dump(mode="json")
+
     @app.post("/api/runs", status_code=status.HTTP_201_CREATED)
     def create_run(
         payload: RunCreate,
+        response: Response,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
         context: RequestContext = Depends(get_request_context),
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
+        idempotency_request = build_idempotency_request(
+            tenant_id=context.tenant_id,
+            key=idempotency_key,
+            method=RUN_CREATE_METHOD,
+            path=RUN_CREATE_PATH,
+            payload=payload,
+        )
+        replay_record = find_idempotent_replay(app.state.store, idempotency_request)
+        if replay_record is not None:
+            response.status_code = replay_record.status_code
+            return replay_record.response_body
+
         run = app.state.store.create_run(
             tenant_id=context.tenant_id,
             user_id=context.user_id,
             payload=payload,
         )
-        return {
+        response_body = {
             "run_id": run.id,
-            "status": run.status,
+            "status": run.status.value,
             "events_url": f"/api/runs/{run.id}/events",
         }
+        save_idempotent_response(
+            app.state.store,
+            idempotency_request,
+            status.HTTP_201_CREATED,
+            response_body,
+        )
+        return response_body
+
+    @app.get("/api/runs")
+    def list_runs(
+        page: PageRequest = Depends(get_page_request),
+        workspace_id: str | None = None,
+        run_status: RunStatus | None = Query(default=None, alias="status"),
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        return paginate_created_at_records(
+            app.state.store.list_runs(
+                context.tenant_id,
+                workspace_id=workspace_id,
+                status=run_status,
+            ),
+            page,
+        ).model_dump(mode="json")
+
+    @app.post("/api/triggers", status_code=status.HTTP_201_CREATED)
+    def create_trigger(
+        payload: TriggerCreateRequest,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "triggers.manage")
+        trigger = app.state.trigger_service.create_trigger(
+            TriggerDefinitionCreate(
+                tenant_id=context.tenant_id,
+                workspace_id=payload.workspace_id,
+                agent_id=payload.agent_id,
+                created_by_user_id=context.user_id,
+                service_account_id=payload.service_account_id,
+                type=payload.type,
+                name=payload.name,
+                status=payload.status,
+                input_template=payload.input_template,
+                policy_profile=payload.policy_profile,
+                budget_profile=payload.budget_profile,
+                schedule=payload.schedule,
+                connector_event=payload.connector_event,
+                agent_handoff=payload.agent_handoff,
+                next_run_at=payload.next_run_at,
+            )
+        )
+        record_audit_event(
+            app=app,
+            tenant_id=context.tenant_id,
+            workspace_id=trigger.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="trigger.created",
+            metadata={
+                "trigger_id": trigger.id,
+                "trigger_type": trigger.type.value,
+                "status": trigger.status.value,
+            },
+            request=request,
+        )
+        return trigger.model_dump(mode="json")
+
+    @app.get("/api/triggers")
+    def list_triggers(
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict]:
+        require_permission(request, context, "triggers.read")
+        return [
+            trigger.model_dump(mode="json")
+            for trigger in app.state.trigger_service.list_triggers(context.tenant_id)
+        ]
+
+    @app.get("/api/triggers/operations")
+    def get_trigger_operations(
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "triggers.read")
+        return (
+            TriggerOperationsService(
+                stuck_after_seconds=(
+                    app.state.settings.trigger_operations_stuck_after_seconds
+                ),
+            )
+            .summarize(
+                triggers=app.state.trigger_service.list_triggers(context.tenant_id),
+                audit_events=app.state.audit_service.list_for_tenant(context.tenant_id),
+                now=utc_now(),
+                tenant_id=context.tenant_id,
+            )
+            .model_dump(mode="json")
+        )
+
+    @app.post("/api/connectors", status_code=status.HTTP_201_CREATED)
+    def create_connector(
+        payload: ConnectorCreateRequest,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "connectors.manage")
+        current_connector_count = len(
+            app.state.connector_registry.list_connectors(context.tenant_id)
+        )
+        app.state.license_service.require_entitlement(
+            tenant_id=context.tenant_id,
+            feature=LicensedFeature.PRIVATE_CONNECTOR_COUNT,
+            requested_amount=current_connector_count + 1,
+        )
+        connector = app.state.connector_registry.register_connector(
+            payload.to_definition_create(
+                tenant_id=context.tenant_id,
+                owner_user_id=context.user_id,
+            )
+        )
+        app.state.audit_service.record(
+            AuditEventCreate(
+                tenant_id=context.tenant_id,
+                workspace_id=connector.workspace_id,
+                user_id=context.user_id,
+                run_id=None,
+                event_type="connector.registered",
+                metadata=connector_audit_metadata(connector),
+            )
+        )
+        return connector.model_dump(mode="json")
+
+    @app.get("/api/connectors")
+    def list_connectors(
+        request: Request,
+        workspace_id: str | None = None,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict]:
+        require_permission(request, context, "connectors.read")
+        return [
+            connector.model_dump(mode="json")
+            for connector in app.state.connector_registry.list_connectors(
+                context.tenant_id,
+                workspace_id=workspace_id,
+            )
+        ]
+
+    @app.get("/api/connectors/{connector_id}")
+    def get_connector(
+        connector_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "connectors.read")
+        connector = app.state.connector_registry.get_connector(
+            context.tenant_id,
+            connector_id,
+        )
+        return connector.model_dump(mode="json")
+
+    @app.patch("/api/connectors/{connector_id}")
+    def update_connector(
+        connector_id: str,
+        payload: ConnectorUpdateRequest,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "connectors.manage")
+        connector = app.state.connector_registry.update_connector(
+            context.tenant_id,
+            connector_id,
+            payload,
+        )
+        app.state.audit_service.record(
+            AuditEventCreate(
+                tenant_id=context.tenant_id,
+                workspace_id=connector.workspace_id,
+                user_id=context.user_id,
+                run_id=None,
+                event_type="connector.updated",
+                metadata=connector_audit_metadata(connector)
+                | {"updated_fields": sorted(payload.update_values().keys())},
+            )
+        )
+        return connector.model_dump(mode="json")
+
+    @app.post("/api/connectors/{connector_id}/enable")
+    def enable_connector(
+        connector_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "connectors.manage")
+        connector = app.state.connector_registry.update_connector_status(
+            context.tenant_id,
+            connector_id,
+            ConnectorStatus.ENABLED,
+        )
+        app.state.audit_service.record(
+            AuditEventCreate(
+                tenant_id=context.tenant_id,
+                workspace_id=connector.workspace_id,
+                user_id=context.user_id,
+                run_id=None,
+                event_type="connector.enabled",
+                metadata=connector_audit_metadata(connector),
+            )
+        )
+        return connector.model_dump(mode="json")
+
+    @app.post("/api/connectors/{connector_id}/disable")
+    def disable_connector(
+        connector_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "connectors.manage")
+        connector = app.state.connector_registry.update_connector_status(
+            context.tenant_id,
+            connector_id,
+            ConnectorStatus.DISABLED,
+        )
+        app.state.audit_service.record(
+            AuditEventCreate(
+                tenant_id=context.tenant_id,
+                workspace_id=connector.workspace_id,
+                user_id=context.user_id,
+                run_id=None,
+                event_type="connector.disabled",
+                metadata=connector_audit_metadata(connector),
+            )
+        )
+        return connector.model_dump(mode="json")
+
+    @app.post("/api/connectors/{connector_id}/oauth/authorize")
+    def authorize_connector_oauth(
+        connector_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "connectors.manage")
+        connector = app.state.connector_registry.get_connector(
+            context.tenant_id,
+            connector_id,
+        )
+        result = app.state.connector_oauth_service.build_authorization_url(
+            connector=connector,
+            requested_by_user_id=context.user_id,
+        )
+        record_audit_event(
+            app=app,
+            tenant_id=context.tenant_id,
+            workspace_id=connector.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="connector.oauth_authorization_started",
+            metadata=connector_oauth_audit_metadata(connector, result),
+            request=request,
+        )
+        return result.model_dump(mode="json")
+
+    @app.post("/api/connectors/{connector_id}/oauth/callback")
+    def complete_connector_oauth(
+        connector_id: str,
+        payload: ConnectorOAuthCallbackRequest,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "connectors.manage")
+        connector = app.state.connector_registry.get_connector(
+            context.tenant_id,
+            connector_id,
+        )
+        result = app.state.connector_oauth_service.complete_callback(
+            connector=connector,
+            request=payload,
+        )
+        record_audit_event(
+            app=app,
+            tenant_id=context.tenant_id,
+            workspace_id=connector.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="connector.oauth_completed",
+            metadata=connector_oauth_audit_metadata(connector, result),
+            request=request,
+        )
+        return result.model_dump(mode="json")
+
+    @app.post("/api/connectors/{connector_id}/oauth/refresh")
+    def refresh_connector_oauth(
+        connector_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "connectors.manage")
+        connector = app.state.connector_registry.get_connector(
+            context.tenant_id,
+            connector_id,
+        )
+        result = app.state.connector_oauth_service.refresh(connector)
+        record_audit_event(
+            app=app,
+            tenant_id=context.tenant_id,
+            workspace_id=connector.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="connector.oauth_refreshed",
+            metadata=connector_oauth_audit_metadata(connector, result),
+            request=request,
+        )
+        return result.model_dump(mode="json")
+
+    @app.post(
+        "/api/connectors/{connector_id}/sync-jobs", status_code=status.HTTP_202_ACCEPTED
+    )
+    def enqueue_connector_sync_job(
+        connector_id: str,
+        payload: ConnectorSyncJobCreate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "connectors.sync")
+        connector = app.state.connector_registry.get_connector(
+            context.tenant_id,
+            connector_id,
+        )
+        for document in payload.documents:
+            if document.tenant_id != context.tenant_id:
+                raise TenantAccessError("connector sync document is not in tenant")
+            if document.workspace_id != connector.workspace_id:
+                raise TenantAccessError("connector sync document is not in workspace")
+            if document.connector_id != connector.id:
+                raise TenantAccessError(
+                    "connector sync document does not match connector"
+                )
+        queue = app.state.job_queue
+        if queue is None:
+            raise RedisQueueConfigurationError("job queue backend is disabled")
+        run = app.state.store.create_run(
+            tenant_id=context.tenant_id,
+            user_id=context.user_id,
+            payload=RunCreate(
+                workspace_id=connector.workspace_id,
+                agent_id="connector_sync",
+                message=f"Sync connector {connector.id} into knowledge base.",
+                mode=RunMode.AUTONOMOUS,
+            ),
+        )
+        queued_run = app.state.store.update_run_status(
+            context.tenant_id,
+            run.id,
+            RunStatus.QUEUED,
+        )
+        job_payload = ConnectorSyncJob(
+            tenant_id=context.tenant_id,
+            workspace_id=connector.workspace_id,
+            connector_id=connector.id,
+            run_id=queued_run.id,
+            knowledge_base_id=payload.knowledge_base_id,
+            requested_by_user_id=context.user_id,
+            documents=payload.documents,
+            acl_mapping=payload.acl_mapping,
+            cursor=payload.cursor,
+        )
+        job = queue.enqueue(
+            JobType.CONNECTOR_SYNC,
+            job_payload,
+            max_attempts=app.state.settings.worker_job_max_attempts,
+        )
+        app.state.connector_registry.update_connector_sync_state(
+            context.tenant_id,
+            connector.id,
+            ConnectorSyncStateUpdate(
+                status=ConnectorSyncStatus.PENDING,
+                run_id=queued_run.id,
+                job_id=job.id,
+                knowledge_base_id=payload.knowledge_base_id,
+                cursor=payload.cursor,
+            ),
+        )
+        app.state.store.append_run_event(
+            queued_run,
+            "connector.sync_queued",
+            {
+                "job_id": job.id,
+                "queue": JobType.CONNECTOR_SYNC.value,
+                "connector_id": connector.id,
+                "knowledge_base_id": payload.knowledge_base_id,
+            },
+        )
+        record_audit_event(
+            app=app,
+            tenant_id=context.tenant_id,
+            workspace_id=connector.workspace_id,
+            user_id=context.user_id,
+            run_id=queued_run.id,
+            event_type="connector.sync_requested",
+            metadata=connector_sync_audit_metadata(
+                connector_id=connector.id,
+                knowledge_base_id=payload.knowledge_base_id,
+                documents=payload.documents,
+                cursor=payload.cursor,
+                job_id=job.id,
+            ),
+            request=request,
+        )
+        return {
+            "job_id": job.id,
+            "run_id": queued_run.id,
+            "status": job.status.value,
+            "queue": JobType.CONNECTOR_SYNC.value,
+        }
+
+    @app.post(
+        "/api/connectors/{connector_id}/invoke", status_code=status.HTTP_202_ACCEPTED
+    )
+    def invoke_connector(
+        connector_id: str,
+        payload: ConnectorInvocationCreate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "connectors.invoke")
+        connector = app.state.connector_registry.get_connector(
+            context.tenant_id,
+            connector_id,
+        )
+
+        run = app.state.store.get_run(context.tenant_id, payload.run_id)
+        if run.workspace_id != connector.workspace_id:
+            raise TenantAccessError("connector workspace does not match run workspace")
+
+        decision = app.state.connector_invocation_service.evaluate(
+            connector=connector,
+            request=payload.to_invocation_request(
+                tenant_id=context.tenant_id,
+                workspace_id=connector.workspace_id,
+                user_id=context.user_id,
+                connector_id=connector.id,
+            ),
+        )
+
+        if decision.status == ConnectorInvocationStatus.DENIED:
+            record_audit_event(
+                app=app,
+                tenant_id=context.tenant_id,
+                workspace_id=connector.workspace_id,
+                user_id=context.user_id,
+                run_id=payload.run_id,
+                event_type="connector.invocation_denied",
+                metadata=connector_invocation_audit_metadata(
+                    decision,
+                    connector=connector,
+                ),
+                request=request,
+            )
+            raise TenantAccessError(decision.reason or "connector invocation denied")
+
+        if decision.status == ConnectorInvocationStatus.APPROVAL_REQUIRED:
+            approval = get_or_create_connector_approval(
+                app=app,
+                tenant_id=context.tenant_id,
+                run_id=payload.run_id,
+                connector_id=connector.id,
+                capability_name=decision.capability_name,
+                step_id=decision.step_id,
+            )
+            record_audit_event(
+                app=app,
+                tenant_id=context.tenant_id,
+                workspace_id=connector.workspace_id,
+                user_id=context.user_id,
+                run_id=payload.run_id,
+                event_type="connector.approval_required",
+                metadata=connector_invocation_audit_metadata(
+                    decision,
+                    connector=connector,
+                    approval_id=approval.id,
+                ),
+                request=request,
+            )
+            response_body = decision.model_dump(mode="json")
+            response_body["approval_id"] = approval.id
+            return response_body
+
+        approved_approval_id = None
+        if decision.approval_required:
+            approved_approval = require_approved_connector_approval(
+                app=app,
+                tenant_id=context.tenant_id,
+                run_id=payload.run_id,
+                approval_id=payload.approval_id,
+                connector_id=connector.id,
+                capability_name=decision.capability_name,
+                step_id=decision.step_id,
+            )
+            approved_approval_id = approved_approval.id
+
+        dispatch_result = None
+        try:
+            dispatch_result = app.state.connector_dispatcher.dispatch(
+                connector=connector,
+                tool_input=payload.tool_input,
+                tool_name=decision.tool_name,
+            )
+        except ConnectorDispatchError:
+            record_audit_event(
+                app=app,
+                tenant_id=context.tenant_id,
+                workspace_id=connector.workspace_id,
+                user_id=context.user_id,
+                run_id=payload.run_id,
+                event_type="connector.dispatch_failed",
+                metadata=connector_invocation_audit_metadata(
+                    decision,
+                    connector=connector,
+                    error_code="connector_dispatch_failed",
+                    approval_id=approved_approval_id,
+                ),
+                request=request,
+            )
+            raise
+
+        if decision.billing_meter_type is not None:
+            app.state.store.record_billing_meter(
+                tenant_id=context.tenant_id,
+                run_id=payload.run_id,
+                meter_type=decision.billing_meter_type,
+                quantity=1,
+                unit="invocation",
+                metadata={
+                    "connector_id": connector.id,
+                    "capability_name": decision.capability_name,
+                    "tool_name": decision.tool_name,
+                    "risk_level": decision.risk_level,
+                }
+                | connector_dispatch_billing_metadata(dispatch_result),
+            )
+        record_audit_event(
+            app=app,
+            tenant_id=context.tenant_id,
+            workspace_id=connector.workspace_id,
+            user_id=context.user_id,
+            run_id=payload.run_id,
+            event_type="connector.invoked",
+            metadata=connector_invocation_audit_metadata(
+                decision,
+                connector=connector,
+                dispatch_result=dispatch_result,
+                approval_id=approved_approval_id,
+            ),
+            request=request,
+        )
+        response_body = decision.model_dump(mode="json")
+        if dispatch_result is not None:
+            response_body["output"] = dispatch_result.output
+        return response_body
+
+    @app.post("/api/triggers/connector-events", status_code=status.HTTP_202_ACCEPTED)
+    def ingest_connector_event(
+        payload: ConnectorEventIngestRequest,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "triggers.invoke")
+        event = ConnectorEvent(
+            tenant_id=context.tenant_id,
+            workspace_id=payload.workspace_id,
+            connector_id=payload.connector_id,
+            event_type=payload.event_type,
+            external_event_id=payload.external_event_id,
+            payload=payload.payload,
+        )
+        matched_triggers = match_connector_event_triggers(
+            app.state.trigger_service.list_triggers(context.tenant_id),
+            event,
+        )
+        runs: list[ConnectorEventIngestRun] = []
+        for trigger in matched_triggers:
+            try:
+                run_request = app.state.trigger_service.build_run_request(
+                    tenant_id=context.tenant_id,
+                    trigger_id=trigger.id,
+                    invoked_by_user_id=trigger.service_account_id,
+                    invocation_payload=event.payload,
+                )
+            except TriggerDisabledError as error:
+                raise TenantAccessError(str(error)) from error
+            run = app.state.store.create_run(
+                tenant_id=context.tenant_id,
+                user_id=run_request.requested_by_user_id,
+                payload=RunCreate(
+                    workspace_id=run_request.workspace_id,
+                    agent_id=run_request.agent_id,
+                    message=run_request.message,
+                    mode=RunMode.AUTONOMOUS,
+                ),
+            )
+            record_audit_event(
+                app=app,
+                tenant_id=context.tenant_id,
+                workspace_id=run.workspace_id,
+                user_id=run_request.requested_by_user_id,
+                run_id=run.id,
+                event_type="trigger.invoked",
+                metadata={
+                    "trigger_id": run_request.trigger_id,
+                    "trigger_type": run_request.trigger_type.value,
+                    "run_id": run.id,
+                    "invocation_payload_keys": run_request.invocation_payload_keys,
+                    "connector_id": event.connector_id,
+                    "connector_event_type": event.event_type,
+                    "connector_external_event_id": event.external_event_id,
+                },
+                request=request,
+            )
+            app.state.store.record_billing_meter(
+                tenant_id=context.tenant_id,
+                run_id=run.id,
+                meter_type="trigger_invocation_count",
+                quantity=1,
+                unit="invocation",
+                metadata={
+                    "trigger_id": run_request.trigger_id,
+                    "trigger_type": run_request.trigger_type.value,
+                    "connector_id": event.connector_id,
+                    "connector_event_type": event.event_type,
+                },
+            )
+            runs.append(
+                ConnectorEventIngestRun(
+                    trigger_id=run_request.trigger_id,
+                    run_id=run.id,
+                    status=run.status.value,
+                    events_url=f"/api/runs/{run.id}/events",
+                )
+            )
+        return ConnectorEventIngestResponse(
+            connector_id=event.connector_id,
+            event_type=event.event_type,
+            external_event_id=event.external_event_id,
+            matched_trigger_count=len(matched_triggers),
+            runs=runs,
+        ).model_dump(mode="json")
+
+    @app.get("/api/triggers/{trigger_id}")
+    def get_trigger(
+        trigger_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "triggers.read")
+        return app.state.trigger_service.get_trigger(
+            context.tenant_id,
+            trigger_id,
+        ).model_dump(mode="json")
+
+    @app.post("/api/triggers/{trigger_id}/enable")
+    def enable_trigger(
+        trigger_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "triggers.manage")
+        trigger = app.state.trigger_service.enable_trigger(
+            context.tenant_id, trigger_id
+        )
+        record_audit_event(
+            app=app,
+            tenant_id=context.tenant_id,
+            workspace_id=trigger.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="trigger.enabled",
+            metadata={"trigger_id": trigger.id, "trigger_type": trigger.type.value},
+            request=request,
+        )
+        return trigger.model_dump(mode="json")
+
+    @app.post("/api/triggers/{trigger_id}/disable")
+    def disable_trigger(
+        trigger_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "triggers.manage")
+        trigger = app.state.trigger_service.disable_trigger(
+            context.tenant_id, trigger_id
+        )
+        record_audit_event(
+            app=app,
+            tenant_id=context.tenant_id,
+            workspace_id=trigger.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="trigger.disabled",
+            metadata={"trigger_id": trigger.id, "trigger_type": trigger.type.value},
+            request=request,
+        )
+        return trigger.model_dump(mode="json")
+
+    @app.post("/api/triggers/{trigger_id}/invoke", status_code=status.HTTP_202_ACCEPTED)
+    def invoke_trigger(
+        trigger_id: str,
+        payload: TriggerInvokeRequest,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "triggers.invoke")
+        try:
+            run_request = app.state.trigger_service.build_run_request(
+                tenant_id=context.tenant_id,
+                trigger_id=trigger_id,
+                invoked_by_user_id=context.user_id,
+                invocation_payload=payload.payload,
+            )
+        except TriggerDisabledError as error:
+            raise TenantAccessError(str(error)) from error
+        run = app.state.store.create_run(
+            tenant_id=context.tenant_id,
+            user_id=run_request.requested_by_user_id,
+            payload=RunCreate(
+                workspace_id=run_request.workspace_id,
+                agent_id=run_request.agent_id,
+                message=run_request.message,
+                mode=RunMode.AUTONOMOUS,
+            ),
+        )
+        record_audit_event(
+            app=app,
+            tenant_id=context.tenant_id,
+            workspace_id=run.workspace_id,
+            user_id=context.user_id,
+            run_id=run.id,
+            event_type="trigger.invoked",
+            metadata={
+                "trigger_id": run_request.trigger_id,
+                "trigger_type": run_request.trigger_type.value,
+                "run_id": run.id,
+                "invocation_payload_keys": run_request.invocation_payload_keys,
+            },
+            request=request,
+        )
+        app.state.store.record_billing_meter(
+            tenant_id=context.tenant_id,
+            run_id=run.id,
+            meter_type="trigger_invocation_count",
+            quantity=1,
+            unit="invocation",
+            metadata={
+                "trigger_id": run_request.trigger_id,
+                "trigger_type": run_request.trigger_type.value,
+            },
+        )
+        return TriggerInvokeResponse(
+            trigger_id=run_request.trigger_id,
+            run_id=run.id,
+            status=run.status.value,
+            events_url=f"/api/runs/{run.id}/events",
+        ).model_dump(mode="json")
+
+    @app.post(
+        "/api/triggers/{trigger_id}/webhook", status_code=status.HTTP_202_ACCEPTED
+    )
+    async def invoke_webhook_trigger(
+        trigger_id: str,
+        request: Request,
+        response: Response,
+        tenant_id: str = Header(alias="X-Tenant-ID"),
+        timestamp: str | None = Header(
+            default=None,
+            alias="X-Taroai-Webhook-Timestamp",
+        ),
+        signature: str | None = Header(
+            default=None,
+            alias="X-Taroai-Webhook-Signature",
+        ),
+        webhook_delivery_id: str | None = Header(
+            default=None,
+            alias="X-Taroai-Webhook-Delivery-ID",
+        ),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> dict:
+        body = await request.body()
+        verification = app.state.trigger_webhook_verifier.verify(
+            body=body,
+            timestamp_header=timestamp,
+            signature_header=signature,
+        )
+        idempotency_request = build_idempotency_request(
+            tenant_id=tenant_id,
+            key=select_webhook_idempotency_key(webhook_delivery_id, idempotency_key),
+            method=TRIGGER_WEBHOOK_METHOD,
+            path=trigger_webhook_path(trigger_id),
+            payload={
+                "trigger_id": trigger_id,
+                "webhook_body_sha256": verification.body_sha256,
+            },
+        )
+        replay_record = find_idempotent_replay(app.state.store, idempotency_request)
+        if replay_record is not None:
+            response.status_code = replay_record.status_code
+            return replay_record.response_body
+
+        trigger = app.state.trigger_service.get_trigger(tenant_id, trigger_id)
+        if trigger.type != TriggerType.WEBHOOK:
+            raise TenantAccessError("trigger is not a webhook trigger")
+        payload = parse_webhook_json_payload(body)
+        try:
+            run_request = app.state.trigger_service.build_run_request(
+                tenant_id=tenant_id,
+                trigger_id=trigger_id,
+                invoked_by_user_id=None,
+                invocation_payload=payload,
+            )
+        except TriggerDisabledError as error:
+            raise TenantAccessError(str(error)) from error
+        run = app.state.store.create_run(
+            tenant_id=tenant_id,
+            user_id=run_request.requested_by_user_id,
+            payload=RunCreate(
+                workspace_id=run_request.workspace_id,
+                agent_id=run_request.agent_id,
+                message=run_request.message,
+                mode=RunMode.AUTONOMOUS,
+            ),
+        )
+        record_audit_event(
+            app=app,
+            tenant_id=tenant_id,
+            workspace_id=run.workspace_id,
+            user_id=run_request.requested_by_user_id,
+            run_id=run.id,
+            event_type="trigger.invoked",
+            metadata={
+                "trigger_id": run_request.trigger_id,
+                "trigger_type": run_request.trigger_type.value,
+                "run_id": run.id,
+                "invocation_payload_keys": run_request.invocation_payload_keys,
+                "webhook_signature_verified": verification.verified,
+                "webhook_signature_algorithm": verification.algorithm,
+                "webhook_body_sha256": verification.body_sha256,
+            },
+            request=request,
+        )
+        app.state.store.record_billing_meter(
+            tenant_id=tenant_id,
+            run_id=run.id,
+            meter_type="trigger_invocation_count",
+            quantity=1,
+            unit="invocation",
+            metadata={
+                "trigger_id": run_request.trigger_id,
+                "trigger_type": run_request.trigger_type.value,
+            },
+        )
+        response_body = TriggerInvokeResponse(
+            trigger_id=run_request.trigger_id,
+            run_id=run.id,
+            status=run.status.value,
+            events_url=f"/api/runs/{run.id}/events",
+        ).model_dump(mode="json")
+        save_idempotent_response(
+            app.state.store,
+            idempotency_request,
+            status.HTTP_202_ACCEPTED,
+            response_body,
+        )
+        return response_body
+
+    @app.post(
+        "/api/triggers/{trigger_id}/agent-handoff", status_code=status.HTTP_202_ACCEPTED
+    )
+    def invoke_agent_handoff_trigger(
+        trigger_id: str,
+        payload: AgentHandoffRequest,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "triggers.invoke")
+        trigger = app.state.trigger_service.get_trigger(context.tenant_id, trigger_id)
+        if trigger.agent_handoff is not None:
+            for required_permission in trigger.agent_handoff.required_permissions:
+                require_permission(request, context, required_permission)
+        source_run = app.state.store.get_run(context.tenant_id, payload.source_run_id)
+        target_depth = assert_agent_handoff_allowed(trigger, source_run, payload)
+        try:
+            run_request = app.state.trigger_service.build_run_request(
+                tenant_id=context.tenant_id,
+                trigger_id=trigger_id,
+                invoked_by_user_id=trigger.service_account_id,
+                invocation_payload=payload.handoff_input,
+            )
+        except TriggerDisabledError as error:
+            raise TenantAccessError(str(error)) from error
+        run = app.state.store.create_run(
+            tenant_id=context.tenant_id,
+            user_id=run_request.requested_by_user_id,
+            payload=RunCreate(
+                workspace_id=run_request.workspace_id,
+                agent_id=run_request.agent_id,
+                message=run_request.message,
+                mode=RunMode.AUTONOMOUS,
+            ),
+        )
+        handoff_metadata = {
+            "trigger_id": run_request.trigger_id,
+            "source_run_id": source_run.id,
+            "source_agent_id": source_run.agent_id,
+            "target_run_id": run.id,
+            "target_agent_id": run.agent_id,
+            "reason_code": payload.reason_code,
+            "handoff_depth": target_depth,
+            "max_depth": (
+                trigger.agent_handoff.max_depth
+                if trigger.agent_handoff
+                else target_depth
+            ),
+            "handoff_input_keys": sorted(payload.handoff_input.keys()),
+        }
+        app.state.store.append_run_event(
+            source_run,
+            "agent.handoff.requested",
+            handoff_metadata,
+        )
+        app.state.store.append_run_event(
+            run,
+            "agent.handoff.received",
+            handoff_metadata,
+        )
+        record_audit_event(
+            app=app,
+            tenant_id=context.tenant_id,
+            workspace_id=run.workspace_id,
+            user_id=run_request.requested_by_user_id,
+            run_id=run.id,
+            event_type="trigger.invoked",
+            metadata={
+                "trigger_id": run_request.trigger_id,
+                "trigger_type": run_request.trigger_type.value,
+                "run_id": run.id,
+                "source_run_id": source_run.id,
+                "source_agent_id": source_run.agent_id,
+                "target_agent_id": run.agent_id,
+                "handoff_depth": target_depth,
+                "max_depth": (
+                    trigger.agent_handoff.max_depth
+                    if trigger.agent_handoff
+                    else target_depth
+                ),
+                "reason_code": payload.reason_code,
+                "invocation_payload_keys": run_request.invocation_payload_keys,
+            },
+            request=request,
+        )
+        app.state.store.record_billing_meter(
+            tenant_id=context.tenant_id,
+            run_id=run.id,
+            meter_type="trigger_invocation_count",
+            quantity=1,
+            unit="invocation",
+            metadata={
+                "trigger_id": run_request.trigger_id,
+                "trigger_type": run_request.trigger_type.value,
+                "source_run_id": source_run.id,
+                "target_agent_id": run.agent_id,
+            },
+        )
+        return AgentHandoffResponse(
+            trigger_id=run_request.trigger_id,
+            run_id=run.id,
+            status=run.status.value,
+            events_url=f"/api/runs/{run.id}/events",
+        ).model_dump(mode="json")
 
     @app.get("/api/runs/{run_id}")
     def get_run(
         run_id: str,
         context: RequestContext = Depends(get_request_context),
     ) -> dict:
-        return app.state.store.get_run(context.tenant_id, run_id).model_dump(mode="json")
+        return app.state.store.get_run(context.tenant_id, run_id).model_dump(
+            mode="json"
+        )
+
+    @app.get("/api/runs/{run_id}/state")
+    def get_run_state(
+        run_id: str,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        return app.state.store.get_runtime_state(
+            context.tenant_id,
+            run_id,
+        ).model_dump(mode="json")
 
     @app.get("/api/runs/{run_id}/events")
     def get_run_events(
         run_id: str,
+        after_sequence: int | None = None,
+        last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
         context: RequestContext = Depends(get_request_context),
     ) -> StreamingResponse:
-        events = app.state.store.list_run_events(context.tenant_id, run_id)
+        replay_after_sequence = resolve_event_replay_sequence(
+            after_sequence, last_event_id
+        )
+        events = app.state.store.list_run_events(
+            context.tenant_id,
+            run_id,
+            after_sequence=replay_after_sequence,
+        )
 
         def stream() -> Iterator[str]:
             for event in events:
-                payload = json.dumps(event.model_dump(mode="json"), separators=(",", ":"))
+                payload = json.dumps(
+                    event.model_dump(mode="json"), separators=(",", ":")
+                )
+                yield f"id: {event.sequence}\n"
                 yield f"event: {event.type}\n"
                 yield f"data: {payload}\n\n"
 
-        return StreamingResponse(stream(), media_type=app.state.settings.event_stream_media_type)
+        return StreamingResponse(
+            stream(), media_type=app.state.settings.event_stream_media_type
+        )
 
     @app.post("/api/runs/{run_id}/execute")
     def execute_run(
@@ -609,7 +2615,10 @@ def create_app(
             app.state.store.append_run_event(
                 queued_run,
                 "run.execution_queued",
-                {"job_id": job.id, "queue": app.state.settings.run_execution_queue_name},
+                {
+                    "job_id": job.id,
+                    "queue": app.state.settings.run_execution_queue_name,
+                },
             )
             response.status_code = status.HTTP_202_ACCEPTED
             return RunQueuedResponse(
@@ -635,43 +2644,188 @@ def create_app(
         )
         return run.model_dump(mode="json")
 
+    @app.post("/api/runs/{run_id}/retry")
+    def retry_run(
+        run_id: str,
+        response: Response,
+        payload: RunRetryRequest | None = None,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        resolved_payload = payload or RunRetryRequest()
+        if app.state.settings.run_execution_dispatch_mode == "queue":
+            queue = app.state.job_queue
+            if queue is None:
+                raise RedisQueueConfigurationError("job queue backend is disabled")
+            run = app.state.store.request_run_retry(
+                tenant_id=context.tenant_id,
+                run_id=run_id,
+                requested_by_user_id=context.user_id,
+                reason_code=resolved_payload.reason_code,
+            )
+            app.state.store.cancel_pending_approval_requests(
+                tenant_id=context.tenant_id,
+                run_id=run_id,
+                cancelled_by_user_id=context.user_id,
+            )
+            job = queue.enqueue(
+                JobType.RUN_EXECUTION,
+                RunExecutionJob(
+                    tenant_id=run.tenant_id,
+                    workspace_id=run.workspace_id,
+                    user_id=run.user_id,
+                    run_id=run.id,
+                    requested_by_user_id=context.user_id,
+                ),
+                max_attempts=app.state.settings.worker_job_max_attempts,
+            )
+            queued_run = app.state.store.update_run_status(
+                context.tenant_id,
+                run_id,
+                RunStatus.QUEUED,
+            )
+            app.state.store.append_run_event(
+                queued_run,
+                "run.execution_queued",
+                {
+                    "job_id": job.id,
+                    "queue": app.state.settings.run_execution_queue_name,
+                    "reason": "retry",
+                },
+            )
+            response.status_code = status.HTTP_202_ACCEPTED
+            return RunQueuedResponse(
+                run_id=run_id,
+                job_id=job.id,
+                queue=app.state.settings.run_execution_queue_name,
+            ).model_dump(mode="json")
+        state = app.state.runtime.retry_run(
+            tenant_id=context.tenant_id,
+            run_id=run_id,
+            requested_by_user_id=context.user_id,
+            reason_code=resolved_payload.reason_code,
+        )
+        return state.model_dump(mode="json")
+
     @app.post("/api/runs/{run_id}/approvals")
     def resolve_approval(
         run_id: str,
         payload: ApprovalResolveRequest,
+        response: Response,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
         context: RequestContext = Depends(get_request_context),
-    ) -> dict:
-        state = app.state.runtime.resume_after_approval(
+    ) -> dict[str, Any]:
+        idempotency_request = build_idempotency_request(
+            tenant_id=context.tenant_id,
+            key=idempotency_key,
+            method=RUN_APPROVAL_METHOD,
+            path=run_approval_path(run_id),
+            payload=payload,
+        )
+        replay_record = find_idempotent_replay(app.state.store, idempotency_request)
+        if replay_record is not None:
+            response.status_code = replay_record.status_code
+            return replay_record.response_body
+
+        connector_approval = find_connector_approval(
+            app=app,
             tenant_id=context.tenant_id,
             run_id=run_id,
             approval_id=payload.approval_id,
-            approved_by_user_id=context.user_id,
         )
-        return state.model_dump(mode="json")
+        if connector_approval is not None:
+            resolved_approval = app.state.store.resolve_approval_request(
+                tenant_id=context.tenant_id,
+                run_id=run_id,
+                approval_id=payload.approval_id,
+                approved_by_user_id=context.user_id,
+            )
+            response_body = {
+                "run_id": run_id,
+                "approval_id": resolved_approval.id,
+                "status": resolved_approval.status.value,
+            }
+        else:
+            state = app.state.runtime.resume_after_approval(
+                tenant_id=context.tenant_id,
+                run_id=run_id,
+                approval_id=payload.approval_id,
+                approved_by_user_id=context.user_id,
+            )
+            response_body = state.model_dump(mode="json")
+        save_idempotent_response(
+            app.state.store,
+            idempotency_request,
+            status.HTTP_200_OK,
+            response_body,
+        )
+        return response_body
 
     @app.post("/api/runs/{run_id}/approvals/reject")
     def reject_approval(
         run_id: str,
         payload: ApprovalRejectRequest,
+        response: Response,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
         context: RequestContext = Depends(get_request_context),
-    ) -> dict:
-        state = app.state.runtime.reject_approval(
+    ) -> dict[str, Any]:
+        idempotency_request = build_idempotency_request(
+            tenant_id=context.tenant_id,
+            key=idempotency_key,
+            method=RUN_APPROVAL_METHOD,
+            path=run_approval_reject_path(run_id),
+            payload=payload,
+        )
+        replay_record = find_idempotent_replay(app.state.store, idempotency_request)
+        if replay_record is not None:
+            response.status_code = replay_record.status_code
+            return replay_record.response_body
+
+        connector_approval = find_connector_approval(
+            app=app,
             tenant_id=context.tenant_id,
             run_id=run_id,
             approval_id=payload.approval_id,
-            rejected_by_user_id=context.user_id,
         )
-        return state.model_dump(mode="json")
+        if connector_approval is not None:
+            rejected_approval = app.state.store.reject_approval_request(
+                tenant_id=context.tenant_id,
+                run_id=run_id,
+                approval_id=payload.approval_id,
+                rejected_by_user_id=context.user_id,
+            )
+            response_body = {
+                "run_id": run_id,
+                "approval_id": rejected_approval.id,
+                "status": rejected_approval.status.value,
+            }
+        else:
+            state = app.state.runtime.reject_approval(
+                tenant_id=context.tenant_id,
+                run_id=run_id,
+                approval_id=payload.approval_id,
+                rejected_by_user_id=context.user_id,
+            )
+            response_body = state.model_dump(mode="json")
+        save_idempotent_response(
+            app.state.store,
+            idempotency_request,
+            status.HTTP_200_OK,
+            response_body,
+        )
+        return response_body
 
     @app.get("/api/runs/{run_id}/artifacts")
     def list_artifacts(
         run_id: str,
+        request: Request,
+        page: PageRequest = Depends(get_page_request),
         context: RequestContext = Depends(get_request_context),
-    ) -> list[dict]:
-        return [
-            artifact.model_dump(mode="json")
-            for artifact in app.state.store.list_artifacts(context.tenant_id, run_id)
-        ]
+    ) -> list[dict[str, Any]] | dict[str, Any]:
+        return list_or_page_created_at_records(
+            app.state.store.list_artifacts(context.tenant_id, run_id),
+            request,
+            page,
+        )
 
     @app.get("/api/runs/{run_id}/trace")
     def get_run_trace(
@@ -723,10 +2877,7 @@ def create_app(
                 updated_by_user_id=context.user_id,
             )
         )
-        app.state.runtime.model_policy = build_model_policy(
-            app.state.settings,
-            app.state.model_policy_store,
-        )
+        refresh_runtime_model_policy(app)
         record_audit_event(
             app=app,
             tenant_id=context.tenant_id,
@@ -739,22 +2890,614 @@ def create_app(
                 "default_model": record.default_model,
                 "allowed_model_count": len(record.allowed_models),
                 "denied_model_count": len(record.denied_models),
+                "model_sensitivity_limit_count": len(record.model_sensitivity_limits),
             },
             request=request,
         )
         return record.model_dump(mode="json")
 
-    @app.get("/api/billing/meters")
-    def list_billing_meters(
+    @app.get("/api/model-policies/versions")
+    def list_model_policy_versions(
         request: Request,
-        query: BillingMeterQuery = Depends(get_billing_meter_query),
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict]:
+        require_permission(request, context, "model_policy.read")
+        return [
+            _model_policy_version_api_payload(record)
+            for record in app.state.model_policy_store.list_policy_versions(
+                context.tenant_id
+            )
+        ]
+
+    @app.get("/api/model-policies/change-requests")
+    def list_model_policy_change_requests(
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict]:
+        require_permission(request, context, "model_policy.read")
+        return [
+            _model_policy_change_request_api_payload(record)
+            for record in app.state.model_policy_store.list_policy_change_requests(
+                context.tenant_id
+            )
+        ]
+
+    @app.post(
+        "/api/model-policies/change-requests",
+        status_code=status.HTTP_201_CREATED,
+    )
+    def create_model_policy_change_request(
+        payload: ModelPolicyChangeRequestApiCreate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "model_policy.manage")
+        record = app.state.model_policy_store.create_policy_change_request(
+            payload.to_create(
+                tenant_id=context.tenant_id,
+                requested_by_user_id=context.user_id,
+            )
+        )
+        record_audit_event(
+            app=app,
+            tenant_id=context.tenant_id,
+            workspace_id=record.scope_upsert.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="model_policy.change_requested",
+            metadata=model_policy_change_audit_metadata(record),
+            request=request,
+        )
+        return _model_policy_change_request_api_payload(record)
+
+    @app.post("/api/model-policies/change-requests/{request_id}/approve")
+    def approve_model_policy_change_request(
+        request_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "model_policy.approve")
+        result = app.state.model_policy_store.approve_policy_change_request(
+            tenant_id=context.tenant_id,
+            request_id=request_id,
+            reviewed_by_user_id=context.user_id,
+        )
+        refresh_runtime_model_policy(app)
+        record_audit_event(
+            app=app,
+            tenant_id=context.tenant_id,
+            workspace_id=result.change_request.scope_upsert.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="model_policy.change_approved",
+            metadata=model_policy_change_audit_metadata(result.change_request),
+            request=request,
+        )
+        return {
+            "change_request": _model_policy_change_request_api_payload(
+                result.change_request
+            ),
+            "scope": result.scope_record.model_dump(mode="json")
+            if result.scope_record is not None
+            else None,
+        }
+
+    @app.post("/api/model-policies/change-requests/{request_id}/reject")
+    def reject_model_policy_change_request(
+        request_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "model_policy.approve")
+        record = app.state.model_policy_store.reject_policy_change_request(
+            tenant_id=context.tenant_id,
+            request_id=request_id,
+            reviewed_by_user_id=context.user_id,
+        )
+        record_audit_event(
+            app=app,
+            tenant_id=context.tenant_id,
+            workspace_id=record.scope_upsert.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="model_policy.change_rejected",
+            metadata=model_policy_change_audit_metadata(record),
+            request=request,
+        )
+        return _model_policy_change_request_api_payload(record)
+
+    @app.get("/api/model-providers")
+    def list_model_providers(
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict]:
+        require_permission(request, context, "model_providers.read")
+        settings_providers = [
+            _model_provider_api_payload(
+                app.state.settings,
+                provider,
+                status="active",
+                source="settings",
+            )
+            for provider in app.state.settings.model_gateway_providers
+            if _model_provider_visible_to_tenant(provider, context.tenant_id)
+        ]
+        stored_providers = [
+            _model_provider_record_api_payload(app.state.settings, record)
+            for record in app.state.model_provider_store.list_providers(context.tenant_id)
+        ]
+        return settings_providers + stored_providers
+
+    @app.get("/api/model-providers/change-requests")
+    def list_model_provider_change_requests(
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict]:
+        require_permission(request, context, "model_providers.read")
+        return [
+            _model_provider_change_request_api_payload(app.state.settings, record)
+            for record in app.state.model_provider_store.list_provider_change_requests(
+                context.tenant_id
+            )
+        ]
+
+    @app.post(
+        "/api/model-providers/{provider_id}/change-requests",
+        status_code=status.HTTP_201_CREATED,
+    )
+    def create_model_provider_change_request(
+        provider_id: str,
+        payload: ModelProviderChangeRequestApiCreate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "model_providers.manage")
+        record = app.state.model_provider_store.create_provider_change_request(
+            payload.to_create(
+                tenant_id=context.tenant_id,
+                provider_id=provider_id,
+                requested_by_user_id=context.user_id,
+            )
+        )
+        record_audit_event(
+            app=app,
+            tenant_id=context.tenant_id,
+            workspace_id=record.provider_upsert.workspace_id
+            if record.provider_upsert is not None
+            else None,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="model_provider.change_requested",
+            metadata=model_provider_change_audit_metadata(record),
+            request=request,
+        )
+        return _model_provider_change_request_api_payload(app.state.settings, record)
+
+    @app.post("/api/model-providers/change-requests/{request_id}/approve")
+    def approve_model_provider_change_request(
+        request_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "model_providers.approve")
+        result = app.state.model_provider_store.approve_provider_change_request(
+            tenant_id=context.tenant_id,
+            request_id=request_id,
+            reviewed_by_user_id=context.user_id,
+        )
+        refresh_runtime_model_gateway(app)
+        metadata = model_provider_change_audit_metadata(result.change_request)
+        if result.provider_record is not None:
+            metadata["current_version"] = result.provider_record.current_version
+        record_audit_event(
+            app=app,
+            tenant_id=context.tenant_id,
+            workspace_id=result.provider_record.provider.workspace_id
+            if result.provider_record is not None
+            else None,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="model_provider.change_approved",
+            metadata=metadata,
+            request=request,
+        )
+        return {
+            "change_request": _model_provider_change_request_api_payload(
+                app.state.settings,
+                result.change_request,
+            ),
+            "provider": _model_provider_record_api_payload(
+                app.state.settings,
+                result.provider_record,
+            )
+            if result.provider_record is not None
+            else None,
+        }
+
+    @app.post("/api/model-providers/change-requests/{request_id}/reject")
+    def reject_model_provider_change_request(
+        request_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "model_providers.approve")
+        record = app.state.model_provider_store.reject_provider_change_request(
+            tenant_id=context.tenant_id,
+            request_id=request_id,
+            reviewed_by_user_id=context.user_id,
+        )
+        record_audit_event(
+            app=app,
+            tenant_id=context.tenant_id,
+            workspace_id=record.provider_upsert.workspace_id
+            if record.provider_upsert is not None
+            else None,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="model_provider.change_rejected",
+            metadata=model_provider_change_audit_metadata(record),
+            request=request,
+        )
+        return _model_provider_change_request_api_payload(app.state.settings, record)
+
+    @app.put("/api/model-providers/{provider_id}")
+    def upsert_model_provider(
+        provider_id: str,
+        payload: ModelProviderApiUpsert,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "model_providers.manage")
+        record = app.state.model_provider_store.upsert_provider(
+            payload.to_upsert(
+                tenant_id=context.tenant_id,
+                provider_id=provider_id,
+                updated_by_user_id=context.user_id,
+            )
+        )
+        refresh_runtime_model_gateway(app)
+        record_audit_event(
+            app=app,
+            tenant_id=context.tenant_id,
+            workspace_id=record.provider.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="model_provider.upserted",
+            metadata=model_provider_audit_metadata(record),
+            request=request,
+        )
+        return _model_provider_record_api_payload(app.state.settings, record)
+
+    @app.post("/api/model-providers/{provider_id}/disable")
+    def disable_model_provider(
+        provider_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "model_providers.manage")
+        record = app.state.model_provider_store.set_status(
+            tenant_id=context.tenant_id,
+            provider_id=provider_id,
+            status="disabled",
+            updated_by_user_id=context.user_id,
+        )
+        refresh_runtime_model_gateway(app)
+        record_audit_event(
+            app=app,
+            tenant_id=context.tenant_id,
+            workspace_id=record.provider.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="model_provider.disabled",
+            metadata=model_provider_audit_metadata(record),
+            request=request,
+        )
+        return _model_provider_record_api_payload(app.state.settings, record)
+
+    @app.post("/api/model-providers/{provider_id}/enable")
+    def enable_model_provider(
+        provider_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "model_providers.manage")
+        record = app.state.model_provider_store.set_status(
+            tenant_id=context.tenant_id,
+            provider_id=provider_id,
+            status="active",
+            updated_by_user_id=context.user_id,
+        )
+        refresh_runtime_model_gateway(app)
+        record_audit_event(
+            app=app,
+            tenant_id=context.tenant_id,
+            workspace_id=record.provider.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="model_provider.enabled",
+            metadata=model_provider_audit_metadata(record),
+            request=request,
+        )
+        return _model_provider_record_api_payload(app.state.settings, record)
+
+    @app.post("/api/model-providers/{provider_id}/credential")
+    def rotate_model_provider_credential(
+        provider_id: str,
+        payload: ModelProviderCredentialRotateRequest,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "model_providers.manage")
+        record = app.state.model_provider_store.rotate_credential(
+            tenant_id=context.tenant_id,
+            provider_id=provider_id,
+            api_key_secret_ref_id=payload.api_key_secret_ref_id,
+            updated_by_user_id=context.user_id,
+        )
+        refresh_runtime_model_gateway(app)
+        record_audit_event(
+            app=app,
+            tenant_id=context.tenant_id,
+            workspace_id=record.provider.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="model_provider.credential_rotated",
+            metadata=model_provider_audit_metadata(record),
+            request=request,
+        )
+        return _model_provider_record_api_payload(app.state.settings, record)
+
+    @app.get("/api/model-providers/{provider_id}/versions")
+    def list_model_provider_versions(
+        provider_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict]:
+        require_permission(request, context, "model_providers.read")
+        return [
+            _model_provider_version_api_payload(app.state.settings, record)
+            for record in app.state.model_provider_store.list_provider_versions(
+                context.tenant_id,
+                provider_id,
+            )
+        ]
+
+    @app.post("/api/model-providers/{provider_id}/versions/{version}/rollback")
+    def rollback_model_provider_version(
+        provider_id: str,
+        version: int,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "model_providers.manage")
+        record = app.state.model_provider_store.rollback_provider_version(
+            tenant_id=context.tenant_id,
+            provider_id=provider_id,
+            version=version,
+            updated_by_user_id=context.user_id,
+        )
+        refresh_runtime_model_gateway(app)
+        metadata = model_provider_audit_metadata(record)
+        metadata["restored_version"] = version
+        record_audit_event(
+            app=app,
+            tenant_id=context.tenant_id,
+            workspace_id=record.provider.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="model_provider.version_rolled_back",
+            metadata=metadata,
+            request=request,
+        )
+        return _model_provider_record_api_payload(app.state.settings, record)
+
+    @app.get("/api/billing/invoices")
+    def list_billing_invoices(
+        request: Request,
         context: RequestContext = Depends(get_request_context),
     ) -> list[dict]:
         require_permission(request, context, "billing.read")
         return [
-            meter.model_dump(mode="json")
-            for meter in query.apply(app.state.store.list_billing_meters(context.tenant_id))
+            record.model_dump(mode="json")
+            for record in app.state.billing_invoice_store.list_invoices(
+                context.tenant_id
+            )
         ]
+
+    @app.post("/api/billing/invoices", status_code=status.HTTP_201_CREATED)
+    def create_billing_invoice_snapshot(
+        payload: BillingInvoiceQuery,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "billing.manage")
+        invoice = app.state.billing_invoice_service.create_invoice(
+            tenant_id=context.tenant_id,
+            meters=app.state.store.list_billing_meters(context.tenant_id),
+            query=payload,
+        )
+        record = app.state.billing_invoice_store.create_invoice(
+            BillingInvoiceRecord(
+                invoice_id=new_id("invoice"),
+                tenant_id=context.tenant_id,
+                invoice=invoice,
+                created_by_user_id=context.user_id,
+                created_at=utc_now(),
+            )
+        )
+        record_audit_event(
+            app=app,
+            tenant_id=context.tenant_id,
+            workspace_id=None,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="billing.invoice.created",
+            metadata={
+                "invoice_id": record.invoice_id,
+                "currency": invoice.currency,
+                "group_by": invoice.group_by,
+                "meter_event_count": invoice.meter_event_count,
+                "unpriced_event_count": invoice.unpriced_event_count,
+                "line_count": len(invoice.lines),
+            },
+            request=request,
+        )
+        return record.model_dump(mode="json")
+
+    @app.get("/api/billing/invoices/{invoice_id}")
+    def get_billing_invoice_snapshot(
+        invoice_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "billing.read")
+        return app.state.billing_invoice_store.get_invoice(
+            context.tenant_id,
+            invoice_id,
+        ).model_dump(mode="json")
+
+    @app.get("/api/billing/pricing-rules")
+    def list_billing_pricing_rules(
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict]:
+        require_permission(request, context, "billing.read")
+        return [
+            rule.model_dump(mode="json")
+            for rule in app.state.billing_pricing_rule_store.list_rules(
+                context.tenant_id
+            )
+        ]
+
+    @app.put("/api/billing/pricing-rules")
+    def upsert_billing_pricing_rule(
+        payload: BillingPricingRuleApiUpsert,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "billing.manage")
+        record = app.state.billing_pricing_rule_store.upsert_rule(
+            payload.to_upsert(
+                tenant_id=context.tenant_id,
+                updated_by_user_id=context.user_id,
+            )
+        )
+        app.state.billing_pricing_service = build_billing_pricing_service(
+            app.state.settings,
+            app.state.billing_pricing_rule_store,
+        )
+        record_audit_event(
+            app=app,
+            tenant_id=context.tenant_id,
+            workspace_id=record.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="billing.pricing_rule.upserted",
+            metadata={
+                "workspace_id": record.workspace_id,
+                "skill_id": record.skill_id,
+                "meter_type": record.meter_type,
+                "unit": record.unit,
+                "provider_present": record.provider is not None,
+                "model_present": record.model is not None,
+                "currency": record.currency,
+            },
+            request=request,
+        )
+        return record.model_dump(mode="json")
+
+    @app.get("/api/share-grants")
+    def list_share_grants(
+        request: Request,
+        resource_type: ShareResourceType | None = None,
+        resource_id: str | None = None,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict]:
+        require_permission(request, context, "sharing.read")
+        return [
+            share_grant_response_body(grant)
+            for grant in app.state.share_grant_store.list_grants(
+                tenant_id=context.tenant_id,
+                resource_type=resource_type,
+                resource_id=resource_id,
+            )
+        ]
+
+    @app.post("/api/share-grants", status_code=status.HTTP_201_CREATED)
+    def create_share_grant(
+        payload: ShareGrantApiCreate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "sharing.manage")
+        create_payload = payload
+        if payload.subject_type == ShareSubjectType.EXTERNAL_LINK:
+            require_external_share_links_enabled(request)
+            create_payload = payload.model_copy(
+                update={
+                    "subject_id": external_share_link_subject_id(
+                        payload.subject_id,
+                        context.tenant_id,
+                        request.app.state.settings,
+                    )
+                }
+            )
+        grant = app.state.share_grant_store.create_grant(
+            create_payload.to_create(
+                tenant_id=context.tenant_id,
+                created_by_user_id=context.user_id,
+            )
+        )
+        record_audit_event(
+            app=app,
+            tenant_id=context.tenant_id,
+            workspace_id=None,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="share.grant.created",
+            metadata=share_grant_audit_metadata(grant),
+            request=request,
+        )
+        return share_grant_response_body(grant)
+
+    @app.post("/api/share-grants/{grant_id}/revoke")
+    def revoke_share_grant(
+        grant_id: str,
+        request: Request,
+        payload: ShareGrantRevokeRequest | None = Body(default=None),
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "sharing.manage")
+        grant = app.state.share_grant_store.revoke_grant(
+            tenant_id=context.tenant_id,
+            grant_id=grant_id,
+            revoked_by_user_id=context.user_id,
+        )
+        record_audit_event(
+            app=app,
+            tenant_id=context.tenant_id,
+            workspace_id=None,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="share.grant.revoked",
+            metadata=share_grant_audit_metadata(grant),
+            request=request,
+        )
+        return share_grant_response_body(grant)
+
+    @app.get("/api/billing/meters")
+    def list_billing_meters(
+        request: Request,
+        query: BillingMeterQuery = Depends(get_billing_meter_query),
+        page: PageRequest = Depends(get_page_request),
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict[str, Any]] | dict[str, Any]:
+        require_permission(request, context, "billing.read")
+        return list_or_page_created_at_records(
+            query.apply(app.state.store.list_billing_meters(context.tenant_id)),
+            request,
+            page,
+        )
 
     @app.get("/api/billing/summary")
     def summarize_billing_meters(
@@ -771,17 +3514,33 @@ def create_app(
             )
         ]
 
+    @app.get("/api/billing/invoice")
+    def export_billing_invoice(
+        request: Request,
+        query: BillingInvoiceQuery = Depends(get_billing_invoice_query),
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "billing.read")
+        invoice = app.state.billing_invoice_service.create_invoice(
+            tenant_id=context.tenant_id,
+            meters=app.state.store.list_billing_meters(context.tenant_id),
+            query=query,
+        )
+        return invoice.model_dump(mode="json")
+
     @app.get("/api/audit-events")
     def list_audit_events(
         request: Request,
         query: AuditEventQuery = Depends(get_audit_event_query),
+        page: PageRequest = Depends(get_page_request),
         context: RequestContext = Depends(get_request_context),
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]] | dict[str, Any]:
         require_permission(request, context, "audit.read")
-        return [
-            event.model_dump(mode="json")
-            for event in query.apply(app.state.audit_service.list_for_tenant(context.tenant_id))
-        ]
+        return list_or_page_created_at_records(
+            query.apply(app.state.audit_service.list_for_tenant(context.tenant_id)),
+            request,
+            page,
+        )
 
     @app.get("/api/audit-events/coverage")
     def get_audit_coverage(
@@ -792,6 +3551,230 @@ def create_app(
         return app.state.audit_service.check_coverage(
             context.tenant_id,
             DEFAULT_AUDIT_COVERAGE_REQUIREMENTS,
+        ).model_dump(mode="json")
+
+    @app.get("/api/customer-success/summary")
+    def get_customer_success_summary(
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "customer_success.read")
+        return app.state.customer_success_service.build_tenant_summary(
+            context.tenant_id
+        ).model_dump(mode="json")
+
+    @app.post("/api/customer-success/feedback", status_code=status.HTTP_201_CREATED)
+    def submit_customer_feedback(
+        payload: CustomerFeedbackCreate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "customer_success.feedback")
+        feedback = app.state.customer_feedback_service.capture_feedback(
+            tenant_id=context.tenant_id,
+            payload=payload.model_copy(
+                update={"submitted_by_user_id": context.user_id}
+            ),
+        )
+        return customer_feedback_response_body(feedback)
+
+    @app.get("/api/customer-success/feedback")
+    def list_customer_feedback(
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict]:
+        require_permission(request, context, "customer_success.read")
+        return [
+            customer_feedback_response_body(feedback)
+            for feedback in app.state.customer_feedback_service.list_feedback(
+                context.tenant_id
+            )
+        ]
+
+    @app.post(
+        "/api/customer-success/evaluation-candidates",
+        status_code=status.HTTP_201_CREATED,
+    )
+    def create_customer_success_evaluation_candidates(
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict]:
+        require_permission(request, context, "customer_success.manage")
+        feedback_service = app.state.customer_feedback_service
+        return [
+            candidate.model_dump(mode="json")
+            for candidate in feedback_service.create_evaluation_candidates_for_low_rated_runs(
+                tenant_id=context.tenant_id,
+                reviewed_by_user_id=context.user_id,
+            )
+        ]
+
+    @app.get("/api/customer-success/evaluation-candidates")
+    def list_customer_success_evaluation_candidates(
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict]:
+        require_permission(request, context, "customer_success.manage")
+        return [
+            candidate.model_dump(mode="json")
+            for candidate in app.state.customer_feedback_service.list_evaluation_candidates(
+                context.tenant_id,
+            )
+        ]
+
+    @app.get("/api/customer-success/evaluation-cases")
+    def list_customer_success_evaluation_cases(
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict]:
+        require_permission(request, context, "customer_success.manage")
+        feedback_service = app.state.customer_feedback_service
+        return [
+            evaluation_case.model_dump(mode="json")
+            for evaluation_case in feedback_service.list_evaluation_cases(
+                context.tenant_id,
+            )
+        ]
+
+    @app.post("/api/customer-success/evaluation-candidates/{candidate_id}/review")
+    def review_customer_success_evaluation_candidate(
+        candidate_id: str,
+        payload: CustomerSuccessCandidateReview,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "customer_success.manage")
+        return app.state.customer_feedback_service.review_evaluation_candidate(
+            tenant_id=context.tenant_id,
+            candidate_id=candidate_id,
+            reviewed_by_user_id=context.user_id,
+            status=payload.status,
+            review_note=payload.review_note,
+        ).model_dump(mode="json")
+
+    @app.post(
+        "/api/customer-success/solution-pack-candidates",
+        status_code=status.HTTP_201_CREATED,
+    )
+    def create_customer_success_solution_pack_candidates(
+        payload: CustomerSuccessCandidateCreate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict]:
+        require_permission(request, context, "customer_success.manage")
+        feedback_service = app.state.customer_feedback_service
+        return [
+            candidate.model_dump(mode="json")
+            for candidate in feedback_service.create_solution_pack_improvement_candidates(
+                tenant_id=context.tenant_id,
+                reviewed_by_user_id=context.user_id,
+                minimum_repeated_feedback=payload.minimum_repeated_feedback,
+            )
+        ]
+
+    @app.get("/api/customer-success/solution-pack-candidates")
+    def list_customer_success_solution_pack_candidates(
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict]:
+        require_permission(request, context, "customer_success.manage")
+        return [
+            candidate.model_dump(mode="json")
+            for candidate in app.state.customer_feedback_service.list_solution_pack_candidates(
+                context.tenant_id,
+            )
+        ]
+
+    @app.get("/api/customer-success/solution-pack-drafts")
+    def list_customer_success_solution_pack_drafts(
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict]:
+        require_permission(request, context, "customer_success.manage")
+        feedback_service = app.state.customer_feedback_service
+        return [
+            publication_draft.model_dump(mode="json")
+            for publication_draft in feedback_service.list_solution_pack_publication_drafts(
+                context.tenant_id,
+            )
+        ]
+
+    @app.patch("/api/customer-success/solution-pack-drafts/{publication_draft_id}")
+    def update_customer_success_solution_pack_draft(
+        publication_draft_id: str,
+        payload: CustomerSuccessSolutionPackDraftUpdate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "customer_success.manage")
+        return app.state.customer_feedback_service.update_solution_pack_publication_draft(
+            tenant_id=context.tenant_id,
+            publication_draft_id=publication_draft_id,
+            updated_by_user_id=context.user_id,
+            requested_skill_name=payload.requested_skill_name,
+            proposed_change_summary=payload.proposed_change_summary,
+            proposed_pack_version=payload.proposed_pack_version,
+            proposed_skill_manifest=payload.proposed_skill_manifest,
+            proposed_skill_manifests=payload.proposed_skill_manifests,
+        ).model_dump(mode="json")
+
+    @app.post("/api/customer-success/solution-pack-drafts/{publication_draft_id}/submit")
+    def submit_customer_success_solution_pack_draft(
+        publication_draft_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "customer_success.manage")
+        return app.state.customer_feedback_service.submit_solution_pack_publication_draft(
+            tenant_id=context.tenant_id,
+            publication_draft_id=publication_draft_id,
+            submitted_by_user_id=context.user_id,
+        ).model_dump(mode="json")
+
+    @app.post("/api/customer-success/solution-pack-drafts/{publication_draft_id}/review")
+    def review_customer_success_solution_pack_draft(
+        publication_draft_id: str,
+        payload: CustomerSuccessSolutionPackDraftReview,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "customer_success.manage")
+        return app.state.customer_feedback_service.review_solution_pack_publication_draft(
+            tenant_id=context.tenant_id,
+            publication_draft_id=publication_draft_id,
+            reviewed_by_user_id=context.user_id,
+            status=payload.status,
+            review_note=payload.review_note,
+        ).model_dump(mode="json")
+
+    @app.post("/api/customer-success/solution-pack-drafts/{publication_draft_id}/apply")
+    def apply_customer_success_solution_pack_draft(
+        publication_draft_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "customer_success.manage")
+        require_permission(request, context, "solution_packs.manage")
+        return app.state.customer_feedback_service.apply_solution_pack_publication_draft(
+            tenant_id=context.tenant_id,
+            publication_draft_id=publication_draft_id,
+            applied_by_user_id=context.user_id,
+        ).model_dump(mode="json")
+
+    @app.post("/api/customer-success/solution-pack-candidates/{candidate_id}/review")
+    def review_customer_success_solution_pack_candidate(
+        candidate_id: str,
+        payload: CustomerSuccessCandidateReview,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "customer_success.manage")
+        return app.state.customer_feedback_service.review_solution_pack_candidate(
+            tenant_id=context.tenant_id,
+            candidate_id=candidate_id,
+            reviewed_by_user_id=context.user_id,
+            status=payload.status,
+            review_note=payload.review_note,
         ).model_dump(mode="json")
 
     @app.put("/api/lifecycle/policies/{category}")
@@ -925,7 +3908,9 @@ def create_app(
         )
         return manifest.model_dump(mode="json")
 
-    @app.post("/api/lifecycle/data-residency/reports", status_code=status.HTTP_201_CREATED)
+    @app.post(
+        "/api/lifecycle/data-residency/reports", status_code=status.HTTP_201_CREATED
+    )
     def create_data_residency_report(
         request: Request,
         context: RequestContext = Depends(get_request_context),
@@ -949,7 +3934,300 @@ def create_app(
         )
         return report.model_dump(mode="json")
 
-    @app.post("/api/lifecycle/tenant-offboarding-requests", status_code=status.HTTP_201_CREATED)
+    @app.post(
+        "/api/lifecycle/restore-drill-schedules",
+        status_code=status.HTTP_201_CREATED,
+    )
+    def create_restore_drill_schedule(
+        payload: RestoreDrillScheduleApiCreate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "lifecycle.manage")
+        schedule = app.state.restore_drill_schedule_store.create_schedule(
+            RestoreDrillScheduleCreate(
+                tenant_id=context.tenant_id,
+                created_by_user_id=context.user_id,
+                **payload.model_dump(),
+            )
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=schedule.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="restore_drill.schedule.created",
+            metadata=restore_drill_schedule_audit_metadata(schedule),
+            request=request,
+        )
+        return schedule.model_dump(mode="json")
+
+    @app.get("/api/lifecycle/restore-drill-schedules")
+    def list_restore_drill_schedules(
+        request: Request,
+        workspace_id: str | None = None,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict]:
+        require_permission(request, context, "lifecycle.read")
+        return [
+            schedule.model_dump(mode="json")
+            for schedule in app.state.restore_drill_schedule_store.list_schedules(
+                context.tenant_id,
+            )
+            if workspace_id is None or schedule.workspace_id == workspace_id
+        ]
+
+    @app.patch("/api/lifecycle/restore-drill-schedules/{schedule_id}")
+    def update_restore_drill_schedule(
+        schedule_id: str,
+        payload: RestoreDrillScheduleApiUpdate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "lifecycle.manage")
+        updated = app.state.restore_drill_schedule_store.update_schedule_status(
+            tenant_id=context.tenant_id,
+            schedule_id=schedule_id,
+            status=payload.status,
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=updated.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="restore_drill.schedule.updated",
+            metadata=restore_drill_schedule_audit_metadata(updated),
+            request=request,
+        )
+        return updated.model_dump(mode="json")
+
+    @app.get("/api/lifecycle/restore-drill-schedules/{schedule_id}/runs")
+    def list_restore_drill_run_records(
+        schedule_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict]:
+        require_permission(request, context, "lifecycle.read")
+        app.state.restore_drill_schedule_store.get_schedule(
+            context.tenant_id,
+            schedule_id,
+        )
+        return [
+            record.model_dump(mode="json")
+            for record in app.state.restore_drill_schedule_store.list_run_records(
+                context.tenant_id,
+                schedule_id,
+            )
+        ]
+
+    @app.post(
+        "/api/lifecycle/restore-drill-schedules/{schedule_id}/runs/{run_record_id}/execute",
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def enqueue_restore_drill_run_record_execution(
+        schedule_id: str,
+        run_record_id: str,
+        payload: RestoreDrillRunExecutionApiCreate,
+        request: Request,
+        response: Response,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "lifecycle.manage")
+        idempotency_request = build_idempotency_request(
+            tenant_id=context.tenant_id,
+            key=idempotency_key,
+            method=RESTORE_DRILL_EXECUTION_METHOD,
+            path=restore_drill_execution_path(schedule_id, run_record_id),
+            payload=payload,
+        )
+        replay_record = find_idempotent_replay(app.state.store, idempotency_request)
+        if replay_record is not None:
+            response.status_code = replay_record.status_code
+            return replay_record.response_body
+
+        queue = app.state.job_queue
+        if queue is None:
+            raise RedisQueueConfigurationError("job queue backend is disabled")
+        schedule = app.state.restore_drill_schedule_store.get_schedule(
+            context.tenant_id,
+            schedule_id,
+        )
+        existing = app.state.restore_drill_schedule_store.get_run_record(
+            context.tenant_id,
+            run_record_id,
+        )
+        if existing.schedule_id != schedule.id:
+            raise NotFoundError(f"Restore drill run record not found: {run_record_id}")
+        require_restore_drill_run_record_update_allowed(existing)
+        job = queue.enqueue(
+            JobType.RESTORE_DRILL_EXECUTION,
+            RestoreDrillExecutionJob(
+                tenant_id=context.tenant_id,
+                workspace_id=schedule.workspace_id,
+                schedule_id=schedule.id,
+                run_record_id=existing.id,
+                requested_by_user_id=existing.requested_by_user_id,
+                verification_config=payload.verification_config,
+                retention_expires_at=payload.retention_expires_at,
+            ),
+            max_attempts=app.state.settings.worker_job_max_attempts,
+        )
+        queue_name = JobType.RESTORE_DRILL_EXECUTION.value
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=existing.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="restore_drill.execution_queued",
+            metadata={
+                **restore_drill_run_record_audit_metadata(existing),
+                "job_id": job.id,
+                "queue": queue_name,
+                "drill_id": payload.verification_config.drill_id,
+                "has_redis_queue_verification": (
+                    payload.verification_config.redis_queue_verification_path is not None
+                ),
+            },
+            request=request,
+        )
+        response_body = RestoreDrillExecutionQueuedResponse(
+            schedule_id=schedule.id,
+            run_record_id=existing.id,
+            job_id=job.id,
+            queue=queue_name,
+        ).model_dump(mode="json")
+        save_idempotent_response(
+            app.state.store,
+            idempotency_request,
+            status.HTTP_202_ACCEPTED,
+            response_body,
+        )
+        return response_body
+
+    @app.post(
+        "/api/lifecycle/restore-drill-schedules/{schedule_id}/runs/{run_record_id}/evidence",
+        status_code=status.HTTP_201_CREATED,
+    )
+    def upload_restore_drill_run_record_evidence(
+        schedule_id: str,
+        run_record_id: str,
+        payload: RestoreDrillRunEvidenceApiCreate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "lifecycle.manage")
+        schedule = app.state.restore_drill_schedule_store.get_schedule(
+            context.tenant_id,
+            schedule_id,
+        )
+        existing = app.state.restore_drill_schedule_store.get_run_record(
+            context.tenant_id,
+            run_record_id,
+        )
+        if existing.schedule_id != schedule.id:
+            raise NotFoundError(f"Restore drill run record not found: {run_record_id}")
+        require_restore_drill_run_record_update_allowed(existing)
+        require_restore_drill_verification_result_ready(payload.verification)
+        evidence_content = restore_drill_evidence_content(payload.verification)
+        evidence_object = app.state.storage_catalog.register(
+            StorageObjectCreate(
+                tenant_id=context.tenant_id,
+                workspace_id=schedule.workspace_id,
+                purpose=StoragePurpose.DATA_EXPORT,
+                filename=restore_drill_evidence_filename(run_record_id),
+                content_type="application/json",
+                size_bytes=len(evidence_content),
+                retention_expires_at=payload.retention_expires_at,
+            )
+        )
+        upload_storage_object(
+            app=app,
+            storage_object=evidence_object,
+            content=evidence_content,
+            request=request,
+            context=context,
+        )
+        evidence_object_id = validate_restore_drill_evidence_object(
+            RestoreDrillEvidenceValidationRequest(
+                tenant_id=context.tenant_id,
+                workspace_id=schedule.workspace_id,
+                evidence_object_id=evidence_object.id,
+            ),
+            app.state.storage_catalog,
+            app.state.object_storage,
+        )
+        updated = app.state.restore_drill_schedule_store.update_run_record_status(
+            tenant_id=context.tenant_id,
+            run_record_id=run_record_id,
+            status=RestoreDrillRunStatus.EVIDENCE_READY,
+            evidence_object_id=evidence_object_id,
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=updated.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="restore_drill.run_record.updated",
+            metadata=restore_drill_run_record_audit_metadata(updated),
+            request=request,
+        )
+        return updated.model_dump(mode="json")
+
+    @app.patch("/api/lifecycle/restore-drill-schedules/{schedule_id}/runs/{run_record_id}")
+    def update_restore_drill_run_record(
+        schedule_id: str,
+        run_record_id: str,
+        payload: RestoreDrillRunRecordApiUpdate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "lifecycle.manage")
+        schedule = app.state.restore_drill_schedule_store.get_schedule(
+            context.tenant_id,
+            schedule_id,
+        )
+        existing = app.state.restore_drill_schedule_store.get_run_record(
+            context.tenant_id,
+            run_record_id,
+        )
+        if existing.schedule_id != schedule.id:
+            raise NotFoundError(f"Restore drill run record not found: {run_record_id}")
+        require_restore_drill_run_record_update_allowed(existing)
+        updated = app.state.restore_drill_schedule_store.update_run_record_status(
+            tenant_id=context.tenant_id,
+            run_record_id=run_record_id,
+            status=payload.status,
+            evidence_object_id=validate_restore_drill_evidence_object(
+                RestoreDrillEvidenceValidationRequest(
+                    tenant_id=context.tenant_id,
+                    workspace_id=schedule.workspace_id,
+                    evidence_object_id=payload.evidence_object_id,
+                ),
+                app.state.storage_catalog,
+                app.state.object_storage,
+            ),
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=updated.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="restore_drill.run_record.updated",
+            metadata=restore_drill_run_record_audit_metadata(updated),
+            request=request,
+        )
+        return updated.model_dump(mode="json")
+
+    @app.post(
+        "/api/lifecycle/tenant-offboarding-requests",
+        status_code=status.HTTP_201_CREATED,
+    )
     def create_tenant_offboarding_request(
         payload: TenantOffboardingApiRequest,
         request: Request,
@@ -982,10 +4260,14 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> dict:
         require_permission(request, context, "lifecycle.read")
-        return build_tenant_offboarding_service(app).get_plan(
-            context.tenant_id,
-            plan_id,
-        ).model_dump(mode="json")
+        return (
+            build_tenant_offboarding_service(app)
+            .get_plan(
+                context.tenant_id,
+                plan_id,
+            )
+            .model_dump(mode="json")
+        )
 
     @app.post("/api/lifecycle/tenant-offboarding-requests/{plan_id}/approve")
     def approve_tenant_offboarding_request(
@@ -1191,6 +4473,448 @@ def create_app(
             user_id=context.user_id,
         ).model_dump(mode="json")
 
+    @app.post("/api/sso/providers", status_code=status.HTTP_201_CREATED)
+    def register_sso_provider(
+        payload: SsoProviderCreate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "sso.manage")
+        app.state.license_service.require_entitlement(
+            tenant_id=context.tenant_id,
+            feature=LicensedFeature.SSO,
+        )
+        entry = app.state.sso_provider_registry.create_or_update(
+            tenant_id=context.tenant_id,
+            created_by_user_id=context.user_id,
+            request=payload,
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=None,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="sso.provider.configured",
+            metadata=sso_provider_audit_metadata(entry),
+            request=request,
+        )
+        return entry.model_dump(mode="json")
+
+    @app.get("/api/sso/providers")
+    def list_sso_providers(
+        request: Request,
+        page: PageRequest = Depends(get_page_request),
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict[str, Any]] | dict[str, Any]:
+        require_permission(request, context, "sso.read")
+        return list_or_page_created_at_records(
+            app.state.sso_provider_registry.list_for_tenant(context.tenant_id),
+            request,
+            page,
+        )
+
+    @app.get("/api/sso/providers/{provider_id}")
+    def get_sso_provider(
+        provider_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "sso.read")
+        return app.state.sso_provider_registry.get_for_tenant(
+            context.tenant_id,
+            provider_id,
+        ).model_dump(mode="json")
+
+    @app.post("/api/sso/providers/{provider_id}/enable")
+    def enable_sso_provider(
+        provider_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "sso.manage")
+        app.state.license_service.require_entitlement(
+            tenant_id=context.tenant_id,
+            feature=LicensedFeature.SSO,
+        )
+        entry = app.state.sso_provider_registry.enable(context.tenant_id, provider_id)
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=None,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="sso.provider.enabled",
+            metadata=sso_provider_audit_metadata(entry),
+            request=request,
+        )
+        return entry.model_dump(mode="json")
+
+    @app.post("/api/sso/providers/{provider_id}/disable")
+    def disable_sso_provider(
+        provider_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "sso.manage")
+        entry = app.state.sso_provider_registry.disable(context.tenant_id, provider_id)
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=None,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="sso.provider.disabled",
+            metadata=sso_provider_audit_metadata(entry),
+            request=request,
+        )
+        return entry.model_dump(mode="json")
+
+    @app.post("/api/scim/providers", status_code=status.HTTP_201_CREATED)
+    def register_scim_provider(
+        payload: ScimProviderCreate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "scim.manage")
+        app.state.license_service.require_entitlement(
+            tenant_id=context.tenant_id,
+            feature=LicensedFeature.SCIM,
+        )
+        entry = app.state.scim_provisioning_store.create_or_update_provider(
+            tenant_id=context.tenant_id,
+            created_by_user_id=context.user_id,
+            request=payload,
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=None,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="scim.provider.configured",
+            metadata=scim_provider_audit_metadata(entry),
+            request=request,
+        )
+        return entry.model_dump(mode="json")
+
+    @app.get("/api/scim/providers")
+    def list_scim_providers(
+        request: Request,
+        page: PageRequest = Depends(get_page_request),
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict[str, Any]] | dict[str, Any]:
+        require_permission(request, context, "scim.read")
+        return list_or_page_created_at_records(
+            app.state.scim_provisioning_store.list_providers(context.tenant_id),
+            request,
+            page,
+        )
+
+    @app.get("/api/scim/providers/{provider_id}")
+    def get_scim_provider(
+        provider_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "scim.read")
+        return app.state.scim_provisioning_store.get_provider(
+            context.tenant_id,
+            provider_id,
+        ).model_dump(mode="json")
+
+    @app.post("/api/scim/providers/{provider_id}/enable")
+    def enable_scim_provider(
+        provider_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "scim.manage")
+        app.state.license_service.require_entitlement(
+            tenant_id=context.tenant_id,
+            feature=LicensedFeature.SCIM,
+        )
+        entry = app.state.scim_provisioning_store.enable_provider(
+            context.tenant_id,
+            provider_id,
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=None,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="scim.provider.enabled",
+            metadata=scim_provider_audit_metadata(entry),
+            request=request,
+        )
+        return entry.model_dump(mode="json")
+
+    @app.post("/api/scim/providers/{provider_id}/disable")
+    def disable_scim_provider(
+        provider_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "scim.manage")
+        entry = app.state.scim_provisioning_store.disable_provider(
+            context.tenant_id,
+            provider_id,
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=None,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="scim.provider.disabled",
+            metadata=scim_provider_audit_metadata(entry),
+            request=request,
+        )
+        return entry.model_dump(mode="json")
+
+    @app.post(
+        "/api/scim/providers/{provider_id}/group-role-mappings",
+        status_code=status.HTTP_201_CREATED,
+    )
+    def upsert_scim_group_role_mapping(
+        provider_id: str,
+        payload: ScimGroupRoleMapping,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "scim.manage")
+        app.state.license_service.require_entitlement(
+            tenant_id=context.tenant_id,
+            feature=LicensedFeature.SCIM,
+        )
+        for role_id in payload.role_ids:
+            app.state.identity_service.get_role(context.tenant_id, role_id)
+        entry = app.state.scim_provisioning_store.upsert_group_role_mapping(
+            tenant_id=context.tenant_id,
+            provider_id=provider_id,
+            created_by_user_id=context.user_id,
+            mapping=payload,
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=None,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="scim.group_role_mapping.configured",
+            metadata=scim_group_role_mapping_audit_metadata(entry),
+            request=request,
+        )
+        return entry.model_dump(mode="json")
+
+    @app.get("/api/scim/providers/{provider_id}/group-role-mappings")
+    def list_scim_group_role_mappings(
+        provider_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict]:
+        require_permission(request, context, "scim.read")
+        return [
+            entry.model_dump(mode="json")
+            for entry in app.state.scim_provisioning_store.list_group_role_mappings(
+                context.tenant_id,
+                provider_id,
+            )
+        ]
+
+    @app.post(
+        "/api/scim/providers/{provider_id}/import", status_code=status.HTTP_201_CREATED
+    )
+    def import_scim_resources(
+        provider_id: str,
+        payload: ScimImportRequest,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "scim.manage")
+        app.state.license_service.require_entitlement(
+            tenant_id=context.tenant_id,
+            feature=LicensedFeature.SCIM,
+        )
+        result = app.state.scim_provisioning_service.apply_import(
+            tenant_id=context.tenant_id,
+            provider_id=provider_id,
+            imported_by_user_id=context.user_id,
+            request=payload,
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=None,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="scim.import.completed",
+            metadata=scim_import_audit_metadata(result),
+            request=request,
+        )
+        return result.model_dump(mode="json")
+
+    @app.get("/api/scim/providers/{provider_id}/imports")
+    def list_scim_imports(
+        provider_id: str,
+        request: Request,
+        page: PageRequest = Depends(get_page_request),
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict[str, Any]] | dict[str, Any]:
+        require_permission(request, context, "scim.read")
+        return list_or_page_created_at_records(
+            app.state.scim_provisioning_store.list_import_records(
+                context.tenant_id,
+                provider_id,
+            ),
+            request,
+            page,
+        )
+
+    @app.post("/api/solution-packs", status_code=status.HTTP_201_CREATED)
+    def register_solution_pack(
+        payload: SolutionPackManifest,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "solution_packs.manage")
+        entry = app.state.solution_pack_registry.register_for_tenant(
+            tenant_id=context.tenant_id,
+            created_by_user_id=context.user_id,
+            manifest=payload,
+        )
+        return entry.model_dump(mode="json")
+
+    @app.get("/api/solution-packs")
+    def list_solution_packs(
+        request: Request,
+        page: PageRequest = Depends(get_page_request),
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict[str, Any]] | dict[str, Any]:
+        require_permission(request, context, "solution_packs.read")
+        return list_or_page_created_at_records(
+            app.state.solution_pack_registry.list_for_tenant(context.tenant_id),
+            request,
+            page,
+        )
+
+    @app.get("/api/solution-packs/{pack_id}/versions")
+    def list_solution_pack_versions(
+        pack_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict]:
+        require_permission(request, context, "solution_packs.read")
+        return [
+            entry.model_dump(mode="json")
+            for entry in app.state.solution_pack_registry.list_versions(
+                context.tenant_id,
+                pack_id,
+            )
+        ]
+
+    @app.post("/api/solution-packs/{pack_id}/publish")
+    def publish_solution_pack(
+        pack_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "solution_packs.manage")
+        entry = app.state.solution_pack_registry.publish(context.tenant_id, pack_id)
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=None,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="solution_pack.published",
+            metadata={
+                "pack_id": entry.manifest.id,
+                "version": entry.manifest.version,
+                "status": entry.status.value,
+                "skill_count": len(entry.manifest.skills),
+            },
+            request=request,
+        )
+        return entry.model_dump(mode="json")
+
+    @app.post("/api/solution-packs/{pack_id}/disable")
+    def disable_solution_pack(
+        pack_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "solution_packs.manage")
+        return app.state.solution_pack_registry.disable(
+            context.tenant_id,
+            pack_id,
+        ).model_dump(mode="json")
+
+    @app.post(
+        "/api/solution-packs/{pack_id}/install", status_code=status.HTTP_201_CREATED
+    )
+    def install_solution_pack(
+        pack_id: str,
+        payload: SolutionPackInstallRequest,
+        response: Response,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "solution_packs.install")
+        app.state.license_service.require_entitlement(
+            tenant_id=context.tenant_id,
+            feature=LicensedFeature.SOLUTION_PACKS,
+        )
+        if payload.dry_run:
+            response.status_code = status.HTTP_200_OK
+            return app.state.solution_pack_service.preview_install(
+                tenant_id=context.tenant_id,
+                pack_id=pack_id,
+                workspace_ids=payload.workspace_ids,
+                installed_by_user_id=context.user_id,
+                selected_resource_ids=payload.selected_resource_ids,
+            ).model_dump(mode="json")
+        installation = app.state.solution_pack_service.install_for_tenant(
+            tenant_id=context.tenant_id,
+            pack_id=pack_id,
+            workspace_ids=payload.workspace_ids,
+            installed_by_user_id=context.user_id,
+            selected_resource_ids=payload.selected_resource_ids,
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=None,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="solution_pack.installed",
+            metadata={
+                "pack_id": installation.pack_id,
+                "version": installation.version,
+                "workspace_ids": installation.workspace_ids,
+                "workspace_count": len(installation.workspace_ids),
+                "installed_skill_ids": installation.installed_skill_ids,
+                "installed_skill_count": len(installation.installed_skill_ids),
+                "status": installation.status.value,
+            },
+            request=request,
+        )
+        return installation.model_dump(mode="json")
+
+    @app.get("/api/solution-pack-installations")
+    def list_solution_pack_installations(
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict]:
+        require_permission(request, context, "solution_packs.read")
+        return [
+            installation.model_dump(mode="json")
+            for installation in app.state.solution_pack_registry.list_installations(
+                context.tenant_id,
+            )
+        ]
+
     @app.post("/api/skills", status_code=status.HTTP_201_CREATED)
     def register_skill(
         payload: SkillManifest,
@@ -1210,18 +4934,20 @@ def create_app(
         request: Request,
         workspace_id: str | None = None,
         department_id: str | None = None,
+        page: PageRequest = Depends(get_page_request),
         context: RequestContext = Depends(get_request_context),
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]] | dict[str, Any]:
         require_permission(request, context, "skills.read")
-        return [
-            entry.model_dump(mode="json")
-            for entry in app.state.skill_registry.list_visible_for_tenant(
+        return list_or_page_created_at_records(
+            app.state.skill_registry.list_visible_for_tenant(
                 context.tenant_id,
                 user_id=context.user_id,
                 workspace_id=workspace_id,
                 department_id=department_id,
-            )
-        ]
+            ),
+            request,
+            page,
+        )
 
     @app.get("/api/skills/analytics")
     def get_skill_marketplace_analytics(
@@ -1304,7 +5030,10 @@ def create_app(
             skill_id,
         ).model_dump(mode="json")
 
-    @app.post("/api/workspaces/{workspace_id}/skills/{skill_id}/install", status_code=status.HTTP_201_CREATED)
+    @app.post(
+        "/api/workspaces/{workspace_id}/skills/{skill_id}/install",
+        status_code=status.HTTP_201_CREATED,
+    )
     def install_workspace_skill(
         workspace_id: str,
         skill_id: str,
@@ -1326,13 +5055,56 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> list[dict]:
         require_permission(request, context, "skills.read")
-        return [
-            installation.model_dump(mode="json")
-            for installation in app.state.skill_registry.list_for_workspace(
-                context.tenant_id,
-                workspace_id,
+        items = []
+        for installation in app.state.skill_registry.list_for_workspace(
+            context.tenant_id,
+            workspace_id,
+        ):
+            item = installation.model_dump(mode="json")
+            try:
+                entry = app.state.skill_registry.get_visible_for_tenant(
+                    context.tenant_id,
+                    installation.skill_id,
+                    user_id=context.user_id,
+                    workspace_id=workspace_id,
+                )
+            except NotFoundError:
+                item.update(
+                    {
+                        "invocation_mode": "unavailable",
+                        "invocation_ready": False,
+                        "missing_required_scopes": [],
+                    }
+                )
+                items.append(item)
+                continue
+            granted_scopes = resolve_granted_scopes(
+                request,
+                context,
+                entry.manifest.required_scopes,
             )
-        ]
+            missing_scopes = sorted(
+                set(entry.manifest.required_scopes) - set(granted_scopes)
+            )
+            invocation_mode = skill_invocation_mode(entry.manifest)
+            executable = (
+                is_agent_run_skill(entry.manifest)
+                or app.state.runtime.tool_gateway.can_execute_tool(entry.manifest.id)
+            )
+            item.update(
+                {
+                    "invocation_mode": invocation_mode,
+                    "invocation_ready": (
+                        installation.status == SkillInstallationStatus.ENABLED
+                        and entry.status == SkillStatus.PUBLISHED
+                        and not missing_scopes
+                        and executable
+                    ),
+                    "missing_required_scopes": missing_scopes,
+                }
+            )
+            items.append(item)
+        return items
 
     @app.post("/api/workspaces/{workspace_id}/skills/{skill_id}/enable")
     def enable_workspace_skill(
@@ -1362,6 +5134,166 @@ def create_app(
             skill_id,
         ).model_dump(mode="json")
 
+    @app.post("/api/workspaces/{workspace_id}/skills/{skill_id}/invoke")
+    def invoke_workspace_skill(
+        workspace_id: str,
+        skill_id: str,
+        payload: SkillInvokeRequest,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "skills.invoke")
+        entry = app.state.skill_registry.get_visible_for_tenant(
+            context.tenant_id,
+            skill_id,
+            user_id=context.user_id,
+            workspace_id=workspace_id,
+        )
+        if entry.status != SkillStatus.PUBLISHED:
+            raise TenantAccessError(f"Skill is not published: {skill_id}")
+        installation = next(
+            (
+                installed
+                for installed in app.state.skill_registry.list_for_workspace(
+                    context.tenant_id,
+                    workspace_id,
+                )
+                if installed.skill_id == skill_id
+            ),
+            None,
+        )
+        if installation is None:
+            raise NotFoundError(f"Skill installation not found: {skill_id}")
+        if installation.status != SkillInstallationStatus.ENABLED:
+            raise TenantAccessError(f"Skill installation is disabled: {skill_id}")
+
+        granted_scopes = resolve_granted_scopes(
+            request,
+            context,
+            entry.manifest.required_scopes,
+        )
+        missing_scopes = sorted(set(entry.manifest.required_scopes) - set(granted_scopes))
+        if missing_scopes:
+            raise TenantAccessError(
+                f"Permission denied: missing skill scopes: {', '.join(missing_scopes)}"
+            )
+
+        if is_agent_run_skill(entry.manifest):
+            run = app.state.store.create_run(
+                tenant_id=context.tenant_id,
+                user_id=context.user_id,
+                payload=RunCreate(
+                    workspace_id=workspace_id,
+                    agent_id=entry.manifest.id,
+                    message=build_agent_run_skill_message(
+                        entry.manifest,
+                        payload.input,
+                    ),
+                    mode=RunMode.WORKFLOW,
+                ),
+            )
+            app.state.store.append_run_event(
+                run,
+                "skill.workflow_invoked",
+                {
+                    "skill_id": entry.manifest.id,
+                    "skill_version": entry.manifest.version,
+                    "input_keys": sorted(payload.input.keys()),
+                },
+            )
+            state = app.state.runtime.execute_run(context.tenant_id, run.id)
+            output = {
+                "run_id": run.id,
+                "status": state.status.value,
+                "events_url": f"/api/runs/{run.id}/events",
+            }
+            metadata = {
+                "skill_id": entry.manifest.id,
+                "tool_name": "agent.workflow",
+                "workspace_id": workspace_id,
+                "run_id": run.id,
+                "input_keys": sorted(payload.input.keys()),
+                "output_keys": sorted(output.keys()),
+            }
+            app.state.store.record_billing_meter(
+                tenant_id=context.tenant_id,
+                run_id=run.id,
+                meter_type="skill_call_count",
+                quantity=1,
+                unit="call",
+                skill_id=entry.manifest.id,
+                workspace_id=workspace_id,
+                user_id=context.user_id,
+                metadata=metadata,
+            )
+            record_audit_event(
+                app,
+                tenant_id=context.tenant_id,
+                workspace_id=workspace_id,
+                user_id=context.user_id,
+                run_id=run.id,
+                event_type="skill.workflow_invoked",
+                metadata=metadata,
+                request=request,
+            )
+            return {
+                "skill_id": entry.manifest.id,
+                "tool_name": "agent.workflow",
+                "run_id": run.id,
+                "status": state.status.value,
+                "output": output,
+            }
+
+        result = app.state.runtime.tool_gateway.execute_request(
+            ToolGatewayRequest(
+                tenant_id=context.tenant_id,
+                workspace_id=workspace_id,
+                user_id=context.user_id,
+                run_id="workspace_skill_invoke",
+                step_id=new_id("skill_step"),
+                tool_name=entry.manifest.id,
+                skill_id=entry.manifest.id,
+                tool_input=payload.input,
+                granted_scopes=granted_scopes,
+            )
+        )
+        if result.tool_name != entry.manifest.id:
+            raise ToolExecutionError("skill tool result does not match invoked skill")
+
+        metadata = {
+            "skill_id": entry.manifest.id,
+            "tool_name": result.tool_name,
+            "workspace_id": workspace_id,
+            "input_keys": sorted(payload.input.keys()),
+            "output_keys": sorted(result.output.keys()),
+        }
+        app.state.store.record_billing_meter(
+            tenant_id=context.tenant_id,
+            run_id=None,
+            meter_type="skill_call_count",
+            quantity=1,
+            unit="call",
+            skill_id=entry.manifest.id,
+            workspace_id=workspace_id,
+            user_id=context.user_id,
+            metadata=metadata,
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="skill.invoked",
+            metadata=metadata,
+            request=request,
+        )
+        return {
+            "skill_id": entry.manifest.id,
+            "tool_name": result.tool_name,
+            "output": result.output,
+        }
+
     @app.post("/api/storage/objects", status_code=status.HTTP_201_CREATED)
     def register_storage_object(
         payload: StorageObjectApiCreate,
@@ -1381,13 +5313,15 @@ def create_app(
     def list_storage_objects(
         run_id: str,
         request: Request,
+        page: PageRequest = Depends(get_page_request),
         context: RequestContext = Depends(get_request_context),
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]] | dict[str, Any]:
         require_permission(request, context, "storage.read")
-        return [
-            storage_object.model_dump(mode="json")
-            for storage_object in app.state.storage_catalog.list_for_run(context.tenant_id, run_id)
-        ]
+        return list_or_page_created_at_records(
+            app.state.storage_catalog.list_for_run(context.tenant_id, run_id),
+            request,
+            page,
+        )
 
     @app.post("/api/storage/objects/{storage_object_id}/signed-url")
     def create_storage_signed_url(
@@ -1396,7 +5330,9 @@ def create_app(
         request: Request,
         context: RequestContext = Depends(get_request_context),
     ) -> dict:
-        storage_object = app.state.storage_catalog.get(context.tenant_id, storage_object_id)
+        storage_object = app.state.storage_catalog.get(
+            context.tenant_id, storage_object_id
+        )
         if payload.operation == "read":
             require_permission(request, context, "storage.read")
             require_storage_read_access(request, context, storage_object)
@@ -1436,7 +5372,9 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> dict:
         require_permission(request, context, "storage.write")
-        storage_object = app.state.storage_catalog.get(context.tenant_id, storage_object_id)
+        storage_object = app.state.storage_catalog.get(
+            context.tenant_id, storage_object_id
+        )
         if len(content) != storage_object.size_bytes:
             raise ValueError(
                 f"Uploaded content length {len(content)} does not match declared size {storage_object.size_bytes}"
@@ -1477,7 +5415,9 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> Response:
         require_permission(request, context, "storage.read")
-        storage_object = app.state.storage_catalog.get(context.tenant_id, storage_object_id)
+        storage_object = app.state.storage_catalog.get(
+            context.tenant_id, storage_object_id
+        )
         require_storage_read_access(request, context, storage_object)
         result = app.state.object_storage.download(storage_object)
         record_audit_event(
@@ -1492,6 +5432,49 @@ def create_app(
         )
         return Response(content=result.content, media_type=result.content_type)
 
+    @app.get(
+        "/api/share-links/{external_link_id}/storage/objects/{storage_object_id}/content"
+    )
+    def download_external_share_link_storage_object_content(
+        external_link_id: str,
+        storage_object_id: str,
+        request: Request,
+        tenant_id: str = Query(min_length=1),
+    ) -> Response:
+        storage_object = app.state.storage_catalog.get(tenant_id, storage_object_id)
+        require_external_share_link_storage_read_access(
+            request=request,
+            tenant_id=tenant_id,
+            external_link_id=external_link_id,
+            storage_object=storage_object,
+        )
+        result = app.state.object_storage.download(storage_object)
+        metadata = {
+            **storage_audit_metadata(storage_object),
+            "access_via": "external_link",
+            "external_link_id_present": True,
+        }
+        if storage_object.run_id is not None:
+            app.state.store.record_billing_meter(
+                tenant_id=tenant_id,
+                run_id=storage_object.run_id,
+                meter_type="external_artifact_download_bytes",
+                quantity=len(result.content),
+                unit="byte",
+                metadata=metadata,
+            )
+        record_audit_event(
+            app,
+            tenant_id=tenant_id,
+            workspace_id=storage_object.workspace_id,
+            user_id=None,
+            run_id=storage_object.run_id,
+            event_type="storage.downloaded",
+            metadata=metadata,
+            request=request,
+        )
+        return Response(content=result.content, media_type=result.content_type)
+
     @app.delete("/api/storage/objects/{storage_object_id}")
     def delete_storage_object(
         storage_object_id: str,
@@ -1499,7 +5482,9 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> dict:
         require_permission(request, context, "storage.write")
-        storage_object = app.state.storage_catalog.get(context.tenant_id, storage_object_id)
+        storage_object = app.state.storage_catalog.get(
+            context.tenant_id, storage_object_id
+        )
         now = utc_now()
         if (
             storage_object.retention_expires_at is not None
@@ -1585,16 +5570,18 @@ def create_app(
     def list_short_term_memory(
         run_id: str,
         request: Request,
+        page: PageRequest = Depends(get_page_request),
         context: RequestContext = Depends(get_request_context),
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]] | dict[str, Any]:
         require_permission(request, context, "memory.read")
-        return [
-            entry.model_dump(mode="json")
-            for entry in app.state.short_term_memory_service.list_for_run(
+        return list_or_page_created_at_records(
+            app.state.short_term_memory_service.list_for_run(
                 context.tenant_id,
                 run_id,
-            )
-        ]
+            ),
+            request,
+            page,
+        )
 
     @app.delete("/api/memory/short-term")
     def delete_short_term_memory(
@@ -1685,17 +5672,19 @@ def create_app(
         scope_type: MemoryScopeType,
         scope_id: str,
         request: Request,
+        page: PageRequest = Depends(get_page_request),
         context: RequestContext = Depends(get_request_context),
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]] | dict[str, Any]:
         require_permission(request, context, "memory.read")
-        return [
-            memory.model_dump(mode="json")
-            for memory in app.state.long_term_memory_service.list_by_scope(
+        return list_or_page_created_at_records(
+            app.state.long_term_memory_service.list_by_scope(
                 context.tenant_id,
                 scope_type,
                 scope_id,
-            )
-        ]
+            ),
+            request,
+            page,
+        )
 
     @app.post("/api/memory/{memory_id}/approve")
     def approve_memory_candidate(
@@ -1745,6 +5734,23 @@ def create_app(
         )
         return memory.model_dump(mode="json")
 
+    @app.get("/api/knowledge-bases")
+    def list_knowledge_bases(
+        request: Request,
+        workspace_id: str | None = None,
+        page: PageRequest = Depends(get_page_request),
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict[str, Any]] | dict[str, Any]:
+        require_permission(request, context, "knowledge.read")
+        if workspace_id is None:
+            bases = app.state.knowledge_service.list_bases_for_tenant(context.tenant_id)
+        else:
+            bases = app.state.knowledge_service.list_bases_for_workspace(
+                context.tenant_id,
+                workspace_id,
+            )
+        return list_or_page_created_at_records(bases, request, page)
+
     @app.post("/api/knowledge-bases", status_code=status.HTTP_201_CREATED)
     def create_knowledge_base(
         payload: KnowledgeBaseCreate,
@@ -1768,6 +5774,25 @@ def create_app(
             request=request,
         )
         return knowledge_base.model_dump(mode="json")
+
+    @app.get("/api/knowledge-documents")
+    def list_knowledge_documents(
+        request: Request,
+        knowledge_base_id: str | None = None,
+        workspace_id: str | None = None,
+        page: PageRequest = Depends(get_page_request),
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict[str, Any]] | dict[str, Any]:
+        require_permission(request, context, "knowledge.read")
+        return list_or_page_created_at_records(
+            app.state.knowledge_service.list_documents(
+                context.tenant_id,
+                knowledge_base_id=knowledge_base_id,
+                workspace_id=workspace_id,
+            ),
+            request,
+            page,
+        )
 
     @app.post("/api/knowledge-documents", status_code=status.HTTP_201_CREATED)
     def register_knowledge_document(
@@ -1796,12 +5821,27 @@ def create_app(
             request=request,
             context=context,
         )
+        document_chunks = knowledge_document_chunks(
+            payload=payload,
+            content=document_content,
+            settings=app.state.settings,
+        )
+        document_chunks = embed_knowledge_document_chunks(
+            app=app,
+            request=request,
+            payload=payload,
+            context=context,
+            chunks=document_chunks,
+            embedding_gateway=app.state.embedding_gateway,
+            settings=app.state.settings,
+        )
         document = app.state.knowledge_service.register_document(
             KnowledgeDocumentCreate(
                 tenant_id=context.tenant_id,
                 uploaded_by_user_id=context.user_id,
                 storage_object_id=storage_object.id,
-                **payload.model_dump(exclude={"content", "content_type"}),
+                chunks=document_chunks,
+                **payload.model_dump(exclude={"content", "content_type", "chunks"}),
             )
         )
         record_audit_event(
@@ -1811,7 +5851,7 @@ def create_app(
             user_id=context.user_id,
             run_id=None,
             event_type="knowledge.document.registered",
-            metadata=knowledge_document_audit_metadata(document, len(payload.chunks)),
+            metadata=knowledge_document_audit_metadata(document, len(document_chunks)),
             request=request,
         )
         return document.model_dump(mode="json")
@@ -1823,12 +5863,15 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> list[dict]:
         require_permission(request, context, "knowledge.read")
-        results = app.state.knowledge_service.retrieve(
-            RetrievalRequest(
-                tenant_id=context.tenant_id,
-                **payload.model_dump(),
-            )
+        retrieval_request = knowledge_retrieval_request(
+            app=app,
+            request=request,
+            payload=payload,
+            context=context,
+            embedding_gateway=app.state.embedding_gateway,
+            settings=app.state.settings,
         )
+        results = app.state.knowledge_service.retrieve(retrieval_request)
         record_audit_event(
             app,
             tenant_id=context.tenant_id,
@@ -1848,6 +5891,20 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> dict:
         require_permission(request, context, "sandbox.create")
+        active_session_count = len(
+            [
+                session
+                for session in app.state.sandbox_adapter.list_sessions(
+                    context.tenant_id
+                )
+                if session.status == SandboxSessionStatus.ACTIVE
+            ]
+        )
+        app.state.license_service.require_entitlement(
+            tenant_id=context.tenant_id,
+            feature=LicensedFeature.SANDBOX_CONCURRENCY,
+            requested_amount=active_session_count + 1,
+        )
         session = app.state.sandbox_adapter.create(
             SandboxCreateRequest(
                 tenant_id=context.tenant_id,
@@ -1881,7 +5938,9 @@ def create_app(
     ) -> dict:
         require_permission(request, context, "sandbox.execute")
         session = app.state.sandbox_adapter.get_session(context.tenant_id, session_id)
-        timeout_seconds = payload.timeout_seconds or app.state.settings.sandbox_timeout_seconds
+        timeout_seconds = (
+            payload.timeout_seconds or app.state.settings.sandbox_timeout_seconds
+        )
         result = app.state.sandbox_adapter.execute(
             SandboxCommand(
                 tenant_id=context.tenant_id,
@@ -1948,7 +6007,40 @@ def create_app(
         )
         return result.model_dump(mode="json")
 
-    @app.post("/api/sandbox/sessions/{session_id}/files", status_code=status.HTTP_201_CREATED)
+    @app.post("/api/sandbox/secret-leases/resolve")
+    def resolve_sandbox_secret_lease(
+        payload: SecretLeaseResolveRequest,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "sandbox.execute")
+        require_sandbox_secret_resolver_token(request)
+        resolution = app.state.secret_service.resolve_lease(
+            tenant_id=context.tenant_id,
+            workspace_id=payload.workspace_id,
+            run_id=payload.run_id,
+            step_id=payload.step_id,
+            session_id=payload.session_id,
+            lease_token=payload.lease_token,
+            tool_name="sandbox.command",
+            action=payload.action,
+            require_bound_context=True,
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=payload.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="secret.lease.resolved",
+            metadata=resolution.to_audit_metadata(),
+            request=request,
+        )
+        return resolution.model_dump(mode="json")
+
+    @app.post(
+        "/api/sandbox/sessions/{session_id}/files", status_code=status.HTTP_201_CREATED
+    )
     def upload_sandbox_file(
         session_id: str,
         payload: SandboxFileWriteRequest,
@@ -2062,9 +6154,7 @@ def create_app(
                     size_bytes=0,
                 )
             )
-            snapshot = snapshot.model_copy(
-                update={"uri": snapshot_storage_object.uri}
-            )
+            snapshot = snapshot.model_copy(update={"uri": snapshot_storage_object.uri})
             snapshot_content = sandbox_snapshot_content(snapshot)
             snapshot_storage_object = app.state.storage_catalog.mark_uploaded(
                 context.tenant_id,
@@ -2202,6 +6292,13 @@ def build_job_queue(settings: Settings) -> JobQueue | None:
 
 
 def build_browser_controller(settings: Settings) -> BrowserController:
+    if settings.browser_provider in {"playwright", "browserbase"}:
+        return HttpBrowserController(
+            provider=settings.browser_provider,
+            base_url=settings.browser_controller_base_url,
+            api_key=settings.browser_controller_api_key,
+            timeout_seconds=settings.browser_controller_timeout_seconds,
+        )
     return BrowserController(provider=settings.browser_provider)
 
 
@@ -2219,9 +6316,69 @@ def build_run_trace_service(settings: Settings) -> RunTraceService:
     return RunTraceService()
 
 
+def build_billing_invoice_store(settings: Settings) -> BillingInvoiceStore:
+    if settings.billing_invoice_store_backend == "sql":
+        config = settings.database_config()
+        MigrationRunner(
+            config=config,
+            migrations_path=Path("apps/api/migrations"),
+        ).apply()
+        return SqlBillingInvoiceStore(config=config)
+    return InMemoryBillingInvoiceStore()
+
+
+def build_billing_pricing_rule_store(settings: Settings) -> BillingPricingRuleStore:
+    if settings.billing_pricing_rule_store_backend == "sql":
+        config = settings.database_config()
+        MigrationRunner(
+            config=config,
+            migrations_path=Path("apps/api/migrations"),
+        ).apply()
+        return SqlBillingPricingRuleStore(config=config)
+    return InMemoryBillingPricingRuleStore()
+
+
+def build_share_grant_store(settings: Settings) -> ShareGrantStore:
+    if settings.share_grant_store_backend == "sql":
+        config = settings.database_config()
+        MigrationRunner(
+            config=config,
+            migrations_path=Path("apps/api/migrations"),
+        ).apply()
+        return SqlShareGrantStore(config=config)
+    return InMemoryShareGrantStore()
+
+
+def build_billing_pricing_service(
+    settings: Settings,
+    billing_pricing_rule_store: BillingPricingRuleStore | None = None,
+) -> BillingPricingService:
+    effective_rules: dict[tuple, BillingPricingRule] = {
+        billing_pricing_rule_key(rule): rule for rule in settings.billing_pricing_rules
+    }
+    if billing_pricing_rule_store is not None:
+        for record in billing_pricing_rule_store.list_all_rules():
+            rule = record.to_pricing_rule()
+            effective_rules[billing_pricing_rule_key(rule)] = rule
+    return BillingPricingService(rules=list(effective_rules.values()))
+
+
+def billing_pricing_rule_key(rule: BillingPricingRule) -> tuple:
+    return (
+        rule.tenant_id,
+        rule.workspace_id,
+        rule.skill_id,
+        rule.meter_type,
+        rule.unit,
+        rule.provider,
+        rule.model,
+        rule.currency,
+    )
+
+
 def build_model_policy_store(settings: Settings) -> ModelPolicyStore:
     if settings.model_gateway_policy_store_backend == "sql":
-        config = DatabaseConfig(url=settings.database_url)
+        config = settings.database_config()
         MigrationRunner(
             config=config,
             migrations_path=Path("apps/api/migrations"),
@@ -2230,9 +6387,502 @@ def build_model_policy_store(settings: Settings) -> ModelPolicyStore:
     return InMemoryModelPolicyStore()
 
 
+def build_model_provider_store(settings: Settings) -> ModelProviderStore:
+    if settings.model_gateway_provider_store_backend == "sql":
+        config = settings.database_config()
+        MigrationRunner(
+            config=config,
+            migrations_path=Path("apps/api/migrations"),
+        ).apply()
+        return SqlModelProviderStore(config=config)
+    return InMemoryModelProviderStore()
+
+
+def build_model_gateway(
+    settings: Settings,
+    secret_service: SecretService | None,
+    model_provider_store: ModelProviderStore | None = None,
+) -> ModelGateway:
+    providers = effective_model_gateway_providers(settings, model_provider_store)
+    if providers:
+        return ModelGatewayRouter(
+            provider_registry=ModelProviderRegistry(
+                providers=providers
+            ),
+            secret_service=secret_service,
+            rate_limiter=build_model_provider_rate_limiter(settings),
+        )
+    return OpenAICompatibleModelGateway(
+        base_url=settings.model_gateway_base_url,
+        api_key=settings.model_gateway_api_key,
+        api_key_secret_ref_id=settings.model_gateway_api_key_secret_ref_id or None,
+        secret_service=secret_service,
+        secret_lease_ttl_seconds=settings.model_gateway_secret_lease_ttl_seconds,
+        default_model=settings.model_gateway_model,
+        timeout_seconds=settings.model_gateway_timeout_seconds,
+        chat_request_options=settings.model_gateway_chat_request_options,
+    )
+
+
+def effective_model_gateway_providers(
+    settings: Settings,
+    model_provider_store: ModelProviderStore | None = None,
+) -> list[ModelProviderConfig]:
+    providers = list(settings.model_gateway_providers)
+    if model_provider_store is not None:
+        providers.extend(
+            record.to_provider_config()
+            for record in model_provider_store.list_all_providers()
+            if record.status == "active"
+        )
+    return providers
+
+
+def build_model_provider_rate_limiter(settings: Settings) -> ModelProviderRateLimiter:
+    if settings.model_gateway_provider_rate_limit_backend == "sql":
+        config = settings.database_config()
+        MigrationRunner(
+            config=config,
+            migrations_path=Path("apps/api/migrations"),
+        ).apply()
+        return ModelProviderRateLimiter(
+            store=SqlModelProviderRateLimitStore(config=config)
+        )
+    if settings.model_gateway_provider_rate_limit_backend == "redis":
+        return ModelProviderRateLimiter(
+            store=RedisModelProviderRateLimitStore(url=settings.redis_url)
+        )
+    return ModelProviderRateLimiter()
+
+
+def build_model_gateway_readiness(
+    settings: Settings,
+    model_provider_store: ModelProviderStore | None = None,
+) -> ModelGatewayReadiness:
+    providers = effective_model_gateway_providers(settings, model_provider_store)
+    if providers:
+        return _build_provider_model_gateway_readiness(settings, providers)
+    missing: list[str] = []
+    model_source = _model_gateway_model_source(settings)
+    credential_source = _model_gateway_direct_credential_source(settings)
+    if model_source == "none":
+        missing.append("model")
+    if credential_source == "none":
+        missing.append("credential")
+    return ModelGatewayReadiness(
+        configured=not missing,
+        gateway_type="openai_compatible",
+        base_url=settings.model_gateway_base_url,
+        model=settings.model_gateway_model,
+        provider_count=0,
+        configured_provider_count=0,
+        missing=missing,
+        model_source=model_source,
+        credential_source=credential_source,
+    )
+
+
+def build_sandbox_readiness(
+    settings: Settings,
+    sandbox_adapter: SandboxAdapter | None = None,
+) -> SandboxReadiness:
+    missing: list[str] = []
+    controller_required = settings.sandbox_provider in ENTERPRISE_SANDBOX_PROVIDERS
+    controller_endpoint_configured = bool(settings.sandbox_controller_base_url.strip())
+    controller_auth_configured = bool(settings.sandbox_controller_api_key.strip())
+    controller_configured = (
+        controller_endpoint_configured and controller_auth_configured
+        if controller_required
+        else False
+    )
+    if settings.sandbox_provider == "disabled":
+        missing.append("provider")
+    if controller_required and not controller_endpoint_configured:
+        missing.append("sandbox_controller_base_url")
+    if controller_required and not controller_auth_configured:
+        missing.append("sandbox_controller_api_key")
+    readiness = SandboxReadiness(
+        configured=not missing,
+        provider=settings.sandbox_provider,
+        controller_required=controller_required,
+        controller_configured=controller_configured,
+        controller_endpoint_configured=controller_endpoint_configured,
+        controller_auth_configured=controller_auth_configured,
+        missing=missing,
+    )
+    if (
+        sandbox_adapter is not None
+        and settings.sandbox_provider != "disabled"
+        and (not controller_required or controller_configured)
+    ):
+        try:
+            capabilities = sandbox_adapter.get_capabilities()
+        except Exception:
+            if controller_required:
+                controller_missing = list(readiness.missing)
+                if "sandbox_controller_capabilities" not in controller_missing:
+                    controller_missing.append("sandbox_controller_capabilities")
+                return readiness.model_copy(
+                    update={
+                        "configured": False,
+                        "capabilities_checked": False,
+                        "missing": controller_missing,
+                    }
+                )
+            return readiness
+        readiness = readiness.model_copy(
+            update={
+                "capabilities_checked": True,
+                "network_isolation_declared": capabilities.network_isolation,
+                "filesystem_isolation_declared": capabilities.filesystem_isolation,
+                "resource_limits_declared": capabilities.resource_limits,
+                "destroy_supported_declared": capabilities.destroy_supported,
+                "session_ttl_enforced_declared": capabilities.session_ttl_enforced,
+                "runtime_isolation_declared": capabilities.runtime_isolation,
+                "image_policy_enforced_declared": capabilities.image_policy_enforced,
+                "allowed_image_count": capabilities.allowed_image_count,
+                "max_session_ttl_seconds": capabilities.max_session_ttl_seconds,
+                "max_sessions": capabilities.max_sessions,
+                "max_sessions_per_tenant": capabilities.max_sessions_per_tenant,
+                "max_sessions_per_run": capabilities.max_sessions_per_run,
+            }
+        )
+    return readiness
+
+
+def build_browser_readiness(
+    settings: Settings,
+    browser_controller: BrowserController | None = None,
+) -> BrowserReadiness:
+    missing: list[str] = []
+    controller_required = settings.browser_provider in {"playwright", "browserbase"}
+    controller_endpoint_configured = bool(settings.browser_controller_base_url.strip())
+    controller_auth_configured = bool(settings.browser_controller_api_key.strip())
+    controller_configured = (
+        controller_endpoint_configured and controller_auth_configured
+        if controller_required
+        else False
+    )
+    if settings.browser_provider == "disabled":
+        missing.append("provider")
+    if controller_required and not controller_endpoint_configured:
+        missing.append("browser_controller_base_url")
+    if controller_required and not controller_auth_configured:
+        missing.append("browser_controller_api_key")
+    readiness = BrowserReadiness(
+        configured=not missing,
+        provider=settings.browser_provider,
+        controller_required=controller_required,
+        controller_configured=controller_configured,
+        controller_endpoint_configured=controller_endpoint_configured,
+        controller_auth_configured=controller_auth_configured,
+        missing=missing,
+    )
+    if (
+        browser_controller is not None
+        and settings.browser_provider != "disabled"
+        and (not controller_required or controller_configured)
+    ):
+        try:
+            capabilities = browser_controller.capabilities()
+        except Exception:
+            if controller_required:
+                controller_missing = list(readiness.missing)
+                if "browser_controller_capabilities" not in controller_missing:
+                    controller_missing.append("browser_controller_capabilities")
+                return readiness.model_copy(
+                    update={
+                        "configured": False,
+                        "capabilities_checked": False,
+                        "missing": controller_missing,
+                    }
+                )
+            return readiness
+        readiness = readiness.model_copy(
+            update={
+                "capabilities_checked": True,
+                "auth_required_declared": capabilities.auth_required,
+                "session_ttl_enforced_declared": capabilities.session_ttl_enforced,
+                "max_session_ttl_seconds": capabilities.max_session_ttl_seconds,
+                "max_sessions": capabilities.max_sessions,
+                "max_sessions_per_tenant": capabilities.max_sessions_per_tenant,
+                "max_sessions_per_run": capabilities.max_sessions_per_run,
+                "navigation_allowlist_enforced_declared": (
+                    capabilities.navigation_allowlist_enforced
+                ),
+                "navigation_allowed_host_count": (
+                    capabilities.navigation_allowed_host_count
+                ),
+            }
+        )
+    return readiness
+
+
+def _build_provider_model_gateway_readiness(
+    settings: Settings,
+    providers: list[ModelProviderConfig],
+) -> ModelGatewayReadiness:
+    model_source = (
+        "provider"
+        if any(provider.default_model or provider.model_ids for provider in providers)
+        else _model_gateway_model_source(settings)
+    )
+    configured_provider_count = 0
+    provider_ids: list[str] = []
+    configured_provider_ids: list[str] = []
+    has_model = False
+    has_credential = False
+    for provider in providers:
+        provider_ids.append(provider.id)
+        provider_model_source = _model_provider_model_source(settings, provider)
+        provider_credential_source = _model_provider_credential_source(provider)
+        if provider_model_source != "none":
+            has_model = True
+        if provider_credential_source != "none":
+            has_credential = True
+        if (
+            provider_model_source != "none"
+            and provider_credential_source != "none"
+        ):
+            configured_provider_count += 1
+            configured_provider_ids.append(provider.id)
+    missing: list[str] = []
+    if not has_model:
+        missing.append("model")
+    if not has_credential:
+        missing.append("credential")
+    if configured_provider_count == 0:
+        missing.append("configured_provider")
+    return ModelGatewayReadiness(
+        configured=configured_provider_count > 0,
+        gateway_type="provider_registry",
+        provider_count=len(providers),
+        configured_provider_count=configured_provider_count,
+        provider_ids=provider_ids,
+        configured_provider_ids=configured_provider_ids,
+        missing=missing,
+        model_source=model_source,
+        credential_source="provider_registry" if has_credential else "none",
+    )
+
+
+def _model_gateway_model_source(settings: Settings) -> str:
+    if settings.model_gateway_model:
+        return "settings"
+    if any(scope.default_model for scope in settings.model_gateway_policy_scopes):
+        return "policy_scope"
+    if any(
+        provider.default_model or provider.model_ids
+        for provider in settings.model_gateway_providers
+    ):
+        return "provider"
+    return "none"
+
+
+def _model_gateway_direct_credential_source(settings: Settings) -> str:
+    if settings.model_gateway_api_key_secret_ref_id:
+        return "secret_ref"
+    if settings.model_gateway_api_key:
+        return "api_key"
+    return "none"
+
+
+def _model_provider_model_source(
+    settings: Settings,
+    provider: ModelProviderConfig,
+) -> str:
+    if provider.default_model or provider.model_ids:
+        return "provider"
+    if settings.model_gateway_model:
+        return "settings"
+    if any(scope.default_model for scope in settings.model_gateway_policy_scopes):
+        return "policy_scope"
+    return "none"
+
+
+def _model_provider_credential_source(provider: ModelProviderConfig) -> str:
+    if provider.api_key_secret_ref_id:
+        return "secret_ref"
+    if provider.api_key:
+        return "api_key"
+    return "none"
+
+
+def _model_provider_api_payload(
+    settings: Settings,
+    provider: ModelProviderConfig,
+    status: str = "active",
+    source: str = "settings",
+) -> dict:
+    payload = provider.model_dump(mode="json")
+    payload.pop("api_key", None)
+    payload["model_source"] = _model_provider_model_source(settings, provider)
+    payload["credential_source"] = _model_provider_credential_source(provider)
+    payload["status"] = status
+    payload["source"] = source
+    return payload
+
+
+def _model_provider_record_api_payload(
+    settings: Settings,
+    record: ModelProviderRecord,
+) -> dict:
+    payload = _model_provider_api_payload(
+        settings=settings,
+        provider=record.provider,
+        status=record.status,
+        source="store",
+    )
+    payload["current_version"] = record.current_version
+    return payload
+
+
+def _model_provider_version_api_payload(
+    settings: Settings,
+    record: ModelProviderVersionRecord,
+) -> dict:
+    payload = _model_provider_api_payload(
+        settings=settings,
+        provider=record.provider,
+        status=record.status,
+        source="store",
+    )
+    payload["provider_id"] = record.provider_id
+    payload["version"] = record.version
+    payload["change_type"] = record.change_type
+    payload["created_by_user_id"] = record.created_by_user_id
+    payload["created_at"] = record.created_at.isoformat()
+    return payload
+
+
+def _model_policy_version_api_payload(record: ModelPolicyVersionRecord) -> dict:
+    return {
+        "tenant_id": record.tenant_id,
+        "workspace_id": record.workspace_id,
+        "version": record.version,
+        "default_model": record.default_model,
+        "allowed_models": record.allowed_models,
+        "denied_models": record.denied_models,
+        "model_sensitivity_limits": record.model_sensitivity_limits,
+        "change_type": record.change_type,
+        "change_request_id": record.change_request_id,
+        "created_by_user_id": record.created_by_user_id,
+        "created_at": record.created_at.isoformat(),
+    }
+
+
+def _model_policy_change_request_api_payload(
+    record: ModelPolicyChangeRequestRecord,
+) -> dict:
+    return {
+        "id": record.id,
+        "tenant_id": record.tenant_id,
+        "operation": record.operation,
+        "status": record.status,
+        "requested_by_user_id": record.requested_by_user_id,
+        "reviewed_by_user_id": record.reviewed_by_user_id,
+        "created_at": record.created_at.isoformat(),
+        "reviewed_at": record.reviewed_at.isoformat()
+        if record.reviewed_at is not None
+        else None,
+        "scope": record.scope_upsert.model_dump(mode="json"),
+    }
+
+
+def _model_provider_change_request_api_payload(
+    settings: Settings,
+    record: ModelProviderChangeRequestRecord,
+) -> dict:
+    payload = {
+        "id": record.id,
+        "tenant_id": record.tenant_id,
+        "provider_id": record.provider_id,
+        "operation": record.operation,
+        "status": record.status,
+        "requested_by_user_id": record.requested_by_user_id,
+        "reviewed_by_user_id": record.reviewed_by_user_id,
+        "created_at": record.created_at.isoformat(),
+        "reviewed_at": record.reviewed_at.isoformat()
+        if record.reviewed_at is not None
+        else None,
+    }
+    if record.provider_upsert is not None:
+        payload["provider"] = _model_provider_api_payload(
+            settings=settings,
+            provider=record.provider_upsert.to_provider_config(),
+            status="pending",
+            source="change_request",
+        )
+    if record.api_key_secret_ref_id is not None:
+        payload["credential_source"] = "secret_ref"
+    if record.target_status is not None:
+        payload["target_status"] = record.target_status
+    if record.rollback_version is not None:
+        payload["rollback_version"] = record.rollback_version
+    return payload
+
+
+def _model_provider_visible_to_tenant(
+    provider: ModelProviderConfig,
+    tenant_id: str,
+) -> bool:
+    return provider.tenant_id == tenant_id
+
+
+def build_embedding_gateway(
+    settings: Settings,
+    secret_service: SecretService | None,
+) -> EmbeddingGateway | None:
+    if not settings.embedding_gateway_enabled:
+        return None
+    return OpenAICompatibleEmbeddingGateway(
+        base_url=settings.embedding_gateway_base_url,
+        api_key=settings.embedding_gateway_api_key,
+        api_key_secret_ref_id=settings.embedding_gateway_api_key_secret_ref_id or None,
+        secret_service=secret_service,
+        secret_lease_ttl_seconds=settings.embedding_gateway_secret_lease_ttl_seconds,
+        default_model=settings.embedding_gateway_model,
+        dimensions=settings.embedding_gateway_dimensions,
+        timeout_seconds=settings.embedding_gateway_timeout_seconds,
+    )
+
+
+def build_trigger_service(settings: Settings) -> TriggerService:
+    if settings.trigger_store_backend == "sql":
+        config = settings.database_config()
+        MigrationRunner(
+            config=config,
+            migrations_path=Path("apps/api/migrations"),
+        ).apply()
+        return TriggerService(store=SqlTriggerStore(config=config))
+    return TriggerService(store=InMemoryTriggerStore())
+
+
+def build_trigger_webhook_verifier(settings: Settings) -> TriggerWebhookVerifier:
+    return TriggerWebhookVerifier(
+        signing_secrets=settings.trigger_webhook_signing_secrets,
+        tolerance_seconds=settings.trigger_webhook_signature_tolerance_seconds,
+        allow_unsigned=settings.trigger_webhook_allow_unsigned,
+    )
+
+
+def build_connector_registry(
+    settings: Settings,
+) -> InMemoryConnectorRegistry | SqlConnectorRegistry:
+    if settings.connector_registry_backend == "sql":
+        config = settings.database_config()
+        MigrationRunner(
+            config=config,
+            migrations_path=Path("apps/api/migrations"),
+        ).apply()
+        return SqlConnectorRegistry(config=config)
+    return InMemoryConnectorRegistry()
+
+
 def build_model_budget_guard(settings: Settings) -> ModelBudgetGuard:
     return ModelBudgetGuard(
         policy=ModelBudgetPolicy(
+            budget_window_seconds=settings.model_gateway_budget_window_seconds,
             max_model_calls_per_run=settings.model_gateway_run_call_limit,
             max_model_tokens_per_run=settings.model_gateway_run_token_limit,
             max_model_calls_per_tenant=settings.model_gateway_tenant_call_limit,
@@ -2263,13 +6913,16 @@ def build_model_policy(
         default_model=settings.model_gateway_model,
         allowed_models=settings.model_gateway_allowed_models,
         denied_models=settings.model_gateway_denied_models,
+        model_sensitivity_limits=settings.model_gateway_sensitivity_limits,
         scoped_policies=list(scoped_policies.values()),
     )
 
 
-def build_control_plane_store(settings: Settings) -> InMemoryControlPlaneStore | SqlControlPlaneRepository:
+def build_control_plane_store(
+    settings: Settings,
+) -> InMemoryControlPlaneStore | SqlControlPlaneRepository:
     if settings.control_plane_store_backend == "sql":
-        repository = SqlControlPlaneRepository(config=DatabaseConfig(url=settings.database_url))
+        repository = SqlControlPlaneRepository(config=settings.database_config())
         repository.initialize_schema(Path("apps/api/migrations"))
         return repository
     return InMemoryControlPlaneStore()
@@ -2285,7 +6938,7 @@ def build_identity_service(
     )
     if settings.identity_service_backend == "sql":
         return SqlIdentityService(
-            config=DatabaseConfig(url=settings.database_url),
+            config=settings.database_config(),
             password_hasher=password_hasher,
             audit_service=audit_service,
         )
@@ -2297,16 +6950,19 @@ def build_identity_service(
 
 def build_auth_session_store(settings: Settings) -> AuthSessionStore:
     if settings.auth_session_backend == "sql" or (
-        settings.auth_session_backend == "auto" and settings.identity_service_backend == "sql"
+        settings.auth_session_backend == "auto"
+        and settings.identity_service_backend == "sql"
     ):
-        return SqlAuthSessionStore(config=DatabaseConfig(url=settings.database_url))
+        return SqlAuthSessionStore(config=settings.database_config())
     return InMemoryAuthSessionStore()
 
 
-def build_storage_catalog(settings: Settings) -> InMemoryStorageCatalog | SqlStorageCatalog:
+def build_storage_catalog(
+    settings: Settings,
+) -> InMemoryStorageCatalog | SqlStorageCatalog:
     if settings.storage_catalog_backend == "sql":
         return SqlStorageCatalog(
-            config=DatabaseConfig(url=settings.database_url),
+            config=settings.database_config(),
             bucket=settings.object_storage_bucket,
         )
     return InMemoryStorageCatalog(bucket=settings.object_storage_bucket)
@@ -2323,11 +6979,23 @@ def build_lifecycle_policy_store(
 ) -> InMemoryLifecyclePolicyStore | SqlLifecyclePolicyStore:
     if settings.lifecycle_policy_backend == "sql":
         MigrationRunner(
-            config=DatabaseConfig(url=settings.database_url),
+            config=settings.database_config(),
             migrations_path=Path("apps/api/migrations"),
         ).apply()
-        return SqlLifecyclePolicyStore(config=DatabaseConfig(url=settings.database_url))
+        return SqlLifecyclePolicyStore(config=settings.database_config())
     return InMemoryLifecyclePolicyStore()
+
+
+def build_restore_drill_schedule_store(
+    settings: Settings,
+) -> RestoreDrillScheduleStore:
+    if settings.restore_drill_schedule_backend == "sql":
+        MigrationRunner(
+            config=settings.database_config(),
+            migrations_path=Path("apps/api/migrations"),
+        ).apply()
+        return SqlRestoreDrillScheduleStore(config=settings.database_config())
+    return InMemoryRestoreDrillScheduleStore()
 
 
 def build_tenant_offboarding_store(
@@ -2335,10 +7003,10 @@ def build_tenant_offboarding_store(
 ) -> InMemoryTenantOffboardingStore | SqlTenantOffboardingStore:
     if settings.lifecycle_policy_backend == "sql":
         MigrationRunner(
-            config=DatabaseConfig(url=settings.database_url),
+            config=settings.database_config(),
             migrations_path=Path("apps/api/migrations"),
         ).apply()
-        return SqlTenantOffboardingStore(config=DatabaseConfig(url=settings.database_url))
+        return SqlTenantOffboardingStore(config=settings.database_config())
     return InMemoryTenantOffboardingStore()
 
 
@@ -2374,7 +7042,9 @@ def build_tenant_offboarding_service(app: FastAPI) -> TenantOffboardingService:
     )
 
 
-def build_tenant_offboarding_deletion_service(app: FastAPI) -> TenantOffboardingDeletionService:
+def build_tenant_offboarding_deletion_service(
+    app: FastAPI,
+) -> TenantOffboardingDeletionService:
     return TenantOffboardingDeletionService(
         lifecycle_policy_store=app.state.lifecycle_policy_store,
         offboarding_store=app.state.tenant_offboarding_store,
@@ -2386,25 +7056,89 @@ def build_tenant_offboarding_deletion_service(app: FastAPI) -> TenantOffboarding
     )
 
 
-def build_knowledge_service(settings: Settings) -> InMemoryKnowledgeService | SqlKnowledgeService:
+def build_knowledge_service(
+    settings: Settings,
+) -> InMemoryKnowledgeService | SqlKnowledgeService:
     if settings.knowledge_service_backend == "sql":
         MigrationRunner(
-            config=DatabaseConfig(url=settings.database_url),
+            config=settings.database_config(),
             migrations_path=Path("apps/api/migrations"),
         ).apply()
-        return SqlKnowledgeService(config=DatabaseConfig(url=settings.database_url))
+        return SqlKnowledgeService(config=settings.database_config())
     return InMemoryKnowledgeService()
 
 
-def build_skill_registry(settings: Settings) -> InMemorySkillRegistry | SqlSkillRegistry:
+def build_skill_registry(
+    settings: Settings,
+) -> InMemorySkillRegistry | SqlSkillRegistry:
     if settings.skill_registry_backend == "sql":
-        repository = SqlSkillRegistry(config=DatabaseConfig(url=settings.database_url))
+        repository = SqlSkillRegistry(config=settings.database_config())
         MigrationRunner(
-            config=DatabaseConfig(url=settings.database_url),
+            config=settings.database_config(),
             migrations_path=Path("apps/api/migrations"),
         ).apply()
         return repository
     return InMemorySkillRegistry()
+
+
+def build_solution_pack_registry(
+    settings: Settings,
+) -> InMemorySolutionPackRegistry | SqlSolutionPackRegistry:
+    if settings.solution_pack_registry_backend == "sql":
+        repository = SqlSolutionPackRegistry(config=settings.database_config())
+        MigrationRunner(
+            config=settings.database_config(),
+            migrations_path=Path("apps/api/migrations"),
+        ).apply()
+        return repository
+    return InMemorySolutionPackRegistry()
+
+
+def build_customer_feedback_service(
+    settings: Settings,
+    audit_store,
+    solution_pack_registry,
+) -> InMemoryCustomerFeedbackService | SqlCustomerFeedbackService:
+    if settings.customer_feedback_service_backend == "sql":
+        MigrationRunner(
+            config=settings.database_config(),
+            migrations_path=Path("apps/api/migrations"),
+        ).apply()
+        return SqlCustomerFeedbackService(
+            config=settings.database_config(),
+            audit_store=audit_store,
+            solution_pack_registry=solution_pack_registry,
+        )
+    return InMemoryCustomerFeedbackService(
+        audit_store=audit_store,
+        solution_pack_registry=solution_pack_registry,
+    )
+
+
+def build_sso_provider_registry(
+    settings: Settings,
+) -> InMemorySsoProviderRegistry | SqlSsoProviderRegistry:
+    if settings.sso_provider_registry_backend == "sql":
+        repository = SqlSsoProviderRegistry(config=settings.database_config())
+        MigrationRunner(
+            config=settings.database_config(),
+            migrations_path=Path("apps/api/migrations"),
+        ).apply()
+        return repository
+    return InMemorySsoProviderRegistry()
+
+
+def build_scim_provisioning_store(
+    settings: Settings,
+) -> InMemoryScimProvisioningStore | SqlScimProvisioningStore:
+    if settings.scim_provisioning_store_backend == "sql":
+        repository = SqlScimProvisioningStore(config=settings.database_config())
+        MigrationRunner(
+            config=settings.database_config(),
+            migrations_path=Path("apps/api/migrations"),
+        ).apply()
+        return repository
+    return InMemoryScimProvisioningStore()
 
 
 def build_long_term_memory_service(
@@ -2412,10 +7146,10 @@ def build_long_term_memory_service(
 ) -> InMemoryLongTermMemoryService | SqlLongTermMemoryService:
     if settings.long_term_memory_backend == "sql":
         MigrationRunner(
-            config=DatabaseConfig(url=settings.database_url),
+            config=settings.database_config(),
             migrations_path=Path("apps/api/migrations"),
         ).apply()
-        return SqlLongTermMemoryService(config=DatabaseConfig(url=settings.database_url))
+        return SqlLongTermMemoryService(config=settings.database_config())
     return InMemoryLongTermMemoryService()
 
 
@@ -2434,7 +7168,9 @@ def build_guardrail_service(settings: Settings) -> InMemoryGuardrailService:
     if settings.guardrail_prompt_threat_detector_enabled:
         detectors.append(
             GuardrailPromptThreatDetector(
-                action=GuardrailAction(settings.guardrail_prompt_threat_detector_action),
+                action=GuardrailAction(
+                    settings.guardrail_prompt_threat_detector_action
+                ),
                 stages=[
                     GuardrailStage(stage)
                     for stage in settings.guardrail_prompt_threat_detector_stages
@@ -2460,7 +7196,11 @@ def build_guardrail_service(settings: Settings) -> InMemoryGuardrailService:
 
 
 def guard_long_term_memory_service(
-    service: InMemoryLongTermMemoryService | SqlLongTermMemoryService | GuardedLongTermMemoryService,
+    service: (
+        InMemoryLongTermMemoryService
+        | SqlLongTermMemoryService
+        | GuardedLongTermMemoryService
+    ),
     guardrail_service: InMemoryGuardrailService,
     audit_service: Any | None,
 ) -> GuardedLongTermMemoryService:
@@ -2482,7 +7222,11 @@ def build_short_term_memory_service(
 
 
 def guard_short_term_memory_service(
-    service: InMemoryShortTermMemoryService | RedisShortTermMemoryService | GuardedShortTermMemoryService,
+    service: (
+        InMemoryShortTermMemoryService
+        | RedisShortTermMemoryService
+        | GuardedShortTermMemoryService
+    ),
     guardrail_service: InMemoryGuardrailService,
     audit_service: Any | None,
     review_store: Any,
@@ -2500,10 +7244,10 @@ def guard_short_term_memory_service(
 def build_short_term_memory_review_store(settings: Settings):
     if settings.control_plane_store_backend == "sql":
         MigrationRunner(
-            config=DatabaseConfig(url=settings.database_url),
+            config=settings.database_config(),
             migrations_path=Path("apps/api/migrations"),
         ).apply()
-        return SqlShortTermMemoryReviewStore(config=DatabaseConfig(url=settings.database_url))
+        return SqlShortTermMemoryReviewStore(config=settings.database_config())
     return InMemoryShortTermMemoryReviewStore()
 
 
@@ -2575,6 +7319,144 @@ def knowledge_document_storage_content(payload: KnowledgeDocumentApiCreate) -> b
     return content.encode("utf-8")
 
 
+def knowledge_document_chunks(
+    payload: KnowledgeDocumentApiCreate,
+    content: bytes,
+    settings: Settings,
+) -> list[DocumentChunkCreate]:
+    if payload.chunks:
+        return payload.chunks
+    return chunk_text_content(
+        content.decode("utf-8"),
+        source_document_id=payload.source_document_id,
+        max_characters=settings.knowledge_chunk_max_characters,
+        overlap_characters=settings.knowledge_chunk_overlap_characters,
+    )
+
+
+def embed_knowledge_document_chunks(
+    app: FastAPI,
+    request: Request,
+    payload: KnowledgeDocumentApiCreate,
+    context: RequestContext,
+    chunks: list[DocumentChunkCreate],
+    embedding_gateway: EmbeddingGateway | None,
+    settings: Settings,
+) -> list[DocumentChunkCreate]:
+    if embedding_gateway is None or not chunks:
+        return chunks
+    response = embedding_gateway.embed(
+        EmbeddingGatewayRequest(
+            tenant_id=context.tenant_id,
+            workspace_id=payload.workspace_id,
+            user_id=context.user_id,
+            purpose="knowledge_index",
+            input=[chunk.content for chunk in chunks],
+            model=settings.embedding_gateway_model,
+            dimensions=settings.embedding_gateway_dimensions,
+            metadata={
+                "knowledge_base_id": payload.knowledge_base_id,
+                "source_document_id": payload.source_document_id,
+                "chunk_count": len(chunks),
+            },
+        )
+    )
+    record_embedding_gateway_usage(
+        app=app,
+        request=request,
+        record=EmbeddingUsageRecord(
+            tenant_id=context.tenant_id,
+            workspace_id=payload.workspace_id,
+            user_id=context.user_id,
+            purpose="knowledge_index",
+            response=response,
+            input_count=len(chunks),
+            metadata={
+                "knowledge_base_id": payload.knowledge_base_id,
+                "source_document_id": payload.source_document_id,
+                "chunk_count": len(chunks),
+            },
+        ),
+    )
+    embeddings_by_index = {
+        embedding.index: embedding.embedding for embedding in response.embeddings
+    }
+    embedded_at = utc_now()
+    embedding_model = response.model or settings.embedding_gateway_model
+    return [
+        chunk.model_copy(
+            update={
+                "embedding": embeddings_by_index.get(index, chunk.embedding),
+                "embedding_model": embedding_model,
+                "embedding_provider": "openai_compatible",
+                "embedded_at": embedded_at,
+            }
+        )
+        for index, chunk in enumerate(chunks)
+    ]
+
+
+def knowledge_retrieval_request(
+    app: FastAPI,
+    request: Request,
+    payload: KnowledgeQueryRequest,
+    context: RequestContext,
+    embedding_gateway: EmbeddingGateway | None,
+    settings: Settings,
+) -> RetrievalRequest:
+    request_data = payload.model_dump()
+    if embedding_gateway is None:
+        return RetrievalRequest(tenant_id=context.tenant_id, **request_data)
+
+    response = embedding_gateway.embed(
+        EmbeddingGatewayRequest(
+            tenant_id=context.tenant_id,
+            workspace_id=(
+                payload.allowed_workspace_ids[0]
+                if payload.allowed_workspace_ids
+                else None
+            ),
+            user_id=context.user_id,
+            purpose="knowledge_query",
+            input=[payload.query],
+            model=settings.embedding_gateway_model,
+            dimensions=settings.embedding_gateway_dimensions,
+            metadata={
+                "allowed_workspace_count": len(payload.allowed_workspace_ids),
+                "clearance_level": payload.clearance_level,
+            },
+        )
+    )
+    record_embedding_gateway_usage(
+        app=app,
+        request=request,
+        record=EmbeddingUsageRecord(
+            tenant_id=context.tenant_id,
+            workspace_id=(
+                payload.allowed_workspace_ids[0]
+                if payload.allowed_workspace_ids
+                else None
+            ),
+            user_id=context.user_id,
+            purpose="knowledge_query",
+            response=response,
+            input_count=1,
+            metadata={
+                "allowed_workspace_count": len(payload.allowed_workspace_ids),
+                "clearance_level": payload.clearance_level,
+            },
+        ),
+    )
+    if not response.embeddings:
+        raise ValueError("embedding gateway returned no query embedding")
+    return RetrievalRequest(
+        tenant_id=context.tenant_id,
+        query_embedding=response.embeddings[0].embedding,
+        embedding_model=response.model or settings.embedding_gateway_model,
+        **request_data,
+    )
+
+
 def knowledge_document_storage_filename(payload: KnowledgeDocumentApiCreate) -> str:
     filename = payload.source_uri.rstrip("/").rsplit("/", 1)[-1]
     return filename or f"{payload.source_document_id}.txt"
@@ -2591,6 +7473,191 @@ def knowledge_query_audit_metadata(payload: KnowledgeQueryRequest, results) -> d
         "document_ids": [result.document_id for result in results],
         "chunk_ids": [result.chunk_id for result in results],
         "source_document_ids": [result.source_document_id for result in results],
+    }
+
+
+def connector_audit_metadata(connector: ConnectorDefinition) -> dict:
+    credential_ref_id = None
+    if connector.credential_ref is not None:
+        credential_ref_id = connector.credential_ref.secret_ref_id
+    return {
+        "connector_id": connector.id,
+        "workspace_id": connector.workspace_id,
+        "connector_type": connector.type.value,
+        "auth_mode": connector.auth_mode.value,
+        "status": connector.status.value,
+        "capability_count": len(connector.capabilities),
+        "credential_ref_id": credential_ref_id,
+        "sensitivity_level": connector.sensitivity_level,
+    }
+
+
+def connector_oauth_audit_metadata(
+    connector: ConnectorDefinition, result: Any | None = None
+) -> dict:
+    metadata = connector_audit_metadata(connector)
+    oauth_config = connector.metadata.get("oauth2")
+    if isinstance(oauth_config, dict):
+        scopes = oauth_config.get("scopes")
+        metadata.update(
+            {
+                "callback_url": oauth_config.get("callback_url"),
+                "scope_count": len(scopes) if isinstance(scopes, list) else 0,
+                "access_token_secret_ref_id": oauth_config.get(
+                    "access_token_secret_ref_id"
+                ),
+                "refresh_token_secret_ref_id": oauth_config.get(
+                    "refresh_token_secret_ref_id"
+                ),
+            }
+        )
+    if result is None:
+        return metadata
+    expires_at = getattr(result, "expires_at", None)
+    if expires_at is not None:
+        metadata["expires_at"] = expires_at.isoformat()
+    status_value = getattr(result, "status", None)
+    if status_value is not None:
+        metadata["oauth_status"] = status_value
+    expires_in = getattr(result, "expires_in", None)
+    if expires_in is not None:
+        metadata["expires_in"] = expires_in
+    token_type = getattr(result, "token_type", None)
+    if token_type is not None:
+        metadata["token_type"] = token_type
+    return metadata
+
+
+def connector_sync_audit_metadata(
+    connector_id: str,
+    knowledge_base_id: str,
+    documents: list,
+    cursor: str | None,
+    job_id: str | None = None,
+) -> dict:
+    metadata = {
+        "connector_id": connector_id,
+        "knowledge_base_id": knowledge_base_id,
+        "document_count": len(documents),
+        "chunk_count": sum(len(document.chunks) for document in documents),
+        "cursor": cursor,
+    }
+    if job_id is not None:
+        metadata["job_id"] = job_id
+    return metadata
+
+
+def connector_invocation_audit_metadata(
+    decision: ConnectorInvocationDecision,
+    connector: ConnectorDefinition | None = None,
+    dispatch_result: ConnectorDispatchResult | None = None,
+    approval_id: str | None = None,
+    error_code: str | None = None,
+) -> dict:
+    metadata = {
+        "connector_id": decision.connector_id,
+        "workspace_id": decision.workspace_id,
+        "run_id": decision.run_id,
+        "step_id": decision.step_id,
+        "capability_name": decision.capability_name,
+        "tool_name": decision.tool_name,
+        "status": decision.status.value,
+        "required_scopes": decision.required_scopes,
+        "granted_scope_count": len(decision.granted_scopes),
+        "missing_scopes": decision.missing_scopes,
+        "risk_level": decision.risk_level,
+        "approval_required": decision.approval_required,
+        "approved": decision.approved,
+        "input_keys": decision.input_keys,
+        "billing_meter_type": decision.billing_meter_type,
+    }
+    if connector is not None and connector.credential_ref is not None:
+        metadata["credential_ref_id"] = connector.credential_ref.secret_ref_id
+        metadata["credential_actions"] = connector.credential_ref.required_actions
+    if dispatch_result is not None:
+        metadata.update(connector_dispatch_billing_metadata(dispatch_result))
+    if approval_id is not None:
+        metadata["approval_id"] = approval_id
+    if error_code is not None:
+        metadata["error_code"] = error_code
+    return metadata
+
+
+def get_or_create_connector_approval(
+    app: FastAPI,
+    tenant_id: str,
+    run_id: str,
+    connector_id: str,
+    capability_name: str,
+    step_id: str,
+):
+    reason = connector_approval_reason(connector_id, capability_name)
+    for approval in app.state.store.list_approval_requests(tenant_id, run_id):
+        if (
+            approval.status == ApprovalStatus.PENDING
+            and approval.step_id == step_id
+            and approval.reason == reason
+        ):
+            return approval
+    return app.state.store.create_approval_request(
+        tenant_id=tenant_id,
+        run_id=run_id,
+        step_id=step_id,
+        reason=reason,
+    )
+
+
+def find_connector_approval(
+    app: FastAPI,
+    tenant_id: str,
+    run_id: str,
+    approval_id: str,
+) -> ApprovalRequest | None:
+    for approval in app.state.store.list_approval_requests(tenant_id, run_id):
+        if approval.id == approval_id and is_connector_approval_reason(approval.reason):
+            return approval
+    return None
+
+
+def require_approved_connector_approval(
+    app: FastAPI,
+    tenant_id: str,
+    run_id: str,
+    approval_id: str | None,
+    connector_id: str,
+    capability_name: str,
+    step_id: str,
+) -> ApprovalRequest:
+    if approval_id is None:
+        raise TenantAccessError("approved connector invocation requires approval_id")
+    expected_reason = connector_approval_reason(connector_id, capability_name)
+    for approval in app.state.store.list_approval_requests(tenant_id, run_id):
+        if approval.id != approval_id:
+            continue
+        if approval.step_id != step_id or approval.reason != expected_reason:
+            raise TenantAccessError("connector approval does not match invocation")
+        if approval.status != ApprovalStatus.APPROVED:
+            raise TenantAccessError("connector approval is not approved")
+        return approval
+    raise TenantAccessError("connector approval is required")
+
+
+def connector_approval_reason(connector_id: str, capability_name: str) -> str:
+    return f"connector approval required: {connector_id}:{capability_name}"
+
+
+def is_connector_approval_reason(reason: str) -> bool:
+    return reason.startswith("connector approval required: ")
+
+
+def connector_dispatch_billing_metadata(
+    dispatch_result: ConnectorDispatchResult | None,
+) -> dict:
+    if dispatch_result is None:
+        return {}
+    return {
+        "dispatch_status_code": dispatch_result.status_code,
+        "response_size_bytes": dispatch_result.response_size_bytes,
     }
 
 
@@ -2672,12 +7739,47 @@ def data_residency_report_audit_metadata(report) -> dict:
         "compliant": report.compliant,
         "check_count": len(report.checks),
         "disallowed_count": len(disallowed_checks),
-        "checked_resource_types": [check.resource_type.value for check in report.checks],
+        "checked_resource_types": [
+            check.resource_type.value for check in report.checks
+        ],
         "disallowed_resource_types": [
             check.resource_type.value for check in disallowed_checks
         ],
         "checked_regions": sorted({check.region for check in report.checks}),
     }
+
+
+def restore_drill_schedule_audit_metadata(schedule) -> dict:
+    return {
+        "schedule_id": schedule.id,
+        "workspace_id": schedule.workspace_id,
+        "status": schedule.status.value,
+        "interval_days": schedule.interval_days,
+        "max_catch_up_runs": schedule.max_catch_up_runs,
+        "next_run_at": (
+            schedule.next_run_at.isoformat() if schedule.next_run_at is not None else None
+        ),
+        "has_service_account": schedule.service_account_id is not None,
+        "created_by_user_id": schedule.created_by_user_id,
+    }
+
+
+def restore_drill_run_record_audit_metadata(record) -> dict:
+    return {
+        "run_record_id": record.id,
+        "workspace_id": record.workspace_id,
+        "schedule_id": record.schedule_id,
+        "scheduled_for": record.scheduled_for.isoformat(),
+        "requested_by_user_id": record.requested_by_user_id,
+        "status": record.status.value,
+        "has_evidence_object": record.evidence_object_id is not None,
+    }
+
+
+def require_restore_drill_run_record_update_allowed(record) -> None:
+    if record.status == RestoreDrillRunStatus.REQUESTED:
+        return
+    raise ValueError("restore drill run record is already terminal")
 
 
 def tenant_offboarding_audit_metadata(plan) -> dict:
@@ -2699,7 +7801,9 @@ def tenant_offboarding_audit_metadata(plan) -> dict:
         "blocking_legal_hold_count": len(plan.blocking_legal_hold_ids),
         "deletion_scope": plan.deletion_scope,
         "approved_by_user_id": plan.approved_by_user_id,
-        "approved_at": plan.approved_at.isoformat() if plan.approved_at is not None else None,
+        "approved_at": (
+            plan.approved_at.isoformat() if plan.approved_at is not None else None
+        ),
         "export_bundle_id": plan.export_bundle_id,
         "export_storage_object_id": plan.export_storage_object_id,
         "export_completed_by_user_id": plan.export_completed_by_user_id,
@@ -2709,7 +7813,9 @@ def tenant_offboarding_audit_metadata(plan) -> dict:
             else None
         ),
         "deleted_by_user_id": plan.deleted_by_user_id,
-        "deleted_at": plan.deleted_at.isoformat() if plan.deleted_at is not None else None,
+        "deleted_at": (
+            plan.deleted_at.isoformat() if plan.deleted_at is not None else None
+        ),
     }
 
 
@@ -2760,8 +7866,12 @@ def legal_hold_audit_metadata(hold) -> dict:
         "scope_id": hold.scope_id,
         "created_by_user_id": hold.created_by_user_id,
         "reason_length": len(hold.reason),
-        "expires_at": hold.expires_at.isoformat() if hold.expires_at is not None else None,
-        "released_at": hold.released_at.isoformat() if hold.released_at is not None else None,
+        "expires_at": (
+            hold.expires_at.isoformat() if hold.expires_at is not None else None
+        ),
+        "released_at": (
+            hold.released_at.isoformat() if hold.released_at is not None else None
+        ),
     }
 
 

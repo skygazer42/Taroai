@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "taroai.fullname" . }}-runtime-config
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-runtime
+    app.kubernetes.io/component: runtime-config
+data:
+  {{- $root := . }}
+  {{- range $key, $value := .Values.config }}
+  {{- if and (eq $key "TAROAI_SANDBOX_CONTROLLER_BASE_URL") $root.Values.sandboxController.enabled }}
+  {{ $key }}: {{ printf "http://%s-sandbox-controller:%v" (include "taroai.fullname" $root) $root.Values.sandboxController.service.port | quote }}
+  {{- else if and (eq $key "TAROAI_SANDBOX_CONTROLLER_KUBERNETES_NAMESPACE") $root.Values.sandboxController.enabled }}
+  {{ $key }}: {{ $root.Release.Namespace | quote }}
+  {{- else if and (eq $key "TAROAI_SANDBOX_CONTROLLER_KUBERNETES_SERVICE_ACCOUNT_NAME") $root.Values.sandboxController.enabled }}
+  {{ $key }}: {{ printf "%s-sandbox-runner" (include "taroai.fullname" $root) | quote }}
+  {{- else if and (eq $key "TAROAI_BROWSER_CONTROLLER_BASE_URL") $root.Values.browserController.enabled }}
+  {{ $key }}: {{ printf "http://%s-browser-controller:%v" (include "taroai.fullname" $root) $root.Values.browserController.service.port | quote }}
+  {{- else }}
+  {{ $key }}: {{ $value | quote }}
+  {{- end }}
+  {{- end }}

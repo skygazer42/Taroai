@@ -3,13 +3,18 @@ from pydantic import BaseModel
 from taroai.config import Settings
 from taroai.db import SqlControlPlaneRepository
 from taroai.identity import InMemoryIdentityService, SqlIdentityService
+from taroai.knowledge import InMemoryKnowledgeService, SqlKnowledgeService
 from taroai.onboarding.models import (
     ReadinessCheckStatus,
     TenantReadinessCheck,
     TenantReadinessReport,
 )
+from taroai.skills import InMemorySkillRegistry, SqlSkillRegistry
 from taroai.store import InMemoryControlPlaneStore
 from taroai.workers import JobQueue
+
+
+STARTER_SKILL_ID_PREFIX = "starter."
 
 
 class TenantReadinessService(BaseModel):
@@ -17,6 +22,8 @@ class TenantReadinessService(BaseModel):
     store: InMemoryControlPlaneStore | SqlControlPlaneRepository
     settings: Settings
     job_queue: JobQueue | None = None
+    knowledge_service: InMemoryKnowledgeService | SqlKnowledgeService | None = None
+    skill_registry: InMemorySkillRegistry | SqlSkillRegistry | None = None
 
     def check_tenant_readiness(self, tenant_id: str, user_id: str) -> TenantReadinessReport:
         checks = [
@@ -28,8 +35,8 @@ class TenantReadinessService(BaseModel):
             self._billing_read_check(tenant_id),
             self._storage_check(),
             self._queue_check(),
-            self._starter_skills_check(),
-            self._knowledge_spaces_check(),
+            self._starter_skills_check(tenant_id),
+            self._knowledge_spaces_check(tenant_id),
         ]
         blocking_checks = [
             check.name
@@ -124,20 +131,46 @@ class TenantReadinessService(BaseModel):
             },
         )
 
-    def _starter_skills_check(self) -> TenantReadinessCheck:
-        return TenantReadinessCheck(
-            name="starter_skills",
-            status=ReadinessCheckStatus.WARNING,
-            required=False,
-            message="starter skill packs are not seeded yet",
+    def _starter_skills_check(self, tenant_id: str) -> TenantReadinessCheck:
+        if self.skill_registry is None:
+            return self._warning("starter_skills", "starter skill registry is not attached")
+        try:
+            entries = self.skill_registry.list_for_tenant(tenant_id)
+            analytics = self.skill_registry.get_marketplace_analytics(tenant_id)
+        except Exception as error:
+            return self._warning("starter_skills", "starter skill registry cannot be queried", {"error": str(error)})
+        starter_skill_ids = [
+            entry.manifest.id
+            for entry in entries
+            if entry.manifest.id.startswith(STARTER_SKILL_ID_PREFIX)
+        ]
+        if starter_skill_ids == []:
+            return self._warning("starter_skills", "starter skill packs are not seeded yet")
+        return self._passed(
+            "starter_skills",
+            "starter skill packs are seeded",
+            {
+                "skill_ids": starter_skill_ids,
+                "installation_count": analytics.total_installations,
+            },
         )
 
-    def _knowledge_spaces_check(self) -> TenantReadinessCheck:
-        return TenantReadinessCheck(
-            name="knowledge_spaces",
-            status=ReadinessCheckStatus.WARNING,
-            required=False,
-            message="starter knowledge spaces are not seeded yet",
+    def _knowledge_spaces_check(self, tenant_id: str) -> TenantReadinessCheck:
+        if self.knowledge_service is None:
+            return self._warning("knowledge_spaces", "knowledge service is not attached")
+        try:
+            knowledge_bases = self.knowledge_service.list_bases_for_tenant(tenant_id)
+        except Exception as error:
+            return self._warning("knowledge_spaces", "knowledge spaces cannot be queried", {"error": str(error)})
+        if knowledge_bases == []:
+            return self._warning("knowledge_spaces", "starter knowledge spaces are not seeded yet")
+        return self._passed(
+            "knowledge_spaces",
+            "starter knowledge spaces are seeded",
+            {
+                "knowledge_base_ids": [knowledge_base.id for knowledge_base in knowledge_bases],
+                "workspace_ids": sorted({knowledge_base.workspace_id for knowledge_base in knowledge_bases}),
+            },
         )
 
     def _passed(self, name: str, message: str, metadata: dict | None = None) -> TenantReadinessCheck:
@@ -152,6 +185,15 @@ class TenantReadinessService(BaseModel):
         return TenantReadinessCheck(
             name=name,
             status=ReadinessCheckStatus.FAILED,
+            message=message,
+            metadata=metadata or {},
+        )
+
+    def _warning(self, name: str, message: str, metadata: dict | None = None) -> TenantReadinessCheck:
+        return TenantReadinessCheck(
+            name=name,
+            status=ReadinessCheckStatus.WARNING,
+            required=False,
             message=message,
             metadata=metadata or {},
         )

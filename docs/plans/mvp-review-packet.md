@@ -46,7 +46,7 @@ Answer these before plan 26 moves from `draft` to `approved`.
 | Q-003 | First vector backend | Internal retrieval contract first, then pgvector for durable PoC. | TBD |  |
 | Q-004 | First model gateway strategy | OpenAI-compatible Model Gateway contract first; evaluate LiteLLM if multi-provider routing is needed. | TBD |  |
 | Q-005 | MVP auth mode | Password PoC plus dev headers behind settings. | TBD |  |
-| Q-006 | Frontend timing | Answered: defer frontend implementation to final user-managed phase; write contracts now. | Accepted |  |
+| Q-006 | Frontend timing | Answered: implement a minimal static workspace for local PoC; defer full portal. | Accepted |  |
 | Q-007 | Private deployment priority | Not sales-critical for MVP unless a named customer requires it. | TBD |  |
 | Q-008 | API versioning timing | Keep `/api/*` for MVP; plan `/api/v1` before external SDK release. | TBD |  |
 
@@ -105,7 +105,7 @@ Copy this into `review-decisions.md` after review:
 
 **Impacted Plans:** 01, 02, 03, 04, 05, 06, 07, 08, 10, 13, 14, 17, 21, 25, 26, 27
 
-**Implementation Impact:** Backend-focused implementation starts from `2026-07-01-26-mvp-cloud-poc-execution.md`; frontend implementation remains deferred to the final user-managed phase unless separately approved.
+**Implementation Impact:** Implementation starts from `2026-07-01-26-mvp-cloud-poc-execution.md`; the minimal static workspace is in scope for local PoC visibility, while the full frontend portal remains deferred unless separately approved.
 
 **Owner:** product/engineering
 ```

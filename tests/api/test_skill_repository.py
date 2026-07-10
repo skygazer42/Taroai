@@ -1,4 +1,5 @@
 from pathlib import Path
+from datetime import datetime, timezone
 
 from taroai.db import DatabaseConfig, MigrationRunner
 from taroai.skills import SkillManifest, SkillRuntime, SkillType
@@ -55,6 +56,29 @@ def test_sql_skill_registry_persists_tenant_skill_lifecycle(tmp_path: Path):
     assert entries[0].manifest.id == "support.ticket_triage"
     assert entries[0].manifest.required_scopes == ["support.read", "support.route"]
     assert restarted.list_for_tenant("tenant_other") == []
+
+
+def test_sql_skill_registry_hydrates_postgresql_native_json_and_datetime_values():
+    from taroai.skills.repository import SqlSkillRegistry
+
+    registry = SqlSkillRegistry(config=DatabaseConfig(url="postgresql://example"))
+    now = datetime(2026, 7, 3, 13, 30, tzinfo=timezone.utc)
+    manifest = skill_manifest().model_dump(mode="json")
+
+    entry = registry._entry_from_row(
+        {
+            "tenant_id": "tenant_acme",
+            "manifest": manifest,
+            "status": "published",
+            "created_by_user_id": "user_owner",
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+
+    assert entry.manifest.id == "support.ticket_triage"
+    assert entry.status == "published"
+    assert entry.created_at == now
 
 
 def test_sql_skill_registry_persists_skill_version_history(tmp_path: Path):

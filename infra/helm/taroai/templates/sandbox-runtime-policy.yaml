@@ -1,0 +1,69 @@
+{{- if .Values.sandboxRuntimePolicy.enabled }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Release.Namespace | quote }}
+  labels:
+    app.kubernetes.io/name: {{ include "taroai.name" . }}
+    app.kubernetes.io/part-of: taroai
+    pod-security.kubernetes.io/enforce: {{ .Values.sandboxRuntimePolicy.podSecurity.enforce | quote }}
+    pod-security.kubernetes.io/enforce-version: {{ index .Values.sandboxRuntimePolicy.namespaceLabels "pod-security.kubernetes.io/enforce-version" | quote }}
+    pod-security.kubernetes.io/audit: {{ .Values.sandboxRuntimePolicy.podSecurity.audit | quote }}
+    pod-security.kubernetes.io/audit-version: {{ index .Values.sandboxRuntimePolicy.namespaceLabels "pod-security.kubernetes.io/audit-version" | quote }}
+    pod-security.kubernetes.io/warn: {{ .Values.sandboxRuntimePolicy.podSecurity.warn | quote }}
+    pod-security.kubernetes.io/warn-version: {{ index .Values.sandboxRuntimePolicy.namespaceLabels "pod-security.kubernetes.io/warn-version" | quote }}
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: {{ include "taroai.fullname" . }}-sandbox-runtime-quota
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.name" . }}
+    app.kubernetes.io/component: sandbox-runtime
+spec:
+  hard:
+    pods: {{ .Values.sandboxRuntimePolicy.resourceQuota.pods | quote }}
+    requests.cpu: {{ .Values.sandboxRuntimePolicy.resourceQuota.requestsCpu | quote }}
+    requests.memory: {{ .Values.sandboxRuntimePolicy.resourceQuota.requestsMemory | quote }}
+    limits.cpu: {{ .Values.sandboxRuntimePolicy.resourceQuota.limitsCpu | quote }}
+    limits.memory: {{ .Values.sandboxRuntimePolicy.resourceQuota.limitsMemory | quote }}
+    requests.ephemeral-storage: {{ .Values.sandboxRuntimePolicy.resourceQuota.requestsEphemeralStorage | quote }}
+    limits.ephemeral-storage: {{ .Values.sandboxRuntimePolicy.resourceQuota.limitsEphemeralStorage | quote }}
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: {{ include "taroai.fullname" . }}-sandbox-runtime-limits
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.name" . }}
+    app.kubernetes.io/component: sandbox-runtime
+spec:
+  limits:
+    - type: Container
+      default:
+        {{- toYaml .Values.sandboxRuntimePolicy.limitRange.default | nindent 8 }}
+      defaultRequest:
+        {{- toYaml .Values.sandboxRuntimePolicy.limitRange.defaultRequest | nindent 8 }}
+      max:
+        {{- toYaml .Values.sandboxRuntimePolicy.limitRange.max | nindent 8 }}
+      min:
+        {{- toYaml .Values.sandboxRuntimePolicy.limitRange.min | nindent 8 }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "taroai.fullname" . }}-{{ .Values.sandboxRuntimePolicy.networkPolicy.name }}
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.name" . }}
+    app.kubernetes.io/component: sandbox-runtime
+spec:
+  podSelector:
+    matchLabels:
+      {{- toYaml .Values.sandboxRuntimePolicy.networkPolicy.podSelector | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+{{- end }}

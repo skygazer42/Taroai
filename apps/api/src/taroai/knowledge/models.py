@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from taroai.domain import new_id, utc_now
 
@@ -25,6 +25,10 @@ class KnowledgeBase(BaseModel):
 class DocumentChunkCreate(BaseModel):
     content: str = Field(min_length=1)
     citation: dict[str, Any] = Field(default_factory=dict)
+    embedding: list[float] = Field(default_factory=list)
+    embedding_model: str | None = None
+    embedding_provider: str | None = None
+    embedded_at: datetime | None = None
 
 
 class KnowledgeDocumentCreate(BaseModel):
@@ -57,6 +61,12 @@ class KnowledgeDocumentApiCreate(BaseModel):
     content_hash: str = Field(min_length=1)
     chunks: list[DocumentChunkCreate] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def validate_content_or_chunks(self) -> "KnowledgeDocumentApiCreate":
+        if (self.content is None or not self.content.strip()) and not self.chunks:
+            raise ValueError("knowledge document requires content or chunks")
+        return self
+
 
 class KnowledgeDocument(BaseModel):
     id: str = Field(default_factory=lambda: new_id("knowledge_document"))
@@ -87,6 +97,10 @@ class DocumentChunk(BaseModel):
     citation: dict[str, Any] = Field(default_factory=dict)
     acl_subjects: list[str] = Field(default_factory=list)
     sensitivity_level: int = 0
+    embedding: list[float] = Field(default_factory=list)
+    embedding_model: str | None = None
+    embedding_provider: str | None = None
+    embedded_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
 
 
@@ -97,6 +111,8 @@ class RetrievalRequest(BaseModel):
     acl_subjects: list[str] = Field(default_factory=list)
     clearance_level: int = Field(default=0, ge=0)
     limit: int = Field(default=5, ge=1, le=50)
+    query_embedding: list[float] = Field(default_factory=list)
+    embedding_model: str | None = None
 
 
 class KnowledgeQueryRequest(BaseModel):
@@ -115,6 +131,7 @@ class RetrievalResult(BaseModel):
     excerpt: str
     score: float
     citation: dict[str, Any] = Field(default_factory=dict)
+    sensitivity_level: int = Field(default=0, ge=0)
 
 
 class KnowledgeTenantDeletionResult(BaseModel):

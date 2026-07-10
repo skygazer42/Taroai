@@ -36,6 +36,12 @@ Enterprise customers will care about reliability and support workflow as much as
 - Incidents are structured objects.
 - Tenant-specific incidents do not leak to other tenants.
 
+**Current Implementation Notes:**
+
+- `apps/api/src/taroai/incidents/` now defines Pydantic incident severity/status/create/read models and an in-memory incident service.
+- Incident lifecycle transitions are constrained from detected through triaging, mitigating, monitoring, resolved, and closed; invalid transitions raise the shared transition error.
+- `tests/api/test_incident_models.py` covers create, valid lifecycle transitions, invalid transition rejection, and tenant-scoped read/list behavior.
+
 ## Task 2: SLO and Error Budget Models
 
 **Files:**
@@ -55,6 +61,13 @@ Enterprise customers will care about reliability and support workflow as much as
 
 - Reliability targets are explicit.
 - Enterprise tiers can have stricter SLOs.
+
+**Current Implementation Notes:**
+
+- `apps/api/src/taroai/incidents/slo.py` now defines Pydantic SLO metrics, tiers, target direction, windows, measurements, error budgets, and status values.
+- Default targets cover API availability, run creation latency, event stream availability, sandbox startup, model gateway availability, and connector sync success for PoC, business, and enterprise tiers; enterprise targets are stricter than business and PoC.
+- `build_error_budget()` computes an in-memory average measurement, remaining error budget ratio, and healthy/warning/breached status.
+- `tests/api/test_slo_error_budget.py` covers tier overrides plus healthy, warning, and breached states. Persistence, API exposure, alert linkage, and live metric ingestion remain later tasks.
 
 ## Task 3: Alert Routing and Escalation
 
@@ -76,6 +89,14 @@ Enterprise customers will care about reliability and support workflow as much as
 
 - Alerts have owners and escalation paths.
 - Customer-impacting alerts are auditable.
+
+**Current Implementation Notes:**
+
+- `apps/api/src/taroai/incidents/alerts.py` now defines Pydantic alert sources, alert create/read records, routing rules, escalation policies, route decisions, acknowledgements, and an in-memory routing service.
+- Routing supports severity, source, component, tenant tier, priority, and UTC business-hours matching.
+- Customer-impacting alert acknowledgements write safe `alert.acknowledged` audit metadata through the configured control-plane audit store without storing the raw alert summary.
+- `docs/operations/alert-routing.md` documents the current routing model, audit boundary, and production follow-up work.
+- `tests/api/test_alert_routing.py` covers sev1 executive escalation, business-hours routing, enterprise-tier escalation, and customer-impact acknowledgement audit.
 
 ## Task 4: Run Quarantine and Kill Switch
 
@@ -99,6 +120,14 @@ Enterprise customers will care about reliability and support workflow as much as
 - Operations can stop unsafe automation quickly.
 - Kill switches do not require code deploys.
 
+**Current Implementation Notes:**
+
+- `apps/api/src/taroai/incidents/quarantine.py` now defines typed quarantine records for run, agent, skill, connector, trigger, and tenant targets, plus tenant-scoped kill switch records for high-risk tools, external writes, model providers, and sandbox creation.
+- `InMemoryOperationalControlService` can enable run/resource quarantine and kill switches, records safe audit events for each change, and evaluates runtime execution/step policy decisions without storing prompts, tool inputs, or artifact content.
+- `OperationalPolicyService` wraps the normal policy boundary with operational controls, so runtime blocking remains a policy decision rather than hard-coded tool behavior.
+- `AgentRuntime` now checks operational policy before model planning and before each tool step; blocked runs move to `awaiting_policy`, emit `policy.blocked`, and avoid calling the model gateway, tool gateway, or automatic sandbox/session creation.
+- `tests/api/test_run_quarantine_kill_switch.py` covers audit events, quarantined run blocking before planning, quarantined skill blocking before tool execution, sandbox creation kill switch behavior, and high-risk tool kill switch behavior.
+
 ## Task 5: Support Access and Customer Debugging
 
 **Files:**
@@ -121,6 +150,14 @@ Enterprise customers will care about reliability and support workflow as much as
 - Support can debug without uncontrolled customer data access.
 - Every support access is time-bound and audited.
 
+**Current Implementation Notes:**
+
+- `apps/api/src/taroai/support/models.py` now defines Pydantic support session lifecycle models, access scopes, redacted run metadata, event summaries, artifact metadata, billing summaries, audit summaries, trace summaries, and a read-only run debug bundle.
+- `apps/api/src/taroai/support/service.py` now provides an in-memory support access service with request, tenant-owner approval, break-glass approval, expiration enforcement, and safe audit events.
+- Support debug bundles intentionally omit raw run messages, attachments, event payload values, artifact content, billing metadata values, and audit metadata values; they expose counts, IDs, event types, payload keys, metadata keys, and trace shape for debugging.
+- Break-glass sessions are time-bound, approved by the requesting incident commander, and emit `support.session.break_glass` audit events with structured reason codes.
+- `tests/api/test_support_access.py` covers approved redacted bundle generation, expired session denial, unapproved sensitive tenant debugging denial, and break-glass audit behavior. Persistence and FastAPI exposure remain later hardening work.
+
 ## Task 6: Postmortem and Improvement Linkage
 
 **Files:**
@@ -141,6 +178,14 @@ Enterprise customers will care about reliability and support workflow as much as
 
 - Incidents feed improvement workflow safely.
 - Closed incidents have owner, root cause, and follow-up actions.
+
+**Current Implementation Notes:**
+
+- `apps/api/src/taroai/incidents/postmortem.py` now defines structured postmortem timeline, impact, root cause, contributing factors, remediation tasks, owner, customer summary, linked runs, review metadata, and linked improvement candidate IDs.
+- Incident closure through the postmortem service requires impact summary, root cause, timeline, remediation tasks, and customer-facing summary before moving a resolved incident to closed.
+- Incident learnings create `pending_review` improvement candidates only after the postmortem has been human reviewed; candidates record target, source runs, risk, rationale, owner, and reviewer but do not apply production changes.
+- `docs/operations/postmortem-template.md` documents the customer-safe postmortem format and the candidate review boundary, and release package required entries now include it.
+- `tests/api/test_incident_postmortem.py` covers closure field enforcement, reviewed closure, human-review gating for candidates, and candidate creation without direct production publication.
 
 ## Verification
 

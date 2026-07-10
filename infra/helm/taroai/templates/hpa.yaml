@@ -1,0 +1,54 @@
+{{- if .Values.autoscaling.api.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "taroai.fullname" . }}-api
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-api
+    app.kubernetes.io/component: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "taroai.fullname" . }}-api
+  minReplicas: {{ .Values.autoscaling.api.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.api.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.api.targetCPUUtilizationPercentage }}
+{{- end }}
+{{- if .Values.autoscaling.workers.enabled }}
+{{- $root := . }}
+{{- range $name, $worker := .Values.workers.kinds }}
+{{- if $worker.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "taroai.fullname" $root }}-{{ replace "_" "-" $worker.workerKind }}-worker
+  labels:
+    {{- include "taroai.labels" $root | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.fullname" $root }}-{{ replace "_" "-" $worker.workerKind }}-worker
+    app.kubernetes.io/component: worker
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "taroai.fullname" $root }}-{{ replace "_" "-" $worker.workerKind }}-worker
+  minReplicas: {{ $root.Values.autoscaling.workers.minReplicas }}
+  maxReplicas: {{ $root.Values.autoscaling.workers.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $root.Values.autoscaling.workers.targetCPUUtilizationPercentage }}
+{{- end }}
+{{- end }}
+{{- end }}

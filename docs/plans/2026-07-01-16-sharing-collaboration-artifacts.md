@@ -14,14 +14,20 @@
 
 The product promise includes shared knowledge, skill reuse, team memory, and enterprise artifacts. This plan defines how employee work moves from private run output to team or tenant-visible resource with approval, audit, and revocation.
 
+Current implementation note: Task 1 has a first-pass backend implementation. `taroai.sharing` now provides typed share grant models, in-memory and SQL stores, Pydantic settings, migrations with PostgreSQL RLS, and FastAPI create/list/revoke APIs behind `sharing.read` and `sharing.manage`. External-link share grant create/list/revoke responses redact the link token, external-link token input shorter than 32 characters is rejected, non-`view` external-link permissions are rejected, non-artifact external-link resources are rejected, and newly created external-link grants store only a tenant-scoped `hmac-sha256:` subject digest instead of the raw token, keyed by `TAROAI_EXTERNAL_SHARE_LINK_TOKEN_HASH_SECRET` when set and otherwise `TAROAI_ACCESS_TOKEN_SECRET`. Task 2 has started: storage signed-url and content-download read paths now accept active direct artifact share grants after sensitivity checks and reject revoked grants. External artifact link downloads are started behind `TAROAI_EXTERNAL_SHARE_LINKS_ENABLED=false` by default, require an active unexpired `external_link` artifact grant, reject sensitive artifacts, hash the URL token with the requested tenant before authorization, and record download audit plus `external_artifact_download_bytes` billing metadata without the link token. Artifact visibility states, password-protected or separately signed external-link tokens, run collaboration, output promotion, promotion/evaluation billing meters, and retention automation remain planned follow-up work.
+
 ## Task 1: Share Grant Domain Model
 
 **Files:**
 
 - Create: `apps/api/src/taroai/sharing/__init__.py`
 - Create: `apps/api/src/taroai/sharing/models.py`
-- Create: `apps/api/src/taroai/sharing/service.py`
-- Test: `tests/api/test_share_grant_models.py`
+- Create: `apps/api/src/taroai/sharing/repository.py`
+- Modify: `apps/api/src/taroai/app.py`
+- Modify: `apps/api/src/taroai/config.py`
+- Create: `apps/api/migrations/021_share_grants.sql`
+- Test: `tests/api/test_share_grants.py`
+- Test: `tests/api/test_share_grant_repository.py`
 
 **Steps:**
 
@@ -30,11 +36,15 @@ The product promise includes shared knowledge, skill reuse, team memory, and ent
 3. Define `SharePermission`: `view`, `comment`, `use`, `copy`, `edit`, `publish`, and `admin`.
 4. Define `ShareGrant` with tenant ID, resource ID, resource type, subject, permission, created by, expiration, status, and reason.
 5. Add tests for tenant isolation, expiration validation, and unsupported permission/resource pairs.
+6. Expose create/list/revoke API routes and safe share-grant audit metadata without raw reason text.
+7. Store grants through memory or SQL based on Pydantic settings.
 
 **Acceptance Criteria:**
 
 - Share state is explicit and typed.
 - Expired grants stop authorizing access.
+- Revoked grants stop authorizing access.
+- Tenant isolation applies at API, store, migration, and PostgreSQL RLS boundaries.
 
 ## Task 2: Artifact Delivery and Access Control
 
@@ -43,7 +53,8 @@ The product promise includes shared knowledge, skill reuse, team memory, and ent
 - Modify: `apps/api/src/taroai/storage/models.py`
 - Modify: `apps/api/src/taroai/storage/catalog.py`
 - Modify: `apps/api/src/taroai/app.py`
-- Test: `tests/api/test_artifact_sharing_access.py`
+- Test: `tests/api/test_app.py`
+- Future test: `tests/api/test_artifact_sharing_access.py`
 
 **Steps:**
 
@@ -52,11 +63,19 @@ The product promise includes shared knowledge, skill reuse, team memory, and ent
 3. External links require explicit expiration and optional password or signed token.
 4. Artifact downloads are audited.
 5. Add tests for private owner access, workspace share access, revoked share denial, and cross-tenant denial.
+6. First-pass implementation: direct artifact share grants satisfy storage object ACL checks for signed URL and content-download reads, but do not bypass sensitivity clearance.
+7. First-pass external-link implementation: when enabled by setting, `GET /api/share-links/{external_link_id}/storage/objects/{storage_object_id}/content?tenant_id=...` downloads only non-sensitive artifact objects with an active external-link artifact grant, rejects non-artifact external-link resources, rejects link tokens shorter than 32 characters at grant creation, rejects non-`view` external-link permissions, stores newly created external-link grant subjects as tenant-scoped keyed `hmac-sha256:` digests, hashes the URL token with the requested tenant before authorization, and writes token-redacted API responses, audit metadata, and `external_artifact_download_bytes` billing metadata.
 
 **Acceptance Criteria:**
 
 - Artifacts can be safely shared without moving storage objects.
 - External sharing is disabled by default unless tenant policy allows it.
+- Active direct artifact grants can authorize storage reads; revoked grants deny them again.
+- Active external-link artifact grants can authorize unauthenticated artifact content download only when external links are explicitly enabled.
+- External-link grants only support `artifact` resources.
+- External-link grant creation rejects link tokens shorter than 32 characters.
+- External-link grants only support `view` permission.
+- External-link artifact downloads are metered by byte without storing the link token in share-grant storage, API responses, audit metadata, or meter metadata.
 
 ## Task 3: Run and Workspace Collaboration
 
@@ -151,7 +170,7 @@ The product promise includes shared knowledge, skill reuse, team memory, and ent
 Run after implementation:
 
 ```bash
-python -m pytest tests/api/test_share_grant_models.py -q
+python -m pytest tests/api/test_share_grants.py tests/api/test_share_grant_repository.py -q
 python -m pytest tests/api/test_artifact_sharing_access.py -q
 python -m pytest tests/api/test_run_collaboration.py -q
 python -m pytest tests/api/test_output_promotion_flow.py -q

@@ -52,6 +52,14 @@ class JobQueue(BaseModel):
     def list_dead_letters(self, job_type: JobType | None = None) -> list[JobEnvelope]:
         raise NotImplementedError
 
+    def reap_expired_leases(
+        self,
+        job_type: JobType | None = None,
+        now: datetime | None = None,
+        error: str = "worker lease expired",
+    ) -> list[JobEnvelope]:
+        raise NotImplementedError
+
 
 class InMemoryJobQueue(JobQueue):
     jobs: list[JobEnvelope] = Field(default_factory=list)
@@ -82,6 +90,7 @@ class InMemoryJobQueue(JobQueue):
         lease_seconds: int = 300,
     ) -> JobEnvelope | None:
         resolved_now = now or utc_now()
+        self.reap_expired_leases(job_type, now=resolved_now)
         for index, job in enumerate(self.jobs):
             if job.type != job_type:
                 continue
@@ -174,12 +183,56 @@ class InMemoryJobQueue(JobQueue):
             if job.status == JobStatus.DEAD_LETTER and (job_type is None or job.type == job_type)
         ]
 
+    def reap_expired_leases(
+        self,
+        job_type: JobType | None = None,
+        now: datetime | None = None,
+        error: str = "worker lease expired",
+    ) -> list[JobEnvelope]:
+        resolved_now = now or utc_now()
+        reaped: list[JobEnvelope] = []
+        for index, job in enumerate(self.jobs):
+            if job_type is not None and job.type != job_type:
+                continue
+            if not self._lease_expired(job, resolved_now):
+                continue
+            if job.attempts < job.max_attempts:
+                updated = job.model_copy(
+                    update={
+                        "status": JobStatus.PENDING,
+                        "available_at": resolved_now,
+                        "lease_expires_at": None,
+                        "worker_id": None,
+                        "completed_at": None,
+                        "error": error,
+                    }
+                )
+            else:
+                updated = job.model_copy(
+                    update={
+                        "status": JobStatus.DEAD_LETTER,
+                        "completed_at": resolved_now,
+                        "lease_expires_at": None,
+                        "error": error,
+                    }
+                )
+            self.jobs[index] = updated
+            reaped.append(updated)
+        return reaped
+
     def _replace(self, updated: JobEnvelope) -> None:
         for index, job in enumerate(self.jobs):
             if job.id == updated.id:
                 self.jobs[index] = updated
                 return
         raise NotFoundError(f"Job not found: {updated.id}")
+
+    def _lease_expired(self, job: JobEnvelope, now: datetime) -> bool:
+        return (
+            job.status == JobStatus.RUNNING
+            and job.lease_expires_at is not None
+            and job.lease_expires_at <= now
+        )
 
 
 class RedisJobQueue(JobQueue):
@@ -216,6 +269,7 @@ class RedisJobQueue(JobQueue):
     ) -> JobEnvelope | None:
         resolved_now = now or utc_now()
         client = self._client()
+        self.reap_expired_leases(job_type, now=resolved_now)
         while True:
             job_id = client.lpop(self._pending_key(job_type))
             if job_id is None:
@@ -318,6 +372,47 @@ class RedisJobQueue(JobQueue):
             dead_letters.extend(self.list_dead_letters(current_type))
         return dead_letters
 
+    def reap_expired_leases(
+        self,
+        job_type: JobType | None = None,
+        now: datetime | None = None,
+        error: str = "worker lease expired",
+    ) -> list[JobEnvelope]:
+        resolved_now = now or utc_now()
+        client = self._client()
+        reaped: list[JobEnvelope] = []
+        for job in self._list_jobs(client):
+            if job_type is not None and job.type != job_type:
+                continue
+            if not self._lease_expired(job, resolved_now):
+                continue
+            if job.attempts < job.max_attempts:
+                updated = job.model_copy(
+                    update={
+                        "status": JobStatus.PENDING,
+                        "available_at": resolved_now,
+                        "lease_expires_at": None,
+                        "worker_id": None,
+                        "completed_at": None,
+                        "error": error,
+                    }
+                )
+                self._write(client, updated)
+                client.rpush(self._pending_key(updated.type), updated.id)
+            else:
+                updated = job.model_copy(
+                    update={
+                        "status": JobStatus.DEAD_LETTER,
+                        "completed_at": resolved_now,
+                        "lease_expires_at": None,
+                        "error": error,
+                    }
+                )
+                self._write(client, updated)
+                client.rpush(self._dead_key(updated.type), updated.id)
+            reaped.append(updated)
+        return reaped
+
     def _client(self):
         if self.client is not None:
             return self.client
@@ -352,6 +447,19 @@ class RedisJobQueue(JobQueue):
         if raw is None:
             return None
         return JobEnvelope.model_validate_json(self._decode(raw))
+
+    def _list_jobs(self, client) -> list[JobEnvelope]:
+        return [
+            JobEnvelope.model_validate_json(self._decode(raw))
+            for raw in client.hvals(self._jobs_key())
+        ]
+
+    def _lease_expired(self, job: JobEnvelope, now: datetime) -> bool:
+        return (
+            job.status == JobStatus.RUNNING
+            and job.lease_expires_at is not None
+            and job.lease_expires_at <= now
+        )
 
     def _decode(self, value: str | bytes) -> str:
         if isinstance(value, bytes):

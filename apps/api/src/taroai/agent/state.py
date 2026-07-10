@@ -27,6 +27,11 @@ class AgentRuntimeState(BaseModel):
     pending_guardrail_approval_key: str | None = None
     pending_guardrail_approval_stage: str | None = None
     tool_results: list[ToolResult] = Field(default_factory=list)
-    retrieved_context: AgentRetrievedContext = Field(default_factory=AgentRetrievedContext)
+    retrieved_context: AgentRetrievedContext = Field(
+        default_factory=AgentRetrievedContext
+    )
+    sandbox_session_id: str | None = None
+    browser_session_id: str | None = None
+    promoted_sandbox_artifact_paths: list[str] = Field(default_factory=list)
     approval_id: str | None = None
     failure_reason: str | None = None

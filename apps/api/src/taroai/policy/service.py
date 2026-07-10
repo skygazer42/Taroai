@@ -8,6 +8,12 @@ class PolicyService(BaseModel):
     def decide(self, request: PolicyRequest) -> PolicyDecision:
         raise NotImplementedError
 
+    def decide_runtime_execution(self, request: PolicyRequest) -> PolicyDecision:
+        return PolicyDecision.allow()
+
+    def decide_runtime_step(self, request: PolicyRequest) -> PolicyDecision:
+        return PolicyDecision.allow()
+
 
 class IdentityPolicyService(PolicyService):
     identity_service: InMemoryIdentityService | SqlIdentityService

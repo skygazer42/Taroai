@@ -7,6 +7,11 @@ from taroai.observability.models import (
     TraceSpan,
 )
 from taroai.observability.service import RunTraceService
+from taroai.observability.verification import (
+    TraceCollectorVerificationConfig,
+    TraceCollectorVerificationResult,
+    verify_trace_collector,
+)
 
 __all__ = [
     "ErrorClassification",
@@ -16,4 +21,7 @@ __all__ = [
     "TraceEvent",
     "TraceExportResult",
     "TraceSpan",
+    "TraceCollectorVerificationConfig",
+    "TraceCollectorVerificationResult",
+    "verify_trace_collector",
 ]

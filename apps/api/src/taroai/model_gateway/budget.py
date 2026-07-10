@@ -1,6 +1,9 @@
+from datetime import timedelta
 from typing import Any
 
 from pydantic import BaseModel, Field
+
+from taroai.domain import utc_now
 
 
 class ModelBudgetExceededError(RuntimeError):
@@ -10,6 +13,7 @@ class ModelBudgetExceededError(RuntimeError):
 
 
 class ModelBudgetPolicy(BaseModel):
+    budget_window_seconds: int = Field(default=0, ge=0)
     max_model_calls_per_run: int = Field(default=0, ge=0)
     max_model_tokens_per_run: int = Field(default=0, ge=0)
     max_model_calls_per_tenant: int = Field(default=0, ge=0)
@@ -27,7 +31,7 @@ class ModelBudgetGuard(BaseModel):
 
     def assert_plan_allowed(self, store, tenant_id: str, run_id: str) -> None:
         run = store.get_run(tenant_id, run_id)
-        tenant_meters = store.list_billing_meters(tenant_id)
+        tenant_meters = self._filter_window_meters(store.list_billing_meters(tenant_id))
         scope_checks = [
             (
                 "run",
@@ -145,6 +149,12 @@ class ModelBudgetGuard(BaseModel):
             if meter.meter_type in meter_types
         )
 
+    def _filter_window_meters(self, meters: list) -> list:
+        if self.policy.budget_window_seconds <= 0:
+            return meters
+        cutoff = utc_now() - timedelta(seconds=self.policy.budget_window_seconds)
+        return [meter for meter in meters if meter.created_at >= cutoff]
+
     def _metadata(
         self,
         run_id: str,
@@ -169,4 +179,5 @@ class ModelBudgetGuard(BaseModel):
             "limit_type": limit_type,
             "current_quantity": current_quantity,
             "limit": limit,
+            "window_seconds": self.policy.budget_window_seconds,
         }

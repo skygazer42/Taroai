@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 from taroai.app import create_app
 from taroai.config import Settings
+from taroai.deployment.install_evidence import RestoreDrillVerificationResult
 from taroai.domain import utc_now
 from taroai.identity import (
     InMemoryIdentityService,
@@ -14,6 +15,12 @@ from taroai.identity import (
     UserAccountCreate,
 )
 from taroai.lifecycle import InMemoryLifecyclePolicyStore
+from taroai.lifecycle.restore_drill import (
+    InMemoryRestoreDrillScheduleStore,
+    RestoreDrillRunRecord,
+    RestoreDrillRunStatus,
+    RestoreDrillScheduleCreate,
+)
 from taroai.storage import (
     InMemoryStorageCatalog,
     S3CompatibleObjectStorage,
@@ -21,16 +28,29 @@ from taroai.storage import (
     StoragePurpose,
 )
 from taroai.store import InMemoryControlPlaneStore
+from taroai.workers import (
+    InMemoryJobQueue,
+    JobType,
+    RestoreDrillExecutionJob,
+)
 
 
 class RecordingObjectStorageClient:
     def __init__(self):
         self.deleted_objects: list[dict] = []
         self.put_objects: list[dict] = []
+        self.objects: dict[tuple[str, str], bytes] = {}
 
     def put_object(self, **kwargs):
         self.put_objects.append(kwargs)
+        self.objects[(kwargs["Bucket"], kwargs["Key"])] = kwargs["Body"]
         return {"ETag": '"export-etag"'}
+
+    def get_object(self, **kwargs):
+        key = (kwargs["Bucket"], kwargs["Key"])
+        if key not in self.objects:
+            raise FileNotFoundError(kwargs["Key"])
+        return {"Body": self.objects[key]}
 
     def delete_object(self, **kwargs):
         self.deleted_objects.append(kwargs)
@@ -85,6 +105,49 @@ def create_lifecycle_reader_identity():
     )
     identity.assign_role("tenant_acme", account.id, "role_lifecycle_reader")
     return identity, account
+
+
+def restore_drill_verification_json(
+    **overrides,
+) -> bytes:
+    values = {
+        "drill_id": "restore_drill_2026_07",
+        "backup_manifest_generated": True,
+        "restore_order_executed": True,
+        "database_restore_verified": True,
+        "object_storage_restore_verified": True,
+        "redis_restore_or_rebuild_verified": True,
+        "config_restore_verified": True,
+        "post_restore_validation_passed": True,
+        "rpo_minutes": 45,
+        "rto_minutes": 25,
+    }
+    values.update(overrides)
+    return RestoreDrillVerificationResult(
+        **values,
+    ).model_dump_json().encode("utf-8")
+
+
+def restore_drill_execution_payload(**overrides) -> dict:
+    values = {
+        "verification_config": {
+            "drill_id": "restore_drill_2026_07",
+            "backup_manifest_path": "/restore/evidence/backup-manifest.json",
+            "executed_restore_order": ["database", "object_storage", "redis", "config"],
+            "migration_plan_path": "/restore/evidence/migration-plan.json",
+            "object_storage_verification_path": (
+                "/restore/evidence/object-storage-verification.json"
+            ),
+            "redis_queue_verification_path": "/restore/evidence/redis-verification.json",
+            "config_restored": True,
+            "post_restore_checks_passed": True,
+            "rpo_minutes": 45,
+            "rto_minutes": 25,
+        },
+        "retention_expires_at": (utc_now() + timedelta(days=30)).isoformat(),
+    }
+    values.update(overrides)
+    return values
 
 
 def test_lifecycle_policy_api_requires_manage_permission_and_records_audit():
@@ -503,6 +566,1500 @@ def test_lifecycle_backup_manifest_api_returns_safe_manifest_and_records_summary
         "config",
     ]
     assert "components" not in backup_events[0]["metadata"]
+
+
+def test_restore_drill_schedule_api_creates_lists_and_records_safe_audit():
+    identity, admin = create_lifecycle_admin_identity()
+    store = InMemoryControlPlaneStore()
+    restore_drill_store = InMemoryRestoreDrillScheduleStore()
+    client = TestClient(
+        create_app(
+            store=store,
+            identity_service=identity,
+            restore_drill_schedule_store=restore_drill_store,
+        )
+    )
+    headers = {"X-Tenant-ID": "tenant_acme", "X-User-ID": admin.id}
+
+    created = client.post(
+        "/api/lifecycle/restore-drill-schedules",
+        json={
+            "workspace_id": "workspace_ops",
+            "name": "Monthly private restore drill",
+            "service_account_id": "svc_restore_drill",
+            "interval_days": 30,
+            "max_catch_up_runs": 2,
+            "runbook_ref": "docs/operations/disaster-recovery.md",
+            "next_run_at": "2026-07-01T02:00:00Z",
+        },
+        headers=headers,
+    )
+    listed = client.get("/api/lifecycle/restore-drill-schedules", headers=headers)
+    audits = client.get("/api/audit-events", headers=headers)
+
+    assert created.status_code == 201
+    assert created.json()["tenant_id"] == "tenant_acme"
+    assert created.json()["workspace_id"] == "workspace_ops"
+    assert created.json()["created_by_user_id"] == admin.id
+    assert created.json()["service_account_id"] == "svc_restore_drill"
+    assert listed.status_code == 200
+    assert [schedule["id"] for schedule in listed.json()] == [created.json()["id"]]
+    events = [
+        event
+        for event in audits.json()
+        if event["event_type"] == "restore_drill.schedule.created"
+    ]
+    assert len(events) == 1
+    assert events[0]["workspace_id"] == "workspace_ops"
+    assert events[0]["metadata"]["schedule_id"] == created.json()["id"]
+    assert events[0]["metadata"]["has_service_account"] is True
+    assert "backup_manifest_path" not in events[0]["metadata"]
+    assert "object_storage_verification_path" not in events[0]["metadata"]
+
+
+def test_restore_drill_schedule_api_rejects_reader_without_manage_permission():
+    identity, reader = create_lifecycle_reader_identity()
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            restore_drill_schedule_store=InMemoryRestoreDrillScheduleStore(),
+        )
+    )
+
+    response = client.post(
+        "/api/lifecycle/restore-drill-schedules",
+        json={
+            "workspace_id": "workspace_ops",
+            "name": "Monthly private restore drill",
+            "interval_days": 30,
+            "max_catch_up_runs": 2,
+            "runbook_ref": "docs/operations/disaster-recovery.md",
+        },
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": reader.id},
+    )
+
+    assert response.status_code == 403
+
+
+def test_restore_drill_schedule_api_updates_status_and_records_safe_audit():
+    identity, admin = create_lifecycle_admin_identity()
+    restore_drill_store = InMemoryRestoreDrillScheduleStore()
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            restore_drill_schedule_store=restore_drill_store,
+        )
+    )
+    headers = {"X-Tenant-ID": "tenant_acme", "X-User-ID": admin.id}
+    created = client.post(
+        "/api/lifecycle/restore-drill-schedules",
+        json={
+            "workspace_id": "workspace_ops",
+            "name": "Monthly private restore drill",
+            "interval_days": 30,
+            "max_catch_up_runs": 2,
+            "runbook_ref": "docs/operations/disaster-recovery.md",
+            "next_run_at": "2026-07-01T02:00:00Z",
+        },
+        headers=headers,
+    )
+
+    updated = client.patch(
+        f"/api/lifecycle/restore-drill-schedules/{created.json()['id']}",
+        json={"status": "disabled"},
+        headers=headers,
+    )
+    listed = client.get("/api/lifecycle/restore-drill-schedules", headers=headers)
+    audits = client.get("/api/audit-events", headers=headers)
+
+    assert updated.status_code == 200
+    assert updated.json()["id"] == created.json()["id"]
+    assert updated.json()["status"] == "disabled"
+    assert listed.json()[0]["status"] == "disabled"
+    events = [
+        event
+        for event in audits.json()
+        if event["event_type"] == "restore_drill.schedule.updated"
+    ]
+    assert len(events) == 1
+    assert events[0]["metadata"]["schedule_id"] == created.json()["id"]
+    assert events[0]["metadata"]["status"] == "disabled"
+    assert "backup_manifest_path" not in events[0]["metadata"]
+    assert "object_storage_verification_path" not in events[0]["metadata"]
+
+
+def test_restore_drill_schedule_api_rejects_reader_status_update():
+    identity, reader = create_lifecycle_reader_identity()
+    restore_drill_store = InMemoryRestoreDrillScheduleStore()
+    schedule = restore_drill_store.create_schedule(
+        RestoreDrillScheduleCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            name="Monthly private restore drill",
+            created_by_user_id="user_owner",
+            interval_days=30,
+            max_catch_up_runs=2,
+            runbook_ref="docs/operations/disaster-recovery.md",
+            next_run_at=utc_now(),
+        )
+    )
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            restore_drill_schedule_store=restore_drill_store,
+        )
+    )
+
+    response = client.patch(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}",
+        json={"status": "disabled"},
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": reader.id},
+    )
+
+    assert response.status_code == 403
+
+
+def test_restore_drill_schedule_api_lists_run_records_for_schedule():
+    identity, admin = create_lifecycle_admin_identity()
+    restore_drill_store = InMemoryRestoreDrillScheduleStore()
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            restore_drill_schedule_store=restore_drill_store,
+        )
+    )
+    headers = {"X-Tenant-ID": "tenant_acme", "X-User-ID": admin.id}
+    schedule = restore_drill_store.create_schedule(
+        RestoreDrillScheduleCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            name="Monthly private restore drill",
+            created_by_user_id=admin.id,
+            interval_days=30,
+            max_catch_up_runs=2,
+            runbook_ref="docs/operations/disaster-recovery.md",
+            next_run_at=utc_now(),
+        )
+    )
+    record = restore_drill_store.create_run_record(
+        RestoreDrillRunRecord(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            schedule_id=schedule.id,
+            scheduled_for=utc_now(),
+            requested_by_user_id=admin.id,
+            runbook_ref="docs/operations/disaster-recovery.md",
+        )
+    )
+
+    response = client.get(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()] == [record.id]
+    assert response.json()[0]["status"] == "requested"
+
+
+def test_restore_drill_run_record_api_updates_evidence_status_and_records_safe_audit():
+    identity, admin = create_lifecycle_admin_identity()
+    restore_drill_store = InMemoryRestoreDrillScheduleStore()
+    storage_catalog = InMemoryStorageCatalog(bucket="taroai-artifacts")
+    storage_client = RecordingObjectStorageClient()
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            restore_drill_schedule_store=restore_drill_store,
+            storage_catalog=storage_catalog,
+            object_storage=S3CompatibleObjectStorage(
+                endpoint_url="http://object-storage.local",
+                region="us-east-1",
+                client=storage_client,
+            ),
+        )
+    )
+    headers = {"X-Tenant-ID": "tenant_acme", "X-User-ID": admin.id}
+    schedule = restore_drill_store.create_schedule(
+        RestoreDrillScheduleCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            name="Monthly private restore drill",
+            created_by_user_id=admin.id,
+            interval_days=30,
+            max_catch_up_runs=2,
+            runbook_ref="docs/operations/disaster-recovery.md",
+            next_run_at=utc_now(),
+        )
+    )
+    record = restore_drill_store.create_run_record(
+        RestoreDrillRunRecord(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            schedule_id=schedule.id,
+            scheduled_for=utc_now(),
+            requested_by_user_id=admin.id,
+            runbook_ref="docs/operations/disaster-recovery.md",
+        )
+    )
+    evidence_content = restore_drill_verification_json()
+    evidence = storage_catalog.register(
+        StorageObjectCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            purpose=StoragePurpose.DATA_EXPORT,
+            filename="restore-drill-evidence.json",
+            content_type="application/json",
+            size_bytes=len(evidence_content),
+        )
+    )
+    storage_client.objects[(evidence.bucket, evidence.key)] = evidence_content
+
+    response = client.patch(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs/{record.id}",
+        json={
+            "status": "evidence_ready",
+            "evidence_object_id": evidence.id,
+        },
+        headers=headers,
+    )
+    listed = client.get(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs",
+        headers=headers,
+    )
+    audits = client.get("/api/audit-events", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["id"] == record.id
+    assert response.json()["status"] == "evidence_ready"
+    assert response.json()["evidence_object_id"] == evidence.id
+    assert listed.json()[0]["status"] == "evidence_ready"
+    events = [
+        event
+        for event in audits.json()
+        if event["event_type"] == "restore_drill.run_record.updated"
+    ]
+    assert len(events) == 1
+    assert events[0]["metadata"]["schedule_id"] == schedule.id
+    assert events[0]["metadata"]["run_record_id"] == record.id
+    assert events[0]["metadata"]["status"] == "evidence_ready"
+    assert events[0]["metadata"]["has_evidence_object"] is True
+    assert "backup_manifest_path" not in events[0]["metadata"]
+    assert "object_storage_verification_path" not in events[0]["metadata"]
+
+
+def test_restore_drill_run_record_api_uploads_verification_evidence_and_marks_ready():
+    identity, admin = create_lifecycle_admin_identity()
+    restore_drill_store = InMemoryRestoreDrillScheduleStore()
+    storage_catalog = InMemoryStorageCatalog(bucket="taroai-artifacts")
+    storage_client = RecordingObjectStorageClient()
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            restore_drill_schedule_store=restore_drill_store,
+            storage_catalog=storage_catalog,
+            object_storage=S3CompatibleObjectStorage(
+                endpoint_url="http://object-storage.local",
+                region="us-east-1",
+                client=storage_client,
+            ),
+        )
+    )
+    headers = {"X-Tenant-ID": "tenant_acme", "X-User-ID": admin.id}
+    schedule = restore_drill_store.create_schedule(
+        RestoreDrillScheduleCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            name="Monthly private restore drill",
+            created_by_user_id=admin.id,
+            interval_days=30,
+            max_catch_up_runs=2,
+            runbook_ref="docs/operations/disaster-recovery.md",
+            next_run_at=utc_now(),
+        )
+    )
+    record = restore_drill_store.create_run_record(
+        RestoreDrillRunRecord(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            schedule_id=schedule.id,
+            scheduled_for=utc_now(),
+            requested_by_user_id=admin.id,
+            runbook_ref="docs/operations/disaster-recovery.md",
+        )
+    )
+    verification_payload = json.loads(restore_drill_verification_json())
+
+    response = client.post(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs/{record.id}/evidence",
+        json={
+            "verification": verification_payload,
+            "retention_expires_at": (utc_now() + timedelta(days=30)).isoformat(),
+        },
+        headers=headers,
+    )
+    listed = client.get(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs",
+        headers=headers,
+    )
+    audits = client.get("/api/audit-events", headers=headers)
+
+    assert response.status_code == 201
+    assert response.json()["id"] == record.id
+    assert response.json()["status"] == "evidence_ready"
+    evidence_object_id = response.json()["evidence_object_id"]
+    assert evidence_object_id
+    evidence_object = storage_catalog.get("tenant_acme", evidence_object_id)
+    assert evidence_object.workspace_id == "workspace_ops"
+    assert evidence_object.purpose == StoragePurpose.DATA_EXPORT
+    assert evidence_object.filename == f"restore-drill-{record.id}-evidence.json"
+    assert evidence_object.content_type == "application/json"
+    assert evidence_object.size_bytes == len(storage_client.put_objects[0]["Body"])
+    assert json.loads(storage_client.put_objects[0]["Body"]) == verification_payload
+    assert listed.json()[0]["status"] == "evidence_ready"
+    assert listed.json()[0]["evidence_object_id"] == evidence_object_id
+    updated_events = [
+        event
+        for event in audits.json()
+        if event["event_type"] == "restore_drill.run_record.updated"
+    ]
+    assert len(updated_events) == 1
+    assert updated_events[0]["metadata"]["has_evidence_object"] is True
+    assert "backup_manifest_path" not in updated_events[0]["metadata"]
+    assert "object_storage_verification_path" not in updated_events[0]["metadata"]
+
+
+def test_restore_drill_run_record_api_enqueues_execution_job_and_records_safe_audit():
+    identity, admin = create_lifecycle_admin_identity()
+    restore_drill_store = InMemoryRestoreDrillScheduleStore()
+    queue = InMemoryJobQueue()
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            restore_drill_schedule_store=restore_drill_store,
+            job_queue=queue,
+        )
+    )
+    headers = {"X-Tenant-ID": "tenant_acme", "X-User-ID": admin.id}
+    schedule = restore_drill_store.create_schedule(
+        RestoreDrillScheduleCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            name="Monthly private restore drill",
+            created_by_user_id=admin.id,
+            interval_days=30,
+            max_catch_up_runs=2,
+            runbook_ref="docs/operations/disaster-recovery.md",
+            next_run_at=utc_now(),
+        )
+    )
+    record = restore_drill_store.create_run_record(
+        RestoreDrillRunRecord(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            schedule_id=schedule.id,
+            scheduled_for=utc_now(),
+            requested_by_user_id=admin.id,
+            runbook_ref="docs/operations/disaster-recovery.md",
+        )
+    )
+
+    response = client.post(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs/{record.id}/execute",
+        json=restore_drill_execution_payload(),
+        headers=headers,
+    )
+    audits = client.get("/api/audit-events", headers=headers)
+
+    assert response.status_code == 202
+    assert response.json()["run_record_id"] == record.id
+    assert response.json()["status"] == "queued"
+    assert response.json()["queue"] == "restore_drill.execute"
+    assert len(queue.jobs) == 1
+    queued_job = queue.get(response.json()["job_id"])
+    assert queued_job.type == JobType.RESTORE_DRILL_EXECUTION
+    payload = RestoreDrillExecutionJob.model_validate(queued_job.payload)
+    assert payload.tenant_id == "tenant_acme"
+    assert payload.workspace_id == "workspace_ops"
+    assert payload.schedule_id == schedule.id
+    assert payload.run_record_id == record.id
+    assert payload.requested_by_user_id == admin.id
+    assert payload.verification_config.drill_id == "restore_drill_2026_07"
+    assert str(payload.verification_config.backup_manifest_path) == (
+        "/restore/evidence/backup-manifest.json"
+    )
+    assert restore_drill_store.get_run_record("tenant_acme", record.id).status == "requested"
+
+    queued_events = [
+        event
+        for event in audits.json()
+        if event["event_type"] == "restore_drill.execution_queued"
+    ]
+    assert len(queued_events) == 1
+    assert queued_events[0]["metadata"]["job_id"] == queued_job.id
+    assert queued_events[0]["metadata"]["queue"] == "restore_drill.execute"
+    assert queued_events[0]["metadata"]["run_record_id"] == record.id
+    assert queued_events[0]["metadata"]["drill_id"] == "restore_drill_2026_07"
+    assert queued_events[0]["metadata"]["has_redis_queue_verification"] is True
+    assert "backup_manifest_path" not in queued_events[0]["metadata"]
+    assert "migration_plan_path" not in queued_events[0]["metadata"]
+    assert "object_storage_verification_path" not in queued_events[0]["metadata"]
+    assert "redis_queue_verification_path" not in queued_events[0]["metadata"]
+    assert "/restore/evidence" not in str(queued_events[0]["metadata"])
+
+
+def test_restore_drill_run_record_execute_replays_idempotency_key_without_duplicate_job():
+    identity, admin = create_lifecycle_admin_identity()
+    restore_drill_store = InMemoryRestoreDrillScheduleStore()
+    queue = InMemoryJobQueue()
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            restore_drill_schedule_store=restore_drill_store,
+            job_queue=queue,
+        )
+    )
+    headers = {
+        "X-Tenant-ID": "tenant_acme",
+        "X-User-ID": admin.id,
+        "Idempotency-Key": "restore-drill-execute-001",
+    }
+    schedule = restore_drill_store.create_schedule(
+        RestoreDrillScheduleCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            name="Monthly private restore drill",
+            created_by_user_id=admin.id,
+            interval_days=30,
+            max_catch_up_runs=2,
+            runbook_ref="docs/operations/disaster-recovery.md",
+            next_run_at=utc_now(),
+        )
+    )
+    record = restore_drill_store.create_run_record(
+        RestoreDrillRunRecord(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            schedule_id=schedule.id,
+            scheduled_for=utc_now(),
+            requested_by_user_id=admin.id,
+            runbook_ref="docs/operations/disaster-recovery.md",
+        )
+    )
+    payload = restore_drill_execution_payload()
+
+    first = client.post(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs/{record.id}/execute",
+        json=payload,
+        headers=headers,
+    )
+    second = client.post(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs/{record.id}/execute",
+        json=payload,
+        headers=headers,
+    )
+    audits = client.get(
+        "/api/audit-events",
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": admin.id},
+    )
+    queued_events = [
+        event
+        for event in audits.json()
+        if event["event_type"] == "restore_drill.execution_queued"
+    ]
+
+    assert first.status_code == 202
+    assert second.status_code == 202
+    assert second.json() == first.json()
+    assert len(queue.jobs) == 1
+    assert len(queued_events) == 1
+
+
+def test_restore_drill_run_record_execute_rejects_idempotency_key_reused_with_changed_body():
+    identity, admin = create_lifecycle_admin_identity()
+    restore_drill_store = InMemoryRestoreDrillScheduleStore()
+    queue = InMemoryJobQueue()
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            restore_drill_schedule_store=restore_drill_store,
+            job_queue=queue,
+        )
+    )
+    headers = {
+        "X-Tenant-ID": "tenant_acme",
+        "X-User-ID": admin.id,
+        "Idempotency-Key": "restore-drill-execute-002",
+    }
+    schedule = restore_drill_store.create_schedule(
+        RestoreDrillScheduleCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            name="Monthly private restore drill",
+            created_by_user_id=admin.id,
+            interval_days=30,
+            max_catch_up_runs=2,
+            runbook_ref="docs/operations/disaster-recovery.md",
+            next_run_at=utc_now(),
+        )
+    )
+    record = restore_drill_store.create_run_record(
+        RestoreDrillRunRecord(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            schedule_id=schedule.id,
+            scheduled_for=utc_now(),
+            requested_by_user_id=admin.id,
+            runbook_ref="docs/operations/disaster-recovery.md",
+        )
+    )
+
+    first = client.post(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs/{record.id}/execute",
+        json=restore_drill_execution_payload(),
+        headers=headers,
+    )
+    second = client.post(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs/{record.id}/execute",
+        json=restore_drill_execution_payload(retention_expires_at=None),
+        headers=headers,
+    )
+
+    assert first.status_code == 202
+    assert second.status_code == 409
+    assert second.json()["code"] == "idempotency_key_conflict"
+    assert len(queue.jobs) == 1
+
+
+def test_restore_drill_run_record_api_rejects_execution_enqueue_without_manage_permission():
+    identity, reader = create_lifecycle_reader_identity()
+    restore_drill_store = InMemoryRestoreDrillScheduleStore()
+    queue = InMemoryJobQueue()
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            restore_drill_schedule_store=restore_drill_store,
+            job_queue=queue,
+        )
+    )
+    schedule = restore_drill_store.create_schedule(
+        RestoreDrillScheduleCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            name="Monthly private restore drill",
+            created_by_user_id=reader.id,
+            interval_days=30,
+            max_catch_up_runs=2,
+            runbook_ref="docs/operations/disaster-recovery.md",
+            next_run_at=utc_now(),
+        )
+    )
+    record = restore_drill_store.create_run_record(
+        RestoreDrillRunRecord(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            schedule_id=schedule.id,
+            scheduled_for=utc_now(),
+            requested_by_user_id=reader.id,
+            runbook_ref="docs/operations/disaster-recovery.md",
+        )
+    )
+
+    response = client.post(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs/{record.id}/execute",
+        json=restore_drill_execution_payload(),
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": reader.id},
+    )
+
+    assert response.status_code == 403
+    assert queue.jobs == []
+
+
+def test_restore_drill_run_record_api_rejects_execution_enqueue_for_terminal_record():
+    identity, admin = create_lifecycle_admin_identity()
+    restore_drill_store = InMemoryRestoreDrillScheduleStore()
+    queue = InMemoryJobQueue()
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            restore_drill_schedule_store=restore_drill_store,
+            job_queue=queue,
+        )
+    )
+    headers = {"X-Tenant-ID": "tenant_acme", "X-User-ID": admin.id}
+    schedule = restore_drill_store.create_schedule(
+        RestoreDrillScheduleCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            name="Monthly private restore drill",
+            created_by_user_id=admin.id,
+            interval_days=30,
+            max_catch_up_runs=2,
+            runbook_ref="docs/operations/disaster-recovery.md",
+            next_run_at=utc_now(),
+        )
+    )
+    record = restore_drill_store.create_run_record(
+        RestoreDrillRunRecord(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            schedule_id=schedule.id,
+            scheduled_for=utc_now(),
+            requested_by_user_id=admin.id,
+            runbook_ref="docs/operations/disaster-recovery.md",
+        )
+    )
+    restore_drill_store.update_run_record_status(
+        tenant_id="tenant_acme",
+        run_record_id=record.id,
+        status=RestoreDrillRunStatus.FAILED,
+    )
+
+    response = client.post(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs/{record.id}/execute",
+        json=restore_drill_execution_payload(),
+        headers=headers,
+    )
+
+    assert response.status_code == 409
+    assert queue.jobs == []
+
+
+def test_restore_drill_run_record_api_rejects_failed_uploaded_verification_evidence_without_upload():
+    identity, admin = create_lifecycle_admin_identity()
+    restore_drill_store = InMemoryRestoreDrillScheduleStore()
+    storage_catalog = InMemoryStorageCatalog(bucket="taroai-artifacts")
+    storage_client = RecordingObjectStorageClient()
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            restore_drill_schedule_store=restore_drill_store,
+            storage_catalog=storage_catalog,
+            object_storage=S3CompatibleObjectStorage(
+                endpoint_url="http://object-storage.local",
+                region="us-east-1",
+                client=storage_client,
+            ),
+        )
+    )
+    headers = {"X-Tenant-ID": "tenant_acme", "X-User-ID": admin.id}
+    schedule = restore_drill_store.create_schedule(
+        RestoreDrillScheduleCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            name="Monthly private restore drill",
+            created_by_user_id=admin.id,
+            interval_days=30,
+            max_catch_up_runs=2,
+            runbook_ref="docs/operations/disaster-recovery.md",
+            next_run_at=utc_now(),
+        )
+    )
+    record = restore_drill_store.create_run_record(
+        RestoreDrillRunRecord(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            schedule_id=schedule.id,
+            scheduled_for=utc_now(),
+            requested_by_user_id=admin.id,
+            runbook_ref="docs/operations/disaster-recovery.md",
+        )
+    )
+    failed_verification = json.loads(
+        restore_drill_verification_json(
+            object_storage_restore_verified=False,
+            post_restore_validation_passed=False,
+        )
+    )
+
+    response = client.post(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs/{record.id}/evidence",
+        json={"verification": failed_verification},
+        headers=headers,
+    )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "tenant_access_denied"
+    assert storage_client.put_objects == []
+    assert storage_catalog.list_active("tenant_acme") == []
+    assert restore_drill_store.get_run_record("tenant_acme", record.id).status == "requested"
+
+
+def test_restore_drill_run_record_api_requires_evidence_for_ready_status():
+    identity, admin = create_lifecycle_admin_identity()
+    restore_drill_store = InMemoryRestoreDrillScheduleStore()
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            restore_drill_schedule_store=restore_drill_store,
+        )
+    )
+    schedule = restore_drill_store.create_schedule(
+        RestoreDrillScheduleCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            name="Monthly private restore drill",
+            created_by_user_id=admin.id,
+            interval_days=30,
+            max_catch_up_runs=2,
+            runbook_ref="docs/operations/disaster-recovery.md",
+            next_run_at=utc_now(),
+        )
+    )
+    record = restore_drill_store.create_run_record(
+        RestoreDrillRunRecord(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            schedule_id=schedule.id,
+            scheduled_for=utc_now(),
+            requested_by_user_id=admin.id,
+            runbook_ref="docs/operations/disaster-recovery.md",
+        )
+    )
+
+    response = client.patch(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs/{record.id}",
+        json={"status": "evidence_ready"},
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": admin.id},
+    )
+
+    assert response.status_code == 422
+
+
+def test_restore_drill_run_record_api_rejects_requested_status_update():
+    identity, admin = create_lifecycle_admin_identity()
+    restore_drill_store = InMemoryRestoreDrillScheduleStore()
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            restore_drill_schedule_store=restore_drill_store,
+        )
+    )
+    schedule = restore_drill_store.create_schedule(
+        RestoreDrillScheduleCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            name="Monthly private restore drill",
+            created_by_user_id=admin.id,
+            interval_days=30,
+            max_catch_up_runs=2,
+            runbook_ref="docs/operations/disaster-recovery.md",
+            next_run_at=utc_now(),
+        )
+    )
+    record = restore_drill_store.create_run_record(
+        RestoreDrillRunRecord(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            schedule_id=schedule.id,
+            scheduled_for=utc_now(),
+            requested_by_user_id=admin.id,
+            runbook_ref="docs/operations/disaster-recovery.md",
+        )
+    )
+
+    response = client.patch(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs/{record.id}",
+        json={"status": "requested"},
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": admin.id},
+    )
+
+    assert response.status_code == 422
+
+
+def test_restore_drill_run_record_api_rejects_terminal_record_update():
+    identity, admin = create_lifecycle_admin_identity()
+    restore_drill_store = InMemoryRestoreDrillScheduleStore()
+    storage_catalog = InMemoryStorageCatalog(bucket="taroai-artifacts")
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            restore_drill_schedule_store=restore_drill_store,
+            storage_catalog=storage_catalog,
+        )
+    )
+    schedule = restore_drill_store.create_schedule(
+        RestoreDrillScheduleCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            name="Monthly private restore drill",
+            created_by_user_id=admin.id,
+            interval_days=30,
+            max_catch_up_runs=2,
+            runbook_ref="docs/operations/disaster-recovery.md",
+            next_run_at=utc_now(),
+        )
+    )
+    evidence = storage_catalog.register(
+        StorageObjectCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            purpose=StoragePurpose.DATA_EXPORT,
+            filename="restore-drill-evidence.json",
+            content_type="application/json",
+            size_bytes=1024,
+        )
+    )
+    record = restore_drill_store.create_run_record(
+        RestoreDrillRunRecord(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            schedule_id=schedule.id,
+            scheduled_for=utc_now(),
+            requested_by_user_id=admin.id,
+            runbook_ref="docs/operations/disaster-recovery.md",
+            status="evidence_ready",
+            evidence_object_id=evidence.id,
+        )
+    )
+
+    response = client.patch(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs/{record.id}",
+        json={"status": "failed"},
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": admin.id},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "conflict"
+
+
+def test_restore_drill_run_record_api_rejects_reader_without_manage_permission():
+    identity, reader = create_lifecycle_reader_identity()
+    restore_drill_store = InMemoryRestoreDrillScheduleStore()
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            restore_drill_schedule_store=restore_drill_store,
+        )
+    )
+    schedule = restore_drill_store.create_schedule(
+        RestoreDrillScheduleCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            name="Monthly private restore drill",
+            created_by_user_id="user_owner",
+            interval_days=30,
+            max_catch_up_runs=2,
+            runbook_ref="docs/operations/disaster-recovery.md",
+            next_run_at=utc_now(),
+        )
+    )
+    record = restore_drill_store.create_run_record(
+        RestoreDrillRunRecord(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            schedule_id=schedule.id,
+            scheduled_for=utc_now(),
+            requested_by_user_id="user_owner",
+            runbook_ref="docs/operations/disaster-recovery.md",
+        )
+    )
+
+    response = client.patch(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs/{record.id}",
+        json={
+            "status": "evidence_ready",
+            "evidence_object_id": "storage_restore_drill_evidence",
+        },
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": reader.id},
+    )
+
+    assert response.status_code == 403
+
+
+def test_restore_drill_run_record_api_rejects_cross_workspace_evidence_object():
+    identity, admin = create_lifecycle_admin_identity()
+    restore_drill_store = InMemoryRestoreDrillScheduleStore()
+    storage_catalog = InMemoryStorageCatalog(bucket="taroai-artifacts")
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            restore_drill_schedule_store=restore_drill_store,
+            storage_catalog=storage_catalog,
+        )
+    )
+    schedule = restore_drill_store.create_schedule(
+        RestoreDrillScheduleCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            name="Monthly private restore drill",
+            created_by_user_id=admin.id,
+            interval_days=30,
+            max_catch_up_runs=2,
+            runbook_ref="docs/operations/disaster-recovery.md",
+            next_run_at=utc_now(),
+        )
+    )
+    record = restore_drill_store.create_run_record(
+        RestoreDrillRunRecord(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            schedule_id=schedule.id,
+            scheduled_for=utc_now(),
+            requested_by_user_id=admin.id,
+            runbook_ref="docs/operations/disaster-recovery.md",
+        )
+    )
+    other_workspace_evidence = storage_catalog.register(
+        StorageObjectCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_other",
+            purpose=StoragePurpose.DATA_EXPORT,
+            filename="restore-drill-evidence.json",
+            content_type="application/json",
+            size_bytes=1024,
+        )
+    )
+
+    response = client.patch(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs/{record.id}",
+        json={
+            "status": "evidence_ready",
+            "evidence_object_id": other_workspace_evidence.id,
+        },
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": admin.id},
+    )
+
+    assert response.status_code == 403
+
+
+def test_restore_drill_run_record_api_rejects_non_data_export_evidence_object():
+    identity, admin = create_lifecycle_admin_identity()
+    restore_drill_store = InMemoryRestoreDrillScheduleStore()
+    storage_catalog = InMemoryStorageCatalog(bucket="taroai-artifacts")
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            restore_drill_schedule_store=restore_drill_store,
+            storage_catalog=storage_catalog,
+        )
+    )
+    schedule = restore_drill_store.create_schedule(
+        RestoreDrillScheduleCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            name="Monthly private restore drill",
+            created_by_user_id=admin.id,
+            interval_days=30,
+            max_catch_up_runs=2,
+            runbook_ref="docs/operations/disaster-recovery.md",
+            next_run_at=utc_now(),
+        )
+    )
+    record = restore_drill_store.create_run_record(
+        RestoreDrillRunRecord(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            schedule_id=schedule.id,
+            scheduled_for=utc_now(),
+            requested_by_user_id=admin.id,
+            runbook_ref="docs/operations/disaster-recovery.md",
+        )
+    )
+    upload_object = storage_catalog.register(
+        StorageObjectCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            purpose=StoragePurpose.UPLOAD,
+            filename="restore-drill-evidence.json",
+            content_type="application/json",
+            size_bytes=1024,
+        )
+    )
+
+    response = client.patch(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs/{record.id}",
+        json={
+            "status": "evidence_ready",
+            "evidence_object_id": upload_object.id,
+        },
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": admin.id},
+    )
+
+    assert response.status_code == 403
+
+
+def test_restore_drill_run_record_api_rejects_empty_evidence_object():
+    identity, admin = create_lifecycle_admin_identity()
+    restore_drill_store = InMemoryRestoreDrillScheduleStore()
+    storage_catalog = InMemoryStorageCatalog(bucket="taroai-artifacts")
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            restore_drill_schedule_store=restore_drill_store,
+            storage_catalog=storage_catalog,
+        )
+    )
+    schedule = restore_drill_store.create_schedule(
+        RestoreDrillScheduleCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            name="Monthly private restore drill",
+            created_by_user_id=admin.id,
+            interval_days=30,
+            max_catch_up_runs=2,
+            runbook_ref="docs/operations/disaster-recovery.md",
+            next_run_at=utc_now(),
+        )
+    )
+    record = restore_drill_store.create_run_record(
+        RestoreDrillRunRecord(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            schedule_id=schedule.id,
+            scheduled_for=utc_now(),
+            requested_by_user_id=admin.id,
+            runbook_ref="docs/operations/disaster-recovery.md",
+        )
+    )
+    empty_evidence = storage_catalog.register(
+        StorageObjectCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            purpose=StoragePurpose.DATA_EXPORT,
+            filename="restore-drill-evidence.json",
+            content_type="application/json",
+            size_bytes=0,
+        )
+    )
+
+    response = client.patch(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs/{record.id}",
+        json={
+            "status": "evidence_ready",
+            "evidence_object_id": empty_evidence.id,
+        },
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": admin.id},
+    )
+    listed = client.get(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs",
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": admin.id},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "tenant_access_denied"
+    assert listed.json()[0]["status"] == "requested"
+
+
+def test_restore_drill_run_record_api_rejects_missing_evidence_content():
+    identity, admin = create_lifecycle_admin_identity()
+    restore_drill_store = InMemoryRestoreDrillScheduleStore()
+    storage_catalog = InMemoryStorageCatalog(bucket="taroai-artifacts")
+    storage_client = RecordingObjectStorageClient()
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            restore_drill_schedule_store=restore_drill_store,
+            storage_catalog=storage_catalog,
+            object_storage=S3CompatibleObjectStorage(
+                endpoint_url="http://object-storage.local",
+                region="us-east-1",
+                client=storage_client,
+            ),
+        )
+    )
+    schedule = restore_drill_store.create_schedule(
+        RestoreDrillScheduleCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            name="Monthly private restore drill",
+            created_by_user_id=admin.id,
+            interval_days=30,
+            max_catch_up_runs=2,
+            runbook_ref="docs/operations/disaster-recovery.md",
+            next_run_at=utc_now(),
+        )
+    )
+    record = restore_drill_store.create_run_record(
+        RestoreDrillRunRecord(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            schedule_id=schedule.id,
+            scheduled_for=utc_now(),
+            requested_by_user_id=admin.id,
+            runbook_ref="docs/operations/disaster-recovery.md",
+        )
+    )
+    evidence = storage_catalog.register(
+        StorageObjectCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            purpose=StoragePurpose.DATA_EXPORT,
+            filename="restore-drill-evidence.json",
+            content_type="application/json",
+            size_bytes=128,
+        )
+    )
+
+    response = client.patch(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs/{record.id}",
+        json={
+            "status": "evidence_ready",
+            "evidence_object_id": evidence.id,
+        },
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": admin.id},
+    )
+    listed = client.get(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs",
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": admin.id},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "tenant_access_denied"
+    assert listed.json()[0]["status"] == "requested"
+
+
+def test_restore_drill_run_record_api_rejects_evidence_size_mismatch():
+    identity, admin = create_lifecycle_admin_identity()
+    restore_drill_store = InMemoryRestoreDrillScheduleStore()
+    storage_catalog = InMemoryStorageCatalog(bucket="taroai-artifacts")
+    storage_client = RecordingObjectStorageClient()
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            restore_drill_schedule_store=restore_drill_store,
+            storage_catalog=storage_catalog,
+            object_storage=S3CompatibleObjectStorage(
+                endpoint_url="http://object-storage.local",
+                region="us-east-1",
+                client=storage_client,
+            ),
+        )
+    )
+    schedule = restore_drill_store.create_schedule(
+        RestoreDrillScheduleCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            name="Monthly private restore drill",
+            created_by_user_id=admin.id,
+            interval_days=30,
+            max_catch_up_runs=2,
+            runbook_ref="docs/operations/disaster-recovery.md",
+            next_run_at=utc_now(),
+        )
+    )
+    record = restore_drill_store.create_run_record(
+        RestoreDrillRunRecord(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            schedule_id=schedule.id,
+            scheduled_for=utc_now(),
+            requested_by_user_id=admin.id,
+            runbook_ref="docs/operations/disaster-recovery.md",
+        )
+    )
+    evidence = storage_catalog.register(
+        StorageObjectCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            purpose=StoragePurpose.DATA_EXPORT,
+            filename="restore-drill-evidence.json",
+            content_type="application/json",
+            size_bytes=128,
+        )
+    )
+    storage_client.objects[(evidence.bucket, evidence.key)] = b'{"partial":true}'
+
+    response = client.patch(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs/{record.id}",
+        json={
+            "status": "evidence_ready",
+            "evidence_object_id": evidence.id,
+        },
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": admin.id},
+    )
+    listed = client.get(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs",
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": admin.id},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "tenant_access_denied"
+    assert listed.json()[0]["status"] == "requested"
+
+
+def test_restore_drill_run_record_api_rejects_invalid_evidence_schema():
+    identity, admin = create_lifecycle_admin_identity()
+    restore_drill_store = InMemoryRestoreDrillScheduleStore()
+    storage_catalog = InMemoryStorageCatalog(bucket="taroai-artifacts")
+    storage_client = RecordingObjectStorageClient()
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            restore_drill_schedule_store=restore_drill_store,
+            storage_catalog=storage_catalog,
+            object_storage=S3CompatibleObjectStorage(
+                endpoint_url="http://object-storage.local",
+                region="us-east-1",
+                client=storage_client,
+            ),
+        )
+    )
+    schedule = restore_drill_store.create_schedule(
+        RestoreDrillScheduleCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            name="Monthly private restore drill",
+            created_by_user_id=admin.id,
+            interval_days=30,
+            max_catch_up_runs=2,
+            runbook_ref="docs/operations/disaster-recovery.md",
+            next_run_at=utc_now(),
+        )
+    )
+    record = restore_drill_store.create_run_record(
+        RestoreDrillRunRecord(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            schedule_id=schedule.id,
+            scheduled_for=utc_now(),
+            requested_by_user_id=admin.id,
+            runbook_ref="docs/operations/disaster-recovery.md",
+        )
+    )
+    evidence_content = b'{"restore":"ok"}'
+    evidence = storage_catalog.register(
+        StorageObjectCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            purpose=StoragePurpose.DATA_EXPORT,
+            filename="restore-drill-evidence.json",
+            content_type="application/json",
+            size_bytes=len(evidence_content),
+        )
+    )
+    storage_client.objects[(evidence.bucket, evidence.key)] = evidence_content
+
+    response = client.patch(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs/{record.id}",
+        json={
+            "status": "evidence_ready",
+            "evidence_object_id": evidence.id,
+        },
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": admin.id},
+    )
+    listed = client.get(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs",
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": admin.id},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "tenant_access_denied"
+    assert listed.json()[0]["status"] == "requested"
+
+
+def test_restore_drill_run_record_api_rejects_failed_verification_evidence():
+    identity, admin = create_lifecycle_admin_identity()
+    restore_drill_store = InMemoryRestoreDrillScheduleStore()
+    storage_catalog = InMemoryStorageCatalog(bucket="taroai-artifacts")
+    storage_client = RecordingObjectStorageClient()
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            restore_drill_schedule_store=restore_drill_store,
+            storage_catalog=storage_catalog,
+            object_storage=S3CompatibleObjectStorage(
+                endpoint_url="http://object-storage.local",
+                region="us-east-1",
+                client=storage_client,
+            ),
+        )
+    )
+    schedule = restore_drill_store.create_schedule(
+        RestoreDrillScheduleCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            name="Monthly private restore drill",
+            created_by_user_id=admin.id,
+            interval_days=30,
+            max_catch_up_runs=2,
+            runbook_ref="docs/operations/disaster-recovery.md",
+            next_run_at=utc_now(),
+        )
+    )
+    record = restore_drill_store.create_run_record(
+        RestoreDrillRunRecord(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            schedule_id=schedule.id,
+            scheduled_for=utc_now(),
+            requested_by_user_id=admin.id,
+            runbook_ref="docs/operations/disaster-recovery.md",
+        )
+    )
+    evidence_content = restore_drill_verification_json(
+        database_restore_verified=False,
+        post_restore_validation_passed=False,
+    )
+    evidence = storage_catalog.register(
+        StorageObjectCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            purpose=StoragePurpose.DATA_EXPORT,
+            filename="restore-drill-evidence.json",
+            content_type="application/json",
+            size_bytes=len(evidence_content),
+        )
+    )
+    storage_client.objects[(evidence.bucket, evidence.key)] = evidence_content
+
+    response = client.patch(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs/{record.id}",
+        json={
+            "status": "evidence_ready",
+            "evidence_object_id": evidence.id,
+        },
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": admin.id},
+    )
+    listed = client.get(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs",
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": admin.id},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "tenant_access_denied"
+    assert listed.json()[0]["status"] == "requested"
+
+
+def test_restore_drill_run_record_api_rejects_non_json_evidence_content_type():
+    identity, admin = create_lifecycle_admin_identity()
+    restore_drill_store = InMemoryRestoreDrillScheduleStore()
+    storage_catalog = InMemoryStorageCatalog(bucket="taroai-artifacts")
+    storage_client = RecordingObjectStorageClient()
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            restore_drill_schedule_store=restore_drill_store,
+            storage_catalog=storage_catalog,
+            object_storage=S3CompatibleObjectStorage(
+                endpoint_url="http://object-storage.local",
+                region="us-east-1",
+                client=storage_client,
+            ),
+        )
+    )
+    schedule = restore_drill_store.create_schedule(
+        RestoreDrillScheduleCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            name="Monthly private restore drill",
+            created_by_user_id=admin.id,
+            interval_days=30,
+            max_catch_up_runs=2,
+            runbook_ref="docs/operations/disaster-recovery.md",
+            next_run_at=utc_now(),
+        )
+    )
+    record = restore_drill_store.create_run_record(
+        RestoreDrillRunRecord(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            schedule_id=schedule.id,
+            scheduled_for=utc_now(),
+            requested_by_user_id=admin.id,
+            runbook_ref="docs/operations/disaster-recovery.md",
+        )
+    )
+    evidence_content = restore_drill_verification_json()
+    evidence = storage_catalog.register(
+        StorageObjectCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            purpose=StoragePurpose.DATA_EXPORT,
+            filename="restore-drill-evidence.json",
+            content_type="text/plain",
+            size_bytes=len(evidence_content),
+        )
+    )
+    storage_client.objects[(evidence.bucket, evidence.key)] = evidence_content
+
+    response = client.patch(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs/{record.id}",
+        json={
+            "status": "evidence_ready",
+            "evidence_object_id": evidence.id,
+        },
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": admin.id},
+    )
+    listed = client.get(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs",
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": admin.id},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "tenant_access_denied"
+    assert listed.json()[0]["status"] == "requested"
+
+
+def test_restore_drill_run_record_api_rejects_retention_expired_evidence_object():
+    identity, admin = create_lifecycle_admin_identity()
+    restore_drill_store = InMemoryRestoreDrillScheduleStore()
+    storage_catalog = InMemoryStorageCatalog(bucket="taroai-artifacts")
+    storage_client = RecordingObjectStorageClient()
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            restore_drill_schedule_store=restore_drill_store,
+            storage_catalog=storage_catalog,
+            object_storage=S3CompatibleObjectStorage(
+                endpoint_url="http://object-storage.local",
+                region="us-east-1",
+                client=storage_client,
+            ),
+        )
+    )
+    schedule = restore_drill_store.create_schedule(
+        RestoreDrillScheduleCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            name="Monthly private restore drill",
+            created_by_user_id=admin.id,
+            interval_days=30,
+            max_catch_up_runs=2,
+            runbook_ref="docs/operations/disaster-recovery.md",
+            next_run_at=utc_now(),
+        )
+    )
+    record = restore_drill_store.create_run_record(
+        RestoreDrillRunRecord(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            schedule_id=schedule.id,
+            scheduled_for=utc_now(),
+            requested_by_user_id=admin.id,
+            runbook_ref="docs/operations/disaster-recovery.md",
+        )
+    )
+    evidence_content = restore_drill_verification_json()
+    evidence = storage_catalog.register(
+        StorageObjectCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_ops",
+            purpose=StoragePurpose.DATA_EXPORT,
+            filename="restore-drill-evidence.json",
+            content_type="application/json",
+            size_bytes=len(evidence_content),
+            retention_expires_at=utc_now() - timedelta(days=1),
+        )
+    )
+    storage_client.objects[(evidence.bucket, evidence.key)] = evidence_content
+
+    response = client.patch(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs/{record.id}",
+        json={
+            "status": "evidence_ready",
+            "evidence_object_id": evidence.id,
+        },
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": admin.id},
+    )
+    listed = client.get(
+        f"/api/lifecycle/restore-drill-schedules/{schedule.id}/runs",
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": admin.id},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "tenant_access_denied"
+    assert listed.json()[0]["status"] == "requested"
 
 
 def test_lifecycle_data_residency_api_returns_report_and_records_summary_audit():

@@ -44,5 +44,10 @@ class DeterministicToolGateway(ToolGateway):
             },
         )
 
-    def execute_for_run(self, state, step: PlanStep) -> ToolResult:
+    def execute_for_run(
+        self,
+        state,
+        step: PlanStep,
+        granted_scopes: list[str] | None = None,
+    ) -> ToolResult:
         return self.execute(step)

@@ -1,0 +1,338 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "taroai.fullname" . }}-default-deny
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-network-policy
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "taroai.fullname" . }}-allow-dns-egress
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-network-policy
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.dns.namespaceLabel | quote }}
+          podSelector:
+            matchLabels:
+              {{ .Values.networkPolicy.dns.podLabelKey }}: {{ .Values.networkPolicy.dns.podLabelValue | quote }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "taroai.fullname" . }}-api-ingress
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-api
+    app.kubernetes.io/component: api
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "taroai.fullname" . }}-api
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: taroai
+      ports:
+        - protocol: TCP
+          port: {{ .Values.api.service.port }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "taroai.fullname" . }}-api-egress
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-api
+    app.kubernetes.io/component: api
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: api
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ .Values.postgresql.serviceName }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.postgresql.port }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ .Values.redis.serviceName }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.redis.port }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ .Values.objectStorage.serviceName }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.objectStorage.port }}
+    {{- if .Values.sandboxController.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "taroai.fullname" . }}-sandbox-controller
+      ports:
+        - protocol: TCP
+          port: {{ .Values.sandboxController.service.port }}
+    {{- end }}
+    {{- if .Values.browserController.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "taroai.fullname" . }}-browser-controller
+      ports:
+        - protocol: TCP
+          port: {{ .Values.browserController.service.port }}
+    {{- end }}
+    {{- if .Values.networkPolicy.allowExternalHttps }}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+    {{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "taroai.fullname" . }}-worker-egress
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-worker
+    app.kubernetes.io/component: worker
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: worker
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ .Values.postgresql.serviceName }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.postgresql.port }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ .Values.redis.serviceName }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.redis.port }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ .Values.objectStorage.serviceName }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.objectStorage.port }}
+    {{- if .Values.sandboxController.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "taroai.fullname" . }}-sandbox-controller
+      ports:
+        - protocol: TCP
+          port: {{ .Values.sandboxController.service.port }}
+    {{- end }}
+    {{- if .Values.browserController.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "taroai.fullname" . }}-browser-controller
+      ports:
+        - protocol: TCP
+          port: {{ .Values.browserController.service.port }}
+    {{- end }}
+    {{- if .Values.networkPolicy.allowExternalHttps }}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+    {{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "taroai.fullname" . }}-migration-egress
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-db-migrate
+    app.kubernetes.io/component: migration
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: migration
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ .Values.postgresql.serviceName }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.postgresql.port }}
+{{- if .Values.sandboxController.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "taroai.fullname" . }}-sandbox-controller-ingress
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-sandbox-controller
+    app.kubernetes.io/component: sandbox-controller
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "taroai.fullname" . }}-sandbox-controller
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: api
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: worker
+      ports:
+        - protocol: TCP
+          port: {{ .Values.sandboxController.service.port }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "taroai.fullname" . }}-sandbox-controller-egress
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-sandbox-controller
+    app.kubernetes.io/component: sandbox-controller
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: sandbox-controller
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+{{- end }}
+{{- if .Values.browserController.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "taroai.fullname" . }}-browser-controller-ingress
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-browser-controller
+    app.kubernetes.io/component: browser-controller
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "taroai.fullname" . }}-browser-controller
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: api
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: worker
+      ports:
+        - protocol: TCP
+          port: {{ .Values.browserController.service.port }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "taroai.fullname" . }}-browser-controller-egress
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-browser-controller
+    app.kubernetes.io/component: browser-controller
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: browser-controller
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+{{- end }}
+{{- if .Values.web.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "taroai.fullname" . }}-web-ingress
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-web
+    app.kubernetes.io/component: web
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "taroai.fullname" . }}-web
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: api
+      ports:
+        - protocol: TCP
+          port: {{ .Values.web.service.containerPort }}
+{{- end }}
+{{- end }}

@@ -1,8 +1,16 @@
 from fastapi.testclient import TestClient
+from pydantic import Field
 import pytest
 
 from taroai.app import create_app
+from taroai.billing import BillingPricingRule
 from taroai.config import Settings
+from taroai.embeddings import (
+    EmbeddingGateway,
+    EmbeddingGatewayRequest,
+    EmbeddingGatewayResponse,
+    EmbeddingUsage,
+)
 from taroai.identity import (
     InMemoryIdentityService,
     PasswordHasher,
@@ -19,6 +27,29 @@ from taroai.knowledge import (
 )
 from taroai.storage import InMemoryStorageCatalog, S3CompatibleObjectStorage
 from taroai.store import InMemoryControlPlaneStore, NotFoundError
+
+
+class RecordingKnowledgeEmbeddingGateway(EmbeddingGateway):
+    requests: list[EmbeddingGatewayRequest] = Field(default_factory=list, exclude=True, repr=False)
+
+    def embed(self, request: EmbeddingGatewayRequest) -> EmbeddingGatewayResponse:
+        self.requests.append(request)
+        embeddings = []
+        for index, text in enumerate(request.input):
+            normalized = text.lower()
+            if request.purpose == "knowledge_query" or "procurement" in normalized:
+                vector = [0.0, 1.0]
+            else:
+                vector = [1.0, 0.0]
+            embeddings.append({"index": index, "embedding": vector})
+        return EmbeddingGatewayResponse(
+            model=request.model or "text-embedding-3-small",
+            embeddings=embeddings,
+            usage=EmbeddingUsage(
+                prompt_tokens=len(request.input) * 7,
+                total_tokens=len(request.input) * 7,
+            ),
+        )
 
 
 class RecordingKnowledgeStorageClient:
@@ -81,6 +112,7 @@ def create_knowledge_identity():
                 Permission(action="knowledge.write", resource="tenant:tenant_acme"),
                 Permission(action="storage.read", resource="tenant:tenant_acme"),
                 Permission(action="audit.read", resource="tenant:tenant_acme"),
+                Permission(action="billing.read", resource="tenant:tenant_acme"),
             ],
         )
     )
@@ -227,8 +259,72 @@ def test_knowledge_retrieval_filters_by_tenant_workspace_acl_and_sensitivity():
 
     assert [result.source_document_id for result in allowed_results] == ["sales_doc"]
     assert allowed_results[0].citation == {"section": "discovery"}
+    assert allowed_results[0].sensitivity_level == 1
     assert [result.source_document_id for result in blocked_results] == ["sales_doc"]
     assert other_tenant_results == []
+
+
+def test_knowledge_retrieval_uses_chunk_embeddings_after_acl_filtering():
+    service = InMemoryKnowledgeService()
+    knowledge_base = service.create_base(
+        tenant_id="tenant_acme",
+        user_id="user_1",
+        request=KnowledgeBaseCreate(workspace_id="workspace_sales", name="Sales Playbook"),
+    )
+    service.register_document(
+        KnowledgeDocumentCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_sales",
+            knowledge_base_id=knowledge_base.id,
+            source_uri="s3://tenant_acme/sales.md",
+            source_document_id="sales_doc",
+            uploaded_by_user_id="user_1",
+            title="Sales Guidance",
+            acl_subjects=["team:sales"],
+            sensitivity_level=1,
+            document_version="v1",
+            content_hash="sha256:vector-sales",
+            chunks=[
+                DocumentChunkCreate(
+                    content="General account overview.",
+                    embedding=[1.0, 0.0],
+                    embedding_model="text-embedding-3-small",
+                    embedding_provider="openai_compatible",
+                ),
+                DocumentChunkCreate(
+                    content="Procurement approval guidance.",
+                    embedding=[0.0, 1.0],
+                    embedding_model="text-embedding-3-small",
+                    embedding_provider="openai_compatible",
+                ),
+            ],
+        )
+    )
+
+    allowed_results = service.retrieve(
+        RetrievalRequest(
+            tenant_id="tenant_acme",
+            query="executive escalation",
+            query_embedding=[0.0, 1.0],
+            allowed_workspace_ids=["workspace_sales"],
+            acl_subjects=["team:sales"],
+            clearance_level=1,
+        )
+    )
+    denied_results = service.retrieve(
+        RetrievalRequest(
+            tenant_id="tenant_acme",
+            query="executive escalation",
+            query_embedding=[0.0, 1.0],
+            allowed_workspace_ids=["workspace_sales"],
+            acl_subjects=["team:finance"],
+            clearance_level=1,
+        )
+    )
+
+    assert [result.excerpt for result in allowed_results] == ["Procurement approval guidance."]
+    assert allowed_results[0].score == 1.0
+    assert denied_results == []
 
 
 def test_knowledge_document_workspace_must_match_knowledge_base_workspace():
@@ -484,6 +580,275 @@ def test_knowledge_api_enforces_permissions_and_records_safe_audit():
     assert document_content not in str(knowledge_events)
     assert "renewal pricing compliance" not in str(knowledge_events)
     assert "Enterprise discovery requires compliance review" not in str(knowledge_events)
+
+
+def test_knowledge_api_chunks_uploaded_content_when_chunks_are_omitted():
+    identity, curator, reader, _ = create_knowledge_identity()
+    store = InMemoryControlPlaneStore()
+    knowledge_service = InMemoryKnowledgeService()
+    storage_catalog = InMemoryStorageCatalog(bucket="knowledge-test")
+    storage_client = RecordingKnowledgeStorageClient()
+    object_storage = S3CompatibleObjectStorage(
+        endpoint_url="https://storage.example.com",
+        region="us-east-1",
+        access_key_id="access",
+        secret_access_key="secret",
+        bucket="knowledge-test",
+        client=storage_client,
+    )
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            store=store,
+            knowledge_service=knowledge_service,
+            storage_catalog=storage_catalog,
+            object_storage=object_storage,
+            settings=Settings(
+                knowledge_chunk_max_characters=80,
+                knowledge_chunk_overlap_characters=10,
+                _env_file=None,
+            ),
+        )
+    )
+    headers = {"X-Tenant-ID": "tenant_acme", "X-User-ID": curator.id}
+    document_content = (
+        "Enterprise onboarding requires kickoff notes, security owners, and success metrics.\n\n"
+        "Renewal planning requires procurement context, executive sponsor updates, and risk notes."
+    )
+    base = client.post(
+        "/api/knowledge-bases",
+        headers=headers,
+        json={"workspace_id": "workspace_sales", "name": "Sales Playbook"},
+    ).json()
+
+    document = client.post(
+        "/api/knowledge-documents",
+        headers=headers,
+        json={
+            "workspace_id": "workspace_sales",
+            "knowledge_base_id": base["id"],
+            "source_uri": "s3://tenant_acme/playbooks/onboarding.md",
+            "source_document_id": "doc_onboarding",
+            "title": "Onboarding Playbook",
+            "content": document_content,
+            "content_type": "text/markdown",
+            "acl_subjects": [reader.id],
+            "sensitivity_level": 1,
+            "document_version": "1.0.0",
+            "content_hash": "sha256:onboarding",
+        },
+    )
+    query = client.post(
+        "/api/knowledge/query",
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": reader.id},
+        json={
+            "query": "procurement risk",
+            "allowed_workspace_ids": ["workspace_sales"],
+            "acl_subjects": [reader.id],
+            "clearance_level": 1,
+            "limit": 1,
+        },
+    )
+
+    chunks = knowledge_service.list_chunks("tenant_acme", document.json()["id"])
+    knowledge_events = [
+        event
+        for event in client.get("/api/audit-events", headers=headers).json()
+        if event["event_type"] == "knowledge.document.registered"
+    ]
+
+    assert document.status_code == 201
+    assert query.status_code == 200
+    assert len(chunks) >= 2
+    assert all(chunk.acl_subjects == [reader.id] for chunk in chunks)
+    assert all(chunk.sensitivity_level == 1 for chunk in chunks)
+    assert all(chunk.citation["source_document_id"] == "doc_onboarding" for chunk in chunks)
+    assert all("chunk_index" in chunk.citation for chunk in chunks)
+    assert [result["source_document_id"] for result in query.json()] == ["doc_onboarding"]
+    assert query.json()[0]["sensitivity_level"] == 1
+    assert knowledge_events[0]["metadata"]["chunk_count"] == len(chunks)
+    assert document_content not in str(knowledge_events)
+
+
+def test_knowledge_api_embeds_uploaded_content_and_query_when_gateway_is_configured():
+    identity, curator, reader, _ = create_knowledge_identity()
+    store = InMemoryControlPlaneStore()
+    knowledge_service = InMemoryKnowledgeService()
+    storage_client = RecordingKnowledgeStorageClient()
+    embedding_gateway = RecordingKnowledgeEmbeddingGateway()
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            store=store,
+            knowledge_service=knowledge_service,
+            storage_catalog=InMemoryStorageCatalog(bucket="knowledge-test"),
+            object_storage=S3CompatibleObjectStorage(
+                endpoint_url="https://storage.example.com",
+                region="us-east-1",
+                access_key_id="access",
+                secret_access_key="secret",
+                bucket="knowledge-test",
+                client=storage_client,
+            ),
+            embedding_gateway=embedding_gateway,
+            settings=Settings(
+                knowledge_chunk_max_characters=80,
+                knowledge_chunk_overlap_characters=10,
+                embedding_gateway_model="text-embedding-3-small",
+                billing_pricing_rules=[
+                    BillingPricingRule(
+                        meter_type="embedding_tokens",
+                        unit="token",
+                        provider="openai_compatible",
+                        model="text-embedding-3-small",
+                        price_per_unit=0.002,
+                        pricing_unit_quantity=1000,
+                    )
+                ],
+                _env_file=None,
+            ),
+        )
+    )
+    headers = {"X-Tenant-ID": "tenant_acme", "X-User-ID": curator.id}
+    document_content = (
+        "General onboarding notes for account teams.\n\n"
+        "Procurement approval guidance and renewal risk notes."
+    )
+    base = client.post(
+        "/api/knowledge-bases",
+        headers=headers,
+        json={"workspace_id": "workspace_sales", "name": "Sales Playbook"},
+    ).json()
+
+    document = client.post(
+        "/api/knowledge-documents",
+        headers=headers,
+        json={
+            "workspace_id": "workspace_sales",
+            "knowledge_base_id": base["id"],
+            "source_uri": "s3://tenant_acme/playbooks/renewal.md",
+            "source_document_id": "doc_renewal",
+            "title": "Renewal Playbook",
+            "content": document_content,
+            "acl_subjects": [reader.id],
+            "sensitivity_level": 1,
+            "document_version": "1.0.0",
+            "content_hash": "sha256:renewal-embedding",
+        },
+    )
+    query = client.post(
+        "/api/knowledge/query",
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": reader.id},
+        json={
+            "query": "executive escalation",
+            "allowed_workspace_ids": ["workspace_sales"],
+            "acl_subjects": [reader.id],
+            "clearance_level": 1,
+            "limit": 1,
+        },
+    )
+
+    chunks = knowledge_service.list_chunks("tenant_acme", document.json()["id"])
+    purposes = [request.purpose for request in embedding_gateway.requests]
+    embedding_audits = [
+        event
+        for event in store.list_audit_events("tenant_acme")
+        if event.event_type == "embedding.gateway.called"
+    ]
+    embedding_meters = [
+        meter
+        for meter in store.list_billing_meters("tenant_acme")
+        if meter.meter_type.startswith("embedding")
+    ]
+    token_meters = client.get(
+        "/api/billing/meters",
+        headers=headers,
+        params={"meter_type": "embedding_tokens"},
+    )
+
+    assert document.status_code == 201
+    assert query.status_code == 200
+    assert purposes == ["knowledge_index", "knowledge_query"]
+    assert all(chunk.embedding for chunk in chunks)
+    assert all(chunk.embedding_model == "text-embedding-3-small" for chunk in chunks)
+    assert [result["source_document_id"] for result in query.json()] == ["doc_renewal"]
+    assert "Procurement approval guidance" in query.json()[0]["excerpt"]
+    assert [event.metadata["purpose"] for event in embedding_audits] == [
+        "knowledge_index",
+        "knowledge_query",
+    ]
+    assert embedding_audits[0].metadata["input_count"] == len(chunks)
+    assert embedding_audits[0].metadata["source_document_id"] == "doc_renewal"
+    assert embedding_audits[1].metadata["input_count"] == 1
+    assert embedding_audits[1].metadata["usage"] == {
+        "prompt_tokens": 7,
+        "total_tokens": 7,
+    }
+    assert [(meter.meter_type, meter.quantity, meter.unit) for meter in embedding_meters] == [
+        ("embedding_call_count", 1, "call"),
+        ("embedding_tokens", len(chunks) * 7, "token"),
+        ("embedding_call_count", 1, "call"),
+        ("embedding_tokens", 7, "token"),
+    ]
+    assert {meter.run_id for meter in embedding_meters} == {None}
+    assert {meter.workspace_id for meter in embedding_meters} == {"workspace_sales"}
+    assert token_meters.status_code == 200
+    assert [meter["quantity"] for meter in token_meters.json()] == [len(chunks) * 7, 7]
+    assert [meter["cost_estimate"] for meter in token_meters.json()] == [
+        round(len(chunks) * 7 * 0.002 / 1000, 10),
+        0.000014,
+    ]
+    assert document_content not in str(embedding_audits)
+    assert "executive escalation" not in str(embedding_audits)
+    assert "[0.0, 1.0]" not in str(embedding_audits)
+    assert document_content not in str(embedding_meters)
+    assert "executive escalation" not in str(embedding_meters)
+    assert "[0.0, 1.0]" not in str(embedding_meters)
+
+
+def test_knowledge_api_rejects_document_without_content_or_chunks():
+    identity, curator, _, _ = create_knowledge_identity()
+    store = InMemoryControlPlaneStore()
+    storage_client = RecordingKnowledgeStorageClient()
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            store=store,
+            storage_catalog=InMemoryStorageCatalog(bucket="knowledge-test"),
+            object_storage=S3CompatibleObjectStorage(
+                endpoint_url="https://storage.example.com",
+                region="us-east-1",
+                access_key_id="access",
+                secret_access_key="secret",
+                bucket="knowledge-test",
+                client=storage_client,
+            ),
+        )
+    )
+    headers = {"X-Tenant-ID": "tenant_acme", "X-User-ID": curator.id}
+    base = client.post(
+        "/api/knowledge-bases",
+        headers=headers,
+        json={"workspace_id": "workspace_sales", "name": "Sales Playbook"},
+    ).json()
+
+    document = client.post(
+        "/api/knowledge-documents",
+        headers=headers,
+        json={
+            "workspace_id": "workspace_sales",
+            "knowledge_base_id": base["id"],
+            "source_uri": "s3://tenant_acme/playbooks/empty.md",
+            "source_document_id": "doc_empty",
+            "title": "Empty Playbook",
+            "acl_subjects": [curator.id],
+            "document_version": "1.0.0",
+            "content_hash": "sha256:empty",
+        },
+    )
+
+    assert document.status_code == 422
+    assert storage_client.put_calls == []
 
 
 def test_knowledge_document_registration_rejects_source_content_that_matches_scan_policy():

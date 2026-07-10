@@ -27,6 +27,7 @@ class AuthService(BaseModel):
     session_store: AuthSessionStore = Field(default_factory=InMemoryAuthSessionStore)
     access_token_secret: str = Field(min_length=1)
     access_token_ttl_seconds: int = Field(gt=0)
+    sso_provider_registry: Any | None = None
 
     def login(
         self,
@@ -40,6 +41,8 @@ class AuthService(BaseModel):
         except NotFoundError as error:
             raise AuthInvalidCredentialsError("invalid credentials") from error
         if account.status != "active":
+            raise AuthInvalidCredentialsError("invalid credentials")
+        if not self._password_login_allowed(tenant_id, account.email):
             raise AuthInvalidCredentialsError("invalid credentials")
         if not self.identity_service.verify_password(tenant_id, email, password):
             raise AuthInvalidCredentialsError("invalid credentials")
@@ -113,6 +116,12 @@ class AuthService(BaseModel):
             raise AuthRequiredError("access token revoked")
         if session.expires_at <= (now or utc_now()):
             raise AuthRequiredError("access token expired")
+        try:
+            account = self.identity_service.get_user(claims.tenant_id, claims.user_id)
+        except NotFoundError as error:
+            raise AuthRequiredError("invalid access token") from error
+        if account.status != "active":
+            raise AuthRequiredError("access token revoked")
         return claims
 
     def _claims_for_account(
@@ -131,6 +140,14 @@ class AuthService(BaseModel):
             issued_at=issued_at,
             expires_at=expires_at,
         )
+
+    def _password_login_allowed(self, tenant_id: str, email: str) -> bool:
+        if self.sso_provider_registry is None:
+            return True
+        provider_entry = self.sso_provider_registry.find_enabled_for_email(tenant_id, email)
+        if provider_entry is None:
+            return True
+        return provider_entry.provider.password_fallback_enabled
 
     def _sign(self, payload: str) -> str:
         digest = hmac.new(

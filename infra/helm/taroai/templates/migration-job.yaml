@@ -1,0 +1,53 @@
+{{- if .Values.migration.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "taroai.fullname" . }}-db-migrate
+  labels:
+    {{- include "taroai.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "taroai.fullname" . }}-db-migrate
+    app.kubernetes.io/component: migration
+spec:
+  backoffLimit: {{ .Values.migration.backoffLimit }}
+  template:
+    metadata:
+      labels:
+        {{- include "taroai.labels" . | nindent 8 }}
+        app.kubernetes.io/name: {{ include "taroai.fullname" . }}-db-migrate
+        app.kubernetes.io/component: migration
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "taroai.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: migrate
+          image: {{ include "taroai.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            {{- toYaml .Values.migration.command | nindent 12 }}
+          args:
+            {{- toYaml .Values.migration.args | nindent 12 }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "taroai.fullname" . }}-runtime-config
+            - secretRef:
+                name: {{ .Values.secrets.existingSecret | quote }}
+          env:
+            - name: TAROAI_RUN_MIGRATIONS
+              value: {{ .Values.migration.runMigrations | quote }}
+          resources:
+            {{- toYaml .Values.migration.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: {{ .Values.persistence.tmp.mountPath }}
+            - name: taroai-data
+              mountPath: {{ .Values.persistence.runtimeData.mountPath }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: taroai-data
+          emptyDir: {}
+{{- end }}

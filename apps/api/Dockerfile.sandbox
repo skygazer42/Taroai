@@ -1,0 +1,32 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app/src
+ENV PIP_DEFAULT_TIMEOUT=120
+ENV PIP_RETRIES=10
+
+WORKDIR /app
+
+ARG KUBECTL_VERSION=v1.32.0
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl docker.io \
+    && curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+    && chmod +x /usr/local/bin/kubectl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN addgroup --system --gid 65532 taroai \
+    && adduser --system --uid 65532 --ingroup taroai taroai
+
+COPY requirements.txt /app/requirements.txt
+RUN python -m pip install --no-cache-dir --retries 10 --timeout 120 -r /app/requirements.txt
+
+COPY src /app/src
+
+RUN mkdir -p /data/taroai/sandboxes \
+    && chown -R taroai:taroai /app /data/taroai
+
+EXPOSE 8002
+
+CMD ["uvicorn", "taroai.sandbox.controller_service:app", "--host", "0.0.0.0", "--port", "8002"]

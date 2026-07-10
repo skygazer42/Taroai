@@ -1,0 +1,425 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: taroai-default-deny
+  labels:
+    app.kubernetes.io/name: taroai-network-policy
+    app.kubernetes.io/component: network-policy
+    app.kubernetes.io/part-of: taroai
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: taroai-allow-dns-egress
+  labels:
+    app.kubernetes.io/name: taroai-network-policy
+    app.kubernetes.io/component: network-policy
+    app.kubernetes.io/part-of: taroai
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: taroai-api-ingress
+  labels:
+    app.kubernetes.io/name: taroai-api
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: taroai
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: taroai-api
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: taroai
+      ports:
+        - protocol: TCP
+          port: 8000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: taroai-api-egress
+  labels:
+    app.kubernetes.io/name: taroai-api
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: taroai
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: api
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: minio
+      ports:
+        - protocol: TCP
+          port: 9000
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: sandbox-controller
+      ports:
+        - protocol: TCP
+          port: 8002
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: browser-controller
+      ports:
+        - protocol: TCP
+          port: 8001
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: taroai-worker-egress
+  labels:
+    app.kubernetes.io/name: taroai-worker
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/part-of: taroai
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: worker
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: minio
+      ports:
+        - protocol: TCP
+          port: 9000
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: sandbox-controller
+      ports:
+        - protocol: TCP
+          port: 8002
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: browser-controller
+      ports:
+        - protocol: TCP
+          port: 8001
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: taroai-migration-egress
+  labels:
+    app.kubernetes.io/name: taroai-db-migrate
+    app.kubernetes.io/component: migration
+    app.kubernetes.io/part-of: taroai
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: migration
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: taroai-sandbox-controller-ingress
+  labels:
+    app.kubernetes.io/name: sandbox-controller
+    app.kubernetes.io/component: sandbox-controller
+    app.kubernetes.io/part-of: taroai
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: sandbox-controller
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: api
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: worker
+      ports:
+        - protocol: TCP
+          port: 8002
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: taroai-sandbox-controller-egress
+  labels:
+    app.kubernetes.io/name: sandbox-controller
+    app.kubernetes.io/component: sandbox-controller
+    app.kubernetes.io/part-of: taroai
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: sandbox-controller
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: taroai-browser-controller-ingress
+  labels:
+    app.kubernetes.io/name: browser-controller
+    app.kubernetes.io/component: browser-controller
+    app.kubernetes.io/part-of: taroai
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: browser-controller
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: api
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: worker
+      ports:
+        - protocol: TCP
+          port: 8001
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: taroai-browser-controller-egress
+  labels:
+    app.kubernetes.io/name: browser-controller
+    app.kubernetes.io/component: browser-controller
+    app.kubernetes.io/part-of: taroai
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: browser-controller
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: taroai-web-ingress
+  labels:
+    app.kubernetes.io/name: taroai-web
+    app.kubernetes.io/component: web
+    app.kubernetes.io/part-of: taroai
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: taroai-web
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: api
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: taroai-minio-init-egress
+  labels:
+    app.kubernetes.io/name: taroai-minio-init
+    app.kubernetes.io/component: object-storage-init
+    app.kubernetes.io/part-of: taroai
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: object-storage-init
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: minio
+      ports:
+        - protocol: TCP
+          port: 9000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: taroai-postgres-ingress
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: taroai
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: api
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: worker
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: migration
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: taroai-redis-ingress
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/part-of: taroai
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: api
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: worker
+      ports:
+        - protocol: TCP
+          port: 6379
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: taroai-minio-ingress
+  labels:
+    app.kubernetes.io/name: minio
+    app.kubernetes.io/component: object-storage
+    app.kubernetes.io/part-of: taroai
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: minio
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: api
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: worker
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: object-storage-init
+      ports:
+        - protocol: TCP
+          port: 9000
