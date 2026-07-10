@@ -91,9 +91,8 @@ def test_chat_column_preserves_creao_selector_contract():
     assert chat_column is not None
     assert "How can I help" in chat_column.text
 
-    chat_divs = chat_column.direct_children("div")
-    assert len(chat_divs) >= 4
-    composer_shell = chat_divs[3]
+    composer_shell = chat_column.find_by_attr("data-testid", "chat-composer")
+    assert composer_shell is not None
     composer_divs = composer_shell.direct_children("div")
     assert len(composer_divs) >= 2
     assert (

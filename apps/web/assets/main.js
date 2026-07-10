@@ -26,6 +26,15 @@ const state = {
   workspaceSkills: [],
   selectedSkillId: null,
   selectedSolutionPackDraftId: null,
+  selectedModel: localStorage.getItem("taroai.selectedModel") || "Claude Sonnet 5",
+  selectedAttachments: [],
+  filesDialogSelection: new Set(),
+  activePopover: null,
+  returnFocus: null,
+  artifactPanelOpen: false,
+  operationsOpen: false,
+  sidebarCollapsed: localStorage.getItem("taroai.sidebarCollapsed") === "true",
+  appRoute: "chat",
   activeWorkbenchView: localStorage.getItem("taroai.activeWorkbenchView") || "run",
   apiBase: localStorage.getItem("taroai.apiBase") || "http://localhost:8000",
   tenantId: localStorage.getItem("taroai.tenantId") || "tenant_acme",
@@ -53,8 +62,124 @@ const ACTIVE_RUN_STATUSES = [
 ];
 const RETRYABLE_RUN_STATUSES = ["failed", "cancelled", "timed_out"];
 const ARTIFACT_PREVIEW_MAX_CHARACTERS = 6000;
+const ROUTE_DEFINITIONS = {
+  chat: {
+    eyebrow: "Taroai",
+    title: "Chat",
+    description: "Run governed agent tasks from a persistent workspace shell.",
+    cards: [],
+  },
+  search: {
+    eyebrow: "Find anything",
+    title: "Search",
+    description: "Search product areas and recently loaded runs.",
+    cards: [],
+  },
+  discover: {
+    eyebrow: "Explore",
+    title: "Discover agents",
+    description: "Start with a focused workflow, then adapt it in Chat.",
+    cards: [
+      { title: "Case Study Writer", description: "Turn customer interviews into a publishable case study.", meta: "Gmail · Docs", action: "agent:Case Study Writer", actionLabel: "Run agent" },
+      { title: "Product Description Writer", description: "Create consistent product copy from structured inputs.", meta: "Gmail · Sheets", action: "agent:Product Description Writer", actionLabel: "Run agent" },
+      { title: "Cash Flow Forecaster", description: "Build and explain a rolling cash-flow view.", meta: "Sheets · Finance", action: "agent:Cash Flow Forecaster", actionLabel: "Run agent" },
+    ],
+  },
+  feed: {
+    eyebrow: "Workspace activity",
+    title: "Feed",
+    description: "Recent shared activity will appear here when the team feed API is connected.",
+    cards: [
+      { title: "No shared activity yet", description: "Start a governed run and its evidence will remain available in Operations.", meta: "Local workspace", action: "chat", actionLabel: "Start a run" },
+      { title: "Run evidence", description: "Inspect timelines, terminal output, approvals, and artifacts already supported by Taroai.", meta: "Operations", action: "operations", actionLabel: "Open Operations" },
+    ],
+  },
+  agents: {
+    eyebrow: "Reusable work",
+    title: "Agents",
+    description: "Prepare a reusable agent from a successful conversation.",
+    cards: [
+      { title: "Create from Chat", description: "Describe the reusable workflow you want to build.", meta: "Draft flow", action: "prompt:Create a reusable agent from this conversation.", actionLabel: "Create agent" },
+      { title: "Popular agents", description: "Browse ready-to-run workflow ideas.", meta: "Templates", action: "route:discover", actionLabel: "Browse" },
+      { title: "Agent operations", description: "Review the current runtime and governed execution controls.", meta: "Run control", action: "operations", actionLabel: "Open" },
+    ],
+  },
+  workspaces: {
+    eyebrow: "Organize work",
+    title: "Workspaces",
+    description: "Keep runs, files, skills, and evidence within a tenant-scoped workspace.",
+    cards: [
+      { title: "workspace_sales", description: "The active workspace configured for this local session.", meta: "Current workspace", action: "operations", actionLabel: "Open workspace" },
+      { title: "Plan a workspace", description: "Use Chat to define a new workspace structure without pretending it already exists.", meta: "Guided setup", action: "prompt:Plan a new workspace for my team.", actionLabel: "Plan in Chat" },
+    ],
+  },
+  files: {
+    eyebrow: "Workspace drive",
+    title: "Files",
+    description: "Select storage-backed run files and artifacts already available to this session.",
+    cards: [
+      { title: "Chat files", description: "Choose existing storage objects to attach to the next Run.", meta: "Storage objects", action: "files", actionLabel: "Open files" },
+      { title: "Artifact library", description: "Preview or download artifacts created by the selected Run.", meta: "Run outputs", action: "operations", actionLabel: "View artifacts" },
+    ],
+  },
+  brain: {
+    eyebrow: "Agent context",
+    title: "Agent Brain",
+    description: "Inspect the skills and governed context surfaces connected to this workspace.",
+    cards: [
+      { title: "Workspace skills", description: "View installed skills and invoke their supported workflows.", meta: "Skills", action: "inspect", actionLabel: "Open skills" },
+      { title: "Knowledge and memory", description: "Ask Chat to retrieve and organize workspace context.", meta: "Context", action: "prompt:Review the knowledge and memory available in this workspace.", actionLabel: "Ask Chat" },
+    ],
+  },
+  rewards: {
+    eyebrow: "Taroai",
+    title: "Rewards",
+    description: "Referral rewards are not connected in this local build.",
+    cards: [
+      { title: "Local preview", description: "No referral data is sent or generated from this page.", meta: "No external side effects", action: "chat", actionLabel: "Back to Chat" },
+    ],
+  },
+};
 
 const elements = {
+  shell: document.querySelector("[data-app='taroai-workspace']"),
+  sidebarCollapse: document.querySelector("[data-sidebar-collapse]"),
+  newChat: document.querySelector("[data-new-chat]"),
+  routeLinks: document.querySelectorAll("[data-app-route]"),
+  routeSurface: document.querySelector("[data-testid='product-route']"),
+  routeEyebrow: document.querySelector("[data-route-eyebrow]"),
+  routeTitle: document.querySelector("[data-route-title]"),
+  routeDescription: document.querySelector("[data-route-description]"),
+  routeCards: document.querySelector("[data-route-cards]"),
+  routeSearchShell: document.querySelector("[data-route-search-shell]"),
+  routeSearch: document.querySelector("[data-route-search]"),
+  routeSearchResults: document.querySelector("[data-route-search-results]"),
+  agentRunButtons: document.querySelectorAll("[data-agent-prompt]"),
+  agentCarouselNext: document.querySelector("[data-agent-carousel-next]"),
+  agentCardRail: document.querySelector(".agent-card-rail"),
+  createAgent: document.querySelector("[data-create-agent]"),
+  createAgentPrompt: document.querySelector("[data-create-agent-prompt]"),
+  exploreAgents: document.querySelector("[data-explore-agents]"),
+  modelSelectorButton: document.querySelector("#model-selector-button"),
+  modelSelectorMenu: document.querySelector("#model-selector-menu"),
+  selectedModel: document.querySelector("[data-selected-model]"),
+  modelOptions: document.querySelectorAll("[data-model-option]"),
+  composerAddButton: document.querySelector("#composer-add-button"),
+  composerAddMenu: document.querySelector("#composer-add-menu"),
+  addCommands: document.querySelectorAll("[data-add-command]"),
+  composerFileInput: document.querySelector("#composer-file-input"),
+  attachmentChips: document.querySelector("[data-attachment-chips]"),
+  filesDialog: document.querySelector("#files-dialog"),
+  filesDialogOpeners: document.querySelectorAll("[data-open-files-dialog]"),
+  filesDialogClose: document.querySelector("[data-files-dialog-close]"),
+  filesList: document.querySelector("[data-files-list]"),
+  filesSearch: document.querySelector("[data-files-search]"),
+  filesConfirm: document.querySelector("[data-files-confirm]"),
+  filesSelectionStatus: document.querySelector("[data-files-selection-status]"),
+  sidecar: document.querySelector("[data-workspace-sidecar]"),
+  artifactPanelClose: document.querySelector("[data-artifact-panel-close]"),
+  operationsOpeners: document.querySelectorAll("[data-open-operations]"),
+  operationsClose: document.querySelector("[data-operations-close]"),
   workbenchViews: document.querySelectorAll("[data-workbench-view]"),
   workbenchViewToggles: document.querySelectorAll("[data-workbench-view-toggle]"),
   apiBase: document.querySelector("#api-base"),
@@ -278,6 +403,15 @@ function initializeControls() {
   elements.tenantSlug.value = state.tenantSlug;
   elements.ownerDisplayName.value = state.ownerDisplayName;
   elements.loginEmail.value = state.authEmail;
+  setSelectedModel(state.selectedModel);
+  renderAttachmentChips();
+  setActivePopover(null);
+  setArtifactPanelOpen(false);
+  setOperationsOpen(false);
+  setSidebarCollapsed(state.sidebarCollapsed);
+  setChatState(state.currentRunId ? "thread" : "empty");
+  renderAppRoute(routeFromHash(), false);
+  syncComposerState();
   switchWorkbenchView(state.activeWorkbenchView);
   renderBootstrap();
   renderAuth();
@@ -312,6 +446,400 @@ function switchWorkbenchView(viewName) {
     button.classList.toggle("is-active", isActive);
     button.setAttribute("aria-selected", isActive ? "true" : "false");
   });
+}
+
+function setChatState(chatState) {
+  const activeState = chatState === "thread" ? "thread" : "empty";
+  elements.shell.dataset.chatState = activeState;
+}
+
+function routeFromHash() {
+  const routeName = window.location.hash.replace(/^#/, "").trim().toLowerCase();
+  return Object.hasOwn(ROUTE_DEFINITIONS, routeName) ? routeName : "chat";
+}
+
+function renderAppRoute(routeName, updateHash = false) {
+  const activeRoute = Object.hasOwn(ROUTE_DEFINITIONS, routeName)
+    ? routeName
+    : "chat";
+  const definition = ROUTE_DEFINITIONS[activeRoute];
+  state.appRoute = activeRoute;
+  elements.shell.dataset.appRoute = activeRoute;
+  elements.routeSurface.hidden = activeRoute === "chat";
+  elements.routeLinks.forEach((link) => {
+    link.classList.toggle("is-active", link.dataset.appRoute === activeRoute);
+    if (link.tagName === "A") {
+      link.setAttribute(
+        "aria-current",
+        link.dataset.appRoute === activeRoute ? "page" : "false",
+      );
+    }
+  });
+
+  if (activeRoute !== "chat") {
+    closeActivePopover(false);
+    setArtifactPanelOpen(false);
+    setOperationsOpen(false);
+    elements.routeEyebrow.textContent = definition.eyebrow;
+    elements.routeTitle.textContent = definition.title;
+    elements.routeDescription.textContent = definition.description;
+    elements.routeSearchShell.hidden = activeRoute !== "search";
+    renderRouteCards(definition.cards || []);
+    if (activeRoute === "search") {
+      renderRouteSearchResults(elements.routeSearch.value);
+      window.requestAnimationFrame(() => elements.routeSearch.focus());
+    }
+  }
+
+  if (updateHash && window.location.hash !== `#${activeRoute}`) {
+    window.location.hash = activeRoute;
+  }
+}
+
+function renderRouteCards(cards) {
+  elements.routeCards.replaceChildren();
+  for (const card of cards) {
+    const article = document.createElement("article");
+    article.className = "product-route-card";
+    const meta = document.createElement("span");
+    meta.className = "product-route-card-meta";
+    meta.textContent = card.meta;
+    const title = document.createElement("h2");
+    title.textContent = card.title;
+    const description = document.createElement("p");
+    description.textContent = card.description;
+    const action = document.createElement("button");
+    action.type = "button";
+    action.dataset.routeAction = card.action;
+    action.textContent = card.actionLabel;
+    article.append(meta, title, description, action);
+    elements.routeCards.append(article);
+  }
+}
+
+function renderRouteSearchResults(searchTerm = "") {
+  const normalized = searchTerm.trim().toLowerCase();
+  const routeItems = Object.entries(ROUTE_DEFINITIONS)
+    .filter(([routeName]) => !["chat", "search"].includes(routeName))
+    .map(([routeName, definition]) => ({
+      title: definition.title,
+      description: definition.description,
+      action: `route:${routeName}`,
+    }));
+  const runItems = state.runHistory.map((run) => ({
+    title: run.message || run.id,
+    description: `Run · ${run.status || "created"}`,
+    action: `run:${run.id}`,
+  }));
+  const results = [...routeItems, ...runItems].filter((item) => {
+    if (!normalized) {
+      return true;
+    }
+    return `${item.title} ${item.description}`.toLowerCase().includes(normalized);
+  });
+  elements.routeSearchResults.replaceChildren();
+
+  if (!results.length) {
+    const empty = document.createElement("p");
+    empty.className = "product-route-search-empty";
+    empty.textContent = "No matching routes or loaded runs.";
+    elements.routeSearchResults.append(empty);
+    return;
+  }
+
+  for (const result of results.slice(0, 12)) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "product-route-search-result";
+    button.dataset.routeAction = result.action;
+    const title = document.createElement("strong");
+    title.textContent = result.title;
+    const description = document.createElement("small");
+    description.textContent = result.description;
+    button.append(title, description);
+    elements.routeSearchResults.append(button);
+  }
+}
+
+function prefillChatMessage(message) {
+  startNewChat();
+  elements.input.value = message;
+  fitComposer();
+  syncComposerState();
+  elements.input.focus();
+}
+
+function prefillAgentRun(agentName) {
+  prefillChatMessage(`Run the "${agentName}" agent`);
+}
+
+function handleRouteAction(action) {
+  if (!action) {
+    return;
+  }
+  if (action === "chat") {
+    startNewChat();
+    return;
+  }
+  if (action === "files") {
+    openFilesDialog();
+    return;
+  }
+  if (action === "operations") {
+    setOperationsOpen(true);
+    return;
+  }
+  if (action === "inspect") {
+    switchWorkbenchView("inspect");
+    setOperationsOpen(true);
+    return;
+  }
+  if (action.startsWith("route:")) {
+    renderAppRoute(action.slice("route:".length), true);
+    return;
+  }
+  if (action.startsWith("agent:")) {
+    prefillAgentRun(action.slice("agent:".length));
+    return;
+  }
+  if (action.startsWith("prompt:")) {
+    prefillChatMessage(action.slice("prompt:".length));
+    return;
+  }
+  if (action.startsWith("run:")) {
+    renderAppRoute("chat", true);
+    selectRunFromHistory(action.slice("run:".length));
+  }
+}
+
+function setSidebarCollapsed(collapsed) {
+  state.sidebarCollapsed = Boolean(collapsed);
+  elements.shell.classList.toggle("is-sidebar-collapsed", state.sidebarCollapsed);
+  elements.sidebarCollapse.setAttribute(
+    "aria-label",
+    state.sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar",
+  );
+  localStorage.setItem("taroai.sidebarCollapsed", String(state.sidebarCollapsed));
+}
+
+function setActivePopover(popoverName, trigger = null) {
+  const allowed = ["model", "add"];
+  const activePopover = allowed.includes(popoverName) ? popoverName : null;
+  state.activePopover = activePopover;
+  if (activePopover && trigger) {
+    state.returnFocus = trigger;
+  }
+
+  const modelOpen = activePopover === "model";
+  const addOpen = activePopover === "add";
+  elements.modelSelectorMenu.hidden = !modelOpen;
+  elements.modelSelectorButton.setAttribute("aria-expanded", String(modelOpen));
+  elements.composerAddMenu.hidden = !addOpen;
+  elements.composerAddButton.setAttribute("aria-expanded", String(addOpen));
+
+  const firstItem = activePopover
+    ? (activePopover === "model" ? elements.modelSelectorMenu : elements.composerAddMenu)
+        .querySelector('[role^="menuitem"]')
+    : null;
+  if (firstItem) {
+    window.requestAnimationFrame(() => firstItem.focus());
+  }
+}
+
+function closeActivePopover(returnFocus = false) {
+  const focusTarget = state.returnFocus;
+  setActivePopover(null);
+  state.returnFocus = null;
+  if (returnFocus && focusTarget) {
+    window.requestAnimationFrame(() => focusTarget.focus());
+  }
+}
+
+function setSelectedModel(modelName) {
+  const available = Array.from(elements.modelOptions).map(
+    (button) => button.dataset.modelOption,
+  );
+  const selectedModel = available.includes(modelName) ? modelName : available[0];
+  state.selectedModel = selectedModel;
+  elements.selectedModel.textContent = selectedModel;
+  elements.modelOptions.forEach((button) => {
+    const isSelected = button.dataset.modelOption === selectedModel;
+    button.classList.toggle("is-selected", isSelected);
+    button.setAttribute("aria-checked", String(isSelected));
+  });
+  localStorage.setItem("taroai.selectedModel", selectedModel);
+}
+
+function setArtifactPanelOpen(open) {
+  state.artifactPanelOpen = Boolean(open);
+  if (state.artifactPanelOpen) {
+    state.operationsOpen = false;
+  }
+  elements.sidecar.classList.toggle("is-artifact-open", state.artifactPanelOpen);
+  elements.sidecar.classList.toggle("is-operations-open", state.operationsOpen);
+}
+
+function setOperationsOpen(open) {
+  state.operationsOpen = Boolean(open);
+  if (state.operationsOpen) {
+    state.artifactPanelOpen = false;
+  }
+  elements.sidecar.classList.toggle("is-operations-open", state.operationsOpen);
+  elements.sidecar.classList.toggle("is-artifact-open", state.artifactPanelOpen);
+}
+
+function renderAttachmentChips() {
+  elements.attachmentChips.replaceChildren();
+  for (const attachment of state.selectedAttachments) {
+    const chip = document.createElement("span");
+    chip.className = "attachment-chip";
+    const name = document.createElement("span");
+    name.textContent = attachment.filename || attachment.name || attachment.id;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.setAttribute("aria-label", `Remove ${name.textContent}`);
+    remove.dataset.removeAttachmentId = attachment.id;
+    remove.textContent = "×";
+    chip.append(name, remove);
+    elements.attachmentChips.append(chip);
+  }
+}
+
+function renderFilesDialog() {
+  const searchTerm = (elements.filesSearch.value || "").trim().toLowerCase();
+  const candidates = state.storageObjects.filter((storageObject) => {
+    const filename = (storageObject.filename || storageObject.id || "").toLowerCase();
+    return !searchTerm || filename.includes(searchTerm);
+  });
+  elements.filesList.replaceChildren();
+
+  if (!candidates.length) {
+    const empty = document.createElement("div");
+    empty.className = "files-empty-state";
+    empty.setAttribute("data-files-empty", "");
+    const icon = document.createElement("span");
+    icon.className = "files-empty-icon";
+    icon.setAttribute("aria-hidden", "true");
+    icon.textContent = "▧";
+    const title = document.createElement("p");
+    title.textContent = "No files yet";
+    const copy = document.createElement("small");
+    copy.textContent = "Files generated or uploaded will appear here.";
+    empty.append(icon, title, copy);
+    elements.filesList.append(empty);
+  } else {
+    for (const storageObject of candidates) {
+      const label = document.createElement("label");
+      label.className = "files-list-item";
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.value = storageObject.id;
+      checkbox.checked = state.filesDialogSelection.has(storageObject.id);
+      const copy = document.createElement("span");
+      const name = document.createElement("strong");
+      name.textContent = storageObject.filename || storageObject.id;
+      const meta = document.createElement("small");
+      meta.textContent = `${storageObject.purpose || "file"} · ${storageObject.size_bytes || 0} bytes`;
+      copy.append(name, meta);
+      const type = document.createElement("small");
+      type.textContent = storageObject.content_type || "file";
+      label.append(checkbox, copy, type);
+      elements.filesList.append(label);
+    }
+  }
+  updateFilesSelectionStatus();
+}
+
+function updateFilesSelectionStatus() {
+  const count = state.filesDialogSelection.size;
+  elements.filesSelectionStatus.textContent = count
+    ? `${count} file${count === 1 ? "" : "s"} selected`
+    : "No files selected";
+  elements.filesConfirm.disabled = count === 0;
+  elements.filesConfirm.closest(".files-dialog-footer").hidden = count === 0;
+}
+
+function openFilesDialog() {
+  closeActivePopover(false);
+  state.filesDialogSelection = new Set(
+    state.selectedAttachments.map((attachment) => attachment.id),
+  );
+  renderFilesDialog();
+  if (typeof elements.filesDialog.showModal === "function") {
+    elements.filesDialog.showModal();
+  } else {
+    elements.filesDialog.setAttribute("open", "");
+  }
+}
+
+function closeFilesDialog() {
+  if (typeof elements.filesDialog.close === "function") {
+    elements.filesDialog.close();
+  } else {
+    elements.filesDialog.removeAttribute("open");
+  }
+}
+
+function confirmFilesSelection() {
+  const selected = state.storageObjects.filter((storageObject) => {
+    return state.filesDialogSelection.has(storageObject.id);
+  });
+  state.selectedAttachments = selected;
+  renderAttachmentChips();
+  closeFilesDialog();
+  syncComposerState();
+}
+
+function handleAddCommand(command) {
+  closeActivePopover(false);
+  if (command === "files") {
+    openFilesDialog();
+    return;
+  }
+  if (command === "drive") {
+    openFilesDialog();
+    elements.filesSelectionStatus.textContent =
+      "Google Drive requires a connector; choose an existing workspace file for now.";
+    return;
+  }
+  const commandText = {
+    image: "/image ",
+    video: "/video ",
+    voice: "/voice ",
+    connectors: "@",
+    browser: "/browser ",
+    workflow: "/workflow ",
+    slides: "/slides ",
+  }[command];
+  if (commandText) {
+    elements.input.value = commandText;
+    fitComposer();
+    syncComposerState();
+    elements.input.focus();
+  }
+}
+
+function startNewChat() {
+  renderAppRoute("chat", true);
+  stopRunPolling();
+  state.currentRunId = null;
+  state.selectedRunHistoryId = null;
+  state.lastSequence = 0;
+  state.events = [];
+  state.eventStreamIntegrityIssues = [];
+  state.artifacts = [];
+  state.storageObjects = [];
+  state.selectedAttachments = [];
+  renderAttachmentChips();
+  resetConversation();
+  renderRunHistory();
+  renderArtifacts();
+  setStatus("idle");
+  setArtifactPanelOpen(false);
+  elements.input.value = "";
+  fitComposer();
+  syncComposerState();
+  elements.input.focus();
 }
 
 function syncSettings() {
@@ -394,6 +922,7 @@ async function raiseStorageFetchError(response) {
 }
 
 function appendMessage(kind, text) {
+  setChatState("thread");
   const message = document.createElement("article");
   message.className = `message message-${kind}`;
   const paragraph = document.createElement("p");
@@ -404,6 +933,7 @@ function appendMessage(kind, text) {
 }
 
 function resetConversation() {
+  setChatState("empty");
   const message = document.createElement("article");
   message.className = "message message-agent";
   const paragraph = document.createElement("p");
@@ -432,6 +962,10 @@ function setStatus(status) {
 function fitComposer() {
   elements.input.style.height = "auto";
   elements.input.style.height = `${Math.min(elements.input.scrollHeight, 180)}px`;
+}
+
+function syncComposerState() {
+  elements.send.disabled = !elements.input.value.trim();
 }
 
 function renderAuth(status) {
@@ -1517,12 +2051,12 @@ function renderRunHistory(data = state.runHistory, error = null) {
   elements.runHistoryList.replaceChildren();
   if (error) {
     elements.runHistoryStatus.textContent = "Unavailable";
-    appendRunHistoryEmpty(error.message);
+    appendRunHistoryEmpty("No recent chats.");
     return;
   }
   if (data && data.status === "loading") {
     elements.runHistoryStatus.textContent = "Loading runs";
-    appendRunHistoryEmpty("Loading runs.");
+    appendRunHistoryEmpty("No recent chats.");
     return;
   }
 
@@ -1576,6 +2110,45 @@ function shortDateTime(value) {
   });
 }
 
+function renderConversationForRun(run) {
+  setChatState("thread");
+  elements.conversation.replaceChildren();
+  appendMessage("user", run.message || "Run this agent task.");
+
+  if (state.events.length) {
+    const trace = document.createElement("div");
+    trace.className = "tool-trace";
+    trace.setAttribute("aria-label", "Run activity");
+    for (const event of state.events.slice(-6)) {
+      const row = document.createElement("div");
+      row.className = "tool-trace-row";
+      const icon = document.createElement("span");
+      icon.setAttribute("aria-hidden", "true");
+      icon.textContent = event.type?.includes("command") ? "⌁" : "⌘";
+      const label = document.createElement("span");
+      label.textContent = event.type || "Run event";
+      row.append(icon, label);
+      trace.append(row);
+    }
+    elements.conversation.append(trace);
+  }
+
+  const status = state.runStatus || run.status || "created";
+  appendMessage(
+    "agent",
+    `Run status: ${status}. Open Operations for the full timeline, terminal, approvals, and evidence.`,
+  );
+  const actions = document.createElement("div");
+  actions.className = "message-actions";
+  for (const label of ["Copy", "Useful", "Needs work", "More"]) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    actions.append(button);
+  }
+  elements.conversation.append(actions);
+}
+
 async function selectRunFromHistory(runId) {
   const run = state.runHistory.find((item) => item.id === runId);
   if (!run) {
@@ -1591,6 +2164,7 @@ async function selectRunFromHistory(runId) {
   state.storageObjects = [];
   state.runTrace = null;
   state.runtimeState = null;
+  renderConversationForRun(run);
   setStatus(run.status || "created");
   renderTimeline();
   renderRunTrace();
@@ -1604,6 +2178,7 @@ async function selectRunFromHistory(runId) {
   renderTerminal("Loading selected run...");
   renderRunHistory();
   await refreshRun();
+  renderConversationForRun({ ...run, status: state.runStatus });
   if (ACTIVE_RUN_STATUSES.includes(state.runStatus)) {
     startRunPolling();
   }
@@ -2270,10 +2845,14 @@ async function submitRun() {
   if (!message) {
     return;
   }
+  if (elements.shell.dataset.chatState === "empty") {
+    elements.conversation.replaceChildren();
+  }
   stopRunPolling();
   appendMessage("user", message);
   elements.input.value = "";
   fitComposer();
+  syncComposerState();
   setStatus("creating");
   renderTerminal("Creating run...");
 
@@ -2284,11 +2863,14 @@ async function submitRun() {
         workspace_id: state.workspaceId,
         agent_id: state.agentId,
         message,
+        attachments: state.selectedAttachments.map((attachment) => attachment.id),
         mode: "autonomous",
       }),
     });
     state.currentRunId = created.run_id;
     state.selectedRunHistoryId = created.run_id;
+    state.selectedAttachments = [];
+    renderAttachmentChips();
     state.lastSequence = 0;
     state.events = [];
     state.eventStreamIntegrityIssues = [];
@@ -3269,6 +3851,7 @@ async function previewArtifact(storageObjectId) {
         ? `Preview truncated at ${ARTIFACT_PREVIEW_MAX_CHARACTERS} characters`
         : "Preview loaded";
     renderArtifactPreview(storageObject, status, previewText || "(empty artifact)");
+    setArtifactPanelOpen(true);
     return true;
   } catch (error) {
     renderArtifactPreview(storageObject, error.message, "");
@@ -3439,6 +4022,155 @@ async function rejectRun() {
   await refreshRun();
 }
 
+elements.routeLinks.forEach((link) => {
+  link.addEventListener("click", (event) => {
+    if (link === elements.newChat) {
+      return;
+    }
+    event.preventDefault();
+    renderAppRoute(link.dataset.appRoute, true);
+  });
+});
+
+window.addEventListener("hashchange", () => {
+  renderAppRoute(routeFromHash(), false);
+});
+
+elements.routeSearch.addEventListener("input", () => {
+  renderRouteSearchResults(elements.routeSearch.value);
+});
+
+elements.routeSurface.addEventListener("click", (event) => {
+  const button = event.target?.closest?.("[data-route-action]");
+  if (button) {
+    handleRouteAction(button.dataset.routeAction);
+  }
+});
+
+elements.agentRunButtons.forEach((button) => {
+  button.addEventListener("click", () => {
+    prefillAgentRun(button.dataset.agentName || "selected");
+  });
+});
+
+elements.agentCarouselNext.addEventListener("click", () => {
+  const firstCard = elements.agentCardRail.firstElementChild;
+  if (firstCard) {
+    elements.agentCardRail.append(firstCard);
+  }
+});
+
+elements.createAgent.addEventListener("click", () => {
+  renderAppRoute("agents", true);
+});
+
+elements.createAgentPrompt.addEventListener("click", () => {
+  renderAppRoute("agents", true);
+});
+
+elements.exploreAgents.addEventListener("click", () => {
+  renderAppRoute("discover", true);
+});
+
+elements.modelSelectorButton.addEventListener("click", () => {
+  const next = state.activePopover === "model" ? null : "model";
+  setActivePopover(next, elements.modelSelectorButton);
+});
+
+elements.modelOptions.forEach((button) => {
+  button.addEventListener("click", () => {
+    setSelectedModel(button.dataset.modelOption);
+    closeActivePopover(true);
+  });
+});
+
+elements.composerAddButton.addEventListener("click", () => {
+  const next = state.activePopover === "add" ? null : "add";
+  setActivePopover(next, elements.composerAddButton);
+});
+
+elements.addCommands.forEach((button) => {
+  button.addEventListener("click", () => handleAddCommand(button.dataset.addCommand));
+});
+
+elements.filesDialogOpeners.forEach((button) => {
+  button.addEventListener("click", () => openFilesDialog());
+});
+
+elements.filesSearch.addEventListener("input", () => renderFilesDialog());
+elements.filesList.addEventListener("change", (event) => {
+  const target = event.target;
+  if (!target || target.type !== "checkbox") {
+    return;
+  }
+  if (target.checked) {
+    state.filesDialogSelection.add(target.value);
+  } else {
+    state.filesDialogSelection.delete(target.value);
+  }
+  updateFilesSelectionStatus();
+});
+elements.filesConfirm.addEventListener("click", () => confirmFilesSelection());
+elements.filesDialog.addEventListener("close", () => {
+  state.filesDialogSelection = new Set();
+});
+
+elements.composerFileInput.addEventListener("change", () => {
+  const count = elements.composerFileInput.files?.length || 0;
+  openFilesDialog();
+  if (count) {
+    elements.filesSelectionStatus.textContent =
+      `${count} local file${count === 1 ? "" : "s"} selected. Direct upload requires the upcoming Conversation attachment API.`;
+  }
+  elements.composerFileInput.value = "";
+});
+
+elements.attachmentChips.addEventListener("click", (event) => {
+  const target = event.target;
+  const button = target?.closest?.("[data-remove-attachment-id]");
+  if (!button) {
+    return;
+  }
+  state.selectedAttachments = state.selectedAttachments.filter(
+    (attachment) => attachment.id !== button.dataset.removeAttachmentId,
+  );
+  renderAttachmentChips();
+});
+
+elements.artifactPanelClose.addEventListener("click", () => {
+  setArtifactPanelOpen(false);
+});
+elements.operationsOpeners.forEach((button) => {
+  button.addEventListener("click", () => setOperationsOpen(true));
+});
+elements.operationsClose.addEventListener("click", () => setOperationsOpen(false));
+elements.sidebarCollapse.addEventListener("click", () => {
+  setSidebarCollapsed(!state.sidebarCollapsed);
+});
+elements.newChat.addEventListener("click", () => startNewChat());
+
+document.addEventListener("click", (event) => {
+  if (!state.activePopover) {
+    return;
+  }
+  const target = event.target;
+  const activeMenu =
+    state.activePopover === "model" ? elements.modelSelectorMenu : elements.composerAddMenu;
+  const activeButton =
+    state.activePopover === "model" ? elements.modelSelectorButton : elements.composerAddButton;
+  if (activeMenu.contains(target) || activeButton.contains(target)) {
+    return;
+  }
+  closeActivePopover(false);
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && state.activePopover) {
+    event.preventDefault();
+    closeActivePopover(true);
+  }
+});
+
 document.querySelectorAll("[data-prompt]").forEach((button) => {
   button.addEventListener("click", () => {
     elements.input.value = button.dataset.prompt || "";
@@ -3453,7 +4185,10 @@ elements.workbenchViewToggles.forEach((button) => {
   });
 });
 
-elements.input.addEventListener("input", fitComposer);
+elements.input.addEventListener("input", () => {
+  fitComposer();
+  syncComposerState();
+});
 elements.input.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();

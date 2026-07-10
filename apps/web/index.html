@@ -11,75 +11,258 @@
     <link rel="stylesheet" href="./assets/styles.css" />
   </head>
   <body>
-    <div class="workspace-shell" data-app="taroai-workspace">
-      <aside class="rail" aria-label="Workspace navigation">
-        <div class="brand-mark" aria-label="Taroai">T</div>
-        <nav class="rail-nav" aria-label="Primary">
-          <button class="rail-button is-active" type="button" title="Chat" aria-label="Chat">
-            <span aria-hidden="true">⌁</span>
+    <div class="workspace-shell" data-app="taroai-workspace" data-chat-state="empty">
+      <a class="skip-link" href="#main-content">Skip to main content</a>
+
+      <aside
+        class="app-sidebar"
+        data-testid="app-sidebar"
+        aria-label="Main navigation"
+      >
+        <header class="sidebar-brand">
+          <a class="brand-wordmark" href="#chat" aria-label="Taroai chat" data-app-route="chat">TAROAI</a>
+          <button
+            class="icon-button sidebar-collapse"
+            type="button"
+            aria-label="Collapse sidebar"
+            data-sidebar-collapse
+          >
+            <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="2"></rect><path d="M9 5v14m6-10-3 3 3 3"></path></svg>
           </button>
-          <button class="rail-button" type="button" title="Runs" aria-label="Runs">
-            <span aria-hidden="true">▦</span>
+        </header>
+
+        <nav class="sidebar-primary" aria-label="Main">
+          <button class="sidebar-item is-active" type="button" aria-label="New chat" data-new-chat data-app-route="chat">
+            <span class="nav-icon nav-icon-dark" aria-hidden="true">+</span>
+            <span>New chat</span>
           </button>
-          <button class="rail-button" type="button" title="Artifacts" aria-label="Artifacts">
-            <span aria-hidden="true">◫</span>
+          <button class="sidebar-item" type="button" aria-label="Search" data-app-route="search">
+            <span class="nav-icon" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="5.5"></circle><path d="m15 15 4 4"></path></svg></span>
+            <span>Search</span>
           </button>
         </nav>
+
+        <nav class="sidebar-secondary" aria-label="Secondary">
+          <a class="sidebar-item" href="#discover" data-app-route="discover"><span class="nav-icon" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"></circle><path d="m14.5 9.5-1.6 3.4-3.4 1.6 1.6-3.4z"></path></svg></span><span>Discover</span></a>
+          <a class="sidebar-item" href="#feed" data-app-route="feed"><span class="nav-icon" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24"><rect x="5" y="4" width="14" height="16" rx="2"></rect><path d="M8 8h8M8 12h8M8 16h5"></path></svg></span><span>Feed</span></a>
+          <a class="sidebar-item" href="#agents" data-app-route="agents"><span class="nav-icon" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="7"></circle><path d="M12 8v8M8 12h8"></path></svg></span><span>Agents</span></a>
+          <a class="sidebar-item" href="#workspaces" data-app-route="workspaces"><span class="nav-icon" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24"><path d="m13 3-7 10h6l-1 8 7-11h-6z"></path></svg></span><span>Workspaces</span></a>
+          <a class="sidebar-item" href="#files" data-app-route="files"><span class="nav-icon" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24"><path d="M4 9h16l-1.5 9h-13zM7 9l1.5-3h7L17 9"></path></svg></span><span>Files</span></a>
+          <button class="sidebar-item" type="button" data-app-route="brain">
+            <span class="nav-icon" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24"><path d="M8 5C6 5 5 6.5 5 8.5S6 12 8 12c-2 0-3 1.5-3 3.5S6 19 8 19M16 5c2 0 3 1.5 3 3.5S18 12 16 12c2 0 3 1.5 3 3.5S18 19 16 19M10 7v10M14 7v10"></path></svg></span>
+            <span>Agent Brain</span>
+            <span class="sidebar-chevron" aria-hidden="true">›</span>
+          </button>
+        </nav>
+
+        <section class="sidebar-recents" data-testid="run-history" aria-label="Run history">
+          <div class="sidebar-section-heading">
+            <h2>Recents</h2>
+            <button class="icon-button" data-run-history-refresh type="button" title="Refresh runs" aria-label="Refresh runs">↻</button>
+          </div>
+          <div class="run-history-status visually-hidden" data-run-history-status>No runs loaded</div>
+          <ul class="run-history-list" data-run-history-list><li>No runs.</li></ul>
+        </section>
+
+        <footer class="sidebar-footer">
+          <button class="sidebar-rewards" type="button" data-app-route="rewards">
+            <span class="reward-icon" aria-hidden="true">♧</span>
+            <span><strong>Rewards</strong><small>Refer friends, earn credits</small></span>
+            <span aria-hidden="true">›</span>
+          </button>
+          <div class="sidebar-account-row">
+            <button class="sidebar-account" type="button" aria-label="User menu">
+              <span class="account-avatar" aria-hidden="true">O</span>
+              <span><strong>owner@example.com</strong><small>Free</small></span>
+            </button>
+            <button class="icon-button sidebar-ops-launch" type="button" aria-label="Open Operations" data-open-operations>⌘</button>
+          </div>
+        </footer>
       </aside>
 
-      <main class="chat-column" data-testid="chat-column" aria-label="Agent chat">
-        <div class="chat-topbar">
-          <div>
-            <p class="eyebrow">Enterprise Agent Workspace</p>
-            <h1>How can I help, luke?</h1>
-          </div>
-          <div class="status-pill" data-status-pill>Idle</div>
-        </div>
-
-        <div class="conversation" data-testid="conversation-log" aria-live="polite">
-          <article class="message message-agent">
-            <p>
-              Start a governed run. I will stream timeline events, terminal output,
-              approvals, and artifacts from the Taroai backend.
-            </p>
-          </article>
-        </div>
-
-        <div class="quick-row" aria-label="Task shortcuts">
-          <button type="button" data-prompt="Generate a hello report in the sandbox.">
-            Hello report
-          </button>
-          <button type="button" data-prompt="Inspect the latest run events and summarize blockers.">
-            Run review
-          </button>
-          <button type="button" data-prompt="Create a concise artifact from the sandbox output.">
-            Artifact pass
-          </button>
-        </div>
-
-        <div class="composer-shell">
-          <div class="composer-row">
-            <textarea
-              id="composer-input"
-              rows="1"
-              placeholder="Ask Taroai to execute a task"
-              aria-label="Message"
-            ></textarea>
-            <button id="send-button" class="send-button" type="button" aria-label="Send">
-              <span aria-hidden="true">↵</span>
+      <main id="main-content" class="chat-column" data-testid="chat-column" aria-label="Agent chat">
+        <header class="chat-topbar">
+          <div class="model-selector">
+            <button
+              id="model-selector-button"
+              class="model-selector-button"
+              type="button"
+              aria-haspopup="menu"
+              aria-controls="model-selector-menu"
+              aria-expanded="false"
+            >
+              <span class="model-spark" aria-hidden="true">✹</span>
+              <span data-selected-model>Claude Sonnet 5</span>
+              <span aria-hidden="true">⌄</span>
             </button>
+            <div id="model-selector-menu" class="composer-popover model-menu" role="menu" aria-label="Choose a model" hidden>
+              <p class="menu-group-label">Anthropic</p>
+              <button class="model-option" type="button" role="menuitem" disabled aria-disabled="true">
+                <span class="model-mark" aria-hidden="true">✹</span>
+                <span><strong>Claude Fable 5</strong><small>Requires paid plan</small></span>
+                <span aria-hidden="true">ⓘ</span>
+              </button>
+              <button class="model-option is-selected" type="button" role="menuitemradio" aria-checked="true" data-model-option="Claude Sonnet 5">
+                <span class="model-mark" aria-hidden="true">✹</span>
+                <span><strong>Claude Sonnet 5 <em>NEW</em></strong><small>Everyday coding, agents, and professional work.</small></span>
+                <span class="effort-chip">Low ›</span><span aria-hidden="true">✓</span>
+              </button>
+              <button class="model-option" type="button" role="menuitem" disabled aria-disabled="true">
+                <span class="model-mark" aria-hidden="true">✹</span>
+                <span><strong>Claude Opus 4.8</strong><small>Requires paid plan</small></span>
+                <span aria-hidden="true">ⓘ</span>
+              </button>
+              <button class="model-option" type="button" role="menuitemradio" aria-checked="false" data-model-option="Claude Haiku 4.5">
+                <span class="model-mark" aria-hidden="true">✹</span>
+                <span><strong>Claude Haiku 4.5</strong><small>Quick replies and light tasks.</small></span>
+                <span class="effort-chip">Low ›</span>
+              </button>
+              <button class="model-version-row" type="button" role="menuitem"><span aria-hidden="true">›</span> Older versions</button>
+              <div class="menu-separator"></div>
+              <p class="menu-group-label">Google</p>
+              <button class="model-option" type="button" role="menuitemradio" aria-checked="false" data-model-option="Gemini 3.1 Pro">
+                <span class="model-mark" aria-hidden="true">✦</span>
+                <span><strong>Gemini 3.1 Pro</strong><small>Big-picture reasoning over long documents.</small></span><span aria-hidden="true">ⓘ</span>
+              </button>
+              <button class="model-option" type="button" role="menuitemradio" aria-checked="false" data-model-option="Gemini 3.5 Flash">
+                <span class="model-mark" aria-hidden="true">✦</span>
+                <span><strong>Gemini 3.5 Flash <em>NEW</em></strong><small>Fast, high-volume agentic work.</small></span><span aria-hidden="true">ⓘ</span>
+              </button>
+              <div class="menu-separator"></div>
+              <p class="menu-group-label">OpenAI</p>
+              <button class="model-option" type="button" role="menuitemradio" aria-checked="false" data-model-option="GPT-5.6 Sol">
+                <span class="model-mark" aria-hidden="true">◉</span>
+                <span><strong>GPT-5.6 Sol <em>NEW</em></strong><small>Rigorous coding and step-by-step reasoning.</small></span>
+                <span class="effort-chip">Low ›</span>
+              </button>
+              <button class="model-option" type="button" role="menuitemradio" aria-checked="false" data-model-option="GPT-5.6 Terra">
+                <span class="model-mark" aria-hidden="true">◉</span>
+                <span><strong>GPT-5.6 Terra <em>NEW</em></strong><small>Rigorous coding and step-by-step reasoning.</small></span>
+                <span class="effort-chip">Low ›</span>
+              </button>
+              <button class="model-option" type="button" role="menuitemradio" aria-checked="false" data-model-option="GPT-5.6 Luna"><span class="model-mark" aria-hidden="true">◉</span><span><strong>GPT-5.6 Luna <em>NEW</em></strong><small>Rigorous coding and step-by-step reasoning.</small></span><span class="effort-chip">Low ›</span></button>
+              <button class="model-option" type="button" role="menuitemradio" aria-checked="false" data-model-option="GPT-5.5"><span class="model-mark" aria-hidden="true">◉</span><span><strong>GPT-5.5 <em>NEW</em></strong><small>Balanced reasoning and throughput.</small></span><span class="effort-chip">Low ›</span></button>
+              <div class="menu-separator"></div>
+              <p class="menu-group-label">Sakana</p>
+              <button class="model-option" type="button" role="menuitem" disabled aria-disabled="true"><span class="model-mark" aria-hidden="true">S</span><span><strong>Fugu Ultra</strong><small>Requires paid plan</small></span><span aria-hidden="true">ⓘ</span></button>
+              <div class="menu-separator"></div>
+              <p class="menu-group-label">Z.AI</p>
+            </div>
+          </div>
+
+          <div class="chat-topbar-actions">
+            <span class="status-pill" data-status-pill>Upgrade</span>
+            <button class="topbar-pill" type="button" data-open-operations>Operations</button>
+            <button class="topbar-action" type="button" data-open-files-dialog>Files</button>
+            <button class="topbar-action" type="button" disabled title="Thread sharing is not available yet">Share</button>
+          </div>
+        </header>
+
+        <section class="product-route" data-testid="product-route" aria-live="polite" hidden>
+          <header class="product-route-header">
+            <p data-route-eyebrow>Taroai</p>
+            <h1 data-route-title>Workspace</h1>
+            <p data-route-description></p>
+          </header>
+          <div class="product-route-search" data-route-search-shell hidden>
+            <label for="global-route-search">Search chats, agents, workspaces, and files</label>
+            <input id="global-route-search" type="search" data-route-search placeholder="Search Taroai" autocomplete="off" />
+            <div class="product-route-search-results" data-route-search-results></div>
+          </div>
+          <div class="product-route-grid" data-route-cards></div>
+        </section>
+
+        <div class="chat-scroll-region">
+          <section class="chat-empty-state" data-testid="chat-empty-state"><h1>How can I help, luke?</h1></section>
+          <div class="conversation" data-testid="conversation-log" aria-live="polite">
+            <article class="message message-agent"><p>Start a governed run. I will stream timeline events, terminal output, approvals, and artifacts from the Taroai backend.</p></article>
+            <div class="quick-row" aria-label="Suggested follow-ups">
+              <button type="button" data-prompt="Generate a hello report in the sandbox.">Generate a hello report</button>
+              <button type="button" data-prompt="Inspect the latest run events and summarize blockers.">Review the current run</button>
+              <button type="button" data-prompt="Create a concise artifact from the sandbox output.">Create an artifact</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="composer-shell" data-testid="chat-composer">
+          <div class="composer-surface">
+            <div class="composer-row">
+              <textarea id="composer-input" rows="1" placeholder="Ask anything... Type @ to mention skills or connectors, or / for commands" aria-label="Message"></textarea>
+            </div>
+            <div class="composer-actions">
+              <div class="composer-action-group">
+                <button id="composer-add-button" class="composer-icon-button" type="button" aria-label="Add files, create media, and more" aria-haspopup="menu" aria-controls="composer-add-menu" aria-expanded="false"><span aria-hidden="true">+</span></button>
+                <input id="composer-file-input" type="file" multiple hidden />
+                <div data-attachment-chips class="attachment-chips" aria-live="polite"></div>
+              </div>
+              <div class="composer-action-group">
+                <button class="composer-icon-button" type="button" aria-label="Voice input" title="Voice input is not available yet">
+                  <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="12" rx="3"></rect><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3"></path></svg>
+                </button>
+                <button id="send-button" class="send-button" type="button" aria-label="Send message" disabled>
+                  <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M6.5 10.5 12 5l5.5 5.5"></path></svg>
+                </button>
+              </div>
+            </div>
+            <div id="composer-add-menu" class="composer-popover add-menu" role="menu" aria-label="Add content" hidden>
+              <button type="button" role="menuitem" data-add-command="files"><span aria-hidden="true">⌕</span>Add files or photos</button>
+              <button type="button" role="menuitem" data-add-command="drive"><span aria-hidden="true">△</span>Add from Google Drive</button>
+              <div class="menu-separator"></div>
+              <button type="button" role="menuitem" data-add-command="image"><span aria-hidden="true">▧</span>Create image</button>
+              <button type="button" role="menuitem" data-add-command="video"><span aria-hidden="true">▥</span>Create video</button>
+              <button type="button" role="menuitem" data-add-command="voice"><span aria-hidden="true">≋</span>Create voice</button>
+              <div class="menu-separator"></div>
+              <button type="button" role="menuitem" data-add-command="connectors"><span aria-hidden="true">⌁</span>Add connectors</button>
+              <button type="button" role="menuitem" data-add-command="browser"><span aria-hidden="true">◎</span>Browser use <span aria-hidden="true">›</span></button>
+              <div class="menu-separator"></div>
+              <button type="button" role="menuitem" data-add-command="workflow"><span aria-hidden="true">⌘</span>Run a workflow</button>
+              <button type="button" role="menuitem" data-add-command="slides"><span aria-hidden="true">▱</span>Create slide deck</button>
+            </div>
           </div>
           <div class="composer-hint">
-            Press Enter to send, Shift+Enter for a new line.
+            <span class="visually-hidden">Press Enter to send, Shift+Enter for a new line.</span>
+            <button type="button" class="create-agent-prompt" data-create-agent-prompt><span aria-hidden="true">⌘</span><span>Go beyond prompts — create an agent and build systems</span></button>
+            <button type="button" class="create-agent-button" data-create-agent><span class="sparkle-icon" aria-hidden="true">✣</span> Create an agent</button>
           </div>
         </div>
+
+        <section class="popular-agents" aria-label="Homepage agents">
+          <header class="popular-agents-header">
+            <div><h2><span aria-hidden="true">↳</span> Popular agents</h2><p>Ready-made AI workflows — run instantly or schedule to save time on repeat work.</p></div>
+            <button type="button" data-explore-agents>Explore <span aria-hidden="true">→</span></button>
+          </header>
+          <div class="agent-card-rail">
+            <article class="agent-card"><header><span class="agent-card-art" aria-hidden="true">⌁</span><h3>Case Study Writer</h3></header><div class="agent-connectors"><span>Gmail</span><span>Docs</span></div><p>Transforms a customer interview or win report into a polished, SEO-optimized case study.</p><footer><button type="button" data-agent-prompt data-agent-name="Case Study Writer">Run agent</button><span>⌁ 2.0k</span><span>♡ 1.5k</span></footer></article>
+            <article class="agent-card"><header><span class="agent-card-art" aria-hidden="true">◇</span><h3>Product Description Writer</h3></header><div class="agent-connectors"><span>Gmail</span><span>Sheets</span></div><p>Writes SEO-optimized product descriptions for any SKU in your brand voice.</p><footer><button type="button" data-agent-prompt data-agent-name="Product Description Writer">Run agent</button><span>⌁ 1.9k</span><span>♡ 514</span></footer></article>
+            <article class="agent-card"><header><span class="agent-card-art" aria-hidden="true">◫</span><h3>Cash Flow Forecaster</h3></header><div class="agent-connectors"><span>Gmail</span><span>Sheets</span></div><p>Builds a rolling 13-week cash flow forecast from your actuals and commitments.</p><footer><button type="button" data-agent-prompt data-agent-name="Cash Flow Forecaster">Run agent</button><span>⌁ 1.8k</span><span>♡ 1.4k</span></footer></article>
+          </div>
+          <button class="agent-card-next" type="button" aria-label="Show next agents" data-agent-carousel-next>›</button>
+        </section>
       </main>
 
       <aside
-        class="workbench"
-        data-testid="workspace-workbench"
-        aria-label="Run workspace"
+        class="workspace-sidecar"
+        data-testid="artifact-panel"
+        aria-labelledby="artifact-panel-title"
+        data-workspace-sidecar
       >
+        <header class="artifact-panel-header">
+          <div>
+            <span class="panel-kicker">Output</span>
+            <h2 id="artifact-panel-title">Artifacts</h2>
+          </div>
+          <button class="icon-button" type="button" aria-label="Close artifact panel" data-artifact-panel-close>×</button>
+        </header>
+        <div class="operations-drawer" data-testid="operations-drawer">
+          <header class="operations-header">
+            <div><span class="panel-kicker">Workspace</span><h2>Operations</h2></div>
+            <button class="icon-button" type="button" aria-label="Close operations" data-operations-close>×</button>
+          </header>
+          <aside
+            class="workbench"
+            data-testid="workspace-workbench"
+            aria-label="Run workspace"
+          >
         <div
           class="workbench-view-switcher"
           data-testid="workspace-view-switcher"
@@ -309,26 +492,6 @@
               <dd data-event-integrity-closure>--</dd>
             </div>
           </dl>
-        </section>
-        </div>
-
-        <div class="workbench-view" data-workbench-view="inspect" hidden>
-        <section class="panel run-history" data-testid="run-history" aria-label="Run history">
-          <div class="panel-header">
-            <h2>Run History</h2>
-            <button
-              data-run-history-refresh
-              type="button"
-              title="Refresh runs"
-              aria-label="Refresh runs"
-            >
-              ↻
-            </button>
-          </div>
-          <div class="run-history-status" data-run-history-status>No runs loaded</div>
-          <ul class="run-history-list" data-run-history-list>
-            <li>No runs.</li>
-          </ul>
         </section>
         </div>
 
@@ -744,8 +907,49 @@
           </div>
         </section>
         </div>
+          </aside>
+        </div>
       </aside>
     </div>
+
+    <dialog id="files-dialog" class="files-dialog" aria-labelledby="files-dialog-title">
+      <form method="dialog" class="files-dialog-shell">
+        <header class="files-dialog-header">
+          <h2 id="files-dialog-title">Chat files</h2>
+          <button class="icon-button" type="submit" value="cancel" aria-label="Close" data-files-dialog-close>×</button>
+        </header>
+        <div class="files-dialog-toolbar">
+          <label>
+            <span class="visually-hidden">Source</span>
+            <select aria-label="Source" autofocus><option>All sources</option><option>Uploads</option><option>Artifacts</option></select>
+          </label>
+          <label>
+            <span class="visually-hidden">Type</span>
+            <select aria-label="Type"><option>All</option><option>Documents</option><option>Data</option></select>
+          </label>
+          <label class="visually-hidden">
+            <span>Search files</span>
+            <input type="search" data-files-search placeholder="Search files" />
+          </label>
+          <div class="files-view-actions" aria-label="File view">
+            <button class="icon-button is-active" type="button" aria-label="Switch to list view">☷</button>
+            <button class="icon-button" type="button" aria-label="Switch to grid view">▦</button>
+          </div>
+        </div>
+        <label class="files-all-toggle"><input type="checkbox" /> <span>Show all files (include scripts &amp; intermediate data)</span></label>
+        <div class="files-dialog-content" data-files-list>
+          <div class="files-empty-state" data-files-empty>
+            <span class="files-empty-icon" aria-hidden="true">▧</span>
+            <p>No files yet</p>
+            <small>Files generated or uploaded will appear here.</small>
+          </div>
+        </div>
+        <footer class="files-dialog-footer">
+          <span data-files-selection-status>No files selected</span>
+          <button class="files-confirm" type="button" data-files-confirm disabled>Add selected</button>
+        </footer>
+      </form>
+    </dialog>
 
     <script src="./assets/main.js" type="module"></script>
   </body>
