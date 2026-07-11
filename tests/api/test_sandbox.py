@@ -956,7 +956,9 @@ def test_app_default_runtime_registers_browser_tool_gateway_handler():
 
     assert result.tool_name == "browser.action"
     assert result.output["action_type"] == "screenshot"
-    assert result.output["screenshot_uri"].endswith(f"/browser/{session.session_id}.png")
+    assert result.output["screenshot_uri"].endswith(
+        f"/browser/{session.session_id}.png"
+    )
 
 
 def test_sandbox_api_creates_session_and_executes_command_tenant_scoped():
@@ -1736,7 +1738,8 @@ def test_browser_api_applies_actions_with_permissions_audit_and_billing():
     assert navigation.json()["current_url"] == "https://example.com"
     assert typed.status_code == 200
     assert screenshot.status_code == 200
-    assert screenshot.json()["screenshot_uri"].endswith(f"/browser/{session['id']}.png")
+    assert "/browser/storage_" in screenshot.json()["screenshot_uri"]
+    assert screenshot.json()["screenshot_uri"].endswith(f"/{session['id']}.png")
     screenshot_objects = [
         storage_object
         for storage_object in storage_objects.json()

@@ -133,11 +133,16 @@ class MigrationRunner(BaseModel):
         translated = translated.replace("DEFAULT now()", "DEFAULT CURRENT_TIMESTAMP")
         translated = translated.replace("DEFAULT '{}'::jsonb", "DEFAULT '{}'")
         translated = translated.replace("DEFAULT '[]'::jsonb", "DEFAULT '[]'")
-        translated = re.sub(r"REFERENCES [A-Za-z_]+\([^)]*\)", "", translated)
+        translated = re.sub(
+            r"REFERENCES\s+[A-Za-z_]+\s*\([^)]*\)(?:\s+ON\s+DELETE\s+[A-Za-z]+)?",
+            "",
+            translated,
+            flags=re.IGNORECASE,
+        )
         translated = "\n".join(
             line
             for line in translated.splitlines()
-            if not line.strip().startswith("FOREIGN KEY")
+            if not line.strip().startswith(("FOREIGN KEY", "REFERENCES", "ON DELETE"))
         )
         translated = re.sub(r",\s*\)", "\n)", translated)
         return translated
@@ -151,23 +156,29 @@ class MigrationRunner(BaseModel):
             except Exception as error:
                 connection.execute("ROLLBACK TO SAVEPOINT taroai_migration_statement")
                 connection.execute("RELEASE SAVEPOINT taroai_migration_statement")
-                if self._is_skippable_column_add_error(statement, error):
+                if self._is_skippable_partial_schema_error(statement, error):
                     continue
                 raise
 
-    def _is_skippable_column_add_error(self, statement: str, error: Exception) -> bool:
+    def _is_skippable_partial_schema_error(self, statement: str, error: Exception) -> bool:
         normalized = " ".join(statement.lower().split())
         error_text = str(error).lower()
         error_sqlstate = getattr(error, "sqlstate", "")
-        return (
+        duplicate_column = (
             normalized.startswith("alter table")
             and " add column " in normalized
             and (
                 "duplicate column name" in error_text
                 or "already exists" in error_text
-                or "no such table" in error_text
-                or "does not exist" in error_text
                 or error_sqlstate == "42701"
-                or error_sqlstate == "42P01"
             )
         )
+        missing_sqlite_upgrade_table = (
+            self.config.dialect == "sqlite"
+            and (
+                "no such table" in error_text
+                or "no such column" in error_text
+            )
+            and normalized.startswith(("alter table", "update ", "create index"))
+        )
+        return duplicate_column or missing_sqlite_upgrade_table

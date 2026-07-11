@@ -183,7 +183,7 @@ def test_sql_repository_lists_runs_with_filters(tmp_path: Path):
     repository.create_run(
         tenant_id="tenant_other",
         user_id="user_2",
-        payload=RunCreate(workspace_id="workspace_sales", message="Other tenant run."),
+        payload=RunCreate(workspace_id="workspace_other", message="Other tenant run."),
     )
     repository.update_run_status("tenant_acme", ops.id, RunStatus.FAILED)
 
@@ -215,11 +215,11 @@ def test_billing_meters_support_cursor_page_response_when_requested():
         headers=headers,
         json={"workspace_id": "workspace_sales", "message": "Second run."},
     ).json()
-    other = client.post(
-        "/api/runs",
-        headers={"X-Tenant-ID": "tenant_other", "X-User-ID": "user_2"},
-        json={"workspace_id": "workspace_sales", "message": "Other tenant run."},
-    ).json()
+    other = store.create_run(
+        "tenant_other",
+        "user_2",
+        RunCreate(workspace_id="workspace_other", message="Other tenant run."),
+    )
     store.record_billing_meter(
         tenant_id="tenant_acme",
         run_id=second["run_id"],
@@ -229,7 +229,7 @@ def test_billing_meters_support_cursor_page_response_when_requested():
     )
     store.record_billing_meter(
         tenant_id="tenant_other",
-        run_id=other["run_id"],
+        run_id=other.id,
         meter_type="storage_bytes",
         quantity=256,
         unit="bytes",
@@ -268,11 +268,11 @@ def test_audit_events_support_cursor_page_response_when_requested():
         headers=headers,
         json={"workspace_id": "workspace_ops", "message": "Second run."},
     ).json()
-    other = client.post(
-        "/api/runs",
-        headers={"X-Tenant-ID": "tenant_other", "X-User-ID": "user_2"},
-        json={"workspace_id": "workspace_sales", "message": "Other tenant run."},
-    ).json()
+    other = store.create_run(
+        "tenant_other",
+        "user_2",
+        RunCreate(workspace_id="workspace_other", message="Other tenant run."),
+    )
     store.record_audit_event(
         tenant_id="tenant_acme",
         workspace_id="workspace_ops",
@@ -283,9 +283,9 @@ def test_audit_events_support_cursor_page_response_when_requested():
     )
     store.record_audit_event(
         tenant_id="tenant_other",
-        workspace_id="workspace_sales",
+        workspace_id="workspace_other",
         user_id="user_2",
-        run_id=other["run_id"],
+        run_id=other.id,
         event_type="storage.uploaded",
         metadata={"storage_object_id": "storage_456"},
     )

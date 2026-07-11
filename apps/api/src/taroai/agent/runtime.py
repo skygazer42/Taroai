@@ -2139,7 +2139,10 @@ class AgentRuntime(BaseModel):
             references = [item for item in run.resource_refs if item.type == "agent"]
             agent_id = references[0].id if references else run.agent_id
             if agent_id:
-                definition = self.agent_registry.get(run.tenant_id, agent_id)
+                try:
+                    definition = self.agent_registry.get(run.tenant_id, agent_id)
+                except NotFoundError:
+                    return {}
                 version_number = (
                     int(references[0].version)
                     if references and references[0].version

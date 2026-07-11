@@ -1727,7 +1727,27 @@ def create_app(
     def execute_chat_run_chain(tenant_id: str, run_id: str) -> None:
         current_run_id = run_id
         for _ in range(100):
-            state = app.state.runtime.execute_run(tenant_id, current_run_id)
+            try:
+                state = app.state.runtime.execute_run(tenant_id, current_run_id)
+            except Exception as error:
+                failed_run = app.state.store.get_run(tenant_id, current_run_id)
+                if failed_run.status not in {
+                    RunStatus.SUCCEEDED,
+                    RunStatus.FAILED,
+                    RunStatus.CANCELLED,
+                    RunStatus.TIMED_OUT,
+                }:
+                    failed_run = app.state.store.update_run_status(
+                        tenant_id,
+                        current_run_id,
+                        RunStatus.FAILED,
+                    )
+                    app.state.store.append_run_event(
+                        failed_run,
+                        "run.failed",
+                        {"reason": "runtime_execution_error", "error_type": error.__class__.__name__},
+                    )
+                return
             current_run = app.state.store.get_run(tenant_id, current_run_id)
             if current_run.thread_id is None or state.status not in {
                 RunStatus.SUCCEEDED,

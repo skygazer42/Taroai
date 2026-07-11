@@ -3043,19 +3043,11 @@ def test_local_cloud_poc_verification_rejects_workspace_without_login_contract()
 
 
 def test_local_cloud_poc_verification_rejects_workspace_without_readiness_contract():
+    default_client = RecordingHttpClient()
     client = RecordingHttpClient(
-        workspace_html=(
-            '<title>Taroai Workspace</title>'
-            '<main data-testid="chat-column">'
-            "How can I help, luke?"
-            "Press Enter to send, Shift+Enter for a new line."
-            "</main>"
-            '<input id="login-email" />'
-            '<input id="login-password" />'
-            '<button id="login-button">Login</button>'
-            '<button id="logout-button">Logout</button>'
-            '<span data-auth-status>No token</span>'
-            '<script src="./assets/main.js" type="module"></script>'
+        workspace_html=default_client.workspace_html.replace(
+            '<span data-readiness-status>Preflight unchecked</span>',
+            "",
         )
     )
     config = LocalCloudPocVerificationConfig(
@@ -3176,6 +3168,9 @@ def test_local_cloud_poc_verification_rejects_workspace_without_browser_storage_
         browser_base_url="http://browser.local",
         web_base_url="http://web.local",
         bootstrap_token="bootstrap_token",
+    )
+    client.workspace_html = RecordingHttpClient().workspace_html.replace(
+        '<span data-browser-storage-object>--</span>', ""
     )
 
     with pytest.raises(
@@ -3640,6 +3635,9 @@ def test_local_cloud_poc_verification_rejects_workspace_without_run_controls():
         web_base_url="http://web.local",
         bootstrap_token="bootstrap_token",
     )
+    client.workspace_html = RecordingHttpClient().workspace_html.replace(
+        'data-testid="run-controls"', ""
+    )
 
     with pytest.raises(
         RuntimeError,
@@ -3689,6 +3687,9 @@ def test_local_cloud_poc_verification_rejects_workspace_without_artifact_preview
         browser_base_url="http://browser.local",
         web_base_url="http://web.local",
         bootstrap_token="bootstrap_token",
+    )
+    client.workspace_html = RecordingHttpClient().workspace_html.replace(
+        "data-artifact-preview-status", ""
     )
 
     with pytest.raises(
@@ -4443,6 +4444,9 @@ def test_local_cloud_poc_verification_rejects_workspace_without_run_history():
         web_base_url="http://web.local",
         bootstrap_token="bootstrap_token",
     )
+    client.workspace_html = RecordingHttpClient().workspace_html.replace(
+        'data-testid="run-history"', ""
+    )
 
     with pytest.raises(
         RuntimeError,
@@ -4532,6 +4536,9 @@ def test_local_cloud_poc_verification_rejects_workspace_without_trace_panel():
         browser_base_url="http://browser.local",
         web_base_url="http://web.local",
         bootstrap_token="bootstrap_token",
+    )
+    client.workspace_html = RecordingHttpClient().workspace_html.replace(
+        'data-testid="run-trace"', ""
     )
 
     with pytest.raises(
@@ -4631,6 +4638,9 @@ def test_local_cloud_poc_verification_rejects_workspace_without_runtime_state():
         browser_base_url="http://browser.local",
         web_base_url="http://web.local",
         bootstrap_token="bootstrap_token",
+    )
+    client.workspace_html = RecordingHttpClient().workspace_html.replace(
+        'data-testid="runtime-state"', ""
     )
 
     with pytest.raises(

@@ -256,10 +256,10 @@ def test_release_package_builder_creates_clean_zip_with_generated_manifest(tmp_p
 
     image_names = {image["name"] for image in manifest["images"]}
     assert {"api", "worker", "browser-controller", "web"}.issubset(image_names)
-    assert len(manifest["migrations"]) == 32
+    assert len(manifest["migrations"]) == 39
     assert (
         manifest["migrations"][-1]["id"]
-        == "032_solution_pack_publication_draft_multi_manifest"
+        == "039_evaluation_runtime"
     )
 
     forbidden_exact = {".env", "a.md"}
@@ -2633,7 +2633,7 @@ def test_release_package_verifier_rejects_stale_upgrade_matrix(tmp_path: Path):
     assert report.upgrade_matrix_errors == [
         (
             "upgrade matrix must cover migration range "
-            "001_initial to 032_solution_pack_publication_draft_multi_manifest"
+            "001_initial to 039_evaluation_runtime"
         )
     ]
 
@@ -2796,6 +2796,7 @@ def test_verify_compose_strict_e2e_can_emit_install_validation_runtime_evidence(
     assert "TAROAI_RUNTIME_CLOSED_LOOP_EVIDENCE_PATH" in text
 
 
+@pytest.mark.skipif(os.name == "nt", reason="strict Compose shell gate requires POSIX executable semantics")
 def test_verify_compose_strict_e2e_requires_model_secret_when_env_file_is_used(
     tmp_path: Path,
 ):
@@ -2832,6 +2833,7 @@ def test_verify_compose_strict_e2e_requires_model_secret_when_env_file_is_used(
     assert "docker should not run" not in result.stderr
 
 
+@pytest.mark.skipif(os.name == "nt", reason="strict Compose shell gate requires POSIX executable semantics")
 def test_verify_compose_strict_e2e_rejects_secret_ref_only_model_config(
     tmp_path: Path,
 ):
@@ -2865,6 +2867,7 @@ def test_verify_compose_strict_e2e_rejects_secret_ref_only_model_config(
     assert "docker should not run" not in result.stderr
 
 
+@pytest.mark.skipif(os.name == "nt", reason="strict Compose shell gate requires POSIX executable semantics")
 def test_verify_compose_strict_e2e_rejects_provider_secret_ref_without_host_value(
     tmp_path: Path,
 ):

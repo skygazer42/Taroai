@@ -88,7 +88,7 @@ def test_s3_compatible_storage_uploads_downloads_and_builds_signed_url():
     assert client.put_calls == [
         {
             "Bucket": "taroai-artifacts",
-            "Key": "tenant_acme/workspace_sales/runs/run_123/artifacts/agent-result.md",
+            "Key": f"tenant_acme/workspace_sales/runs/run_123/artifacts/{storage_object.id}/agent-result.md",
             "Body": b"# result",
             "ContentType": "text/markdown",
             "Metadata": {
@@ -102,14 +102,14 @@ def test_s3_compatible_storage_uploads_downloads_and_builds_signed_url():
     assert client.get_calls == [
         {
             "Bucket": "taroai-artifacts",
-            "Key": "tenant_acme/workspace_sales/runs/run_123/artifacts/agent-result.md",
+            "Key": f"tenant_acme/workspace_sales/runs/run_123/artifacts/{storage_object.id}/agent-result.md",
         }
     ]
     assert signed_url.method == "GET"
     assert signed_url.expires_at == now + timedelta(seconds=900)
     assert signed_url.url == (
         "https://storage.example.com/taroai-artifacts/"
-        "tenant_acme/workspace_sales/runs/run_123/artifacts/agent-result.md?signed=1"
+        f"tenant_acme/workspace_sales/runs/run_123/artifacts/{storage_object.id}/agent-result.md?signed=1"
     )
     assert "minio_secret" not in signed_url.url
     assert client.presign_calls[0]["ClientMethod"] == "get_object"
@@ -144,7 +144,7 @@ def test_s3_compatible_storage_deletes_object_by_bucket_and_key():
     assert client.delete_calls == [
         {
             "Bucket": "taroai-artifacts",
-            "Key": "tenant_acme/workspace_sales/runs/run_123/artifacts/agent-result.md",
+            "Key": f"tenant_acme/workspace_sales/runs/run_123/artifacts/{storage_object.id}/agent-result.md",
         }
     ]
 

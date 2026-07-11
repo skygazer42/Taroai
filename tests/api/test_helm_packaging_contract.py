@@ -178,7 +178,7 @@ def test_helm_templates_cover_runtime_components_without_secret_literals():
         "templates/hpa.yaml",
     }
     assert {
-        str(path.relative_to(CHART_DIR))
+        path.relative_to(CHART_DIR).as_posix()
         for path in CHART_DIR.glob("templates/*")
         if path.is_file()
     } == expected_templates

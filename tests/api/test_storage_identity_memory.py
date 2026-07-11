@@ -62,7 +62,10 @@ def test_storage_catalog_builds_tenant_scoped_object_keys():
         )
     )
 
-    assert stored.uri == "s3://taroai-artifacts/tenant_acme/workspace_sales/runs/run_123/artifacts/agent-result.md"
+    assert stored.uri == (
+        "s3://taroai-artifacts/tenant_acme/workspace_sales/runs/run_123/"
+        f"artifacts/{stored.id}/agent-result.md"
+    )
     assert catalog.list_for_run("tenant_acme", "run_123") == [stored]
     assert catalog.list_for_run("tenant_other", "run_123") == []
 
@@ -126,15 +129,19 @@ def test_storage_catalog_lists_active_objects_by_tenant_workspace_and_run_scope(
     )
     catalog.mark_deleted("tenant_acme", deleted_object.id, utc_now())
 
-    assert catalog.list_active("tenant_acme") == [
-        sales_run_object,
-        sales_internal_object,
-        support_object,
-    ]
-    assert catalog.list_active("tenant_acme", workspace_id="workspace_sales") == [
-        sales_run_object,
-        sales_internal_object,
-    ]
+    expected_active = sorted(
+        [sales_run_object, sales_internal_object, support_object],
+        key=lambda storage_object: (storage_object.created_at, storage_object.id),
+    )
+    expected_sales = sorted(
+        [sales_run_object, sales_internal_object],
+        key=lambda storage_object: (storage_object.created_at, storage_object.id),
+    )
+    assert catalog.list_active("tenant_acme") == expected_active
+    assert (
+        catalog.list_active("tenant_acme", workspace_id="workspace_sales")
+        == expected_sales
+    )
     assert catalog.list_active("tenant_acme", run_id="run_123") == [sales_run_object]
     assert catalog.list_active("tenant_other") != catalog.list_active("tenant_acme")
 

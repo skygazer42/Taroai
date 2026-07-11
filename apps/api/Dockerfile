@@ -17,7 +17,9 @@ COPY src /app/src
 COPY migrations /app/migrations
 COPY entrypoint.sh /app/entrypoint.sh
 
-RUN chmod +x /app/entrypoint.sh && chown -R taroai:taroai /app
+RUN sed -i 's/\r$//' /app/entrypoint.sh \
+    && chmod +x /app/entrypoint.sh \
+    && chown -R taroai:taroai /app
 
 EXPOSE 8000
 

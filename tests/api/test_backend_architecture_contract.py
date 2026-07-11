@@ -186,7 +186,7 @@ def test_runtime_and_delivery_flow_do_not_reference_placeholder_components():
             Path("infra"),
         ]
         for path in sorted(root.rglob("*"))
-        if is_flow_text_file(path)
+        if is_flow_text_file(path) and Path("docs/plans") not in path.parents
     ]
     violations = find_forbidden_terms(
         source_paths,

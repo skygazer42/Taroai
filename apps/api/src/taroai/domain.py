@@ -236,6 +236,7 @@ class BillingMeterEvent(BaseModel):
         "egress_bytes",
         "run_count",
         "skill_call_count",
+        "skill_management_operation_count",
         "trigger_invocation_count",
         "connector_invocation_count",
         "connector_sync_document_count",

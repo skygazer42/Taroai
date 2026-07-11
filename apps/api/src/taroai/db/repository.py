@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -701,7 +699,7 @@ class SqlControlPlaneRepository(BaseModel):
             }
         )
 
-    def create_agent_cycle(self, cycle: AgentCycle) -> AgentCycle:
+    def create_agent_cycle(self, cycle: "AgentCycle") -> "AgentCycle":
         with self._connect() as connection:
             if self.config.dialect == "sqlite":
                 connection.execute("BEGIN IMMEDIATE")
@@ -771,8 +769,8 @@ class SqlControlPlaneRepository(BaseModel):
         cycle_id: str,
         *,
         status: str,
-        verifier_result: AgentVerificationResult | None = None,
-    ) -> AgentCycle:
+        verifier_result: "AgentVerificationResult | None" = None,
+    ) -> "AgentCycle":
         if status not in {"completed", "failed", "waiting"}:
             raise ValueError(f"Unsupported completed agent cycle status: {status}")
         with self._connect() as connection:
@@ -817,7 +815,7 @@ class SqlControlPlaneRepository(BaseModel):
             deep=True,
         )
 
-    def create_agent_action(self, action: AgentAction) -> AgentAction:
+    def create_agent_action(self, action: "AgentAction") -> "AgentAction":
         if action.status != "pending":
             raise ValueError(
                 f"Agent action {action.id} must be pending until it is claimed"
@@ -908,7 +906,7 @@ class SqlControlPlaneRepository(BaseModel):
             raise
         return action.model_copy(deep=True)
 
-    def get_agent_action(self, tenant_id: str, action_id: str) -> AgentAction:
+    def get_agent_action(self, tenant_id: str, action_id: str) -> "AgentAction":
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM agent_actions WHERE tenant_id = ? AND id = ?",
@@ -922,7 +920,7 @@ class SqlControlPlaneRepository(BaseModel):
         self,
         tenant_id: str,
         run_id: str,
-    ) -> list[AgentAction]:
+    ) -> "list[AgentAction]":
         self.get_run(tenant_id, run_id)
         with self._connect() as connection:
             rows = connection.execute(
@@ -943,7 +941,7 @@ class SqlControlPlaneRepository(BaseModel):
         resolution: str,
         resolved_by_user_id: str,
         note: str = "",
-    ) -> AgentAction:
+    ) -> "AgentAction":
         from taroai.agent.models import AgentObservation
 
         if resolution not in {"succeeded", "failed", "retry"}:
@@ -1028,7 +1026,7 @@ class SqlControlPlaneRepository(BaseModel):
         action_id: str,
         *,
         connector_id: str,
-    ) -> AgentAction:
+    ) -> "AgentAction":
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM agent_actions WHERE tenant_id = ? AND id = ?",
@@ -1080,7 +1078,7 @@ class SqlControlPlaneRepository(BaseModel):
         *,
         connector_id: str,
         resolved_by_user_id: str,
-    ) -> AgentAction:
+    ) -> "AgentAction":
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM agent_actions WHERE tenant_id = ? AND id = ?",
@@ -1143,7 +1141,7 @@ class SqlControlPlaneRepository(BaseModel):
         lease_owner_id: str,
         lease_seconds: int,
         now: datetime | None = None,
-    ) -> AgentAction | None:
+    ) -> "AgentAction | None":
         claimed_at = self._lease_time(now or utc_now())
         lease_expires_at = self._lease_expiration(claimed_at, lease_seconds)
         if not lease_owner_id:
@@ -1180,7 +1178,7 @@ class SqlControlPlaneRepository(BaseModel):
         lease_generation: int,
         lease_seconds: int,
         now: datetime | None = None,
-    ) -> AgentAction | None:
+    ) -> "AgentAction | None":
         renewed_at = self._lease_time(now or utc_now())
         lease_expires_at = self._lease_expiration(renewed_at, lease_seconds)
         with self._connect() as connection:
@@ -1213,7 +1211,7 @@ class SqlControlPlaneRepository(BaseModel):
         *,
         now: datetime | None = None,
         limit: int = 100,
-    ) -> list[AgentAction]:
+    ) -> "list[AgentAction]":
         if limit < 1:
             raise ValueError("limit must be at least 1")
         recovered_at = self._lease_time(now or utc_now())
@@ -1260,7 +1258,7 @@ class SqlControlPlaneRepository(BaseModel):
         self,
         tenant_id: str,
         action_id: str,
-        observation: AgentObservation,
+        observation: "AgentObservation",
         *,
         lease_owner_id: str,
         lease_generation: int,
@@ -1269,7 +1267,7 @@ class SqlControlPlaneRepository(BaseModel):
         state_payload: dict[str, Any],
         checksum: str,
         sandbox_checkpoint_ref: str | None = None,
-    ) -> tuple[AgentAction, AgentCheckpoint]:
+    ) -> "tuple[AgentAction, AgentCheckpoint]":
         from taroai.agent.models import AgentCheckpoint
 
         json.dumps(
@@ -1358,7 +1356,9 @@ class SqlControlPlaneRepository(BaseModel):
             raise ValueError("Agent action lease times must be timezone-aware")
         return value.astimezone(timezone.utc)
 
-    def create_agent_checkpoint(self, checkpoint: AgentCheckpoint) -> AgentCheckpoint:
+    def create_agent_checkpoint(
+        self, checkpoint: "AgentCheckpoint"
+    ) -> "AgentCheckpoint":
         json.dumps(checkpoint.model_dump(mode="json"))
         with self._connect() as connection:
             if self.config.dialect == "sqlite":
@@ -1439,7 +1439,7 @@ class SqlControlPlaneRepository(BaseModel):
         self,
         tenant_id: str,
         run_id: str,
-    ) -> AgentCheckpoint | None:
+    ) -> "AgentCheckpoint | None":
         with self._connect() as connection:
             run_row = connection.execute(
                 "SELECT id FROM runs WHERE tenant_id = ? AND id = ?",
@@ -2724,7 +2724,7 @@ class SqlControlPlaneRepository(BaseModel):
     def _insert_agent_checkpoint(
         self,
         connection,
-        checkpoint: AgentCheckpoint,
+        checkpoint: "AgentCheckpoint",
     ) -> None:
         connection.execute(
             """
@@ -2787,7 +2787,7 @@ class SqlControlPlaneRepository(BaseModel):
             updated_at=self._parse_dt(row["updated_at"]),
         )
 
-    def _agent_cycle_from_row(self, row) -> AgentCycle:
+    def _agent_cycle_from_row(self, row) -> "AgentCycle":
         from taroai.agent.models import AgentCycle
 
         return AgentCycle(
@@ -2806,7 +2806,7 @@ class SqlControlPlaneRepository(BaseModel):
             completed_at=self._parse_optional_dt(row["completed_at"]),
         )
 
-    def _agent_action_from_row(self, row) -> AgentAction:
+    def _agent_action_from_row(self, row) -> "AgentAction":
         from taroai.agent.models import AgentAction
 
         return AgentAction(
@@ -2831,7 +2831,7 @@ class SqlControlPlaneRepository(BaseModel):
             completed_at=self._parse_optional_dt(row["completed_at"]),
         )
 
-    def _agent_checkpoint_from_row(self, row) -> AgentCheckpoint:
+    def _agent_checkpoint_from_row(self, row) -> "AgentCheckpoint":
         from taroai.agent.models import AgentCheckpoint
 
         return AgentCheckpoint(

@@ -66,6 +66,12 @@ def test_migration_runner_applies_pending_schema_and_records_versions(tmp_path: 
         "031_solution_pack_publication_draft_application.sql",
         "032_solution_pack_publication_draft_multi_manifest.sql",
         "033_chat_threads_agent_loop_v2.sql",
+        "034_skill_runtime_v2.sql",
+        "035_agents_shares_and_rich_artifacts.sql",
+        "036_browser_profiles.sql",
+        "037_agent_engines.sql",
+        "038_coding_workspaces.sql",
+        "039_evaluation_runtime.sql",
     ]
     runner = MigrationRunner(
         config=DatabaseConfig(url=f"sqlite:///{database_path}"),
@@ -194,7 +200,15 @@ def test_chat_loop_migration_adds_state_payload_to_existing_runtime_states(
             ("run_legacy",),
         ).fetchone()[0]
 
-    assert result.applied_versions == ["033_chat_threads_agent_loop_v2.sql"]
+    assert result.applied_versions == [
+        "033_chat_threads_agent_loop_v2.sql",
+        "034_skill_runtime_v2.sql",
+        "035_agents_shares_and_rich_artifacts.sql",
+        "036_browser_profiles.sql",
+        "037_agent_engines.sql",
+        "038_coding_workspaces.sql",
+        "039_evaluation_runtime.sql",
+    ]
     assert "state_payload" in columns
     assert state_payload == "{}"
 

@@ -9,7 +9,7 @@ import re
 import stat
 import tempfile
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Literal
 
 from cryptography.exceptions import InvalidSignature
@@ -346,7 +346,8 @@ def build_release_package(config: ReleasePackageBuildConfig) -> ReleasePackageBu
             )
             for path in files:
                 arcname = path.relative_to(config.repository_root).as_posix()
-                archive.write(path, arcname)
+                mode = 0o755 if arcname.endswith(".sh") else 0o644
+                write_bytes_to_zip(archive, arcname, path.read_bytes(), mode=mode)
         os.replace(temp_path, output_path)
         temp_path = None
     finally:
@@ -846,10 +847,11 @@ def find_duplicate_entries(names: list[str]) -> list[str]:
 
 
 def archive_entry_is_unsafe(name: str) -> bool:
-    path = Path(name)
-    if path.is_absolute():
+    posix_path = PurePosixPath(name)
+    windows_path = PureWindowsPath(name)
+    if posix_path.is_absolute() or windows_path.is_absolute():
         return True
-    return ".." in path.parts
+    return ".." in posix_path.parts or ".." in windows_path.parts
 
 
 def find_symlink_entries(archive: zipfile.ZipFile) -> list[str]:

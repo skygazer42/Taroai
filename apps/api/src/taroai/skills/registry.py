@@ -113,7 +113,7 @@ def build_skill_marketplace_analytics(
 class InMemorySkillRegistry(BaseModel):
     manifests: dict[str, SkillManifest] = Field(default_factory=dict)
     entries: dict[str, SkillRegistryEntry] = Field(default_factory=dict)
-    version_entries: dict[str, list[SkillRegistryEntry]] = Field(default_factory=dict)
+    version_entries: dict[str, List[SkillRegistryEntry]] = Field(default_factory=dict)
     installations: dict[str, SkillInstallation] = Field(default_factory=dict)
     packages: dict[str, SkillPackageRecord] = Field(default_factory=dict)
     evaluation_runs: dict[str, SkillEvaluationRun] = Field(default_factory=dict)
@@ -128,7 +128,7 @@ class InMemorySkillRegistry(BaseModel):
             raise NotFoundError(f"Skill not found: {skill_id}")
         return manifest
 
-    def list(self) -> list[SkillManifest]:
+    def list(self) -> List[SkillManifest]:
         return list(self.manifests.values())
 
     def register_for_tenant(
@@ -298,7 +298,7 @@ class InMemorySkillRegistry(BaseModel):
         self,
         tenant_id: str,
         skill_id: str | None = None,
-    ) -> list[SkillPackageRecord]:
+    ) -> List[SkillPackageRecord]:
         return sorted(
             [
                 record
@@ -483,8 +483,8 @@ class InMemorySkillRegistry(BaseModel):
         workspace_id: str,
         user_id: str,
         department_id: str | None = None,
-    ) -> list[SkillPackage]:
-        discovered: list[SkillPackage] = []
+    ) -> List[SkillPackage]:
+        discovered: List[SkillPackage] = []
         for installation in self.list_for_workspace(tenant_id, workspace_id):
             if installation.status != SkillInstallationStatus.ENABLED:
                 continue
@@ -531,7 +531,7 @@ class InMemorySkillRegistry(BaseModel):
         tenant_id: str,
         skill_id: str,
         version: str | None = None,
-    ) -> list[SkillEvaluationRun]:
+    ) -> List[SkillEvaluationRun]:
         return sorted(
             [
                 run

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import difflib
 
 from taroai.skills.discovery import (

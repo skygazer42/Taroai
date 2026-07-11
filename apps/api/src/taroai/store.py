@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import json
 from datetime import datetime, timedelta, timezone
 from threading import RLock
@@ -438,7 +436,7 @@ class InMemoryControlPlaneStore(BaseModel):
                 dispatch_status=ChatMessageDispatchStatus.COMPLETED,
             )
 
-    def create_agent_cycle(self, cycle: AgentCycle) -> AgentCycle:
+    def create_agent_cycle(self, cycle: "AgentCycle") -> "AgentCycle":
         with self._repository_lock:
             run = self.get_run(cycle.tenant_id, cycle.run_id)
             if run.workspace_id != cycle.workspace_id:
@@ -468,8 +466,8 @@ class InMemoryControlPlaneStore(BaseModel):
         cycle_id: str,
         *,
         status: str,
-        verifier_result: AgentVerificationResult | None = None,
-    ) -> AgentCycle:
+        verifier_result: "AgentVerificationResult | None" = None,
+    ) -> "AgentCycle":
         from taroai.agent.models import AgentCycle
 
         if status not in {"completed", "failed", "waiting"}:
@@ -489,7 +487,7 @@ class InMemoryControlPlaneStore(BaseModel):
             self.agent_cycles[cycle_id] = updated.model_copy(deep=True)
         return updated
 
-    def create_agent_action(self, action: AgentAction) -> AgentAction:
+    def create_agent_action(self, action: "AgentAction") -> "AgentAction":
         with self._repository_lock:
             if action.status != "pending":
                 raise ValueError(
@@ -517,7 +515,7 @@ class InMemoryControlPlaneStore(BaseModel):
             self.agent_actions[action.id] = action.model_copy(deep=True)
         return action.model_copy(deep=True)
 
-    def get_agent_action(self, tenant_id: str, action_id: str) -> AgentAction:
+    def get_agent_action(self, tenant_id: str, action_id: str) -> "AgentAction":
         with self._repository_lock:
             action = self.agent_actions.get(action_id)
             if action is None:
@@ -532,7 +530,7 @@ class InMemoryControlPlaneStore(BaseModel):
         self,
         tenant_id: str,
         run_id: str,
-    ) -> list[AgentAction]:
+    ) -> "list[AgentAction]":
         with self._repository_lock:
             self.get_run(tenant_id, run_id)
             return sorted(
@@ -552,7 +550,7 @@ class InMemoryControlPlaneStore(BaseModel):
         resolution: str,
         resolved_by_user_id: str,
         note: str = "",
-    ) -> AgentAction:
+    ) -> "AgentAction":
         from taroai.agent.models import AgentObservation
 
         if resolution not in {"succeeded", "failed", "retry"}:
@@ -619,7 +617,7 @@ class InMemoryControlPlaneStore(BaseModel):
         action_id: str,
         *,
         connector_id: str,
-    ) -> AgentAction:
+    ) -> "AgentAction":
         with self._repository_lock:
             action = self.get_agent_action(tenant_id, action_id)
             retry_count = int(action.usage.get("connector_reconnect_retry_count", 0))
@@ -651,7 +649,7 @@ class InMemoryControlPlaneStore(BaseModel):
         *,
         connector_id: str,
         resolved_by_user_id: str,
-    ) -> AgentAction:
+    ) -> "AgentAction":
         with self._repository_lock:
             action = self.get_agent_action(tenant_id, action_id)
             observed_connector = (
@@ -703,7 +701,7 @@ class InMemoryControlPlaneStore(BaseModel):
         lease_owner_id: str,
         lease_seconds: int,
         now: datetime | None = None,
-    ) -> AgentAction | None:
+    ) -> "AgentAction | None":
         claimed_at = self._lease_time(now or utc_now())
         lease_expires_at = self._lease_expiration(claimed_at, lease_seconds)
         if not lease_owner_id:
@@ -738,7 +736,7 @@ class InMemoryControlPlaneStore(BaseModel):
         lease_generation: int,
         lease_seconds: int,
         now: datetime | None = None,
-    ) -> AgentAction | None:
+    ) -> "AgentAction | None":
         renewed_at = self._lease_time(now or utc_now())
         lease_expires_at = self._lease_expiration(renewed_at, lease_seconds)
         with self._repository_lock:
@@ -766,7 +764,7 @@ class InMemoryControlPlaneStore(BaseModel):
         *,
         now: datetime | None = None,
         limit: int = 100,
-    ) -> list[AgentAction]:
+    ) -> "list[AgentAction]":
         if limit < 1:
             raise ValueError("limit must be at least 1")
         recovered_at = self._lease_time(now or utc_now())
@@ -802,7 +800,7 @@ class InMemoryControlPlaneStore(BaseModel):
         self,
         tenant_id: str,
         action_id: str,
-        observation: AgentObservation,
+        observation: "AgentObservation",
         *,
         lease_owner_id: str,
         lease_generation: int,
@@ -811,7 +809,7 @@ class InMemoryControlPlaneStore(BaseModel):
         state_payload: dict[str, Any],
         checksum: str,
         sandbox_checkpoint_ref: str | None = None,
-    ) -> tuple[AgentAction, AgentCheckpoint]:
+    ) -> "tuple[AgentAction, AgentCheckpoint]":
         from taroai.agent.models import AgentAction, AgentCheckpoint
 
         json.dumps(
@@ -889,7 +887,9 @@ class InMemoryControlPlaneStore(BaseModel):
             raise ValueError("Agent action lease times must be timezone-aware")
         return value.astimezone(timezone.utc)
 
-    def create_agent_checkpoint(self, checkpoint: AgentCheckpoint) -> AgentCheckpoint:
+    def create_agent_checkpoint(
+        self, checkpoint: "AgentCheckpoint"
+    ) -> "AgentCheckpoint":
         json.dumps(checkpoint.model_dump(mode="json"))
         with self._repository_lock:
             run = self.get_run(checkpoint.tenant_id, checkpoint.run_id)
@@ -933,7 +933,7 @@ class InMemoryControlPlaneStore(BaseModel):
         self,
         tenant_id: str,
         run_id: str,
-    ) -> AgentCheckpoint | None:
+    ) -> "AgentCheckpoint | None":
         with self._repository_lock:
             self.get_run(tenant_id, run_id)
             checkpoints = self.agent_checkpoints.get(run_id, [])
@@ -974,7 +974,7 @@ class InMemoryControlPlaneStore(BaseModel):
         self.workspace_tenants[workspace_id] = tenant_id
         self.user_tenants[user_id] = tenant_id
 
-    def _get_agent_cycle(self, tenant_id: str, cycle_id: str) -> AgentCycle:
+    def _get_agent_cycle(self, tenant_id: str, cycle_id: str) -> "AgentCycle":
         with self._repository_lock:
             cycle = self.agent_cycles.get(cycle_id)
             if cycle is None:
@@ -1455,10 +1455,7 @@ class InMemoryControlPlaneStore(BaseModel):
         return list(self.billing_meters.get(tenant_id, []))
 
     def list_audit_events(self, tenant_id: str) -> list[AuditEvent]:
-        return sorted(
-            self.audit_events.get(tenant_id, []),
-            key=lambda event: (event.created_at, event.event_type, event.id),
-        )
+        return list(self.audit_events.get(tenant_id, []))
 
     def record_billing_meter(
         self,

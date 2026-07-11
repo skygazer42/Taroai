@@ -4,7 +4,7 @@ This matrix records supported package compatibility for private delivery. It mus
 
 | App Version | Chart Version | Migration Range | PostgreSQL Version | Redis Version | Object Storage | Rollback Boundary | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0.1.0 | 0.1.0 | 001_initial to 032_solution_pack_publication_draft_multi_manifest | PostgreSQL 16 | Redis 7 | S3-compatible or MinIO current local PoC profile | Restore backup for schema rollback beyond 001_initial | First private package baseline with api, worker, taroai-sandbox-controller, taroai-browser-controller, and taroai-web images, SQL-backed restore drill scheduling records, tenant model provider records, provider version history, provider change approvals, model policy change approvals, model policy version history, SQL/Redis-backed provider rate-limit samples, SQL-backed customer feedback review records, and multi-skill solution-pack publication draft fields. See docs/operations/private-upgrade-rollback.md. |
+| 0.1.0 | 0.1.0 | 001_initial to 039_evaluation_runtime | PostgreSQL 16 | Redis 7 | S3-compatible or MinIO current local PoC profile | Restore backup for schema rollback beyond 001_initial | Private package baseline including Agent Loop V2, Skill Runtime V2, versioned Agents, browser profiles, Agent Engines, coding workspaces, thread sharing, rich artifacts, and evaluation release gates. See docs/operations/private-upgrade-rollback.md. |
 
 ## Compatibility Rules
 
@@ -13,6 +13,7 @@ This matrix records supported package compatibility for private delivery. It mus
 - Migration Range must be fully present before the migration job starts.
 - PostgreSQL Version is the tested major version for database migrations and tenant isolation policy.
 - Redis Version is the tested major version for short-term memory and worker queue paths.
+- model policy version history must remain readable across the full supported migration range so policy rollback evidence stays available.
 - browser controller compatibility must include the packaged `taroai-browser-controller` image whenever browser actions are enabled.
 - sandbox controller compatibility must include the packaged `taroai-sandbox-controller` image whenever HTTP sandbox execution is enabled.
 - Web Workspace compatibility must include the packaged `taroai-web` image and the install-validation web workspace contract whenever the package exposes the customer-facing workspace.

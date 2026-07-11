@@ -192,7 +192,7 @@ def test_private_upgrade_matrix_covers_current_migration_range():
     matrix = Path("infra/package/upgrade-matrix.md").read_text()
 
     assert (
-        "001_initial to 032_solution_pack_publication_draft_multi_manifest"
+        "001_initial to 039_evaluation_runtime"
         in matrix
     )
     assert "model policy version history" in matrix

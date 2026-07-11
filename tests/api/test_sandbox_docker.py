@@ -102,7 +102,7 @@ def test_docker_sandbox_runs_container_with_disabled_network_and_workspace_mount
     )
     run_call = runner.calls[0]
     workspace_host_path = next(
-        Path(item.split(":", 1)[0])
+        Path(item.rsplit(":/workspace", 1)[0])
         for item in run_call
         if item.endswith(":/workspace")
     )

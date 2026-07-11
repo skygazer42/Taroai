@@ -1931,7 +1931,7 @@ def test_storage_metadata_and_signed_url_endpoints_are_tenant_scoped():
     storage_object = created.json()
     assert storage_object["tenant_id"] == "tenant_acme"
     assert storage_object["key"] == (
-        "tenant_acme/workspace_sales/runs/run_123/artifacts/agent-result.md"
+        f"tenant_acme/workspace_sales/runs/run_123/artifacts/{storage_object['id']}/agent-result.md"
     )
 
     listed = client.get(

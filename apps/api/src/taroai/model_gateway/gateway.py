@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import json
 from collections.abc import Iterator
 from typing import Any, Literal
@@ -33,12 +31,12 @@ class ModelGateway(BaseModel):
     def create_plan(self, request: ModelGatewayRequest) -> ModelGatewayResponse:
         raise NotImplementedError
 
-    def decide_next_action(self, request: ModelGatewayRequest) -> AgentDecision:
+    def decide_next_action(self, request: ModelGatewayRequest) -> "AgentDecision":
         raise NotImplementedError
 
     def verify_completion(
         self, request: ModelGatewayRequest
-    ) -> AgentVerificationResult:
+    ) -> "AgentVerificationResult":
         raise NotImplementedError
 
     def stream_response(self, request: ModelGatewayRequest) -> Iterator[str]:
@@ -74,14 +72,14 @@ class OpenAICompatibleModelGateway(ModelGateway):
         response_body = self._post_chat_completions(payload, api_key)
         return self._parse_chat_response(response_body)
 
-    def decide_next_action(self, request: ModelGatewayRequest) -> AgentDecision:
+    def decide_next_action(self, request: ModelGatewayRequest) -> "AgentDecision":
         model, response_body = self._complete_operation(request, "decide")
         del model
         return self._parse_agent_decision(response_body)
 
     def verify_completion(
         self, request: ModelGatewayRequest
-    ) -> AgentVerificationResult:
+    ) -> "AgentVerificationResult":
         model, response_body = self._complete_operation(request, "verify")
         del model
         return self._parse_agent_verification(response_body)
@@ -262,7 +260,7 @@ class OpenAICompatibleModelGateway(ModelGateway):
             raise ModelGatewayResponseError("model gateway response did not include a message")
         return message
 
-    def _parse_agent_decision(self, body: dict[str, Any]) -> AgentDecision:
+    def _parse_agent_decision(self, body: dict[str, Any]) -> "AgentDecision":
         from taroai.agent.models import AgentDecision
 
         message = self._assistant_message(body)
@@ -301,7 +299,7 @@ class OpenAICompatibleModelGateway(ModelGateway):
 
     def _parse_agent_verification(
         self, body: dict[str, Any]
-    ) -> AgentVerificationResult:
+    ) -> "AgentVerificationResult":
         from taroai.agent.models import AgentVerificationResult
 
         content = self._assistant_message(body).get("content") or ""
@@ -495,12 +493,12 @@ class ModelGatewayRouter(ModelGateway):
             raise last_error
         raise ModelGatewayConfigurationError("no model provider could create a plan")
 
-    def decide_next_action(self, request: ModelGatewayRequest) -> AgentDecision:
+    def decide_next_action(self, request: ModelGatewayRequest) -> "AgentDecision":
         return self._route_structured_operation(request, "decide_next_action")
 
     def verify_completion(
         self, request: ModelGatewayRequest
-    ) -> AgentVerificationResult:
+    ) -> "AgentVerificationResult":
         return self._route_structured_operation(request, "verify_completion")
 
     def stream_response(self, request: ModelGatewayRequest) -> Iterator[str]:
@@ -540,7 +538,7 @@ class ModelGatewayRouter(ModelGateway):
         self,
         request: ModelGatewayRequest,
         operation: Literal["decide_next_action", "verify_completion"],
-    ) -> AgentDecision | AgentVerificationResult:
+    ) -> "AgentDecision | AgentVerificationResult":
         candidates = self.provider_registry.candidates(request)
         if not candidates:
             raise ModelGatewayConfigurationError("no model provider matches request")

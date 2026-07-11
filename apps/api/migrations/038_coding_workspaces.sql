@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS coding_changes (
     additions INTEGER NOT NULL DEFAULT 0,
     deletions INTEGER NOT NULL DEFAULT 0,
     patch TEXT NOT NULL DEFAULT '',
-    binary BOOLEAN NOT NULL DEFAULT FALSE,
+    "binary" BOOLEAN NOT NULL DEFAULT FALSE,
     previous_path TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );

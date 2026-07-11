@@ -92,7 +92,7 @@ class RecordingKubectlRunner:
                 stderr="",
             )
         if command[1] == "cp":
-            if ":" in command[2]:
+            if command[2].startswith("tenant-sandboxes/"):
                 Path(command[3]).write_text("downloaded from pod", encoding="utf-8")
             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
         if command[1] == "get":

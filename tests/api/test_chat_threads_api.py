@@ -21,6 +21,7 @@ from taroai.model_gateway import (
 )
 from taroai.domain import RunStatus, utc_now
 from taroai.store import InMemoryControlPlaneStore
+from taroai.workers import InMemoryJobQueue
 
 
 class BarrierSqlControlPlaneRepository(SqlControlPlaneRepository):
@@ -61,6 +62,8 @@ OTHER_TENANT_HEADERS = {
 def chat_settings(**updates) -> Settings:
     values = {
         "_env_file": None,
+        "run_execution_dispatch_mode": "queue",
+        "agent_runtime_mode": "loop_v2",
         "model_gateway_allowed_models": ["deepseek-chat"],
         "model_gateway_policy_scopes": [
             ModelPolicyScope(
@@ -130,6 +133,7 @@ def create_chat_client(
             store=store,
             settings=settings or chat_settings(),
             model_provider_store=model_provider_store,
+            job_queue=InMemoryJobQueue(),
         )
     )
 

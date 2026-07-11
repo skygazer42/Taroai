@@ -116,7 +116,7 @@ class SqlCodingWorkspaceRegistry(CodingWorkspaceRegistry):
             connection.execute("DELETE FROM coding_changes WHERE tenant_id = ? AND coding_workspace_id = ?", (tenant_id, item_id))
             for item in values:
                 connection.execute(
-                    "INSERT INTO coding_changes (id, tenant_id, coding_workspace_id, path, status, additions, deletions, patch, binary, previous_path, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO coding_changes (id, tenant_id, coding_workspace_id, path, status, additions, deletions, patch, \"binary\", previous_path, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (item.id, item.tenant_id, item.coding_workspace_id, item.path,
                      item.status, item.additions, item.deletions, item.patch,
                      item.binary, item.previous_path, self._dt(item.created_at)),

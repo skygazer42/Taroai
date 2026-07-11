@@ -82,9 +82,22 @@ class LocalProcessSandboxAdapter(SandboxAdapter):
         cwd = self._resolve_workspace_path(session, command.cwd)
         cwd.mkdir(parents=True, exist_ok=True)
         local_command = self._local_workspace_command(command.command, session)
+        windows_shells = (
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git/usr/bin/sh.exe",
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git/bin/bash.exe",
+        )
+        shell = next(
+            (str(candidate) for candidate in windows_shells if candidate.is_file()),
+            None,
+        ) if os.name == "nt" else None
+        shell = shell or shutil.which("sh") or shutil.which("bash")
+        if shell is None:
+            raise SandboxProviderUnavailableError(
+                "local process sandbox requires a POSIX-compatible shell"
+            )
         try:
             completed = subprocess.run(
-                ["/bin/sh", "-lc", local_command],
+                [shell, "-lc", local_command],
                 cwd=cwd,
                 env=self._command_env(command.env, session),
                 capture_output=True,
@@ -289,6 +302,10 @@ class LocalProcessSandboxAdapter(SandboxAdapter):
 
     def _command_env(self, custom_env: dict[str, str], session: SandboxSession) -> dict[str, str]:
         workspace_path = self._workspace_path(session)
+        workspace_env_path = str(workspace_path)
+        if os.name == "nt":
+            resolved = workspace_path.resolve()
+            workspace_env_path = f"/{resolved.drive[0].lower()}{resolved.as_posix()[2:]}"
         invalid_names = invalid_sandbox_env_names(custom_env)
         if invalid_names:
             raise SandboxExecutionError(
@@ -302,7 +319,7 @@ class LocalProcessSandboxAdapter(SandboxAdapter):
                 "LANG": os.environ.get("LANG", "C.UTF-8"),
                 "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
                 "PYTHONUNBUFFERED": "1",
-                "TAROAI_SANDBOX_WORKSPACE": str(workspace_path),
+                "TAROAI_SANDBOX_WORKSPACE": workspace_env_path,
             }
         )
         return env
@@ -315,7 +332,7 @@ class LocalProcessSandboxAdapter(SandboxAdapter):
         relative_path = path.resolve().relative_to(self._workspace_path(session).resolve())
         if str(relative_path) == ".":
             return "/workspace"
-        return f"/workspace/{relative_path}"
+        return f"/workspace/{relative_path.as_posix()}"
 
     def _content_type(self, path: Path) -> str:
         return mimetypes.guess_type(path.name)[0] or "text/plain"

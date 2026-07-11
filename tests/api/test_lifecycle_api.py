@@ -985,7 +985,7 @@ def test_restore_drill_run_record_api_enqueues_execution_job_and_records_safe_au
     assert payload.run_record_id == record.id
     assert payload.requested_by_user_id == admin.id
     assert payload.verification_config.drill_id == "restore_drill_2026_07"
-    assert str(payload.verification_config.backup_manifest_path) == (
+    assert payload.verification_config.backup_manifest_path.as_posix() == (
         "/restore/evidence/backup-manifest.json"
     )
     assert restore_drill_store.get_run_record("tenant_acme", record.id).status == "requested"

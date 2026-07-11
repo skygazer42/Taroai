@@ -1,7 +1,5 @@
-from __future__ import annotations
-
 import json
-from typing import Any
+from typing import Any, List
 
 from pydantic import BaseModel, Field
 
@@ -19,7 +17,7 @@ class AgentRegistry(BaseModel):
 
 class InMemoryAgentRegistry(AgentRegistry):
     definitions: dict[str, AgentDefinition] = Field(default_factory=dict)
-    versions: dict[str, list[AgentVersion]] = Field(default_factory=dict)
+    versions: dict[str, List[AgentVersion]] = Field(default_factory=dict)
 
     def create(self, definition: AgentDefinition, version: AgentVersion):
         if definition.id in self.definitions:
@@ -154,7 +152,7 @@ class SqlAgentRegistry(AgentRegistry):
 
     def list(self, tenant_id: str, workspace_id: str | None = None):
         sql = "SELECT * FROM agent_definitions WHERE tenant_id = ?"
-        params: list[Any] = [tenant_id]
+        params: List[Any] = [tenant_id]
         if workspace_id is not None:
             sql += " AND workspace_id = ?"
             params.append(workspace_id)

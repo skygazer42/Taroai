@@ -5,7 +5,7 @@ import shlex
 import shutil
 import subprocess
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from pydantic import ConfigDict, Field
@@ -266,7 +266,7 @@ class KubernetesSandboxAdapter(SandboxAdapter):
         local_path.parent.mkdir(parents=True, exist_ok=True)
         content_bytes = file_write.content_bytes()
         local_path.write_bytes(content_bytes)
-        directory = str(Path(display_path).parent)
+        directory = str(PurePosixPath(display_path).parent)
         mkdir_result = self._run_workspace_shell(
             session,
             f"mkdir -p {shlex.quote(directory)}",
@@ -1419,11 +1419,13 @@ class KubernetesSandboxAdapter(SandboxAdapter):
         if requested_path == "/workspace":
             return "/workspace"
         if requested_path.startswith("/workspace/"):
-            candidate = Path(requested_path)
-        elif Path(requested_path).is_absolute():
+            candidate = PurePosixPath(requested_path)
+        elif PurePosixPath(requested_path).is_absolute() or PureWindowsPath(
+            requested_path
+        ).is_absolute():
             raise SandboxExecutionError("sandbox path is outside sandbox workspace")
         else:
-            candidate = Path("/workspace") / requested_path
+            candidate = PurePosixPath("/workspace") / requested_path
         normalized_parts: list[str] = []
         for part in candidate.parts:
             if part in ("", "/"):

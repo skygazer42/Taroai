@@ -197,7 +197,9 @@ def test_data_export_bundle_uploads_manifest_json_to_object_storage():
     assert len(storage_client.put_objects) == 1
     uploaded = storage_client.put_objects[0]
     assert uploaded["Bucket"] == "taroai-artifacts"
-    assert uploaded["Key"].endswith(f"data-exports/{bundle.filename}")
+    assert uploaded["Key"].endswith(
+        f"data-exports/{bundle.storage_object_id}/{bundle.filename}"
+    )
     content = json.loads(uploaded["Body"].decode("utf-8"))
     assert content["manifest"]["item_count"] == 1
     assert content["manifest"]["items"][0]["resource_id"] == exported.id

@@ -43,7 +43,7 @@ def test_sql_storage_catalog_persists_objects_across_instances(tmp_path: Path):
     assert fetched == stored
     assert fetched.uri == (
         "s3://taroai-artifacts/"
-        "tenant_acme/workspace_sales/runs/run_123/artifacts/agent-result.md"
+        f"tenant_acme/workspace_sales/runs/run_123/artifacts/{stored.id}/agent-result.md"
     )
     assert fetched.content_type == "text/markdown"
     assert fetched.size_bytes == 128
@@ -83,7 +83,7 @@ def test_sql_storage_catalog_persists_internal_objects_without_run_scope(tmp_pat
     assert restarted.list_for_run("tenant_acme", "run_123") == []
     assert fetched.uri == (
         "s3://taroai-artifacts/"
-        "tenant_acme/workspace_sales/knowledge-documents/sales.md"
+        f"tenant_acme/workspace_sales/knowledge-documents/{stored.id}/sales.md"
     )
 
 

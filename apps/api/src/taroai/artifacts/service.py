@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import difflib
 import json
 from html import escape

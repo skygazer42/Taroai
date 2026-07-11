@@ -304,7 +304,14 @@ def test_tenant_offboarding_deletion_deletes_storage_objects_and_marks_plan_dele
     assert result.plan.state == TenantOffboardingState.DELETED
     assert result.plan.deleted_by_user_id == "owner_1"
     assert result.plan.deleted_at is not None
-    assert result.deleted_storage_object_ids == [first_object.id, second_object.id]
+    expected_deleted_ids = [
+        storage_object.id
+        for storage_object in sorted(
+            [first_object, second_object],
+            key=lambda storage_object: (storage_object.created_at, storage_object.id),
+        )
+    ]
+    assert result.deleted_storage_object_ids == expected_deleted_ids
     assert result.deleted_count == 2
     assert len(storage_client.deleted_objects) == 2
     with pytest.raises(NotFoundError):
@@ -1057,10 +1064,14 @@ def test_tenant_offboarding_api_executes_deletion_and_records_summary_audit():
     assert deleted.status_code == 200
     assert deleted.json()["plan"]["state"] == "deleted"
     assert deleted.json()["deleted_count"] == 2
-    assert deleted.json()["deleted_storage_object_ids"] == [
-        first_object.id,
-        second_object.id,
+    expected_deleted_ids = [
+        storage_object.id
+        for storage_object in sorted(
+            [first_object, second_object],
+            key=lambda storage_object: (storage_object.created_at, storage_object.id),
+        )
     ]
+    assert deleted.json()["deleted_storage_object_ids"] == expected_deleted_ids
     assert deleted.json()["preserved_storage_object_ids"] == [
         exported.json()["export_storage_object_id"]
     ]

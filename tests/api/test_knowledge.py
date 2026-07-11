@@ -546,9 +546,8 @@ def test_knowledge_api_enforces_permissions_and_records_safe_audit():
     assert downloaded_document.content == document_content.encode("utf-8")
     assert downloaded_document.headers["content-type"].startswith("text/markdown")
     assert storage_client.put_calls[0]["Bucket"] == "taroai-artifacts"
-    assert storage_client.put_calls[0]["Key"].endswith(
-        "/knowledge-documents/sales.md"
-    )
+    assert "/knowledge-documents/storage_" in storage_client.put_calls[0]["Key"]
+    assert storage_client.put_calls[0]["Key"].endswith("/sales.md")
     assert storage_client.put_calls[0]["Body"] == document_content.encode("utf-8")
     assert storage_client.put_calls[0]["ContentType"] == "text/markdown"
     assert forbidden_query.status_code == 403
