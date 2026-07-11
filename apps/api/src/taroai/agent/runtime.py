@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import re
 import time
@@ -133,6 +134,7 @@ class AgentRuntime(BaseModel):
     connector_dispatcher: Any | None = None
     connector_invocation_service: Any | None = None
     agent_registry: Any | None = None
+    browser_profile_service: Any | None = None
     max_step_retries: int = 0
     runtime_mode: str = "legacy"
     loop_max_iterations: int = Field(default=12, ge=1)
@@ -1974,21 +1976,43 @@ class AgentRuntime(BaseModel):
                 state.sandbox_session_id,
             )
             self._materialize_run_attachments(state, session)
+            self._materialize_runtime_snapshot_files(
+                state, session, self._agent_runtime_snapshot(state)
+            )
             return session
         self._enforce_sandbox_concurrency_license(state)
+        runtime_snapshot = self._agent_runtime_snapshot(state)
+        snapshot_network_mode = str(runtime_snapshot.get("network_mode") or "")
+        network_mode = self.sandbox_network_mode
+        if snapshot_network_mode:
+            requested_network_mode = SandboxNetworkMode(snapshot_network_mode)
+            network_rank = {
+                SandboxNetworkMode.DISABLED: 0,
+                SandboxNetworkMode.ALLOWLIST: 1,
+                SandboxNetworkMode.OPEN: 2,
+            }
+            network_mode = min(
+                (self.sandbox_network_mode, requested_network_mode),
+                key=lambda item: network_rank[item],
+            )
+        snapshot_timeout = int(runtime_snapshot.get("timeout_seconds") or self.sandbox_timeout_seconds)
+        timeout_seconds = min(self.sandbox_timeout_seconds, max(1, snapshot_timeout))
         session = self.sandbox_adapter.create(
             SandboxCreateRequest(
                 tenant_id=state.tenant_id,
                 workspace_id=state.workspace_id,
                 run_id=state.run_id,
                 image=str(
-                    state.runtime_metadata.get(
-                        "skill_runtime_image", self.sandbox_runtime_image
-                    )
+                    state.runtime_metadata.get("skill_runtime_image")
+                    or runtime_snapshot.get("image")
+                    or self.sandbox_runtime_image
                 ),
-                network_mode=self.sandbox_network_mode,
-                timeout_seconds=self.sandbox_timeout_seconds,
-                metadata={"created_by": "agent_runtime"},
+                network_mode=network_mode,
+                timeout_seconds=timeout_seconds,
+                metadata={
+                    "created_by": "agent_runtime",
+                    "agent_runtime_snapshot": bool(runtime_snapshot),
+                },
             )
         )
         state.sandbox_session_id = session.id
@@ -2003,8 +2027,171 @@ class AgentRuntime(BaseModel):
             },
         )
         self._materialize_run_attachments(state, session)
+        self._materialize_runtime_snapshot_files(state, session, runtime_snapshot)
         self._save_state(state)
         return session
+
+    def _agent_runtime_snapshot(self, state: AgentRuntimeState) -> dict[str, Any]:
+        context = state.runtime_metadata.get("agent_context")
+        if isinstance(context, dict) and isinstance(context.get("runtime_snapshot"), dict):
+            return context["runtime_snapshot"]
+        if self.agent_registry is not None:
+            run = self.store.get_run(state.tenant_id, state.run_id)
+            references = [item for item in run.resource_refs if item.type == "agent"]
+            agent_id = references[0].id if references else run.agent_id
+            if agent_id:
+                definition = self.agent_registry.get(run.tenant_id, agent_id)
+                version_number = (
+                    int(references[0].version)
+                    if references and references[0].version
+                    else definition.published_version
+                )
+                if version_number is not None:
+                    return self.agent_registry.get_version(
+                        run.tenant_id, agent_id, version_number
+                    ).spec.runtime_snapshot
+        return {}
+
+    def _materialize_runtime_snapshot_files(
+        self,
+        state: AgentRuntimeState,
+        session,
+        runtime_snapshot: dict[str, Any],
+    ) -> None:
+        if state.runtime_metadata.get("runtime_snapshot_materialized"):
+            return
+        if self.storage_catalog is None or self.object_storage is None:
+            return
+        run = self.store.get_run(state.tenant_id, state.run_id)
+        materialized = []
+        for item in runtime_snapshot.get("files", []):
+            storage_object_id = str(item.get("storage_object_id") or "")
+            path = str(item.get("sandbox_path") or "")
+            if (
+                not storage_object_id
+                or not path.startswith("/workspace/")
+                or path.startswith("/workspace/inputs/")
+                or path.startswith("/workspace/artifacts/")
+                or ".." in path.split("/")
+            ):
+                raise ToolExecutionError("Runtime snapshot contains an unsafe sandbox path")
+            storage_object = self.storage_catalog.get(run.tenant_id, storage_object_id)
+            if storage_object.workspace_id != run.workspace_id:
+                raise ToolExecutionError("Runtime snapshot file is outside the Agent workspace")
+            content = self.object_storage.download(storage_object).content
+            self.sandbox_adapter.upload_file(
+                SandboxFileWrite(
+                    tenant_id=run.tenant_id,
+                    workspace_id=run.workspace_id,
+                    run_id=run.id,
+                    session_id=session.id,
+                    path=path,
+                    content_base64=base64.b64encode(content).decode("ascii"),
+                    content_type=storage_object.content_type,
+                )
+            )
+            materialized.append({**item, "size_bytes": len(content)})
+        state.runtime_metadata["runtime_snapshot_materialized"] = True
+        state.runtime_metadata["restored_runtime_files"] = materialized
+        if materialized:
+            self.store.append_run_event(
+                run,
+                "agent.runtime_snapshot.restored",
+                {"session_id": session.id, "files": materialized},
+            )
+        self._save_state(state)
+
+    def _capture_reusable_runtime_snapshot(
+        self,
+        state: AgentRuntimeState,
+        run: Run,
+    ) -> None:
+        if state.runtime_metadata.get("runtime_snapshot"):
+            return
+        if (
+            self.sandbox_adapter is None
+            or self.storage_catalog is None
+            or self.object_storage is None
+            or state.sandbox_session_id is None
+        ):
+            return
+        session = self.sandbox_adapter.get_session(
+            state.tenant_id, state.sandbox_session_id
+        )
+        captured: list[dict[str, Any]] = []
+        total_bytes = 0
+        for file_ref in self.sandbox_adapter.list_files(
+            state.tenant_id, state.sandbox_session_id
+        ):
+            path = file_ref.path
+            if (
+                path.startswith("/workspace/inputs/")
+                or path.startswith("/workspace/artifacts/")
+                or "/node_modules/" in path
+                or "/.git/" in path
+                or len(captured) >= 128
+                or file_ref.size_bytes > 1_000_000
+                or total_bytes + file_ref.size_bytes > 5_000_000
+            ):
+                continue
+            try:
+                downloaded = self.sandbox_adapter.download_file(
+                    state.tenant_id, state.sandbox_session_id, path
+                )
+            except Exception:
+                continue
+            if downloaded.content is None:
+                continue
+            content = downloaded.content.encode("utf-8")
+            filename = path.removeprefix("/workspace/")
+            storage_object = self.storage_catalog.register(
+                StorageObjectCreate(
+                    tenant_id=run.tenant_id,
+                    workspace_id=run.workspace_id,
+                    run_id=run.id,
+                    purpose=StoragePurpose.SANDBOX_FILE,
+                    filename=filename,
+                    content_type=downloaded.content_type,
+                    size_bytes=len(content),
+                )
+            )
+            try:
+                self._scan_sandbox_artifact_content(run, storage_object, content)
+                self.object_storage.upload(storage_object, content)
+            except Exception:
+                self._mark_storage_object_deleted(run.tenant_id, storage_object)
+                continue
+            total_bytes += len(content)
+            captured.append(
+                {
+                    "storage_object_id": storage_object.id,
+                    "sandbox_path": path,
+                    "content_type": storage_object.content_type,
+                    "size_bytes": len(content),
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                }
+            )
+        snapshot = {
+            "provider": session.provider,
+            "image": session.image,
+            "network_mode": session.network_mode.value,
+            "timeout_seconds": session.timeout_seconds,
+            "files": captured,
+            "source_run_id": run.id,
+        }
+        state.runtime_metadata["runtime_snapshot"] = snapshot
+        self.store.append_run_event(
+            run,
+            "agent.runtime_snapshot.captured",
+            {
+                "session_id": session.id,
+                "file_count": len(captured),
+                "size_bytes": total_bytes,
+                "image": session.image,
+                "network_mode": session.network_mode.value,
+            },
+        )
+        self._save_state(state)
 
     def _attachment_descriptors(self, run: Run) -> list[dict[str, Any]]:
         if self.storage_catalog is None:
@@ -2115,24 +2302,50 @@ class AgentRuntime(BaseModel):
                 state.tenant_id,
                 state.browser_session_id,
             )
-        session = self.browser_controller.open_session(
-            tenant_id=state.tenant_id,
-            workspace_id=state.workspace_id,
-            run_id=state.run_id,
-            session_id=new_id("browser"),
-        )
-        state.browser_session_id = session.session_id
         run = self.store.get_run(state.tenant_id, state.run_id)
+        profile_id = self._browser_profile_id(state, run)
+        if self.browser_profile_service is not None:
+            record = self.browser_profile_service.open_session(
+                tenant_id=state.tenant_id,
+                workspace_id=state.workspace_id,
+                profile_id=profile_id,
+                run_id=state.run_id,
+                user_id=run.user_id,
+            )
+            state.browser_session_id = record.session_id
+            session = self.browser_controller.get_session(
+                state.tenant_id, record.session_id
+            )
+        else:
+            session = self.browser_controller.open_session(
+                tenant_id=state.tenant_id,
+                workspace_id=state.workspace_id,
+                run_id=state.run_id,
+                session_id=new_id("browser"),
+            )
+            state.browser_session_id = session.session_id
         self.store.append_run_event(
             run,
             "browser.session.created",
             {
                 "session_id": session.session_id,
                 "current_url": session.current_url,
+                "profile_id": profile_id,
             },
         )
         self._save_state(state)
         return session
+
+    def _browser_profile_id(self, state: AgentRuntimeState, run: Run) -> str | None:
+        explicit = next(
+            (item.id for item in run.resource_refs if item.type == "browser_profile"),
+            None,
+        )
+        if explicit:
+            return explicit
+        snapshot = self._agent_runtime_snapshot(state)
+        value = snapshot.get("browser_profile_id")
+        return str(value) if value else None
 
     def _record_sandbox_command_event(
         self,
@@ -2646,6 +2859,7 @@ class AgentRuntime(BaseModel):
                 artifact_type=artifact["artifact_type"],
                 uri=artifact["uri"],
             )
+        self._capture_reusable_runtime_snapshot(state, run)
         self._destroy_runtime_sandbox_session(state, reason="success")
         self._destroy_runtime_browser_session(state, reason="success")
         run = self.store.update_run_status(
@@ -2716,14 +2930,22 @@ class AgentRuntime(BaseModel):
     ) -> None:
         if self.browser_controller is None or state.browser_session_id is None:
             return
+        current_url = None
         try:
-            destroyed = self.browser_controller.delete_session(
-                state.tenant_id,
-                state.browser_session_id,
-            )
+            if self.browser_profile_service is not None:
+                record = self.browser_profile_service.close_session(
+                    state.tenant_id, state.browser_session_id
+                )
+                current_url = record.current_url
+            else:
+                destroyed = self.browser_controller.delete_session(
+                    state.tenant_id,
+                    state.browser_session_id,
+                )
+                current_url = destroyed.current_url
         except NotFoundError:
             return
-        except BrowserProviderUnavailableError as error:
+        except Exception as error:
             run = self.store.get_run(state.tenant_id, state.run_id)
             self.store.append_run_event(
                 run,
@@ -2741,8 +2963,8 @@ class AgentRuntime(BaseModel):
             run,
             "browser.session.destroyed",
             {
-                "session_id": destroyed.session_id,
-                "current_url": destroyed.current_url,
+                "session_id": state.browser_session_id,
+                "current_url": current_url,
                 "reason": reason,
             },
         )

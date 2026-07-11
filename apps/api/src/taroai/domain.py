@@ -75,7 +75,7 @@ class ApprovalStatus(str, Enum):
 
 
 class ResourceReference(BaseModel):
-    type: Literal["skill", "connector", "agent", "knowledge", "file"]
+    type: Literal["skill", "connector", "agent", "knowledge", "file", "browser_profile"]
     id: str = Field(min_length=1)
     version: str | None = None
 

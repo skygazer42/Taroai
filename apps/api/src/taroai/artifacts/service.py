@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import difflib
+import json
 from html import escape
 from typing import Any
 
 from taroai.artifacts.models import (
     ArtifactPreview,
     ArtifactRenderPolicy,
+    ArtifactDiff,
+    ArtifactSource,
     DashboardSpec,
     RichArtifactCreate,
 )
@@ -143,4 +147,86 @@ class ArtifactService:
             tenant_id, artifact.storage_object_id
         )
         return artifact, self.object_storage.download(storage_object)
+
+    def source(self, tenant_id: str, artifact_id: str) -> ArtifactSource:
+        artifact = self.store.get_artifact(tenant_id, artifact_id)
+        content_type = artifact.content_type or "text/plain"
+        source = ""
+        truncated = False
+        if artifact.storage_object_id is not None:
+            storage_object = self.storage_catalog.get(
+                tenant_id, artifact.storage_object_id
+            )
+            download = self.object_storage.download(storage_object)
+            limit = ArtifactRenderPolicy().max_preview_bytes
+            raw = download.content[:limit]
+            truncated = len(download.content) > len(raw)
+            source = raw.decode("utf-8", errors="replace")
+        elif artifact.dashboard_payload is not None:
+            content_type = "application/json"
+            source = json.dumps(
+                artifact.dashboard_payload, ensure_ascii=False, indent=2
+            )
+        else:
+            payload = artifact.preview_payload or {}
+            value = next(
+                (
+                    payload[key]
+                    for key in ("source", "code", "text", "content")
+                    if key in payload
+                ),
+                payload,
+            )
+            source = (
+                value
+                if isinstance(value, str)
+                else json.dumps(value, ensure_ascii=False, indent=2)
+            )
+        return ArtifactSource(
+            artifact_id=artifact.id,
+            name=artifact.name,
+            content_type=content_type,
+            source=source,
+            truncated=truncated,
+        )
+
+    def diff(
+        self,
+        tenant_id: str,
+        artifact_id: str,
+        compare_to_artifact_id: str | None = None,
+    ) -> ArtifactDiff:
+        artifact = self.store.get_artifact(tenant_id, artifact_id)
+        comparison = None
+        if compare_to_artifact_id is not None:
+            comparison = self.store.get_artifact(tenant_id, compare_to_artifact_id)
+            if comparison.workspace_id != artifact.workspace_id:
+                raise ValueError("Artifacts must belong to the same workspace")
+        else:
+            candidates = [
+                item
+                for item in self.store.list_artifacts(tenant_id, artifact.run_id)
+                if item.id != artifact.id
+                and item.name == artifact.name
+                and item.created_at < artifact.created_at
+            ]
+            comparison = candidates[-1] if candidates else None
+        current = self.source(tenant_id, artifact.id).source
+        previous = (
+            self.source(tenant_id, comparison.id).source if comparison else ""
+        )
+        lines = difflib.unified_diff(
+            previous.splitlines(keepends=True),
+            current.splitlines(keepends=True),
+            fromfile=comparison.name if comparison else "/dev/null",
+            tofile=artifact.name,
+        )
+        rendered = "".join(lines)
+        return ArtifactDiff(
+            artifact_id=artifact.id,
+            compare_to_artifact_id=comparison.id if comparison else None,
+            compare_to_name=comparison.name if comparison else None,
+            diff=rendered,
+            has_changes=bool(rendered),
+        )
 

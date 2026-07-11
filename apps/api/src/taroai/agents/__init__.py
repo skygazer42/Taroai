@@ -4,6 +4,7 @@ from taroai.agents.models import (
     AgentDefinitionPatch,
     AgentDraft,
     AgentExtractRequest,
+    AgentImportRequest,
     AgentInvocation,
     AgentRunRequest,
     AgentVersion,
@@ -14,8 +15,9 @@ from taroai.agents.repository import AgentRegistry, InMemoryAgentRegistry, SqlAg
 from taroai.agents.service import AgentRegistryService
 
 __all__ = [
-    "AgentDefinition", "AgentDefinitionCreate", "AgentDefinitionPatch", "AgentDraft", "AgentExtractRequest",
-    "AgentInvocation", "AgentRegistry", "AgentRegistryService", "AgentRunRequest",
+    "AgentDefinition", "AgentDefinitionCreate", "AgentDefinitionPatch", "AgentDraft",
+    "AgentExtractRequest", "AgentImportRequest", "AgentInvocation", "AgentRegistry",
+    "AgentRegistryService", "AgentRunRequest",
     "AgentVersion", "AgentVersionCreate", "AgentVersionSpec", "InMemoryAgentRegistry",
     "SqlAgentRegistry",
 ]

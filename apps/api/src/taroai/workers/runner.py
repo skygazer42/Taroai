@@ -70,6 +70,11 @@ from taroai.skills import (
     SqlSkillRegistry,
     register_skill_tool_handlers,
 )
+from taroai.browser_profiles import (
+    BrowserProfileService,
+    InMemoryBrowserProfileRegistry,
+    SqlBrowserProfileRegistry,
+)
 from taroai.skills.import_service import HttpsGithubArchiveFetcher
 from taroai.skills.service import SkillService
 from taroai.store import InMemoryControlPlaneStore
@@ -422,6 +427,12 @@ def build_agent_worker_runner(
     secret_service = build_secret_service_from_settings(settings)
     sandbox_adapter = build_sandbox_adapter(settings)
     browser_controller = build_worker_browser_controller(settings)
+    browser_profile_registry = build_worker_browser_profile_registry(settings)
+    browser_profile_service = BrowserProfileService(
+        registry=browser_profile_registry,
+        secret_service=secret_service,
+        browser_controller=browser_controller,
+    )
     policy_service = IdentityPolicyService(
         identity_service=build_worker_identity_service(settings, audit_service)
     )
@@ -443,6 +454,7 @@ def build_agent_worker_runner(
             sandbox_adapter,
             browser_controller,
             worker_skill_service,
+            browser_profile_service,
         ),
         policy_service=policy_service,
         audit_service=audit_service,
@@ -467,6 +479,7 @@ def build_agent_worker_runner(
         connector_dispatcher=connector_dispatcher,
         connector_invocation_service=connector_invocation_service,
         agent_registry=agent_registry,
+        browser_profile_service=browser_profile_service,
     ), settings)
     if resolved_runtime.skill_service is None:
         resolved_runtime.skill_service = worker_skill_service
@@ -478,6 +491,8 @@ def build_agent_worker_runner(
         resolved_runtime.connector_invocation_service = connector_invocation_service
     if resolved_runtime.agent_registry is None:
         resolved_runtime.agent_registry = agent_registry
+    if resolved_runtime.browser_profile_service is None:
+        resolved_runtime.browser_profile_service = browser_profile_service
     chat_service = ChatService(
         store=resolved_store,
         model_policy_resolver=lambda: resolved_runtime.model_policy,
@@ -966,6 +981,7 @@ def build_worker_tool_gateway(
     sandbox_adapter: SandboxAdapter | None = None,
     browser_controller: BrowserController | None = None,
     skill_service: SkillService | None = None,
+    browser_profile_service: BrowserProfileService | None = None,
 ) -> ToolGateway:
     gateway = ToolGateway(
         audit_service=audit_service,
@@ -979,6 +995,7 @@ def build_worker_tool_gateway(
     register_browser_tool_handlers(
         gateway,
         browser_controller or build_worker_browser_controller(settings),
+        profile_service=browser_profile_service,
     )
     register_skill_tool_handlers(
         gateway,
@@ -996,6 +1013,17 @@ def build_worker_browser_controller(settings: Settings) -> BrowserController:
             timeout_seconds=settings.browser_controller_timeout_seconds,
         )
     return BrowserController(provider=settings.browser_provider)
+
+
+def build_worker_browser_profile_registry(settings: Settings):
+    if settings.browser_profile_store_backend == "sql":
+        config = settings.database_config()
+        MigrationRunner(
+            config=config,
+            migrations_path=Path("apps/api/migrations"),
+        ).apply()
+        return SqlBrowserProfileRegistry(config=config)
+    return InMemoryBrowserProfileRegistry()
 
 
 def build_worker_queue(settings: Settings) -> JobQueue:

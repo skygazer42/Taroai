@@ -33,6 +33,7 @@ export class AgentsUI {
     window.addEventListener("hashchange", () => this.route());
     this.root?.addEventListener("click", (event) => this.click(event));
     this.root?.addEventListener("submit", (event) => this.submit(event));
+    this.root?.addEventListener("change", (event) => this.change(event));
     this.root?.addEventListener("input", (event) => {
       if (event.target.matches("[data-agent-search]")) this.renderCards(event.target.value);
     });
@@ -60,7 +61,7 @@ export class AgentsUI {
   renderShell() {
     this.root.innerHTML = `
       <section class="capability-page agents-page">
-        <header class="capability-page-header"><div><p>Reusable work</p><h1>Agents</h1><span>Versioned applications built from successful execution patterns.</span></div><div class="capability-header-actions"><button type="button" data-agent-import>Import</button><button class="primary" type="button" data-agent-create>Create agent</button></div></header>
+        <header class="capability-page-header"><div><p>Reusable work</p><h1>Agents</h1><span>Versioned applications built from successful execution patterns.</span></div><div class="capability-header-actions"><button type="button" data-agent-import>Import</button><input type="file" accept="application/json,.json" hidden data-agent-import-input /><button class="primary" type="button" data-agent-create>Create agent</button></div></header>
         <div class="capability-toolbar"><label><span>⌕</span><input data-agent-search type="search" placeholder="Search agents" /></label><div class="agent-view-meta" data-agent-count>0 agents</div><button data-agents-refresh>Refresh</button></div>
         <div class="agent-product-layout"><section class="agent-library" data-agent-library><div class="route-loading">Loading agents…</div></section><aside class="agent-inspector" data-agent-inspector><div class="route-empty"><span>A</span><strong>Select an agent</strong><p>Review inputs, pinned context, versions, and recent sessions.</p></div></aside></div>
         <div class="route-toast" data-agent-toast hidden></div>
@@ -69,8 +70,13 @@ export class AgentsUI {
 
   async load() {
     try {
-      const payload = await this.api.get(`/api/agents?workspace_id=${encodeURIComponent(this.api.settings().workspaceId)}`);
+      const workspace = encodeURIComponent(this.api.settings().workspaceId);
+      const [payload, browserProfiles] = await Promise.all([
+        this.api.get(`/api/agents?workspace_id=${workspace}`),
+        this.api.get(`/api/browser/profiles?workspace_id=${workspace}`).catch(() => ({ profiles: [] })),
+      ]);
       this.agents = list(payload, "agents", "definitions");
+      this.draftBrowserProfiles = list(browserProfiles, "profiles");
       this.selected = this.agents.find((agent) => (agent.id || agent.agent_id) === (this.selected?.id || this.selected?.agent_id)) || this.agents[0] || null;
       this.renderCards();
       if (this.selected) await this.select(this.selected.id || this.selected.agent_id);
@@ -142,15 +148,17 @@ export class AgentsUI {
     const fields = schemaFields(schema);
     const versions = list(agent.versions, "items").length ? list(agent.versions, "items") : [{ version: agent.version || agent.latest_version || "1", status: agent.status || "published", created_at: agent.updated_at }];
     root.innerHTML = `
-      <header class="agent-inspector-header"><div><span class="agent-monogram large">${(agent.name || "A").slice(0, 1).toUpperCase()}</span><div><small>${agent.status || "Published"}</small><h2></h2><p></p></div></div><button data-agent-edit>Edit draft</button></header>
+      <header class="agent-inspector-header"><div><span class="agent-monogram large">${(agent.name || "A").slice(0, 1).toUpperCase()}</span><div><small>${agent.status || "Published"}</small><h2></h2><p></p></div></div><div class="agent-inspector-actions"><button data-agent-export>Export</button><button data-agent-edit>Edit draft</button></div></header>
       <nav class="agent-inspector-tabs"><button class="is-active" data-agent-tab="run">Run</button><button data-agent-tab="configuration">Configuration</button><button data-agent-tab="versions">Versions</button><button data-agent-tab="sessions">Sessions</button></nav>
       <section data-agent-panel="run"><form class="agent-run-form" data-agent-run-form>${fields.map((field) => this.fieldMarkup(field)).join("")}<button class="primary" type="submit" ${loading ? "disabled" : ""}>Run agent</button></form></section>
-      <section data-agent-panel="configuration" hidden><div class="agent-config-block"><small>Instructions</small><p></p></div><div class="agent-binding-grid"><div><small>Pinned skills</small><strong>${list(agent.skills, "items").length || list(agent.skill_bindings, "items").length}</strong></div><div><small>Reference files</small><strong>${list(agent.files, "items").length || list(agent.reference_files, "items").length}</strong></div><div><small>Runtime</small><strong>${agent.runtime_profile?.name || agent.runtime || "Workspace default"}</strong></div><div><small>Output</small><strong>${agent.output_format || agent.output_contract?.type || "Structured result"}</strong></div></div></section>
+      <section data-agent-panel="configuration" hidden><div class="agent-config-block"><small>Instructions</small><p></p></div><div class="agent-binding-grid"><div><small>Pinned skills</small><strong>${list(agent.skills, "items").length || list(agent.skill_bindings, "items").length}</strong></div><div><small>Reference files</small><strong>${list(agent.files, "items").length || list(agent.reference_files, "items").length}</strong></div><div><small>Runtime</small><strong>${agent.runtime_snapshot?.image || "Workspace default"}</strong></div><div><small>Autonomy</small><strong>${agent.runtime_snapshot?.autonomy_mode || "workflow"}</strong></div><div><small>Browser profile</small><strong data-agent-browser-profile></strong></div><div><small>Restored files</small><strong>${list(agent.runtime_snapshot?.files, "items").length}</strong></div><div><small>Output</small><strong>${agent.output_format || agent.output_contract?.type || "Structured result"}</strong></div></div></section>
       <section data-agent-panel="versions" hidden><ol class="agent-version-list">${versions.map((version) => `<li><span><strong>v${version.version || version.number}</strong><small>${version.status || "published"} · ${version.created_at ? new Date(version.created_at).toLocaleDateString() : "current"}</small></span><button data-agent-restore="${version.version || version.number}">Restore</button></li>`).join("")}</ol></section>
       <section data-agent-panel="sessions" hidden><ol class="agent-session-list">${this.sessions.length ? this.sessions.map((session) => `<li><span><strong>${session.title || session.input_summary || "Agent session"}</strong><small>${session.status || "completed"} · ${session.created_at ? new Date(session.created_at).toLocaleString() : ""}</small></span><button data-agent-session="${session.thread_id || session.id}">Open</button></li>`).join("") : "<li class='route-note'>No sessions yet.</li>"}</ol></section>`;
     root.querySelector("h2").textContent = agent.name || "Untitled agent";
     root.querySelector(".agent-inspector-header p").textContent = agent.description || "Reusable agent";
     root.querySelector(".agent-config-block p").textContent = agent.instructions || "No additional instructions were published.";
+    const profile = (this.draftBrowserProfiles || []).find((item) => item.id === agent.runtime_snapshot?.browser_profile_id);
+    root.querySelector("[data-agent-browser-profile]").textContent = profile?.name || (agent.runtime_snapshot?.browser_profile_id ? "Pinned profile" : "Workspace default");
   }
 
   fieldMarkup(field) {
@@ -172,7 +180,44 @@ export class AgentsUI {
     if (button.dataset.agentTab) return this.switchTab(button.dataset.agentTab);
     if (button.dataset.agentRestore) return this.restore(button.dataset.agentRestore);
     if (button.dataset.agentSession) { window.location.hash = `chat/${encodeURIComponent(button.dataset.agentSession)}`; return; }
-    if (button.matches("[data-agent-import]")) return this.toast("Agent import is available through the versioned Agent API.", "idle");
+    if (button.matches("[data-agent-import]")) return this.root.querySelector("[data-agent-import-input]")?.click();
+    if (button.matches("[data-agent-export]")) return this.exportAgent();
+  }
+
+  async change(event) {
+    if (!event.target.matches("[data-agent-import-input]") || !event.target.files?.[0]) return;
+    try {
+      const bundle = JSON.parse(await event.target.files[0].text());
+      const result = await this.api.post("/api/agents/import", {
+        workspace_id: this.api.settings().workspaceId,
+        bundle,
+        publish: true,
+      }, { scope: "agent-import" });
+      this.toast(`Imported ${result.agent?.name || "Agent"}`, "success");
+      await this.load();
+    } catch (error) {
+      this.toast(error.message, "error");
+    } finally {
+      event.target.value = "";
+    }
+  }
+
+  async exportAgent() {
+    if (!this.selected) return;
+    try {
+      const id = this.selected.id || this.selected.agent_id;
+      const bundle = await this.api.get(`/api/agents/${encodeURIComponent(id)}/export`);
+      const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `${(bundle.metadata?.name || "agent").replace(/[^A-Za-z0-9._-]+/g, "-")}.agent.json`;
+      anchor.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+      this.toast("Agent bundle exported", "success");
+    } catch (error) {
+      this.toast(error.message, "error");
+    }
   }
 
   submit(event) {
@@ -204,20 +249,33 @@ export class AgentsUI {
   }
 
   async openDraft(agent = {}) {
-    try {
-      const payload = await this.api.get(`/api/workspaces/${encodeURIComponent(this.api.settings().workspaceId)}/files`);
-      this.draftFiles = list(payload, "files");
-    } catch {
-      this.draftFiles = [];
-    }
+    const workspace = encodeURIComponent(this.api.settings().workspaceId);
+    const [files, browserProfiles] = await Promise.allSettled([
+      this.api.get(`/api/workspaces/${workspace}/files`),
+      this.api.get(`/api/browser/profiles?workspace_id=${workspace}`),
+    ]);
+    this.draftFiles = files.status === "fulfilled" ? list(files.value, "files") : [];
+    this.draftBrowserProfiles = browserProfiles.status === "fulfilled" ? list(browserProfiles.value, "profiles").filter((item) => item.status === "active") : [];
     const dialog = document.createElement("dialog");
     dialog.className = "chat-dialog agent-editor-dialog";
-    dialog.innerHTML = `<form class="chat-dialog-card" data-agent-draft-form><header><div><small>Review before publish</small><h2>${agent.id ? "Edit agent draft" : "Create agent"}</h2></div><button type="button" data-close>×</button></header><label><span>Name</span><input name="name" required /></label><label><span>Description</span><textarea name="description" rows="2"></textarea></label><label><span>Instructions</span><textarea name="instructions" rows="6" required></textarea></label><label><span>Output format</span><input name="output_format" placeholder="Report, table, artifact set…" /></label><label><span>Input JSON schema</span><textarea name="input_schema" data-json-field rows="6">${JSON.stringify(agent.input_schema || { type: "object", properties: { request: { type: "string" } }, required: ["request"] }, null, 2)}</textarea></label><fieldset class="agent-reference-picker"><legend>Reference files <small>Materialized into every fresh run</small></legend><div data-agent-reference-options></div></fieldset><div class="agent-draft-bindings"><span>${list(agent.skill_bindings || agent.skills, "items").length} pinned skills</span><span data-agent-reference-count>${list(agent.reference_files || agent.files, "items").length} files</span><span>${agent.runtime || "Default runtime"}</span></div><footer><button type="button" data-close>Cancel</button><button class="primary" type="submit">Save & publish</button></footer></form>`;
+    dialog.innerHTML = `<form class="chat-dialog-card" data-agent-draft-form><header><div><small>Review before publish</small><h2>${agent.id ? "Edit agent draft" : "Create agent"}</h2></div><button type="button" data-close>×</button></header><label><span>Name</span><input name="name" required /></label><label><span>Description</span><textarea name="description" rows="2"></textarea></label><label><span>Instructions</span><textarea name="instructions" rows="6" required></textarea></label><label><span>Output format</span><input name="output_format" placeholder="Report, table, artifact set…" /></label><label><span>Input JSON schema</span><textarea name="input_schema" data-json-field rows="6">${JSON.stringify(agent.input_schema || { type: "object", properties: { request: { type: "string" } }, required: ["request"] }, null, 2)}</textarea></label><div class="agent-runtime-editor"><label><span>Autonomy</span><select name="autonomy_mode"><option value="workflow">Guarded workflow</option><option value="autonomous">Autonomous</option></select></label><label><span>Network policy</span><select name="network_mode"><option value="disabled">Disabled</option><option value="allowlist">Allowlist</option><option value="open">Open</option></select></label><label><span>Browser profile</span><select name="browser_profile_id" data-agent-browser-profile-options><option value="">Workspace default</option></select></label><label><span>Runtime image</span><input name="runtime_image" placeholder="python:3.12-slim" /></label><label><span>Timeout seconds</span><input name="timeout_seconds" type="number" min="1" max="86400" /></label></div><fieldset class="agent-reference-picker"><legend>Reference files <small>Materialized into every fresh run</small></legend><div data-agent-reference-options></div></fieldset><div class="agent-draft-bindings"><span>${list(agent.skill_bindings || agent.skills, "items").length} pinned skills</span><span data-agent-reference-count>${list(agent.reference_files || agent.files, "items").length} files</span><span>${agent.runtime_snapshot?.image || "Default runtime"}</span></div><footer><button type="button" data-close>Cancel</button><button class="primary" type="submit">Save & publish</button></footer></form>`;
     document.body.append(dialog);
     dialog.querySelector("[name='name']").value = agent.name || "";
     dialog.querySelector("[name='description']").value = agent.description || "";
     dialog.querySelector("[name='instructions']").value = agent.instructions || "";
     dialog.querySelector("[name='output_format']").value = agent.output_contract?.format || agent.output_format || "";
+    dialog.querySelector("[name='autonomy_mode']").value = agent.runtime_snapshot?.autonomy_mode || "workflow";
+    dialog.querySelector("[name='network_mode']").value = agent.runtime_snapshot?.network_mode || "disabled";
+    dialog.querySelector("[name='runtime_image']").value = agent.runtime_snapshot?.image || "";
+    dialog.querySelector("[name='timeout_seconds']").value = agent.runtime_snapshot?.timeout_seconds || 300;
+    const profileSelect = dialog.querySelector("[data-agent-browser-profile-options]");
+    for (const profile of this.draftBrowserProfiles) {
+      const option = document.createElement("option");
+      option.value = profile.id;
+      option.textContent = `${profile.name}${profile.is_default ? " · default" : ""}`;
+      profileSelect.append(option);
+    }
+    profileSelect.value = agent.runtime_snapshot?.browser_profile_id || "";
     const selectedFiles = new Set(list(agent.reference_files || agent.files, "items").map((item) => item.storage_object_id || item.id));
     const options = dialog.querySelector("[data-agent-reference-options]");
     if (!this.draftFiles.length) {
@@ -273,7 +331,14 @@ export class AgentsUI {
       knowledge_bindings: list(agent.knowledge_bindings || agent.knowledge, "items"),
       reference_files,
       model_policy: agent.model_policy || {},
-      runtime_snapshot: agent.runtime_snapshot || {},
+      runtime_snapshot: {
+        ...(agent.runtime_snapshot || {}),
+        autonomy_mode: data.get("autonomy_mode") || "workflow",
+        network_mode: data.get("network_mode") || "disabled",
+        image: data.get("runtime_image") || undefined,
+        timeout_seconds: Number(data.get("timeout_seconds") || 300),
+        browser_profile_id: data.get("browser_profile_id") || undefined,
+      },
       source_thread_id: agent.source_thread_id || chatState.currentThreadId || null,
       source_run_id: agent.source_run_id || null,
       change_note: agent.id ? "Updated from Agent editor" : "Created from Agent editor",

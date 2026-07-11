@@ -46,6 +46,8 @@ export class SkillsUI {
     this.files = [];
     this.activeFile = null;
     this.packageRecord = null;
+    this.packages = [];
+    this.versionDiff = null;
     this.evaluations = [];
     this.mode = "rendered";
     this.filter = "all";
@@ -175,6 +177,8 @@ export class SkillsUI {
     this.files = [];
     this.activeFile = null;
     this.packageRecord = null;
+    this.packages = [];
+    this.versionDiff = null;
     this.evaluations = [];
     this.renderList();
     this.renderDetail(true);
@@ -182,6 +186,7 @@ export class SkillsUI {
     let version = this.selected.installed_version || this.selected.version || this.selected.manifest?.version || null;
     try {
       const packages = items(await this.api.get(`/api/skills/${encodeURIComponent(id)}/packages`), "packages");
+      this.packages = packages;
       this.packageRecord = packages.find((item) => item.package?.version === version) || packages[packages.length - 1] || null;
       version = this.packageRecord?.package?.version || version;
       if (!version) throw new Error("No package version is available");
@@ -238,11 +243,82 @@ export class SkillsUI {
         <aside class="skill-file-tree" data-skill-files>${loading ? "<span>Loading package…</span>" : ""}</aside>
         <div class="skill-source-panel"><header><strong data-skill-file-title>SKILL.md</strong><div><button data-skill-source-mode="rendered" class="is-active">Rendered</button><button data-skill-source-mode="raw">Raw</button></div></header><div data-skill-source></div></div>
       </section>
-      <section data-skill-view-panel="versions" hidden><div class="skill-version-actions"><button data-skill-upgrade ${installed ? "" : "disabled"}>Upgrade</button><button data-skill-rollback ${installed ? "" : "disabled"}>Rollback</button></div><div class="route-note">Version changes are pinned to this workspace and remain visible in Run evidence.</div></section>
+      <section data-skill-view-panel="versions" hidden><div class="skill-version-actions"><button data-skill-upgrade ${installed ? "" : "disabled"}>Upgrade</button><button data-skill-rollback ${installed ? "" : "disabled"}>Rollback</button></div><div class="skill-version-workbench"><aside data-skill-version-list></aside><article><form data-skill-version-compare><label><span>Compare from</span><select name="from_version"></select></label><label><span>To</span><select name="to_version"></select></label><button type="submit">Compare versions</button></form><div data-skill-version-diff><div class="route-note">Select two package versions to inspect file, permission, dependency, and source changes.</div></div></article></div></section>
       <section data-skill-view-panel="evaluation" hidden><div class="evaluation-summary"><strong>${latestEvaluation?.status || "Evaluation not run"}</strong><p>${latestEvaluation ? `Score ${latestEvaluation.score ?? "—"} · ${latestEvaluation.id}` : "Run the package evaluation suite before promotion."}</p><button data-skill-evaluate>Run evaluation</button>${packageStatus === "draft" ? `<button data-skill-publish ${latestEvaluation?.passed ? "" : "disabled"}>Publish evaluated version</button>` : ""}</div></section>`;
     detail.querySelector("h2").textContent = skill.name;
     detail.querySelector(".capability-detail-header p").textContent = skill.description || "Reusable execution guidance for this workspace.";
-    if (!loading) this.renderFiles();
+    if (!loading) {
+      this.renderFiles();
+      this.renderVersions();
+    }
+  }
+
+  renderVersions() {
+    const list = this.root.querySelector("[data-skill-version-list]");
+    const form = this.root.querySelector("[data-skill-version-compare]");
+    if (!list || !form) return;
+    list.replaceChildren();
+    for (const record of this.packages) {
+      const pkg = record.package || {};
+      const card = document.createElement("button");
+      card.type = "button";
+      card.dataset.skillVersionOpen = pkg.version;
+      card.className = "skill-version-card";
+      card.classList.toggle("is-active", pkg.version === this.packageRecord?.package?.version);
+      card.innerHTML = `<span><strong></strong><small></small></span><em></em>`;
+      card.querySelector("strong").textContent = `v${pkg.version}`;
+      card.querySelector("small").textContent = `${pkg.files?.length || 0} files · ${(pkg.package_digest || "").slice(0, 10)}`;
+      card.querySelector("em").textContent = record.status || "draft";
+      list.append(card);
+    }
+    for (const select of form.querySelectorAll("select")) select.replaceChildren();
+    for (const record of this.packages) {
+      for (const select of form.querySelectorAll("select")) {
+        const option = document.createElement("option");
+        option.value = record.package.version;
+        option.textContent = `v${record.package.version} · ${record.status}`;
+        select.append(option);
+      }
+    }
+    const current = this.packageRecord?.package?.version;
+    form.elements.to_version.value = current || this.packages.at(-1)?.package?.version || "";
+    form.elements.from_version.value = this.packages.find((item) => item.package.version !== form.elements.to_version.value)?.package?.version || form.elements.to_version.value;
+    form.addEventListener("submit", (event) => { event.preventDefault(); this.compareVersions(new FormData(form)); });
+    if (this.versionDiff) this.renderVersionDiff();
+  }
+
+  renderVersionDiff() {
+    const root = this.root.querySelector("[data-skill-version-diff]");
+    if (!root || !this.versionDiff) return;
+    const diff = this.versionDiff;
+    root.replaceChildren();
+    const summary = document.createElement("div");
+    summary.className = "skill-version-diff-summary";
+    const facts = [
+      ["Files", `+${diff.files.added.length} · ~${diff.files.changed.length} · −${diff.files.removed.length}`],
+      ["Permissions", `+${diff.required_scopes.added.length} · −${diff.required_scopes.removed.length}`],
+      ["Dependencies", `+${diff.dependencies.added.length} · −${diff.dependencies.removed.length}`],
+    ];
+    for (const [label, value] of facts) {
+      const fact = document.createElement("div");
+      const small = document.createElement("small"); small.textContent = label;
+      const strong = document.createElement("strong"); strong.textContent = value;
+      fact.append(small, strong); summary.append(fact);
+    }
+    root.append(summary);
+    if (diff.release_notes) {
+      const notes = document.createElement("section"); notes.className = "skill-release-notes";
+      const title = document.createElement("strong"); title.textContent = "Release notes";
+      const text = document.createElement("p"); text.textContent = diff.release_notes;
+      notes.append(title, text); root.append(notes);
+    }
+    for (const patch of diff.patches) {
+      const section = document.createElement("section"); section.className = "skill-version-patch";
+      const header = document.createElement("header"); header.textContent = patch.path;
+      const pre = document.createElement("pre");
+      pre.textContent = patch.binary ? `Binary file changed (${patch.before_size || 0} → ${patch.after_size || 0} bytes)` : patch.diff || "Metadata changed";
+      section.append(header, pre); root.append(section);
+    }
   }
 
   renderFiles() {
@@ -321,6 +397,7 @@ export class SkillsUI {
     if (button.matches("[data-skill-rollback]")) return this.moveVersion("rollback");
     if (button.matches("[data-skill-evaluate]")) return this.evaluate();
     if (button.matches("[data-skill-publish]")) return this.publish();
+    if (button.dataset.skillVersionOpen) return this.openVersion(button.dataset.skillVersionOpen);
   }
 
   switchView(view) {
@@ -386,6 +463,34 @@ export class SkillsUI {
       await this.api.post(`/api/workspaces/${encodeURIComponent(this.api.settings().workspaceId)}/skills/${encodeURIComponent(this.selected.id)}/${operation}`, { target_version: target, expected_package_digest: this.selected.package_digest || null }, { scope: `skill-${operation}` });
       this.toast(`Skill ${operation} complete`, "success");
       await this.load();
+    } catch (error) { this.toast(error.message, "error"); }
+  }
+
+  async openVersion(version) {
+    if (!this.selected) return;
+    const record = this.packages.find((item) => item.package?.version === version);
+    if (!record) return;
+    this.packageRecord = record;
+    this.versionDiff = null;
+    try {
+      const payload = await this.api.get(`/api/skills/${encodeURIComponent(this.selected.id)}/packages/${encodeURIComponent(version)}/files`);
+      this.files = items(payload, "files", "entries");
+      this.activeFile = this.files.find((file) => (file.path || file.name) === "SKILL.md") || this.files[0] || null;
+      if (this.activeFile) await this.loadFile(this.activeFile.path || this.activeFile.name);
+      this.evaluations = items(await this.api.get(`/api/skills/${encodeURIComponent(this.selected.id)}/packages/${encodeURIComponent(version)}/evaluations`), "evaluations");
+      this.renderDetail();
+      this.switchView("versions");
+    } catch (error) { this.toast(error.message, "error"); }
+  }
+
+  async compareVersions(data) {
+    if (!this.selected) return;
+    const from = String(data.get("from_version") || "");
+    const to = String(data.get("to_version") || "");
+    if (!from || !to || from === to) return this.toast("Choose two different versions", "error");
+    try {
+      this.versionDiff = await this.api.get(`/api/skills/${encodeURIComponent(this.selected.id)}/packages/${encodeURIComponent(to)}/diff?compare_to=${encodeURIComponent(from)}`);
+      this.renderVersionDiff();
     } catch (error) { this.toast(error.message, "error"); }
   }
 

@@ -17,6 +17,7 @@ from taroai.domain import (
     ChatMessageDispatchStatus,
     ChatThreadCreate,
     RunCreate,
+    RunMode,
     RunStatus,
     ResourceReference,
     new_id,
@@ -25,10 +26,18 @@ from taroai.domain import (
 
 
 class AgentRegistryService:
-    def __init__(self, *, registry: Any, store: Any, storage_catalog: Any | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        registry: Any,
+        store: Any,
+        storage_catalog: Any | None = None,
+        browser_profile_service: Any | None = None,
+    ) -> None:
         self.registry = registry
         self.store = store
         self.storage_catalog = storage_catalog
+        self.browser_profile_service = browser_profile_service
 
     def create(
         self,
@@ -109,8 +118,14 @@ class AgentRegistryService:
                     "reasoning_effort": source_run.reasoning_effort,
                 },
                 runtime_snapshot={
-                    "sandbox_session_id": thread.sandbox_session_id,
-                    "runtime_state": runtime_state,
+                    **runtime_state.get("runtime_metadata", {}).get(
+                        "runtime_snapshot", {}
+                    ),
+                    "source_run_id": source_run.id,
+                    "checkpoint_sequence": runtime_state.get(
+                        "checkpoint_sequence", 0
+                    ),
+                    "autonomy_mode": "workflow",
                 },
                 source_thread_id=thread.id,
                 source_run_id=source_run.id,
@@ -150,6 +165,28 @@ class AgentRegistryService:
                 storage_object = self.storage_catalog.get(tenant_id, storage_object_id)
                 if storage_object.workspace_id != target.workspace_id:
                     raise ValueError("Published Agent reference file is not in the Agent workspace")
+        for runtime_file in target.spec.runtime_snapshot.get("files", []):
+            storage_object_id = runtime_file.get("storage_object_id")
+            sandbox_path = str(runtime_file.get("sandbox_path") or "")
+            if (
+                not storage_object_id
+                or not sandbox_path.startswith("/workspace/")
+                or sandbox_path.startswith("/workspace/inputs/")
+                or sandbox_path.startswith("/workspace/artifacts/")
+                or ".." in sandbox_path.split("/")
+            ):
+                raise ValueError("Agent runtime snapshot files must pin storage and sandbox paths")
+            if self.storage_catalog is not None:
+                storage_object = self.storage_catalog.get(tenant_id, storage_object_id)
+                if storage_object.workspace_id != target.workspace_id:
+                    raise ValueError("Agent runtime snapshot file is not in the Agent workspace")
+        browser_profile_id = target.spec.runtime_snapshot.get("browser_profile_id")
+        if browser_profile_id and self.browser_profile_service is not None:
+            profile = self.browser_profile_service.get_profile(
+                tenant_id, str(browser_profile_id)
+            )
+            if profile.workspace_id != target.workspace_id or profile.status != "active":
+                raise ValueError("Agent browser profile is not active in its workspace")
         model_policy = target.spec.model_policy
         if bool(model_policy.get("provider_id")) != bool(model_policy.get("model_id")):
             raise ValueError("Agent model policy must pin provider_id and model_id together")
@@ -171,6 +208,12 @@ class AgentRegistryService:
             raise ValueError("Agent version is not published")
         self._validate_input(version.spec.input_schema, payload.input)
         model_policy = version.spec.model_policy
+        resource_refs = [
+            ResourceReference(
+                type="agent", id=definition.id, version=str(version.version)
+            ),
+            *self._resource_refs(version.spec),
+        ]
         thread = self.store.create_chat_thread(
             tenant_id,
             user_id,
@@ -180,7 +223,7 @@ class AgentRegistryService:
                 provider_id=model_policy.get("provider_id"),
                 model_id=model_policy.get("model_id"),
                 reasoning_effort=model_policy.get("reasoning_effort"),
-                resource_refs=self._resource_refs(version.spec),
+                resource_refs=resource_refs,
             ),
         )
         content = json.dumps(payload.input, ensure_ascii=False)
@@ -196,7 +239,7 @@ class AgentRegistryService:
                     for item in version.spec.reference_files
                     if item.get("storage_object_id")
                 ],
-                resource_refs=self._resource_refs(version.spec),
+                resource_refs=resource_refs,
             ),
         )
         run, _ = self.store.create_queued_thread_run_if_absent(
@@ -220,7 +263,13 @@ class AgentRegistryService:
                 provider_id=model_policy.get("provider_id"),
                 model_id=model_policy.get("model_id"),
                 reasoning_effort=model_policy.get("reasoning_effort"),
-                resource_refs=self._resource_refs(version.spec),
+                mode=RunMode(
+                    payload.mode
+                    or version.spec.runtime_snapshot.get(
+                        "autonomy_mode", RunMode.WORKFLOW.value
+                    )
+                ),
+                resource_refs=resource_refs,
             ),
         )
         return AgentInvocation(

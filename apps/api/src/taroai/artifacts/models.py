@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -116,3 +117,32 @@ class ArtifactPreview(BaseModel):
     truncated: bool = False
     iframe_sandbox: str | None = None
     content_security_policy: str | None = None
+
+
+class ArtifactSource(BaseModel):
+    artifact_id: str
+    name: str
+    content_type: str
+    source: str
+    truncated: bool = False
+
+
+class ArtifactDiff(BaseModel):
+    artifact_id: str
+    compare_to_artifact_id: str | None = None
+    compare_to_name: str | None = None
+    diff: str
+    has_changes: bool
+
+
+class ArtifactShareCreate(BaseModel):
+    expires_in_hours: int = Field(default=168, ge=1, le=720)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ArtifactShareLink(BaseModel):
+    grant_id: str
+    artifact_id: str
+    url: str
+    expires_at: datetime

@@ -5,6 +5,7 @@ from typing import Any
 from taroai.sandbox.adapter import SandboxAdapter
 from taroai.sandbox.browser import BrowserController
 from taroai.sandbox.models import BrowserAction, BrowserActionType, SandboxCommand
+from taroai.store import NotFoundError
 from taroai.secrets import SecretLease
 from taroai.tool_gateway import (
     ToolExecutionError,
@@ -32,14 +33,20 @@ def register_sandbox_tool_handlers(gateway: ToolGateway, adapter: SandboxAdapter
     )
 
 
-def register_browser_tool_handlers(gateway: ToolGateway, controller: BrowserController) -> None:
+def register_browser_tool_handlers(
+    gateway: ToolGateway,
+    controller: BrowserController,
+    profile_service: Any | None = None,
+) -> None:
     gateway.register_tool(
         policy=ToolPolicy(
             tool_name="browser.action",
             required_scopes=["browser.act"],
             risk_level=ToolRiskLevel.HIGH,
         ),
-        handler=lambda request: _apply_browser_action(controller, request),
+        handler=lambda request: _apply_browser_action(
+            controller, request, profile_service=profile_service
+        ),
     )
 
 
@@ -69,9 +76,12 @@ def _execute_command(adapter: SandboxAdapter, request: ToolGatewayRequest) -> To
     )
 
 
-def _apply_browser_action(controller: BrowserController, request: ToolGatewayRequest) -> ToolResult:
-    observation = controller.apply(
-        BrowserAction(
+def _apply_browser_action(
+    controller: BrowserController,
+    request: ToolGatewayRequest,
+    profile_service: Any | None = None,
+) -> ToolResult:
+    action = BrowserAction(
             tenant_id=request.tenant_id,
             workspace_id=request.workspace_id,
             run_id=request.run_id,
@@ -82,7 +92,21 @@ def _apply_browser_action(controller: BrowserController, request: ToolGatewayReq
             text=_optional_str(request.tool_input.get("text")),
             metadata=dict(request.tool_input.get("metadata", {})),
         )
-    )
+    if profile_service is not None:
+        try:
+            observation = profile_service.apply_action(
+                tenant_id=request.tenant_id,
+                session_id=action.session_id,
+                action_type=action.action_type,
+                url=action.url,
+                selector=action.selector,
+                text=action.text,
+                metadata=action.metadata,
+            )
+        except NotFoundError:
+            observation = controller.apply(action)
+    else:
+        observation = controller.apply(action)
     output = observation.model_dump(mode="json")
     if observation.screenshot_content is not None:
         output["screenshot_content_base64"] = base64.b64encode(

@@ -1,4 +1,4 @@
-const TYPE_ORDER = ["skill", "connector", "agent", "knowledge", "file"];
+const TYPE_ORDER = ["skill", "connector", "agent", "knowledge", "file", "browser_profile"];
 
 function asArray(value) {
   if (Array.isArray(value)) return value;
@@ -18,11 +18,13 @@ function normalizeOne(candidate, fallbackType) {
   return {
     type,
     id: String(id),
-    version: candidate.version || candidate.installed_version || null,
+    version: candidate.version || candidate.installed_version
+      ? String(candidate.version || candidate.installed_version)
+      : null,
     name: candidate.name || candidate.display_name || candidate.title || String(id),
     description: candidate.description || candidate.summary || candidate.status || "",
     enabled: candidate.enabled !== false && candidate.status !== "disabled",
-    icon: { skill: "S", connector: "C", agent: "A", knowledge: "K", file: "F" }[type] || "@",
+    icon: { skill: "S", connector: "C", agent: "A", knowledge: "K", file: "F", browser_profile: "B" }[type] || "@",
   };
 }
 
@@ -37,6 +39,7 @@ export function normalizeCapabilities(payload = {}) {
         ...asArray(payload.knowledge).map((item) => ({ ...item, __type: "knowledge" })),
         ...asArray(payload.knowledge_bases).map((item) => ({ ...item, __type: "knowledge" })),
         ...asArray(payload.files).map((item) => ({ ...item, __type: "file" })),
+        ...asArray(payload.browser_profiles).map((item) => ({ ...item, __type: "browser_profile" })),
       ];
   return grouped
     .map((candidate) => normalizeOne(candidate, candidate.__type))

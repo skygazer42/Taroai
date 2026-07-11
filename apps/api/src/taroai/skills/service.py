@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import difflib
+
 from taroai.skills.discovery import (
     SkillDiscoveryService,
     SkillDiscoverySummary,
@@ -274,6 +276,88 @@ class SkillService:
         version: str,
     ) -> str | None:
         return self.imports.get_release_notes(tenant_id, skill_id, version)
+
+    def diff_versions(
+        self,
+        tenant_id: str,
+        skill_id: str,
+        version: str,
+        compare_to: str,
+    ) -> dict:
+        current = self.get_package(
+            tenant_id=tenant_id, skill_id=skill_id, version=version
+        )
+        previous = self.get_package(
+            tenant_id=tenant_id, skill_id=skill_id, version=compare_to
+        )
+        current_files = {item.path: item for item in current.files}
+        previous_files = {item.path: item for item in previous.files}
+        added = sorted(set(current_files) - set(previous_files))
+        removed = sorted(set(previous_files) - set(current_files))
+        changed = sorted(
+            path
+            for path in set(current_files) & set(previous_files)
+            if current_files[path].content_digest
+            != previous_files[path].content_digest
+        )
+        patches = []
+        for path in [*added, *removed, *changed]:
+            before = previous_files.get(path)
+            after = current_files.get(path)
+            try:
+                before_text = before.content.decode("utf-8") if before else ""
+                after_text = after.content.decode("utf-8") if after else ""
+            except UnicodeDecodeError:
+                patches.append(
+                    {
+                        "path": path,
+                        "binary": True,
+                        "diff": "",
+                        "before_size": before.size_bytes if before else 0,
+                        "after_size": after.size_bytes if after else 0,
+                    }
+                )
+                continue
+            patches.append(
+                {
+                    "path": path,
+                    "binary": False,
+                    "diff": "".join(
+                        difflib.unified_diff(
+                            before_text.splitlines(keepends=True),
+                            after_text.splitlines(keepends=True),
+                            fromfile=f"{compare_to}/{path}",
+                            tofile=f"{version}/{path}",
+                        )
+                    ),
+                }
+            )
+        before_scopes = set(previous.manifest.required_scopes)
+        after_scopes = set(current.manifest.required_scopes)
+        before_dependencies = {
+            f"{item.id}@{item.version}" for item in previous.resolved_dependencies
+        }
+        after_dependencies = {
+            f"{item.id}@{item.version}" for item in current.resolved_dependencies
+        }
+        return {
+            "skill_id": skill_id,
+            "from_version": compare_to,
+            "to_version": version,
+            "from_package_digest": previous.package_digest,
+            "to_package_digest": current.package_digest,
+            "files": {"added": added, "removed": removed, "changed": changed},
+            "required_scopes": {
+                "added": sorted(after_scopes - before_scopes),
+                "removed": sorted(before_scopes - after_scopes),
+            },
+            "dependencies": {
+                "added": sorted(after_dependencies - before_dependencies),
+                "removed": sorted(before_dependencies - after_dependencies),
+            },
+            "release_notes": current.release_notes,
+            "patches": patches,
+        }
 
     def discover(
         self,

@@ -33,6 +33,8 @@ class BrowserController(BaseModel):
         workspace_id: str,
         run_id: str,
         session_id: str,
+        storage_state: dict[str, Any] | None = None,
+        profile_id: str | None = None,
     ) -> BrowserSession:
         raise BrowserProviderUnavailableError("browser provider is disabled")
 
@@ -56,6 +58,15 @@ class BrowserController(BaseModel):
         run_id: str | None = None,
     ) -> BrowserSession:
         raise BrowserProviderUnavailableError("browser provider is disabled")
+
+    def export_session_state(
+        self,
+        tenant_id: str,
+        session_id: str,
+        workspace_id: str | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        raise BrowserProviderUnavailableError("browser provider session state is unavailable")
 
     def apply(self, action: BrowserAction) -> BrowserObservation:
         raise BrowserProviderUnavailableError("browser provider is disabled")
@@ -111,6 +122,8 @@ class HttpBrowserController(BrowserController):
         workspace_id: str,
         run_id: str,
         session_id: str,
+        storage_state: dict[str, Any] | None = None,
+        profile_id: str | None = None,
     ) -> BrowserSession:
         self._require_capabilities_for_open(
             tenant_id=tenant_id,
@@ -121,6 +134,8 @@ class HttpBrowserController(BrowserController):
             "workspace_id": workspace_id,
             "run_id": run_id,
             "session_id": session_id,
+            "storage_state": storage_state,
+            "profile_id": profile_id,
         }
         response_body = self._request("POST", "/sessions", body, expected_statuses={200, 201})
         session = BrowserSession.model_validate(response_body)
@@ -285,6 +300,34 @@ class HttpBrowserController(BrowserController):
                 "browser provider did not confirm deleted session"
             )
         return session
+
+    def export_session_state(
+        self,
+        tenant_id: str,
+        session_id: str,
+        workspace_id: str | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        workspace_id, run_id = self._resolve_session_scope(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            workspace_id=workspace_id,
+            run_id=run_id,
+        )
+        query = urlencode(
+            {"tenant_id": tenant_id, "workspace_id": workspace_id, "run_id": run_id}
+        )
+        response = self._request(
+            "GET",
+            f"/sessions/{quote(session_id, safe='')}/state?{query}",
+            None,
+            expected_statuses={200},
+            not_found_message=f"Browser session not found: {session_id}",
+        )
+        state = response.get("storage_state", response)
+        if not isinstance(state, dict):
+            raise BrowserProviderUnavailableError("browser provider returned invalid session state")
+        return state
 
     def _delete_confirmed(self, tenant_id: str, session_id: str) -> bool:
         sessions = self.list_sessions(tenant_id)
@@ -468,6 +511,8 @@ class PlaywrightBrowserController(BrowserController):
         workspace_id: str,
         run_id: str,
         session_id: str,
+        storage_state: dict[str, Any] | None = None,
+        profile_id: str | None = None,
     ) -> BrowserSession:
         if session_id in self._sessions:
             raise BrowserProviderUnavailableError(
@@ -475,7 +520,7 @@ class PlaywrightBrowserController(BrowserController):
             )
         browser = self._ensure_browser()
         try:
-            context = browser.new_context()
+            context = browser.new_context(storage_state=storage_state) if storage_state else browser.new_context()
             page = context.new_page()
         except Exception as error:
             raise BrowserProviderUnavailableError(
@@ -491,6 +536,29 @@ class PlaywrightBrowserController(BrowserController):
         self._sessions[session_id] = session
         self._handles[session_id] = {"context": context, "page": page}
         return session
+
+    def export_session_state(
+        self,
+        tenant_id: str,
+        session_id: str,
+        workspace_id: str | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        self.get_session(
+            tenant_id, session_id, workspace_id=workspace_id, run_id=run_id
+        )
+        handle = self._handles.get(session_id)
+        if handle is None:
+            raise NotFoundError(f"Browser session not found: {session_id}")
+        try:
+            state = handle["context"].storage_state()
+        except Exception as error:
+            raise BrowserProviderUnavailableError(
+                f"browser provider could not export session state: {error}"
+            ) from error
+        if not isinstance(state, dict):
+            raise BrowserProviderUnavailableError("browser provider returned invalid session state")
+        return state
 
     def get_session(
         self,

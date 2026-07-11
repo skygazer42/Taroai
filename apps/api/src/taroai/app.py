@@ -3,9 +3,11 @@ import binascii
 import hashlib
 import hmac
 import json
+import secrets
 import time
 from collections.abc import Iterator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from html import escape
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -19,9 +21,11 @@ from taroai.agents import (
     AgentDefinitionCreate,
     AgentDefinitionPatch,
     AgentExtractRequest,
+    AgentImportRequest,
     AgentRegistryService,
     AgentRunRequest,
     AgentVersionCreate,
+    AgentVersionSpec,
     InMemoryAgentRegistry,
     SqlAgentRegistry,
 )
@@ -69,6 +73,15 @@ from taroai.billing import (
     SqlBillingInvoiceStore,
     SqlBillingPricingRuleStore,
 )
+from taroai.browser_profiles import (
+    BrowserProfileCreate,
+    BrowserProfilePatch,
+    BrowserProfileRegistry,
+    BrowserProfileService,
+    BrowserProfileSessionCreate,
+    InMemoryBrowserProfileRegistry,
+    SqlBrowserProfileRegistry,
+)
 from taroai.chat import (
     ChatMessageEdit,
     ChatMessageSubmit,
@@ -78,7 +91,7 @@ from taroai.chat import (
     ChatThreadPatch,
     MessageDispatch,
 )
-from taroai.artifacts import ArtifactService, RichArtifactCreate
+from taroai.artifacts import ArtifactService, ArtifactShareCreate, RichArtifactCreate
 from taroai.config import ENTERPRISE_SANDBOX_PROVIDERS, Settings, load_settings
 from taroai.connectors import (
     ConnectorCreateRequest,
@@ -1153,6 +1166,38 @@ def require_external_share_link_storage_read_access(
         raise TenantAccessError("External share link denied")
 
 
+def require_external_artifact_read_access(
+    request: Request,
+    tenant_id: str,
+    external_link_id: str,
+    artifact_id: str,
+):
+    require_external_share_links_enabled(request)
+    artifact = request.app.state.store.get_artifact(tenant_id, artifact_id)
+    if artifact.storage_object_id:
+        storage_object = request.app.state.storage_catalog.get(
+            tenant_id, artifact.storage_object_id
+        )
+        if storage_object.sensitivity_level > 0:
+            raise TenantAccessError(
+                "External share link cannot access sensitive artifacts"
+            )
+    allowed = request.app.state.share_grant_store.authorize(
+        tenant_id=tenant_id,
+        resource_type=ShareResourceType.ARTIFACT,
+        resource_id=artifact.id,
+        permission="view",
+        user_id="external_link",
+        workspace_id=artifact.workspace_id,
+        external_link_id=external_share_link_subject_id(
+            external_link_id, tenant_id, request.app.state.settings
+        ),
+    )
+    if not allowed:
+        raise TenantAccessError("External artifact share link denied")
+    return artifact
+
+
 def storage_share_group_ids(request: Request) -> list[str]:
     raw_subjects = request.headers.get("X-ACL-Subjects", "")
     group_ids: list[str] = []
@@ -1241,6 +1286,7 @@ def create_app(
     skill_service: Any | None = None,
     skill_evaluation_runner: Any | None = None,
     agent_registry: InMemoryAgentRegistry | SqlAgentRegistry | None = None,
+    browser_profile_registry: BrowserProfileRegistry | None = None,
     thread_share_store: ThreadShareStore | None = None,
     speech_gateway: SpeechGateway | None = None,
     solution_pack_registry: (
@@ -1459,6 +1505,17 @@ def create_app(
     app.state.secret_service = secret_service or build_secret_service_from_settings(
         resolved_settings
     )
+    app.state.browser_profile_registry = (
+        browser_profile_registry or build_browser_profile_registry(resolved_settings)
+    )
+    app.state.browser_profile_service = BrowserProfileService(
+        registry=app.state.browser_profile_registry,
+        secret_service=app.state.secret_service,
+        browser_controller=app.state.browser_controller,
+    )
+    app.state.agent_registry_service.browser_profile_service = (
+        app.state.browser_profile_service
+    )
     app.state.embedding_gateway = embedding_gateway or build_embedding_gateway(
         resolved_settings,
         app.state.secret_service,
@@ -1524,7 +1581,11 @@ def create_app(
         guardrail_service=app.state.guardrail_service,
     )
     register_sandbox_tool_handlers(tool_gateway, app.state.sandbox_adapter)
-    register_browser_tool_handlers(tool_gateway, app.state.browser_controller)
+    register_browser_tool_handlers(
+        tool_gateway,
+        app.state.browser_controller,
+        profile_service=app.state.browser_profile_service,
+    )
     register_skill_tool_handlers(tool_gateway, app.state.skill_service)
     app.state.runtime = apply_agent_runtime_settings(
         runtime or AgentRuntime(
@@ -1562,6 +1623,7 @@ def create_app(
             connector_dispatcher=app.state.connector_dispatcher,
             connector_invocation_service=app.state.connector_invocation_service,
             agent_registry=app.state.agent_registry,
+            browser_profile_service=app.state.browser_profile_service,
         ),
         resolved_settings,
     )
@@ -1577,6 +1639,8 @@ def create_app(
         )
     if app.state.runtime.agent_registry is None:
         app.state.runtime.agent_registry = app.state.agent_registry
+    if app.state.runtime.browser_profile_service is None:
+        app.state.runtime.browser_profile_service = app.state.browser_profile_service
     app.state.chat_service = ChatService(
         store=app.state.store,
         model_policy_resolver=lambda: app.state.runtime.model_policy,
@@ -2257,6 +2321,20 @@ def create_app(
                     "size_bytes": storage_object.size_bytes,
                 }
             )
+        browser_profiles = [
+            {
+                "id": profile.id,
+                "name": profile.name,
+                "description": profile.description or "Persistent browser identity",
+                "version": str(profile.revision),
+                "is_default": profile.is_default,
+                "allowed_domains": profile.allowed_domains,
+            }
+            for profile in app.state.browser_profile_service.list_profiles(
+                context.tenant_id, workspace_id
+            )
+            if profile.status == "active"
+        ]
         return {
             "workspace_id": workspace_id,
             "skills": installed_skills,
@@ -2264,6 +2342,7 @@ def create_app(
             "agents": agents,
             "knowledge": knowledge,
             "files": files,
+            "browser_profiles": browser_profiles,
             "skill_service_available": app.state.skill_service is not None,
         }
 
@@ -2479,6 +2558,189 @@ def create_app(
             )
         sessions.sort(key=lambda item: (item["created_at"], item["id"]), reverse=True)
         return {"agent_id": agent_id, "sessions": sessions}
+
+    @app.get("/api/agents/{agent_id}/export")
+    def export_agent_definition(
+        agent_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "storage.read")
+        definition = app.state.agent_registry.get(context.tenant_id, agent_id)
+        versions = app.state.agent_registry.list_versions(
+            context.tenant_id, agent_id
+        )
+        storage_object_ids: list[str] = []
+        for version in versions:
+            storage_object_ids.extend(
+                item["storage_object_id"]
+                for item in version.spec.reference_files
+                if item.get("storage_object_id")
+                and item["storage_object_id"] not in storage_object_ids
+            )
+            storage_object_ids.extend(
+                item["storage_object_id"]
+                for item in version.spec.runtime_snapshot.get("files", [])
+                if item.get("storage_object_id")
+                and item["storage_object_id"] not in storage_object_ids
+            )
+        embedded_files = []
+        embedded_size = 0
+        for storage_object_id in storage_object_ids:
+            storage_object = app.state.storage_catalog.get(
+                context.tenant_id, storage_object_id
+            )
+            if storage_object.workspace_id != definition.workspace_id:
+                raise ValueError("Agent export contains a file outside its workspace")
+            require_storage_read_access(request, context, storage_object)
+            content = app.state.object_storage.download(storage_object).content
+            embedded_size += len(content)
+            if embedded_size > app.state.settings.upload_max_bytes:
+                raise ValueError("Agent export embedded files exceed the configured size limit")
+            embedded_files.append(
+                {
+                    "source_storage_object_id": storage_object.id,
+                    "filename": storage_object.filename,
+                    "content_type": storage_object.content_type,
+                    "purpose": storage_object.purpose.value,
+                    "size_bytes": len(content),
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "content_base64": base64.b64encode(content).decode("ascii"),
+                }
+            )
+        return {
+            "apiVersion": "taroai.ai/v1",
+            "kind": "AgentBundle",
+            "metadata": {
+                "name": definition.name,
+                "description": definition.description,
+                "published_version": definition.published_version,
+            },
+            "versions": [
+                {
+                    "source_version": version.version,
+                    "status": version.status,
+                    "spec": version.spec.model_dump(mode="json"),
+                }
+                for version in versions
+            ],
+            "files": embedded_files,
+        }
+
+    @app.post("/api/agents/import", status_code=status.HTTP_201_CREATED)
+    def import_agent_definition(
+        payload: AgentImportRequest,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "storage.write")
+        bundle = payload.bundle
+        if bundle.get("apiVersion") != "taroai.ai/v1" or bundle.get("kind") != "AgentBundle":
+            raise ValueError("Unsupported Agent bundle format")
+        bundled_versions = bundle.get("versions")
+        if not isinstance(bundled_versions, list) or not bundled_versions:
+            raise ValueError("Agent bundle does not contain versions")
+        bundled_files = bundle.get("files", [])
+        if not isinstance(bundled_files, list):
+            raise ValueError("Agent bundle files must be a list")
+        storage_id_map: dict[str, str] = {}
+        total_size = 0
+        for item in bundled_files:
+            if not isinstance(item, dict) or not item.get("filename"):
+                raise ValueError("Agent bundle contains invalid file metadata")
+            try:
+                content = base64.b64decode(item["content_base64"], validate=True)
+            except (KeyError, binascii.Error, ValueError) as error:
+                raise ValueError("Agent bundle contains invalid embedded file content") from error
+            total_size += len(content)
+            if total_size > app.state.settings.upload_max_bytes:
+                raise ValueError("Agent import embedded files exceed the configured size limit")
+            digest = hashlib.sha256(content).hexdigest()
+            if digest != item.get("sha256"):
+                raise ValueError("Agent bundle embedded file digest does not match")
+            storage_object = app.state.storage_catalog.register(
+                StorageObjectCreate(
+                    tenant_id=context.tenant_id,
+                    workspace_id=payload.workspace_id,
+                    purpose=StoragePurpose(item.get("purpose", StoragePurpose.UPLOAD.value)),
+                    filename=normalize_workspace_file_path(item["filename"]),
+                    content_type=item.get("content_type") or "application/octet-stream",
+                    size_bytes=len(content),
+                )
+            )
+            scan = app.state.storage_content_scanner.scan(
+                StorageContentScanRequest(storage_object=storage_object, content=content)
+            )
+            if not scan.allowed:
+                app.state.storage_catalog.mark_deleted(
+                    context.tenant_id, storage_object.id, utc_now()
+                )
+                raise StorageContentRejectedError("Agent bundle file was rejected by the scanner")
+            app.state.object_storage.upload(storage_object, content)
+            source_id = str(item.get("source_storage_object_id") or "")
+            if source_id:
+                storage_id_map[source_id] = storage_object.id
+        imported_specs = []
+        for item in bundled_versions:
+            if not isinstance(item, dict):
+                raise ValueError("Agent bundle contains an invalid version")
+            raw_spec = json.loads(json.dumps(item.get("spec") or {}))
+            for reference in raw_spec.get("reference_files", []):
+                source_id = reference.get("storage_object_id")
+                if source_id in storage_id_map:
+                    reference["storage_object_id"] = storage_id_map[source_id]
+            for runtime_file in raw_spec.get("runtime_snapshot", {}).get("files", []):
+                source_id = runtime_file.get("storage_object_id")
+                if source_id in storage_id_map:
+                    runtime_file["storage_object_id"] = storage_id_map[source_id]
+            imported_specs.append(AgentVersionSpec.model_validate(raw_spec))
+        metadata = bundle.get("metadata") or {}
+        definition, first_version = app.state.agent_registry_service.create(
+            context.tenant_id,
+            context.user_id,
+            AgentDefinitionCreate(
+                workspace_id=payload.workspace_id,
+                name=payload.name or metadata.get("name") or "Imported Agent",
+                description=metadata.get("description") or "Imported Agent bundle",
+                version=imported_specs[0],
+            ),
+        )
+        imported_versions = [first_version]
+        for spec in imported_specs[1:]:
+            imported_versions.append(
+                app.state.agent_registry_service.create_version(
+                    context.tenant_id, context.user_id, definition.id, spec
+                )
+            )
+        if payload.publish:
+            source_published = metadata.get("published_version")
+            publish_index = (
+                max(1, min(len(imported_versions), int(source_published)))
+                if source_published is not None
+                else len(imported_versions)
+            )
+            definition, _ = app.state.agent_registry_service.publish(
+                context.tenant_id, definition.id, publish_index
+            )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=payload.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="agent.bundle.imported",
+            metadata={
+                "agent_id": definition.id,
+                "version_count": len(imported_versions),
+                "embedded_file_count": len(storage_id_map),
+            },
+            request=request,
+        )
+        return {
+            "agent": definition.model_dump(mode="json"),
+            "versions": [item.model_dump(mode="json") for item in imported_versions],
+            "embedded_file_count": len(storage_id_map),
+        }
 
     @app.post("/api/threads/{thread_id}/extract-agent")
     def extract_agent_draft(
@@ -4221,6 +4483,112 @@ def create_app(
         return app.state.artifact_service.preview(
             context.tenant_id, artifact_id
         ).model_dump(mode="json")
+
+    @app.get("/api/artifacts/{artifact_id}/source")
+    def get_artifact_source(
+        artifact_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "storage.read")
+        artifact = app.state.store.get_artifact(context.tenant_id, artifact_id)
+        if artifact.storage_object_id:
+            require_storage_read_access(
+                request,
+                context,
+                app.state.storage_catalog.get(
+                    context.tenant_id, artifact.storage_object_id
+                ),
+            )
+        return app.state.artifact_service.source(
+            context.tenant_id, artifact_id
+        ).model_dump(mode="json")
+
+    @app.get("/api/artifacts/{artifact_id}/diff")
+    def diff_artifact(
+        artifact_id: str,
+        request: Request,
+        compare_to: str | None = None,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "storage.read")
+        artifact = app.state.store.get_artifact(context.tenant_id, artifact_id)
+        if artifact.storage_object_id:
+            require_storage_read_access(
+                request,
+                context,
+                app.state.storage_catalog.get(
+                    context.tenant_id, artifact.storage_object_id
+                ),
+            )
+        return app.state.artifact_service.diff(
+            context.tenant_id, artifact_id, compare_to
+        ).model_dump(mode="json")
+
+    @app.post(
+        "/api/artifacts/{artifact_id}/share",
+        status_code=status.HTTP_201_CREATED,
+    )
+    def create_artifact_share_link(
+        artifact_id: str,
+        payload: ArtifactShareCreate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "sharing.manage")
+        require_external_share_links_enabled(request)
+        artifact = app.state.store.get_artifact(context.tenant_id, artifact_id)
+        if artifact.storage_object_id:
+            storage_object = app.state.storage_catalog.get(
+                context.tenant_id, artifact.storage_object_id
+            )
+            require_storage_read_access(request, context, storage_object)
+            if storage_object.sensitivity_level > 0:
+                raise TenantAccessError(
+                    "Sensitive artifacts cannot be exposed by an external link"
+                )
+        token = secrets.token_urlsafe(32)
+        expires_at = datetime.now(timezone.utc) + timedelta(
+            hours=payload.expires_in_hours
+        )
+        grant_payload = ShareGrantApiCreate(
+            resource_type=ShareResourceType.ARTIFACT,
+            resource_id=artifact.id,
+            subject_type=ShareSubjectType.EXTERNAL_LINK,
+            subject_id=external_share_link_subject_id(
+                token, context.tenant_id, request.app.state.settings
+            ),
+            permission="view",
+            reason="Artifact external link",
+            expires_at=expires_at,
+        )
+        grant = app.state.share_grant_store.create_grant(
+            grant_payload.to_create(context.tenant_id, context.user_id)
+        )
+        url = request.url_for(
+            "view_external_artifact",
+            external_link_id=token,
+            artifact_id=artifact.id,
+        ).include_query_params(tenant_id=context.tenant_id)
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=artifact.workspace_id,
+            user_id=context.user_id,
+            run_id=artifact.run_id,
+            event_type="artifact.share_link.created",
+            metadata={
+                **share_grant_audit_metadata(grant),
+                "artifact_id": artifact.id,
+            },
+            request=request,
+        )
+        return {
+            "grant_id": grant.id,
+            "artifact_id": artifact.id,
+            "url": str(url),
+            "expires_at": expires_at.isoformat(),
+        }
 
     @app.get("/api/artifacts/{artifact_id}/download")
     def download_artifact(
@@ -6568,6 +6936,19 @@ def create_app(
             **package.provenance.model_dump(mode="json"),
         }
 
+    @app.get("/api/skills/{skill_id}/packages/{version}/diff")
+    def diff_skill_package_versions(
+        skill_id: str,
+        version: str,
+        request: Request,
+        compare_to: str = Query(min_length=1),
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "skills.read")
+        return app.state.skill_service.diff_versions(
+            context.tenant_id, skill_id, version, compare_to
+        )
+
     @app.post("/api/skills/{skill_id}/packages/{version}/evaluate")
     def evaluate_skill_package(
         skill_id: str,
@@ -7584,6 +7965,109 @@ def create_app(
         return Response(content=result.content, media_type=result.content_type)
 
     @app.get(
+        "/api/share-links/{external_link_id}/artifacts/{artifact_id}",
+        response_class=HTMLResponse,
+    )
+    def view_external_artifact(
+        external_link_id: str,
+        artifact_id: str,
+        request: Request,
+        tenant_id: str = Query(min_length=1),
+    ) -> HTMLResponse:
+        artifact = require_external_artifact_read_access(
+            request, tenant_id, external_link_id, artifact_id
+        )
+        preview = app.state.artifact_service.preview(tenant_id, artifact.id)
+        download_url = request.url_for(
+            "download_external_artifact",
+            external_link_id=external_link_id,
+            artifact_id=artifact.id,
+        ).include_query_params(tenant_id=tenant_id)
+        if preview.mode == "image":
+            content = f'<img src="{escape(str(download_url), quote=True)}" alt="">'
+        elif preview.mode == "pdf":
+            content = (
+                f'<iframe src="{escape(str(download_url), quote=True)}" '
+                'title="PDF artifact"></iframe>'
+            )
+        elif preview.mode == "iframe":
+            content = (
+                '<iframe sandbox="" title="HTML artifact" srcdoc="'
+                f'{escape(preview.srcdoc or "", quote=True)}"></iframe>'
+            )
+        elif preview.mode == "dashboard" and preview.dashboard is not None:
+            content = "<pre>" + escape(
+                json.dumps(
+                    preview.dashboard.model_dump(mode="json"),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            ) + "</pre>"
+        elif preview.text is not None:
+            content = f"<pre>{escape(preview.text)}</pre>"
+        else:
+            content = '<p class="empty">This artifact is available as a download.</p>'
+        safe_name = escape(artifact.name)
+        safe_type = escape(artifact.artifact_type)
+        html = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer"><title>{safe_name}</title>
+<style>body{{margin:0;background:#f1ede7;color:#393530;font:14px Inter,system-ui,sans-serif}}main{{max-width:1120px;margin:32px auto;padding:0 20px}}header{{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:14px}}small{{color:#8a8179;text-transform:uppercase;letter-spacing:.12em}}h1{{margin:4px 0 0;font-size:22px}}a{{padding:9px 13px;border:1px solid #cfc6bc;border-radius:8px;color:#4d4741;background:#faf8f5;text-decoration:none}}section{{min-height:420px;padding:18px;border:1px solid #d9d1c8;border-radius:14px;background:#fbf9f6;box-shadow:0 12px 36px rgb(55 44 34 / 8%)}}pre{{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.65 ui-monospace,SFMono-Regular,Consolas,monospace}}img,iframe{{display:block;width:100%;min-height:520px;border:0;object-fit:contain}}.empty{{color:#817970}}</style></head>
+<body><main><header><div><small>{safe_type} artifact</small><h1>{safe_name}</h1></div><a href="{escape(str(download_url), quote=True)}">Download</a></header><section>{content}</section></main></body></html>"""
+        record_audit_event(
+            app,
+            tenant_id=tenant_id,
+            workspace_id=artifact.workspace_id,
+            user_id=None,
+            run_id=artifact.run_id,
+            event_type="artifact.share_link.viewed",
+            metadata={
+                "artifact_id": artifact.id,
+                "access_via": "external_link",
+                "external_link_id_present": True,
+            },
+            request=request,
+        )
+        return HTMLResponse(
+            html,
+            headers={
+                "Content-Security-Policy": "default-src 'none'; img-src 'self'; frame-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'",
+                "X-Content-Type-Options": "nosniff",
+                "Referrer-Policy": "no-referrer",
+            },
+        )
+
+    @app.get(
+        "/api/share-links/{external_link_id}/artifacts/{artifact_id}/download"
+    )
+    def download_external_artifact(
+        external_link_id: str,
+        artifact_id: str,
+        request: Request,
+        tenant_id: str = Query(min_length=1),
+    ) -> Response:
+        artifact = require_external_artifact_read_access(
+            request, tenant_id, external_link_id, artifact_id
+        )
+        if artifact.storage_object_id is None:
+            source = app.state.artifact_service.source(tenant_id, artifact.id)
+            content = source.source.encode("utf-8")
+            content_type = source.content_type
+        else:
+            _, result = app.state.artifact_service.download(tenant_id, artifact.id)
+            content = result.content
+            content_type = result.content_type
+        safe_filename = Path(artifact.name).name.replace('"', "").replace("\r", "").replace("\n", "")
+        return Response(
+            content=content,
+            media_type=content_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="{safe_filename}"',
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    @app.get(
         "/api/share-links/{external_link_id}/storage/objects/{storage_object_id}/content"
     )
     def download_external_share_link_storage_object_content(
@@ -8362,6 +8846,235 @@ def create_app(
         )
         return destroyed.model_dump(mode="json")
 
+    @app.get("/api/browser/profiles")
+    def list_browser_profiles(
+        workspace_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "browser.act")
+        profiles = app.state.browser_profile_service.list_profiles(
+            context.tenant_id, workspace_id
+        )
+        return {
+            "workspace_id": workspace_id,
+            "profiles": [browser_profile_public_payload(item) for item in profiles],
+        }
+
+    @app.post("/api/browser/profiles", status_code=status.HTTP_201_CREATED)
+    def create_browser_profile(
+        payload: BrowserProfileCreate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "browser.act")
+        profile = app.state.browser_profile_service.create(
+            context.tenant_id, context.user_id, payload
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=profile.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="browser.profile.created",
+            metadata=browser_profile_audit_metadata(profile),
+            request=request,
+        )
+        return browser_profile_public_payload(profile)
+
+    @app.patch("/api/browser/profiles/{profile_id}")
+    def update_browser_profile(
+        profile_id: str,
+        payload: BrowserProfilePatch,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "browser.act")
+        profile = app.state.browser_profile_service.update(
+            context.tenant_id, profile_id, payload
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=profile.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="browser.profile.updated",
+            metadata=browser_profile_audit_metadata(profile),
+            request=request,
+        )
+        return browser_profile_public_payload(profile)
+
+    @app.delete("/api/browser/profiles/{profile_id}")
+    def disable_browser_profile(
+        profile_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "browser.act")
+        profile = app.state.browser_profile_service.get_profile(
+            context.tenant_id, profile_id
+        )
+        for session in app.state.browser_profile_service.list_sessions(
+            context.tenant_id, profile.workspace_id
+        ):
+            if session.profile_id == profile_id and session.status == "active":
+                app.state.browser_profile_service.close_session(
+                    context.tenant_id, session.session_id
+                )
+        disabled = app.state.browser_profile_service.update(
+            context.tenant_id,
+            profile_id,
+            BrowserProfilePatch(status="disabled", is_default=False),
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=disabled.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="browser.profile.disabled",
+            metadata=browser_profile_audit_metadata(disabled),
+            request=request,
+        )
+        return browser_profile_public_payload(disabled)
+
+    @app.get("/api/browser/profile-sessions")
+    def list_browser_profile_sessions(
+        workspace_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "browser.act")
+        sessions = app.state.browser_profile_service.list_sessions(
+            context.tenant_id, workspace_id
+        )
+        return {
+            "workspace_id": workspace_id,
+            "sessions": [item.model_dump(mode="json") for item in sessions],
+        }
+
+    @app.post(
+        "/api/browser/profiles/{profile_id}/sessions",
+        status_code=status.HTTP_201_CREATED,
+    )
+    def open_browser_profile_session(
+        profile_id: str,
+        payload: BrowserProfileSessionCreate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "browser.act")
+        profile = app.state.browser_profile_service.get_profile(
+            context.tenant_id, profile_id
+        )
+        session = app.state.browser_profile_service.open_session(
+            tenant_id=context.tenant_id,
+            workspace_id=profile.workspace_id,
+            profile_id=profile.id,
+            run_id=None,
+            user_id=context.user_id,
+            start_url=payload.start_url,
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=profile.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="browser.profile_session.opened",
+            metadata={
+                "profile_id": profile.id,
+                "session_id": session.session_id,
+                "current_url": session.current_url,
+            },
+            request=request,
+        )
+        return session.model_dump(mode="json")
+
+    @app.post("/api/browser/profile-sessions/{session_id}/actions")
+    def apply_browser_profile_action(
+        session_id: str,
+        payload: BrowserActionRequest,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "browser.act")
+        observation = app.state.browser_profile_service.apply_action(
+            tenant_id=context.tenant_id,
+            session_id=session_id,
+            action_type=payload.action_type,
+            url=payload.url,
+            selector=payload.selector,
+            text=payload.text,
+            metadata=payload.metadata,
+        )
+        response_payload = observation.model_dump(mode="json")
+        if observation.screenshot_content is not None:
+            session = app.state.browser_profile_registry.get_session(
+                context.tenant_id, session_id
+            )
+            storage_object = app.state.storage_catalog.register(
+                StorageObjectCreate(
+                    tenant_id=context.tenant_id,
+                    workspace_id=session.workspace_id,
+                    purpose=StoragePurpose.BROWSER_SCREENSHOT,
+                    filename=f"{session_id}.png",
+                    content_type="image/png",
+                    size_bytes=len(observation.screenshot_content),
+                )
+            )
+            app.state.object_storage.upload(
+                storage_object, observation.screenshot_content
+            )
+            response_payload["storage_object_id"] = storage_object.id
+        record = app.state.browser_profile_registry.get_session(
+            context.tenant_id, session_id
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=record.workspace_id,
+            user_id=context.user_id,
+            run_id=record.run_id,
+            event_type="browser.profile_session.action",
+            metadata={
+                "profile_id": record.profile_id,
+                "session_id": session_id,
+                "action_type": payload.action_type.value,
+                "current_url": observation.current_url,
+            },
+            request=request,
+        )
+        return response_payload
+
+    @app.delete("/api/browser/profile-sessions/{session_id}")
+    def close_browser_profile_session(
+        session_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "browser.act")
+        session = app.state.browser_profile_service.close_session(
+            context.tenant_id, session_id
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=session.workspace_id,
+            user_id=context.user_id,
+            run_id=session.run_id,
+            event_type="browser.profile_session.closed",
+            metadata={
+                "profile_id": session.profile_id,
+                "session_id": session.session_id,
+                "revision_saved": True,
+            },
+            request=request,
+        )
+        return session.model_dump(mode="json")
+
     @app.post("/api/browser/sessions/{session_id}/actions")
     def apply_browser_action(
         session_id: str,
@@ -8513,6 +9226,14 @@ def build_agent_registry(settings: Settings):
         MigrationRunner(config=config, migrations_path=Path("apps/api/migrations")).apply()
         return SqlAgentRegistry(config=config)
     return InMemoryAgentRegistry()
+
+
+def build_browser_profile_registry(settings: Settings) -> BrowserProfileRegistry:
+    if settings.browser_profile_store_backend == "sql":
+        config = settings.database_config()
+        MigrationRunner(config=config, migrations_path=Path("apps/api/migrations")).apply()
+        return SqlBrowserProfileRegistry(config=config)
+    return InMemoryBrowserProfileRegistry()
 
 
 def build_thread_share_store(settings: Settings) -> ThreadShareStore:
@@ -9868,6 +10589,11 @@ def storage_object_agent_reference_count(
                 for reference in version.spec.reference_files
                 if reference.get("storage_object_id") == storage_object_id
             )
+            reference_count += sum(
+                1
+                for reference in version.spec.runtime_snapshot.get("files", [])
+                if reference.get("storage_object_id") == storage_object_id
+            )
     return reference_count
 
 
@@ -10219,6 +10945,27 @@ def sandbox_snapshot_audit_metadata(snapshot) -> dict:
         "workspace_id": snapshot.workspace_id,
         "run_id": snapshot.run_id,
         "uri": snapshot.uri,
+    }
+
+
+def browser_profile_public_payload(profile) -> dict[str, Any]:
+    payload = profile.model_dump(
+        mode="json",
+        exclude={"secret_ref_id", "secret_backend", "secret_external_name"},
+    )
+    payload["has_saved_state"] = profile.secret_ref_id is not None
+    return payload
+
+
+def browser_profile_audit_metadata(profile) -> dict[str, Any]:
+    return {
+        "profile_id": profile.id,
+        "workspace_id": profile.workspace_id,
+        "status": profile.status,
+        "is_default": profile.is_default,
+        "allowed_domain_count": len(profile.allowed_domains),
+        "has_saved_state": profile.secret_ref_id is not None,
+        "revision": profile.revision,
     }
 
 

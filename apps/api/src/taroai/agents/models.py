@@ -89,6 +89,16 @@ class AgentVersionCreate(BaseModel):
 class AgentRunRequest(BaseModel):
     input: dict[str, Any] = Field(default_factory=dict)
     version: int | None = Field(default=None, ge=1)
+    mode: Literal["workflow", "autonomous"] | None = None
+
+
+class AgentImportRequest(BaseModel):
+    workspace_id: str = Field(min_length=1)
+    bundle: dict[str, Any]
+    name: str | None = Field(default=None, min_length=1, max_length=160)
+    publish: bool = True
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class AgentInvocation(BaseModel):

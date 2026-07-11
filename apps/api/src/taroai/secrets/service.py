@@ -79,6 +79,10 @@ class InMemorySecretService(BaseModel):
         self._secret_values[secret.id] = value
         return secret
 
+    def register_secret_ref(self, secret: SecretRef) -> SecretRef:
+        self.secrets[secret.id] = secret
+        return secret
+
     def create_lease(
         self,
         tenant_id: str,
@@ -242,6 +246,12 @@ class AwsSecretsManagerSecretService(BaseModel):
             )
         except BotoCoreError as error:
             raise SecretStoreError("secret backend create failed") from error
+        self.secrets[secret.id] = secret
+        return secret
+
+    def register_secret_ref(self, secret: SecretRef) -> SecretRef:
+        if secret.backend != "aws_secrets_manager" or not secret.external_name:
+            raise SecretStoreError("external secret reference is incomplete")
         self.secrets[secret.id] = secret
         return secret
 

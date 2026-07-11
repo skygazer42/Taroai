@@ -648,6 +648,7 @@ class AgentLoopV2:
             "connector_bindings": version.spec.connector_bindings,
             "knowledge_bindings": version.spec.knowledge_bindings,
             "reference_files": version.spec.reference_files,
+            "runtime_snapshot": version.spec.runtime_snapshot,
         }
         state.runtime_metadata["agent_context"] = context
         self.runtime.store.append_run_event(
@@ -884,6 +885,8 @@ class AgentLoopV2:
                     "published instructions and output contract as the active workflow. "
                     "When current_request includes files, sandbox actions can read them from "
                     "their declared /workspace/inputs paths. Never guess a different path. "
+                    "Reusable Agent runtime snapshot files are restored at the sandbox paths "
+                    "declared in reusable_agent.runtime_snapshot before the first tool action. "
                     "Never repeat a failed side-effecting action "
                     "unchanged. Available skills are compact summaries: select one by setting "
                     "skill_id on an action, then the controller will load its full SKILL.md and "
