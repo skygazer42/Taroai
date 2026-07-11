@@ -64,7 +64,7 @@ class ChatThreadPatch(BaseModel):
 
 class ChatMessageSubmit(BaseModel):
     content: str = Field(min_length=1)
-    delivery_mode: Literal["auto", "queue", "steer"] = "auto"
+    delivery_mode: Literal["auto", "queue", "manual", "steer"] = "auto"
     attachments: list[str] = Field(default_factory=list)
     resource_refs: list[ResourceReference] = Field(default_factory=list)
 
@@ -256,6 +256,24 @@ class ChatService:
         }:
             raise ValueError("An inflight or completed message cannot be deleted")
         self.store.delete_chat_message(tenant_id, message_id)
+
+    def promote_manual_message(
+        self,
+        tenant_id: str,
+        user_id: str,
+        thread_id: str,
+        message_id: str,
+    ) -> ChatMessage:
+        self.get_thread(tenant_id, thread_id)
+        message = self.store.get_chat_message(tenant_id, message_id)
+        if message.thread_id != thread_id or message.kind != "manual_queue":
+            raise NotFoundError(f"Manual queued message not found: {message_id}")
+        if message.created_by_user_id != user_id:
+            raise TenantAccessError("Only the author can promote a queued message")
+        if message.dispatch_status != ChatMessageDispatchStatus.READY:
+            raise ValueError("Only a pending manual message can be promoted")
+        self.store.delete_chat_message(tenant_id, message_id)
+        return message
 
     def steer(
         self,
@@ -537,6 +555,9 @@ class ChatService:
         payload: ChatMessageSubmit,
     ) -> MessageDispatch:
         dispatch_status = (
+            ChatMessageDispatchStatus.READY
+            if payload.delivery_mode == "manual"
+            else
             ChatMessageDispatchStatus.STEERING
             if self._steering_available_resolver()
             and (
@@ -554,6 +575,7 @@ class ChatService:
             user_id,
             ChatMessageCreate(
                 content=payload.content,
+                kind="manual_queue" if payload.delivery_mode == "manual" else "text",
                 dispatch_status=dispatch_status,
                 attachments=payload.attachments,
                 resource_refs=payload.resource_refs,
@@ -601,7 +623,9 @@ class ChatService:
             raise
         if not run_started:
             fallback_status = (
-                ChatMessageDispatchStatus.STEERING
+                ChatMessageDispatchStatus.READY
+                if payload.delivery_mode == "manual"
+                else ChatMessageDispatchStatus.STEERING
                 if payload.delivery_mode == "steer"
                 else ChatMessageDispatchStatus.QUEUED
             )
@@ -609,6 +633,7 @@ class ChatService:
                 tenant_id,
                 message.id,
                 dispatch_status=fallback_status,
+                kind="manual_queue" if payload.delivery_mode == "manual" else "text",
             )
         return self._dispatch_response(message, run, run_started=run_started)
 

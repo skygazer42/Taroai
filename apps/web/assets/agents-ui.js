@@ -114,7 +114,14 @@ export class AgentsUI {
         this.api.get(`/api/agents/${encodeURIComponent(id)}`),
         this.api.get(`/api/agents/${encodeURIComponent(id)}/sessions`),
       ]);
-      this.detail = detail.status === "fulfilled" ? detail.value.agent || detail.value : this.selected;
+      if (detail.status === "fulfilled") {
+        const definition = detail.value.agent || detail.value;
+        const versions = list(detail.value, "versions");
+        const activeVersion = versions.find((version) => version.version === definition.published_version)
+          || versions.find((version) => version.version === definition.latest_version)
+          || versions.at(-1);
+        this.detail = { ...definition, ...(activeVersion?.spec || {}), version: activeVersion?.version, versions };
+      } else this.detail = this.selected;
       this.sessions = sessions.status === "fulfilled" ? list(sessions.value, "sessions", "runs") : [];
     } catch {
       this.detail = this.selected;
@@ -190,21 +197,54 @@ export class AgentsUI {
     form.querySelector("[type='submit']").disabled = true;
     try {
       const id = this.selected.id || this.selected.agent_id;
-      const result = await this.api.post(`/api/agents/${encodeURIComponent(id)}/runs`, { workspace_id: this.api.settings().workspaceId, input: values }, { scope: "agent-run" });
+      const result = await this.api.post(`/api/agents/${encodeURIComponent(id)}/runs`, { input: values }, { scope: "agent-run" });
       this.toast("Agent session started", "success");
       window.location.hash = `chat/${encodeURIComponent(result.thread_id || result.thread?.id || result.run_id)}`;
     } catch (error) { this.toast(error.message, "error"); form.querySelector("[type='submit']").disabled = false; }
   }
 
-  openDraft(agent = {}) {
+  async openDraft(agent = {}) {
+    try {
+      const payload = await this.api.get(`/api/workspaces/${encodeURIComponent(this.api.settings().workspaceId)}/files`);
+      this.draftFiles = list(payload, "files");
+    } catch {
+      this.draftFiles = [];
+    }
     const dialog = document.createElement("dialog");
     dialog.className = "chat-dialog agent-editor-dialog";
-    dialog.innerHTML = `<form class="chat-dialog-card" data-agent-draft-form><header><div><small>Review before publish</small><h2>${agent.id ? "Edit agent draft" : "Create agent"}</h2></div><button type="button" data-close>×</button></header><label><span>Name</span><input name="name" required /></label><label><span>Description</span><textarea name="description" rows="2"></textarea></label><label><span>Instructions</span><textarea name="instructions" rows="6" required></textarea></label><label><span>Output format</span><input name="output_format" placeholder="Report, table, artifact set…" /></label><label><span>Input JSON schema</span><textarea name="input_schema" data-json-field rows="6">${JSON.stringify(agent.input_schema || { type: "object", properties: { request: { type: "string" } }, required: ["request"] }, null, 2)}</textarea></label><div class="agent-draft-bindings"><span>${list(agent.skills, "items").length} pinned skills</span><span>${list(agent.files, "items").length} files</span><span>${agent.runtime || "Default runtime"}</span></div><footer><button type="button" data-close>Cancel</button><button class="primary" type="submit">Save & publish</button></footer></form>`;
+    dialog.innerHTML = `<form class="chat-dialog-card" data-agent-draft-form><header><div><small>Review before publish</small><h2>${agent.id ? "Edit agent draft" : "Create agent"}</h2></div><button type="button" data-close>×</button></header><label><span>Name</span><input name="name" required /></label><label><span>Description</span><textarea name="description" rows="2"></textarea></label><label><span>Instructions</span><textarea name="instructions" rows="6" required></textarea></label><label><span>Output format</span><input name="output_format" placeholder="Report, table, artifact set…" /></label><label><span>Input JSON schema</span><textarea name="input_schema" data-json-field rows="6">${JSON.stringify(agent.input_schema || { type: "object", properties: { request: { type: "string" } }, required: ["request"] }, null, 2)}</textarea></label><fieldset class="agent-reference-picker"><legend>Reference files <small>Materialized into every fresh run</small></legend><div data-agent-reference-options></div></fieldset><div class="agent-draft-bindings"><span>${list(agent.skill_bindings || agent.skills, "items").length} pinned skills</span><span data-agent-reference-count>${list(agent.reference_files || agent.files, "items").length} files</span><span>${agent.runtime || "Default runtime"}</span></div><footer><button type="button" data-close>Cancel</button><button class="primary" type="submit">Save & publish</button></footer></form>`;
     document.body.append(dialog);
     dialog.querySelector("[name='name']").value = agent.name || "";
     dialog.querySelector("[name='description']").value = agent.description || "";
     dialog.querySelector("[name='instructions']").value = agent.instructions || "";
-    dialog.querySelector("[name='output_format']").value = agent.output_format || "";
+    dialog.querySelector("[name='output_format']").value = agent.output_contract?.format || agent.output_format || "";
+    const selectedFiles = new Set(list(agent.reference_files || agent.files, "items").map((item) => item.storage_object_id || item.id));
+    const options = dialog.querySelector("[data-agent-reference-options]");
+    if (!this.draftFiles.length) {
+      const empty = document.createElement("p");
+      empty.textContent = "No persistent workspace files are available.";
+      options.append(empty);
+    }
+    for (const file of this.draftFiles) {
+      const label = document.createElement("label");
+      const checkbox = document.createElement("input");
+      const copy = document.createElement("span");
+      const strong = document.createElement("strong");
+      const small = document.createElement("small");
+      checkbox.type = "checkbox";
+      checkbox.name = "reference_file";
+      checkbox.value = file.storage_object_id || file.id;
+      checkbox.checked = selectedFiles.has(checkbox.value);
+      strong.textContent = file.logical_path || file.filename || file.id;
+      small.textContent = `${file.content_type || "file"} · ${file.size_bytes || 0} bytes`;
+      copy.append(strong, small);
+      label.append(checkbox, copy);
+      options.append(label);
+    }
+    options.addEventListener("change", () => {
+      const count = options.querySelectorAll("input:checked").length;
+      dialog.querySelector("[data-agent-reference-count]").textContent = `${count} files`;
+    });
     dialog.querySelectorAll("[data-close]").forEach((button) => button.addEventListener("click", () => dialog.close()));
     dialog.querySelector("form").addEventListener("submit", (event) => { event.preventDefault(); this.saveDraft(event.target, dialog, agent); });
     dialog.addEventListener("close", () => dialog.remove());
@@ -215,11 +255,51 @@ export class AgentsUI {
     const data = new FormData(form);
     let input_schema;
     try { input_schema = JSON.parse(data.get("input_schema")); } catch { return this.toast("Input schema must be valid JSON", "error"); }
-    const body = { name: data.get("name"), description: data.get("description"), instructions: data.get("instructions"), output_format: data.get("output_format"), input_schema, workspace_id: this.api.settings().workspaceId, thread_id: chatState.currentThreadId || null };
+    const reference_files = data.getAll("reference_file").map((storageObjectId) => {
+      const file = (this.draftFiles || []).find((item) => (item.storage_object_id || item.id) === storageObjectId) || {};
+      return {
+        storage_object_id: storageObjectId,
+        filename: file.logical_path || file.filename || storageObjectId,
+        content_type: file.content_type || "application/octet-stream",
+        size_bytes: file.size_bytes || 0,
+      };
+    });
+    const version = {
+      input_schema,
+      output_contract: { type: "string", format: data.get("output_format") || "markdown" },
+      instructions: data.get("instructions"),
+      skill_bindings: list(agent.skill_bindings || agent.skills, "items"),
+      connector_bindings: list(agent.connector_bindings || agent.connectors, "items"),
+      knowledge_bindings: list(agent.knowledge_bindings || agent.knowledge, "items"),
+      reference_files,
+      model_policy: agent.model_policy || {},
+      runtime_snapshot: agent.runtime_snapshot || {},
+      source_thread_id: agent.source_thread_id || chatState.currentThreadId || null,
+      source_run_id: agent.source_run_id || null,
+      change_note: agent.id ? "Updated from Agent editor" : "Created from Agent editor",
+    };
     const submit = form.querySelector("[type='submit']"); submit.disabled = true;
     try {
-      const draft = await this.api.post(agent.id ? `/api/agents/${encodeURIComponent(agent.id)}/drafts` : "/api/agent-drafts", body, { scope: "agent-draft-save" });
-      await this.api.post(`/api/agent-drafts/${encodeURIComponent(draft.id || draft.draft_id)}/publish`, {}, { scope: "agent-publish" });
+      let agentId = agent.id;
+      let versionNumber;
+      if (agentId) {
+        await this.api.patch(`/api/agents/${encodeURIComponent(agentId)}`, {
+          name: data.get("name"),
+          description: data.get("description"),
+        }, { scope: "agent-definition-update" });
+        const createdVersion = await this.api.post(`/api/agents/${encodeURIComponent(agentId)}/versions`, { version }, { scope: "agent-version-create" });
+        versionNumber = createdVersion.version;
+      } else {
+        const created = await this.api.post("/api/agents", {
+          workspace_id: this.api.settings().workspaceId,
+          name: data.get("name"),
+          description: data.get("description"),
+          version,
+        }, { scope: "agent-create" });
+        agentId = created.agent.id;
+        versionNumber = created.version.version;
+      }
+      await this.api.post(`/api/agents/${encodeURIComponent(agentId)}/versions/${encodeURIComponent(versionNumber)}/publish`, {}, { scope: "agent-publish" });
       dialog?.close(); this.toast("Agent published", "success"); await this.load();
     } catch (error) { submit.disabled = false; this.toast(error.message, "error"); }
   }

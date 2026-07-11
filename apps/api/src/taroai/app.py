@@ -6,7 +6,7 @@ import json
 import time
 from collections.abc import Iterator
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from fastapi import BackgroundTasks, Body, Depends, FastAPI, Header, Query, Request, Response, status
@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from taroai.agent import AgentRuntime, apply_agent_runtime_settings
 from taroai.agents import (
     AgentDefinitionCreate,
+    AgentDefinitionPatch,
     AgentExtractRequest,
     AgentRegistryService,
     AgentRunRequest,
@@ -310,6 +311,7 @@ from taroai.skills import (
     SkillStatus,
     SkillType,
     SqlSkillRegistry,
+    register_skill_tool_handlers,
 )
 from taroai.skills.import_service import GithubSkillSource, HttpsGithubArchiveFetcher
 from taroai.skills.evaluation import SkillEvaluationSuite
@@ -336,6 +338,7 @@ from taroai.storage import (
     StorageContentScanRequest,
     StorageObjectApiCreate,
     StorageObjectCreate,
+    StorageObjectPatch,
     StorageLifecycleCleanupPreviewRequest,
     StorageLifecycleCleanupRequest,
     StorageLifecycleService,
@@ -996,6 +999,14 @@ def get_request_context(
     raise AuthRequiredError("authentication required")
 
 
+def allowed_oauth_opener_origin(request: Request, settings: Settings) -> str | None:
+    origin = (request.headers.get("origin") or "").rstrip("/")
+    if not origin:
+        return None
+    allowed = {item.rstrip("/") for item in settings.cors_origins}
+    return origin if origin in allowed else None
+
+
 def require_permission(request: Request, context: RequestContext, action: str) -> None:
     resource = f"tenant:{context.tenant_id}"
     decision = request.app.state.policy_service.decide(
@@ -1317,6 +1328,7 @@ def create_app(
     app.state.agent_registry_service = AgentRegistryService(
         registry=app.state.agent_registry,
         store=app.state.store,
+        storage_catalog=app.state.storage_catalog,
     )
     app.state.speech_gateway = speech_gateway or SpeechGateway()
     app.state.thread_share_store = (
@@ -1513,6 +1525,7 @@ def create_app(
     )
     register_sandbox_tool_handlers(tool_gateway, app.state.sandbox_adapter)
     register_browser_tool_handlers(tool_gateway, app.state.browser_controller)
+    register_skill_tool_handlers(tool_gateway, app.state.skill_service)
     app.state.runtime = apply_agent_runtime_settings(
         runtime or AgentRuntime(
             store=app.state.store,
@@ -1548,6 +1561,7 @@ def create_app(
             connector_registry=app.state.connector_registry,
             connector_dispatcher=app.state.connector_dispatcher,
             connector_invocation_service=app.state.connector_invocation_service,
+            agent_registry=app.state.agent_registry,
         ),
         resolved_settings,
     )
@@ -1561,6 +1575,8 @@ def create_app(
         app.state.runtime.connector_invocation_service = (
             app.state.connector_invocation_service
         )
+    if app.state.runtime.agent_registry is None:
+        app.state.runtime.agent_registry = app.state.agent_registry
     app.state.chat_service = ChatService(
         store=app.state.store,
         model_policy_resolver=lambda: app.state.runtime.model_policy,
@@ -1938,6 +1954,31 @@ def create_app(
         )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
+    @app.post("/api/threads/{thread_id}/messages/{message_id}/promote")
+    def promote_manual_chat_message(
+        thread_id: str,
+        message_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        message = app.state.chat_service.promote_manual_message(
+            context.tenant_id,
+            context.user_id,
+            thread_id,
+            message_id,
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=message.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="chat.message.promoted_to_composer",
+            metadata={"thread_id": thread_id, "message_id": message_id},
+            request=request,
+        )
+        return message.model_dump(mode="json")
+
     @app.post(
         "/api/threads/{thread_id}/steer",
         status_code=status.HTTP_202_ACCEPTED,
@@ -2038,13 +2079,29 @@ def create_app(
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
         context: RequestContext = Depends(get_request_context),
     ) -> dict[str, Any]:
+        thread = app.state.chat_service.get_thread(context.tenant_id, thread_id)
+        resolved_attachments = list(payload.attachments)
+        for reference in payload.resource_refs:
+            if reference.type != "file":
+                continue
+            storage_object = app.state.storage_catalog.get(
+                context.tenant_id, reference.id
+            )
+            if storage_object.workspace_id != thread.workspace_id:
+                raise ValueError("Referenced file is not available in this workspace")
+            require_storage_read_access(request, context, storage_object)
+            if storage_object.id not in resolved_attachments:
+                resolved_attachments.append(storage_object.id)
+        resolved_payload = payload.model_copy(
+            update={"attachments": resolved_attachments}
+        )
         path = f"/api/threads/{thread_id}/messages"
         idempotency_request = build_idempotency_request(
             tenant_id=context.tenant_id,
             key=idempotency_key,
             method="POST",
             path=path,
-            payload=payload,
+            payload=resolved_payload,
         )
 
         def accept_message() -> MessageDispatch:
@@ -2052,7 +2109,7 @@ def create_app(
                 context.tenant_id,
                 context.user_id,
                 thread_id,
-                payload,
+                resolved_payload,
             )
             run = app.state.store.get_run(context.tenant_id, dispatch.run_id)
             record_audit_event(
@@ -2067,9 +2124,9 @@ def create_app(
                     "message_id": dispatch.message_id,
                     "run_id": run.id,
                     "dispatch_status": dispatch.dispatch_status.value,
-                    "delivery_mode": payload.delivery_mode,
-                    "attachment_count": len(payload.attachments),
-                    "resource_ref_count": len(payload.resource_refs),
+                    "delivery_mode": resolved_payload.delivery_mode,
+                    "attachment_count": len(resolved_payload.attachments),
+                    "resource_ref_count": len(resolved_payload.resource_refs),
                 },
                 request=request,
             )
@@ -2123,6 +2180,7 @@ def create_app(
     @app.get("/api/workspaces/{workspace_id}/capabilities")
     def get_workspace_capabilities(
         workspace_id: str,
+        request: Request,
         context: RequestContext = Depends(get_request_context),
     ) -> dict[str, Any]:
         installed_skills = [
@@ -2176,12 +2234,36 @@ def create_app(
                 context.tenant_id, workspace_id
             )
         ]
+        files = []
+        for storage_object in app.state.storage_catalog.list_active(
+            context.tenant_id, workspace_id=workspace_id
+        ):
+            if storage_object.run_id is not None:
+                continue
+            try:
+                require_storage_read_access(request, context, storage_object)
+            except TenantAccessError:
+                continue
+            files.append(
+                {
+                    "id": storage_object.id,
+                    "file_id": storage_object.id,
+                    "storage_object_id": storage_object.id,
+                    "name": storage_object.filename,
+                    "description": (
+                        f"{storage_object.content_type} · {storage_object.size_bytes} bytes"
+                    ),
+                    "content_type": storage_object.content_type,
+                    "size_bytes": storage_object.size_bytes,
+                }
+            )
         return {
             "workspace_id": workspace_id,
             "skills": installed_skills,
             "connectors": connectors,
             "agents": agents,
             "knowledge": knowledge,
+            "files": files,
             "skill_service_available": app.state.skill_service is not None,
         }
 
@@ -2354,6 +2436,49 @@ def create_app(
                 for item in app.state.agent_registry.list_versions(context.tenant_id, agent_id)
             ],
         }
+
+    @app.patch("/api/agents/{agent_id}")
+    def update_agent_definition(
+        agent_id: str,
+        payload: AgentDefinitionPatch,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        return app.state.agent_registry.update_definition(
+            context.tenant_id,
+            agent_id,
+            **payload.model_dump(exclude_none=True),
+        ).model_dump(mode="json")
+
+    @app.get("/api/agents/{agent_id}/sessions")
+    def list_agent_sessions(
+        agent_id: str,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        definition = app.state.agent_registry.get(context.tenant_id, agent_id)
+        sessions = []
+        for run in app.state.store.list_runs(
+            context.tenant_id, definition.workspace_id
+        ):
+            if run.agent_id != agent_id:
+                continue
+            thread = (
+                app.state.store.get_chat_thread(context.tenant_id, run.thread_id)
+                if run.thread_id
+                else None
+            )
+            sessions.append(
+                {
+                    "id": run.id,
+                    "run_id": run.id,
+                    "thread_id": run.thread_id,
+                    "title": thread.title if thread is not None else f"{definition.name} run",
+                    "status": run.status.value,
+                    "created_at": run.created_at.isoformat(),
+                    "updated_at": run.updated_at.isoformat(),
+                }
+            )
+        sessions.sort(key=lambda item: (item["created_at"], item["id"]), reverse=True)
+        return {"agent_id": agent_id, "sessions": sessions}
 
     @app.post("/api/threads/{thread_id}/extract-agent")
     def extract_agent_draft(
@@ -2780,13 +2905,13 @@ def create_app(
         resolved_by_user_id: str,
         background_tasks: BackgroundTasks,
     ) -> None:
-        if not oauth_result.reconnect_action_id or not oauth_result.reconnect_run_id:
-            return
         app.state.connector_registry.update_connector_status(
             connector.tenant_id,
             connector.id,
             ConnectorStatus.ENABLED,
         )
+        if not oauth_result.reconnect_action_id or not oauth_result.reconnect_run_id:
+            return
         app.state.store.retry_connector_action_after_reconnect(
             connector.tenant_id,
             oauth_result.reconnect_action_id,
@@ -2832,6 +2957,7 @@ def create_app(
         result = app.state.connector_oauth_service.build_authorization_url(
             connector=connector,
             requested_by_user_id=context.user_id,
+            opener_origin=allowed_oauth_opener_origin(request, app.state.settings),
         )
         record_audit_event(
             app=app,
@@ -2875,6 +3001,7 @@ def create_app(
             reconnect_thread_id=payload.thread_id,
             reconnect_run_id=payload.run_id,
             reconnect_action_id=payload.action_id,
+            opener_origin=allowed_oauth_opener_origin(request, app.state.settings),
         )
         record_audit_event(
             app=app,
@@ -2978,6 +3105,9 @@ def create_app(
                 "action_id": result.reconnect_action_id,
             }
         )
+        target_origin = json.dumps(
+            session.opener_origin or str(request.base_url).rstrip("/")
+        )
         return HTMLResponse(
             "<!doctype html><meta charset='utf-8'>"
             f"<title>{message}</title>"
@@ -2986,7 +3116,7 @@ def create_app(
             "padding:2rem;border:1px solid #deddd7;border-radius:16px;background:white}"
             "h1{font-size:20px}p{color:#62625d}</style>"
             f"<main><h1>{message}</h1><p>You can close this window.</p></main>"
-            f"<script>window.opener?.postMessage({payload}, window.location.origin);"
+            f"<script>window.opener?.postMessage({payload}, {target_origin});"
             "window.setTimeout(()=>window.close(),900);</script>"
         )
 
@@ -7260,6 +7390,90 @@ def create_app(
             page,
         )
 
+    @app.get("/api/workspaces/{workspace_id}/files")
+    def list_workspace_files(
+        workspace_id: str,
+        request: Request,
+        query: str = Query(default="", max_length=200),
+        folder: str = Query(default="", max_length=512),
+        include_run_files: bool = Query(default=False),
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "storage.read")
+        normalized_folder = normalize_workspace_file_path(folder, allow_empty=True)
+        normalized_query = query.strip().casefold()
+        visible = []
+        for storage_object in app.state.storage_catalog.list_active(
+            context.tenant_id, workspace_id=workspace_id
+        ):
+            if not include_run_files and storage_object.run_id is not None:
+                continue
+            logical_path = storage_object.filename.replace("\\", "/")
+            if normalized_folder and not logical_path.startswith(f"{normalized_folder}/"):
+                continue
+            if normalized_query and normalized_query not in logical_path.casefold():
+                continue
+            try:
+                require_storage_read_access(request, context, storage_object)
+            except TenantAccessError:
+                continue
+            item = storage_object.model_dump(mode="json")
+            item.update(
+                {
+                    "storage_object_id": storage_object.id,
+                    "logical_path": logical_path,
+                    "folder": (
+                        ""
+                        if PurePosixPath(logical_path).parent == PurePosixPath(".")
+                        else str(PurePosixPath(logical_path).parent)
+                    ),
+                    "pinned_reference": storage_object_agent_reference_count(
+                        app.state.agent_registry, context.tenant_id, storage_object.id
+                    ),
+                }
+            )
+            visible.append(item)
+        visible.sort(key=lambda item: (item["created_at"], item["id"]), reverse=True)
+        return {
+            "workspace_id": workspace_id,
+            "files": visible,
+            "count": len(visible),
+            "include_run_files": include_run_files,
+        }
+
+    @app.patch("/api/storage/objects/{storage_object_id}")
+    def update_storage_object_metadata(
+        storage_object_id: str,
+        payload: StorageObjectPatch,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "storage.write")
+        storage_object = app.state.storage_catalog.get(
+            context.tenant_id, storage_object_id
+        )
+        filename = normalize_workspace_file_path(payload.filename)
+        updated = app.state.storage_catalog.update_metadata(
+            context.tenant_id,
+            storage_object_id,
+            filename=filename,
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=updated.workspace_id,
+            user_id=context.user_id,
+            run_id=updated.run_id,
+            event_type="storage.metadata.updated",
+            metadata={
+                "storage_object_id": updated.id,
+                "previous_filename": storage_object.filename,
+                "filename": updated.filename,
+            },
+            request=request,
+        )
+        return updated.model_dump(mode="json")
+
     @app.post("/api/storage/objects/{storage_object_id}/signed-url")
     def create_storage_signed_url(
         storage_object_id: str,
@@ -7422,6 +7636,13 @@ def create_app(
         storage_object = app.state.storage_catalog.get(
             context.tenant_id, storage_object_id
         )
+        reference_count = storage_object_agent_reference_count(
+            app.state.agent_registry, context.tenant_id, storage_object_id
+        )
+        if reference_count:
+            raise ValueError(
+                f"Storage object is pinned by {reference_count} Agent version reference(s)"
+            )
         now = utc_now()
         if (
             storage_object.retention_expires_at is not None
@@ -9616,6 +9837,38 @@ def connector_dispatch_billing_metadata(
 
 def storage_audit_metadata(storage_object) -> dict:
     return storage_object_audit_metadata(storage_object)
+
+
+def normalize_workspace_file_path(value: str, *, allow_empty: bool = False) -> str:
+    normalized = value.strip().replace("\\", "/").strip("/")
+    if not normalized:
+        if allow_empty:
+            return ""
+        raise ValueError("Workspace file path is required")
+    raw_parts = normalized.split("/")
+    if any(part in {"", ".", ".."} for part in raw_parts):
+        raise ValueError("Workspace file path contains an invalid segment")
+    if len(normalized) > 512:
+        raise ValueError("Workspace file path is too long")
+    return str(PurePosixPath(*raw_parts))
+
+
+def storage_object_agent_reference_count(
+    registry,
+    tenant_id: str,
+    storage_object_id: str,
+) -> int:
+    if registry is None:
+        return 0
+    reference_count = 0
+    for definition in registry.list(tenant_id):
+        for version in registry.list_versions(tenant_id, definition.id):
+            reference_count += sum(
+                1
+                for reference in version.spec.reference_files
+                if reference.get("storage_object_id") == storage_object_id
+            )
+    return reference_count
 
 
 def lifecycle_policy_audit_metadata(policy) -> dict:

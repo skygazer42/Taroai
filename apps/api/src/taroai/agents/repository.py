@@ -34,6 +34,12 @@ class InMemoryAgentRegistry(AgentRegistry):
             raise NotFoundError(f"Agent not found: {agent_id}")
         return definition.model_copy(deep=True)
 
+    def update_definition(self, tenant_id: str, agent_id: str, **changes):
+        definition = self.get(tenant_id, agent_id)
+        updated = definition.model_copy(update={**changes, "updated_at": utc_now()})
+        self.definitions[agent_id] = updated
+        return updated.model_copy(deep=True)
+
     def list(self, tenant_id: str, workspace_id: str | None = None):
         return sorted(
             [
@@ -127,6 +133,24 @@ class SqlAgentRegistry(AgentRegistry):
         if row is None:
             raise NotFoundError(f"Agent not found: {agent_id}")
         return self._definition(row)
+
+    def update_definition(self, tenant_id: str, agent_id: str, **changes):
+        definition = self.get(tenant_id, agent_id)
+        name = changes.get("name", definition.name)
+        description = changes.get("description", definition.description)
+        updated_at = utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE agent_definitions
+                SET name = ?, description = ?, updated_at = ?
+                WHERE tenant_id = ? AND id = ?
+                """,
+                (name, description, self._dt(updated_at), tenant_id, agent_id),
+            )
+        return definition.model_copy(
+            update={"name": name, "description": description, "updated_at": updated_at}
+        )
 
     def list(self, tenant_id: str, workspace_id: str | None = None):
         sql = "SELECT * FROM agent_definitions WHERE tenant_id = ?"

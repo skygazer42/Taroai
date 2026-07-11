@@ -46,6 +46,7 @@ class OAuthAuthorizationSession(BaseModel):
     reconnect_thread_id: str | None = None
     reconnect_run_id: str | None = None
     reconnect_action_id: str | None = None
+    opener_origin: str | None = None
 
 
 class ConnectorOAuthAuthorizeResult(BaseModel):
@@ -161,6 +162,7 @@ class ConnectorOAuthService(BaseModel):
         reconnect_thread_id: str | None = None,
         reconnect_run_id: str | None = None,
         reconnect_action_id: str | None = None,
+        opener_origin: str | None = None,
         now: datetime | None = None,
     ) -> ConnectorOAuthAuthorizeResult:
         config = self._config(connector)
@@ -175,6 +177,7 @@ class ConnectorOAuthService(BaseModel):
             reconnect_thread_id=reconnect_thread_id,
             reconnect_run_id=reconnect_run_id,
             reconnect_action_id=reconnect_action_id,
+            opener_origin=opener_origin,
         )
         client_id = self._secret_value(
             connector=connector,

@@ -365,6 +365,7 @@ class InMemoryControlPlaneStore(BaseModel):
     ) -> ChatMessage:
         allowed_fields = {
             "content",
+            "kind",
             "dispatch_status",
             "delivery_status",
             "attachments",
@@ -404,6 +405,7 @@ class InMemoryControlPlaneStore(BaseModel):
                     ChatMessageDispatchStatus.READY,
                     ChatMessageDispatchStatus.QUEUED,
                 }
+                and message.kind != "manual_queue"
             ]
             if not candidates:
                 return None

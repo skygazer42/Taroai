@@ -56,6 +56,7 @@ from taroai.sandbox import (
     SandboxAdapter,
     SandboxCreateRequest,
     SandboxExecutionError,
+    SandboxFileWrite,
     SandboxNetworkMode,
     SandboxProviderUnavailableError,
     SandboxSessionStatus,
@@ -131,6 +132,7 @@ class AgentRuntime(BaseModel):
     connector_registry: Any | None = None
     connector_dispatcher: Any | None = None
     connector_invocation_service: Any | None = None
+    agent_registry: Any | None = None
     max_step_retries: int = 0
     runtime_mode: str = "legacy"
     loop_max_iterations: int = Field(default=12, ge=1)
@@ -1967,10 +1969,12 @@ class AgentRuntime(BaseModel):
                 "runtime sandbox adapter is not configured for automatic sandbox sessions"
             )
         if state.sandbox_session_id is not None:
-            return self.sandbox_adapter.get_session(
+            session = self.sandbox_adapter.get_session(
                 state.tenant_id,
                 state.sandbox_session_id,
             )
+            self._materialize_run_attachments(state, session)
+            return session
         self._enforce_sandbox_concurrency_license(state)
         session = self.sandbox_adapter.create(
             SandboxCreateRequest(
@@ -1998,8 +2002,86 @@ class AgentRuntime(BaseModel):
                 "network_mode": session.network_mode.value,
             },
         )
+        self._materialize_run_attachments(state, session)
         self._save_state(state)
         return session
+
+    def _attachment_descriptors(self, run: Run) -> list[dict[str, Any]]:
+        if self.storage_catalog is None:
+            return []
+        storage_object_ids = list(run.attachments)
+        storage_object_ids.extend(
+            reference.id
+            for reference in run.resource_refs
+            if reference.type == "file" and reference.id not in storage_object_ids
+        )
+        descriptors: list[dict[str, Any]] = []
+        used_names: set[str] = set()
+        for storage_object_id in storage_object_ids:
+            storage_object = self.storage_catalog.get(
+                run.tenant_id, storage_object_id
+            )
+            if storage_object.workspace_id != run.workspace_id:
+                raise ToolExecutionError(
+                    f"Attachment is not available in this workspace: {storage_object_id}"
+                )
+            source_name = storage_object.filename.replace("\\", "/").rsplit("/", 1)[-1]
+            safe_name = re.sub(r"[^A-Za-z0-9._ -]", "_", source_name).strip(" .")
+            if not safe_name:
+                safe_name = f"file-{storage_object.id[-8:]}"
+            if safe_name in used_names:
+                stem, dot, suffix = safe_name.rpartition(".")
+                safe_name = (
+                    f"{stem or suffix}-{storage_object.id[-8:]}{dot}{suffix if dot else ''}"
+                )
+            used_names.add(safe_name)
+            descriptors.append(
+                {
+                    "storage_object_id": storage_object.id,
+                    "filename": storage_object.filename,
+                    "content_type": storage_object.content_type,
+                    "size_bytes": storage_object.size_bytes,
+                    "sandbox_path": f"/workspace/inputs/{safe_name}",
+                }
+            )
+        return descriptors
+
+    def _materialize_run_attachments(self, state: AgentRuntimeState, session) -> None:
+        if state.runtime_metadata.get("attachments_materialized"):
+            return
+        if self.object_storage is None or self.storage_catalog is None:
+            return
+        run = self.store.get_run(state.tenant_id, state.run_id)
+        descriptors = self._attachment_descriptors(run)
+        for descriptor in descriptors:
+            storage_object = self.storage_catalog.get(
+                run.tenant_id, descriptor["storage_object_id"]
+            )
+            content = self.object_storage.download(storage_object).content
+            self.sandbox_adapter.upload_file(
+                SandboxFileWrite(
+                    tenant_id=run.tenant_id,
+                    workspace_id=run.workspace_id,
+                    run_id=run.id,
+                    session_id=session.id,
+                    path=descriptor["sandbox_path"],
+                    content_base64=base64.b64encode(content).decode("ascii"),
+                    content_type=storage_object.content_type,
+                )
+            )
+        state.runtime_metadata["attachments_materialized"] = True
+        state.runtime_metadata["materialized_attachments"] = descriptors
+        if descriptors:
+            self.store.append_run_event(
+                run,
+                "run.attachments.materialized",
+                {
+                    "session_id": session.id,
+                    "count": len(descriptors),
+                    "files": descriptors,
+                },
+            )
+        self._save_state(state)
 
     def _enforce_sandbox_concurrency_license(
         self,

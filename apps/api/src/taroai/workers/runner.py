@@ -6,6 +6,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from taroai.agent import AgentRuntime, apply_agent_runtime_settings
+from taroai.agents import InMemoryAgentRegistry, SqlAgentRegistry
 from taroai.audit import AuditService
 from taroai.chat import ChatService
 from taroai.billing import (
@@ -64,7 +65,11 @@ from taroai.sandbox import (
 from taroai.sandbox.tools import register_browser_tool_handlers, register_sandbox_tool_handlers
 from taroai.policy import IdentityPolicyService
 from taroai.secrets import build_secret_service_from_settings
-from taroai.skills import InMemorySkillRegistry, SqlSkillRegistry
+from taroai.skills import (
+    InMemorySkillRegistry,
+    SqlSkillRegistry,
+    register_skill_tool_handlers,
+)
 from taroai.skills.import_service import HttpsGithubArchiveFetcher
 from taroai.skills.service import SkillService
 from taroai.store import InMemoryControlPlaneStore
@@ -423,6 +428,8 @@ def build_agent_worker_runner(
     connector_registry = build_worker_connector_registry(settings)
     connector_dispatcher = ConnectorDispatchService(secret_service=secret_service)
     connector_invocation_service = ConnectorInvocationService()
+    worker_skill_service = build_worker_skill_service(settings)
+    agent_registry = build_worker_agent_registry(settings)
     resolved_runtime = apply_agent_runtime_settings(runtime or AgentRuntime(
         store=resolved_store,
         model_gateway=build_worker_model_gateway(settings, secret_service),
@@ -435,6 +442,7 @@ def build_agent_worker_runner(
             secret_service,
             sandbox_adapter,
             browser_controller,
+            worker_skill_service,
         ),
         policy_service=policy_service,
         audit_service=audit_service,
@@ -454,19 +462,22 @@ def build_agent_worker_runner(
             build_billing_pricing_rule_store(settings),
         ),
         guardrail_service=guardrail_service,
-        skill_service=build_worker_skill_service(settings),
+        skill_service=worker_skill_service,
         connector_registry=connector_registry,
         connector_dispatcher=connector_dispatcher,
         connector_invocation_service=connector_invocation_service,
+        agent_registry=agent_registry,
     ), settings)
     if resolved_runtime.skill_service is None:
-        resolved_runtime.skill_service = build_worker_skill_service(settings)
+        resolved_runtime.skill_service = worker_skill_service
     if resolved_runtime.connector_registry is None:
         resolved_runtime.connector_registry = connector_registry
     if resolved_runtime.connector_dispatcher is None:
         resolved_runtime.connector_dispatcher = connector_dispatcher
     if resolved_runtime.connector_invocation_service is None:
         resolved_runtime.connector_invocation_service = connector_invocation_service
+    if resolved_runtime.agent_registry is None:
+        resolved_runtime.agent_registry = agent_registry
     chat_service = ChatService(
         store=resolved_store,
         model_policy_resolver=lambda: resolved_runtime.model_policy,
@@ -805,6 +816,14 @@ def build_worker_skill_service(settings: Settings) -> SkillService:
     )
 
 
+def build_worker_agent_registry(
+    settings: Settings,
+) -> InMemoryAgentRegistry | SqlAgentRegistry:
+    if settings.agent_registry_backend == "sql":
+        return SqlAgentRegistry(config=settings.database_config())
+    return InMemoryAgentRegistry()
+
+
 def build_worker_audit_service(
     settings: Settings,
     store: InMemoryControlPlaneStore | SqlControlPlaneRepository,
@@ -946,6 +965,7 @@ def build_worker_tool_gateway(
     secret_service=None,
     sandbox_adapter: SandboxAdapter | None = None,
     browser_controller: BrowserController | None = None,
+    skill_service: SkillService | None = None,
 ) -> ToolGateway:
     gateway = ToolGateway(
         audit_service=audit_service,
@@ -959,6 +979,10 @@ def build_worker_tool_gateway(
     register_browser_tool_handlers(
         gateway,
         browser_controller or build_worker_browser_controller(settings),
+    )
+    register_skill_tool_handlers(
+        gateway,
+        skill_service or build_worker_skill_service(settings),
     )
     return gateway
 

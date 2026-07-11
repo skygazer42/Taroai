@@ -3,6 +3,8 @@ import { createSkillsUI } from "./skills-ui.js";
 import { createAgentsUI } from "./agents-ui.js";
 import { createArtifactsUI } from "./artifacts-ui.js";
 import { createSpeechUI } from "./speech-ui.js";
+import { createAgentBrainUI } from "./brain-ui.js";
+import { createFilesUI } from "./files-ui.js";
 
 window.__taroaiThreadChat = true;
 
@@ -13,6 +15,7 @@ const state = {
   eventStreamIntegrityIssues: [],
   artifacts: [],
   storageObjects: [],
+  workspaceFiles: [],
   runHistory: [],
   runTrace: null,
   runtimeState: null,
@@ -725,7 +728,10 @@ function renderAttachmentChips() {
 
 function renderFilesDialog() {
   const searchTerm = (elements.filesSearch.value || "").trim().toLowerCase();
-  const candidates = state.storageObjects.filter((storageObject) => {
+  const allFiles = [...state.workspaceFiles, ...state.storageObjects].filter(
+    (storageObject, index, values) => values.findIndex((item) => item.id === storageObject.id) === index,
+  );
+  const candidates = allFiles.filter((storageObject) => {
     const filename = (storageObject.filename || storageObject.id || "").toLowerCase();
     return !searchTerm || filename.includes(searchTerm);
   });
@@ -777,8 +783,14 @@ function updateFilesSelectionStatus() {
   elements.filesConfirm.closest(".files-dialog-footer").hidden = count === 0;
 }
 
-function openFilesDialog() {
+async function openFilesDialog() {
   closeActivePopover(false);
+  try {
+    const payload = await apiFetch(`/api/workspaces/${encodeURIComponent(state.workspaceId)}/files`);
+    state.workspaceFiles = payload.files || payload.items || payload || [];
+  } catch {
+    state.workspaceFiles = [];
+  }
   state.filesDialogSelection = new Set(
     state.selectedAttachments.map((attachment) => attachment.id),
   );
@@ -799,7 +811,8 @@ function closeFilesDialog() {
 }
 
 function confirmFilesSelection() {
-  const selected = state.storageObjects.filter((storageObject) => {
+  const selected = [...state.workspaceFiles, ...state.storageObjects].filter((storageObject, index, values) => {
+    if (values.findIndex((item) => item.id === storageObject.id) !== index) return false;
     return state.filesDialogSelection.has(storageObject.id);
   });
   state.selectedAttachments = selected;
@@ -4354,3 +4367,5 @@ createSkillsUI();
 createAgentsUI();
 createArtifactsUI();
 createSpeechUI();
+createAgentBrainUI();
+createFilesUI();

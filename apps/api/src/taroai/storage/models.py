@@ -33,7 +33,7 @@ class StorageObjectCreate(BaseModel):
 
 class StorageObjectApiCreate(BaseModel):
     workspace_id: str = Field(min_length=1)
-    run_id: str = Field(min_length=1)
+    run_id: str | None = Field(default=None, min_length=1)
     purpose: StoragePurpose
     filename: str = Field(min_length=1)
     content_type: str = Field(min_length=1)
@@ -41,6 +41,10 @@ class StorageObjectApiCreate(BaseModel):
     acl_subjects: list[str] = Field(default_factory=list)
     sensitivity_level: int = Field(default=0, ge=0)
     retention_expires_at: datetime | None = None
+
+
+class StorageObjectPatch(BaseModel):
+    filename: str = Field(min_length=1, max_length=512)
 
 
 class StorageObject(BaseModel):

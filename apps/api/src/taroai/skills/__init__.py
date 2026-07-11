@@ -27,6 +27,7 @@ from taroai.skills.registry import (
     SkillRegistryEntry,
     SkillStatus,
 )
+from taroai.skills.tools import CREATE_SKILL_DRAFT_TOOL, register_skill_tool_handlers
 
 __all__ = [
     "InMemorySkillRegistry",
@@ -52,9 +53,11 @@ __all__ = [
     "SkillType",
     "SkillVisibility",
     "SqlSkillRegistry",
+    "CREATE_SKILL_DRAFT_TOOL",
     "classify_skill_file",
     "normalize_package_path",
     "parse_json_compatible_taroai_config",
     "parse_skill_frontmatter",
     "stable_package_digest",
+    "register_skill_tool_handlers",
 ]

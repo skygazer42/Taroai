@@ -110,6 +110,21 @@ class InMemoryStorageCatalog(BaseModel):
             return uploaded
         raise NotFoundError(f"Storage object not found: {storage_object_id}")
 
+    def update_metadata(
+        self,
+        tenant_id: str,
+        storage_object_id: str,
+        *,
+        filename: str,
+    ) -> StorageObject:
+        storage_object = self.get(tenant_id, storage_object_id)
+        updated = storage_object.model_copy(update={"filename": filename})
+        self.objects = [
+            updated if existing.id == storage_object_id else existing
+            for existing in self.objects
+        ]
+        return updated
+
     def mark_deleted(
         self,
         tenant_id: str,

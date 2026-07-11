@@ -108,11 +108,12 @@ class AgentLoopV2:
             return self.runtime._pause_for_policy_block(state, run, policy)
         try:
             self._validate_explicit_skill_refs(state, run)
+            self._load_agent_context(state, run)
         except Exception as error:
             return self._fail(
                 state,
                 run,
-                "invalid_skill_reference",
+                "invalid_resource_reference",
                 detail=self._safe_error(error),
             )
         conversation = self._conversation_context(state, run)
@@ -599,6 +600,68 @@ class AgentLoopV2:
         state.runtime_metadata["context_compaction_version"] = 1
         return context
 
+    def _load_agent_context(
+        self,
+        state: AgentRuntimeState,
+        run: Run,
+    ) -> dict[str, Any] | None:
+        cached = state.runtime_metadata.get("agent_context")
+        if isinstance(cached, dict):
+            return cached
+        references = [item for item in run.resource_refs if item.type == "agent"]
+        agent_ids = {item.id for item in references}
+        if run.agent_id:
+            agent_ids.add(run.agent_id)
+        if not agent_ids:
+            return None
+        if len(agent_ids) != 1:
+            raise ValueError("A chat turn can bind only one reusable agent")
+        registry = self.runtime.agent_registry
+        if registry is None:
+            raise ValueError("agent registry is not configured")
+        agent_id = next(iter(agent_ids))
+        definition = registry.get(run.tenant_id, agent_id)
+        if definition.workspace_id != run.workspace_id:
+            raise ValueError("agent is not available in this workspace")
+        reference = next((item for item in references if item.id == agent_id), None)
+        version_number = (
+            int(reference.version)
+            if reference is not None and reference.version is not None
+            else definition.published_version
+        )
+        if version_number is None:
+            if reference is not None:
+                raise ValueError("mentioned agent has no published version")
+            return None
+        version = registry.get_version(run.tenant_id, agent_id, version_number)
+        if reference is not None and version.status != "published":
+            raise ValueError("mentioned agent version is not published")
+        context = {
+            "agent_id": definition.id,
+            "name": definition.name,
+            "description": definition.description,
+            "version": version.version,
+            "instructions": version.spec.instructions,
+            "input_schema": version.spec.input_schema,
+            "output_contract": version.spec.output_contract,
+            "skill_bindings": version.spec.skill_bindings,
+            "connector_bindings": version.spec.connector_bindings,
+            "knowledge_bindings": version.spec.knowledge_bindings,
+            "reference_files": version.spec.reference_files,
+        }
+        state.runtime_metadata["agent_context"] = context
+        self.runtime.store.append_run_event(
+            run,
+            "agent.definition.loaded",
+            {
+                "agent_id": definition.id,
+                "agent_version": version.version,
+                "source": "mention" if reference is not None else "run",
+            },
+        )
+        self.runtime._save_state(state)
+        return context
+
     def _validate_explicit_skill_refs(
         self,
         state: AgentRuntimeState,
@@ -806,6 +869,7 @@ class AgentLoopV2:
         skill_summaries = self._discover_skill_summaries(run)
         connector_tools = self._discover_connector_tools(run)
         conversation = self._conversation_context(state, run)
+        agent_context = self._load_agent_context(state, run)
         loaded_skills = list(
             state.runtime_metadata.get("loaded_skill_context", {}).values()
         )
@@ -816,11 +880,19 @@ class AgentLoopV2:
                     "You are Taroai's iterative agent controller. Decide exactly one next "
                     "observable action. Return strict JSON matching: kind=action|respond|"
                     "request_input|replan; for action include tool_name and tool_input; for "
-                    "respond include response_text. Never repeat a failed side-effecting action "
+                    "respond include response_text. If reusable_agent is present, treat its "
+                    "published instructions and output contract as the active workflow. "
+                    "When current_request includes files, sandbox actions can read them from "
+                    "their declared /workspace/inputs paths. Never guess a different path. "
+                    "Never repeat a failed side-effecting action "
                     "unchanged. Available skills are compact summaries: select one by setting "
                     "skill_id on an action, then the controller will load its full SKILL.md and "
                     "ask you to decide again. Keep skill_id on actions performed for a loaded "
-                    "skill. Use the observations and steering messages to repair or replan."
+                    "skill. When the user explicitly asks to create a reusable skill, use "
+                    "skill.package.create_draft with complete SKILL.md instructions and any "
+                    "small supporting text files; explain that evaluation and publish are the "
+                    "next governance steps. Use the observations and steering messages to "
+                    "repair or replan."
                 ),
             ),
             ModelMessage(
@@ -830,12 +902,14 @@ class AgentLoopV2:
                         "goal": state.goal,
                         "current_request": {
                             "attachments": run.attachments,
+                            "files": self.runtime._attachment_descriptors(run),
                             "resource_refs": [
                                 item.model_dump(mode="json")
                                 for item in run.resource_refs
                             ],
                         },
                         "conversation": conversation,
+                        "reusable_agent": agent_context,
                         "iteration": state.iteration,
                         "plan_revision": state.active_plan_revision,
                         "observations": observations,

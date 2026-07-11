@@ -25,9 +25,10 @@ from taroai.domain import (
 
 
 class AgentRegistryService:
-    def __init__(self, *, registry: Any, store: Any) -> None:
+    def __init__(self, *, registry: Any, store: Any, storage_catalog: Any | None = None) -> None:
         self.registry = registry
         self.store = store
+        self.storage_catalog = storage_catalog
 
     def create(
         self,
@@ -145,6 +146,10 @@ class AgentRegistryService:
             storage_object_id = reference.get("storage_object_id")
             if not storage_object_id:
                 raise ValueError("Published Agent reference files must pin storage_object_id")
+            if self.storage_catalog is not None:
+                storage_object = self.storage_catalog.get(tenant_id, storage_object_id)
+                if storage_object.workspace_id != target.workspace_id:
+                    raise ValueError("Published Agent reference file is not in the Agent workspace")
         model_policy = target.spec.model_policy
         if bool(model_policy.get("provider_id")) != bool(model_policy.get("model_id")):
             raise ValueError("Agent model policy must pin provider_id and model_id together")

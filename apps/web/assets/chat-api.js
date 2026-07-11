@@ -143,6 +143,19 @@ export class ChatApi {
     });
   }
 
+  async blob(path) {
+    const { apiBase } = this.settings();
+    const response = await fetch(`${apiBase}${path}`, {
+      method: "GET",
+      headers: this.headers({}, false),
+    });
+    if (!response.ok) {
+      const body = responseBody(await response.text());
+      throw apiError(response, body);
+    }
+    return response.blob();
+  }
+
   async upload(file, onProgress = () => {}) {
     onProgress(0.08, "Reading");
     const contentBase64 = await fileAsBase64(file);
@@ -152,14 +165,13 @@ export class ChatApi {
       {
         workspace_id: this.settings().workspaceId,
         filename: file.name,
-        media_type: file.type || "application/octet-stream",
-        size_bytes: file.size,
+        content_type: file.type || "application/octet-stream",
         content_base64: contentBase64,
       },
       { scope: "upload" },
     );
     onProgress(1, "Ready");
-    return body;
+    return { ...(body.storage_object || body), upload: body.upload || null };
   }
 
   async streamThreadEvents(threadId, options = {}) {

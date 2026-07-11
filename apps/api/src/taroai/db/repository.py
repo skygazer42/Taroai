@@ -525,6 +525,7 @@ class SqlControlPlaneRepository(BaseModel):
     ) -> ChatMessage:
         field_columns = {
             "content": "content",
+            "kind": "kind",
             "dispatch_status": "dispatch_status",
             "delivery_status": "delivery_status",
             "attachments": "attachments",
@@ -610,11 +611,17 @@ class SqlControlPlaneRepository(BaseModel):
                   AND id = (
                       SELECT id FROM chat_messages
                       WHERE tenant_id = ? AND thread_id = ?
-                        AND dispatch_status IN (?, ?)
+                        AND (
+                          dispatch_status = ?
+                          OR (dispatch_status = ? AND kind <> 'manual_queue')
+                        )
                       ORDER BY sequence, id
                       {candidate_suffix}
                   )
-                  AND dispatch_status IN (?, ?)
+                  AND (
+                    dispatch_status = ?
+                    OR (dispatch_status = ? AND kind <> 'manual_queue')
+                  )
                 RETURNING *
                 """,
                 (
@@ -623,10 +630,10 @@ class SqlControlPlaneRepository(BaseModel):
                     tenant_id,
                     tenant_id,
                     thread_id,
-                    ChatMessageDispatchStatus.READY.value,
                     ChatMessageDispatchStatus.QUEUED.value,
                     ChatMessageDispatchStatus.READY.value,
                     ChatMessageDispatchStatus.QUEUED.value,
+                    ChatMessageDispatchStatus.READY.value,
                 ),
             ).fetchone()
             if row is None:

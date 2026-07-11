@@ -31,6 +31,7 @@ export const chatState = {
   activeSidecar: "artifacts",
   share: null,
   suggestions: [],
+  promotingManual: false,
 };
 
 const ACTIVE_RUN_STATES = new Set([
@@ -388,7 +389,8 @@ export class ChatController {
   }
 
   onWindowMessage(event) {
-    if (event.origin !== window.location.origin) return;
+    const apiOrigin = new URL(this.api.settings().apiBase, window.location.href).origin;
+    if (![window.location.origin, apiOrigin].includes(event.origin)) return;
     if (event.data?.type !== "taroai.connector.oauth.completed") return;
     this.network("Connector reconnected; resuming the paused action", "success");
     if (chatState.currentThreadId) {
@@ -554,6 +556,7 @@ export class ChatController {
       if (updateHash) updateThreadHash(thread.id);
       this.restoreDraft();
       this.renderAll();
+      await this.maybePromoteManualMessage();
       this.network(chatState.running ? "Agent is working" : "Thread ready", chatState.running ? "active" : "idle");
       this.startEventStream();
     } catch (error) {
@@ -1025,10 +1028,11 @@ export class ChatController {
   toggleDeliveryMode() {
     if (!this.refs.deliveryMode) return;
     const current = this.refs.deliveryMode.value || "queue";
-    const next = current === "queue" ? "steer" : "queue";
+    const next = current === "queue" ? "manual" : current === "manual" ? "steer" : "queue";
     this.refs.deliveryMode.value = next;
-    this.refs.deliveryMode.textContent = next === "queue" ? "Queue next" : "Steer now";
+    this.refs.deliveryMode.textContent = next === "queue" ? "Queue automatic" : next === "manual" ? "Queue for review" : "Steer now";
     this.refs.deliveryMode.classList.toggle("is-steer", next === "steer");
+    this.refs.deliveryMode.classList.toggle("is-manual", next === "manual");
   }
 
   saveDraft() {
@@ -1079,7 +1083,8 @@ export class ChatController {
       id: optimisticId,
       role: "user",
       content: submittedContent,
-      dispatch_status: deliveryMode === "auto" ? "sending" : deliveryMode === "steer" ? "steering" : "queued",
+      dispatch_status: deliveryMode === "auto" ? "sending" : deliveryMode === "steer" ? "steering" : deliveryMode === "manual" ? "ready" : "queued",
+      kind: deliveryMode === "manual" ? "manual_queue" : "text",
       created_at: new Date().toISOString(),
       attachments,
       resource_refs: chatState.resourceRefs,
@@ -1090,7 +1095,7 @@ export class ChatController {
     chatState.resourceRefs = [];
     chatState.uploads = [];
     this.renderAll();
-    this.network(deliveryMode === "auto" ? "Starting agent…" : deliveryMode === "steer" ? "Steering requested" : "Message queued", "loading");
+    this.network(deliveryMode === "auto" ? "Starting agent…" : deliveryMode === "steer" ? "Steering requested" : deliveryMode === "manual" ? "Queued for review after this turn" : "Message queued automatically", "loading");
     try {
       const result = await this.api.post(
         `/api/threads/${encodeURIComponent(chatState.currentThreadId)}/messages`,
@@ -1204,8 +1209,66 @@ export class ChatController {
     this.renderAll();
   }
 
+  addExistingAttachment(storageObject) {
+    const id = storageObject?.storage_object_id || storageObject?.id;
+    if (!id || chatState.uploads.some((upload) => (upload.id || upload.storage_object_id) === id)) return;
+    chatState.uploads.push({
+      ...storageObject,
+      id,
+      filename: storageObject.filename || storageObject.logical_path || id,
+      status: "Ready",
+      progress: 1,
+    });
+    this.renderAll();
+    this.syncComposer();
+    this.refs.input?.focus();
+    this.network(`${storageObject.filename || "Workspace file"} attached`, "idle");
+  }
+
+  async promoteManualMessage(messageId) {
+    const queued = chatState.queue.find((item) => item.id === messageId);
+    if (!queued || queued.kind !== "manual_queue") return;
+    const promoted = await this.api.post(
+      `/api/threads/${encodeURIComponent(chatState.currentThreadId)}/messages/${encodeURIComponent(messageId)}/promote`,
+      {},
+      { scope: "queue-promote" },
+    );
+    chatState.queue = chatState.queue.filter((item) => item.id !== messageId);
+    chatState.messages = chatState.messages.filter((item) => item.id !== messageId);
+    chatState.resourceRefs = arrayFrom(promoted.resource_refs || [], "items");
+    chatState.uploads = arrayFrom(promoted.attachments || [], "items").map((attachment) => ({
+      id: typeof attachment === "string" ? attachment : attachment.id || attachment.storage_object_id,
+      filename: typeof attachment === "string" ? attachment : attachment.filename || attachment.name || attachment.id,
+      status: "Ready",
+      progress: 1,
+    }));
+    if (this.refs.input) this.refs.input.value = messageContent(promoted);
+    this.saveDraft();
+    this.renderAll();
+    this.syncComposer();
+    this.refs.input?.focus();
+    this.network("Manual queued message moved to the composer", "idle");
+  }
+
+  async maybePromoteManualMessage() {
+    if (chatState.running || chatState.promotingManual || this.refs.input?.value.trim()) return;
+    const pending = chatState.queue.find(
+      (message) => message.kind === "manual_queue" && dispatchStatus(message) === "ready",
+    );
+    if (!pending) return;
+    chatState.promotingManual = true;
+    try {
+      await this.promoteManualMessage(pending.id);
+    } catch (error) {
+      this.network(`Could not restore manual queue: ${error.message}`, "error");
+    } finally {
+      chatState.promotingManual = false;
+    }
+  }
+
   handleQueueAction(control) {
     const id = control.dataset.queueMessageId;
+    if (control.dataset.queueAction === "promote") return this.promoteManualMessage(id);
     if (control.dataset.queueAction === "edit") return this.editQueuedMessage(id);
     if (control.dataset.queueAction === "delete") return this.deleteQueuedMessage(id);
     if (control.dataset.queueAction === "steer") return this.steerQueuedMessage(id);
@@ -1255,18 +1318,26 @@ export class ChatController {
       const item = document.createElement("li");
       item.className = "queue-item";
       item.dataset.status = dispatchStatus(message);
+      item.dataset.kind = message.kind || "text";
       const order = document.createElement("span");
       order.className = "queue-order";
       order.textContent = String(index + 1).padStart(2, "0");
       const copy = document.createElement("div");
       const status = document.createElement("small");
-      status.textContent = dispatchStatus(message) === "steering" ? "Steer after current action" : "Queued";
+      status.textContent = message.kind === "manual_queue"
+        ? "Manual - review before sending"
+        : dispatchStatus(message) === "steering"
+          ? "Steer after current action"
+          : "Automatic queue";
       const content = document.createElement("p");
       content.textContent = messageContent(message);
       copy.append(status, content);
       const actions = document.createElement("div");
       actions.className = "queue-actions";
-      for (const [action, label] of [["steer", "Steer now"], ["edit", "Edit"], ["delete", "Delete"]]) {
+      const availableActions = message.kind === "manual_queue"
+        ? [["promote", "Move to composer"], ["steer", "Steer now"], ["edit", "Edit"], ["delete", "Delete"]]
+        : [["steer", "Steer now"], ["edit", "Edit"], ["delete", "Delete"]];
+      for (const [action, label] of availableActions) {
         const button = document.createElement("button");
         button.type = "button";
         button.dataset.queueAction = action;
@@ -1448,6 +1519,7 @@ export class ChatController {
             chatState.messages = arrayFrom(messages, "messages", "chat_messages");
             chatState.queue = chatState.messages.filter((message) => ["queued", "steering", "ready"].includes(dispatchStatus(message)));
             this.renderAll();
+            this.maybePromoteManualMessage();
           })
           .catch(() => {});
       }

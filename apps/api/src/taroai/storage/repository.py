@@ -136,6 +136,25 @@ class SqlStorageCatalog(BaseModel):
             )
         return storage_object.model_copy(update={"size_bytes": size_bytes})
 
+    def update_metadata(
+        self,
+        tenant_id: str,
+        storage_object_id: str,
+        *,
+        filename: str,
+    ) -> StorageObject:
+        storage_object = self.get(tenant_id, storage_object_id)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE storage_objects
+                SET filename = ?
+                WHERE tenant_id = ? AND id = ?
+                """,
+                (filename, tenant_id, storage_object_id),
+            )
+        return storage_object.model_copy(update={"filename": filename})
+
     def mark_deleted(
         self,
         tenant_id: str,
