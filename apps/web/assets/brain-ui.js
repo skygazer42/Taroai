@@ -14,8 +14,11 @@ export class AgentBrainUI {
     this.skills = [];
     this.browserProfiles = [];
     this.browserSessions = [];
+    this.engineConnections = [];
+    this.engineSessions = [];
     this.selectedConnectorId = null;
     this.selectedBrowserProfileId = null;
+    this.selectedEngineConnectionId = null;
     this.tab = "connectors";
     this.boundRoute = () => this.route();
     this.boundMessage = (event) => this.oauthCompleted(event);
@@ -59,6 +62,7 @@ export class AgentBrainUI {
           <button data-brain-tab="memory">Memory</button>
           <button data-brain-tab="secrets">Secrets</button>
           <button data-brain-tab="browser">Browser</button>
+          <button data-brain-tab="engines">Engines</button>
         </nav>
         <section data-brain-panel="connectors" class="capability-split brain-connectors">
           <aside class="capability-list" data-connector-list><div class="route-loading">Loading connectors…</div></aside>
@@ -68,6 +72,7 @@ export class AgentBrainUI {
         <section data-brain-panel="memory" hidden></section>
         <section data-brain-panel="secrets" hidden></section>
         <section data-brain-panel="browser" hidden></section>
+        <section data-brain-panel="engines" hidden></section>
         <div class="route-toast" data-brain-toast hidden></div>
       </section>`;
     this.renderStaticPanels();
@@ -75,21 +80,28 @@ export class AgentBrainUI {
 
   async load() {
     const workspace = encodeURIComponent(this.api.settings().workspaceId);
-    const [connectors, skills, browserProfiles, browserSessions] = await Promise.allSettled([
+    const [connectors, skills, browserProfiles, browserSessions, engineConnections, engineSessions] = await Promise.allSettled([
       this.api.get(`/api/connectors?workspace_id=${workspace}`),
       this.api.get(`/api/workspaces/${workspace}/skills`),
       this.api.get(`/api/browser/profiles?workspace_id=${workspace}`),
       this.api.get(`/api/browser/profile-sessions?workspace_id=${workspace}`),
+      this.api.get(`/api/agent-engines/connections?workspace_id=${workspace}`),
+      this.api.get(`/api/agent-engines/sessions?workspace_id=${workspace}`),
     ]);
     this.connectors = connectors.status === "fulfilled" ? asArray(connectors.value, "connectors") : [];
     this.skills = skills.status === "fulfilled" ? asArray(skills.value, "skills") : [];
     this.browserProfiles = browserProfiles.status === "fulfilled" ? asArray(browserProfiles.value, "profiles") : [];
     this.browserSessions = browserSessions.status === "fulfilled" ? asArray(browserSessions.value, "sessions") : [];
+    this.engineConnections = engineConnections.status === "fulfilled" ? asArray(engineConnections.value, "connections") : [];
+    this.engineSessions = engineSessions.status === "fulfilled" ? asArray(engineSessions.value, "sessions") : [];
     if (!this.selectedConnectorId || !this.connectors.some((item) => item.id === this.selectedConnectorId)) {
       this.selectedConnectorId = this.connectors[0]?.id || null;
     }
     if (!this.selectedBrowserProfileId || !this.browserProfiles.some((item) => item.id === this.selectedBrowserProfileId)) {
       this.selectedBrowserProfileId = this.browserProfiles.find((item) => item.is_default)?.id || this.browserProfiles[0]?.id || null;
+    }
+    if (!this.selectedEngineConnectionId || !this.engineConnections.some((item) => item.id === this.selectedEngineConnectionId)) {
+      this.selectedEngineConnectionId = this.engineConnections[0]?.id || null;
     }
     this.renderConnectors();
     this.renderStaticPanels();
@@ -148,10 +160,12 @@ export class AgentBrainUI {
     const memory = this.root.querySelector("[data-brain-panel='memory']");
     const secrets = this.root.querySelector("[data-brain-panel='secrets']");
     const browser = this.root.querySelector("[data-brain-panel='browser']");
+    const engines = this.root.querySelector("[data-brain-panel='engines']");
     if (skills) skills.innerHTML = `<div class="brain-summary-card"><span>S</span><div><h2>${this.skills.length} workspace skills</h2><p>Inspect SKILL.md, package files, evaluations, and pinned versions.</p><button data-open-skills>Manage skills</button></div></div>`;
     if (memory) memory.innerHTML = `<div class="brain-summary-card"><span>M</span><div><h2>Memory</h2><p>Long-term facts and reviewed memories are governed by the workspace memory service.</p><button data-open-operations>Open memory operations</button></div></div>`;
     if (secrets) secrets.innerHTML = `<div class="brain-summary-card"><span>K</span><div><h2>Secrets</h2><p>Connector credentials remain in the Secret Vault and are issued to tools as short-lived leases.</p></div></div>`;
     if (browser) this.renderBrowser(browser);
+    if (engines) this.renderEngines(engines);
   }
 
   click(event) {
@@ -179,6 +193,119 @@ export class AgentBrainUI {
     if (button.dataset.browserSessionClose) return this.closeBrowserSession(button.dataset.browserSessionClose);
     if (button.dataset.browserSessionNavigate) return this.browserSessionAction(button.dataset.browserSessionNavigate, "navigate");
     if (button.dataset.browserSessionScreenshot) return this.browserSessionAction(button.dataset.browserSessionScreenshot, "screenshot");
+    if (button.matches("[data-engine-create]")) return this.openEngineEditor();
+    if (button.dataset.engineConnectionId) { this.selectedEngineConnectionId = button.dataset.engineConnectionId; return this.renderStaticPanels(); }
+    if (button.matches("[data-engine-disable]")) return this.updateEngineConnection({ status: "disabled" });
+    if (button.matches("[data-engine-session-start]")) return this.startEngineSession();
+    if (button.dataset.engineSessionCancel) return this.controlEngineSession(button.dataset.engineSessionCancel, "cancel");
+    if (button.dataset.engineSessionResume) return this.controlEngineSession(button.dataset.engineSessionResume, "resume");
+    if (button.dataset.engineSessionClose) return this.controlEngineSession(button.dataset.engineSessionClose, "close");
+    if (button.dataset.engineSessionSteer) return this.steerEngineSession(button.dataset.engineSessionSteer);
+    if (button.dataset.engineSessionEvents) return this.openEngineEvents(button.dataset.engineSessionEvents);
+    if (button.dataset.engineApproval) return this.decideEngineApproval(button.dataset.engineSession, button.dataset.engineApproval, button.dataset.engineDecision);
+  }
+
+  selectedEngineConnection() {
+    return this.engineConnections.find((item) => item.id === this.selectedEngineConnectionId) || null;
+  }
+
+  renderEngines(root) {
+    const selected = this.selectedEngineConnection();
+    root.innerHTML = `<section class="engine-workspace"><aside><header><div><small>Inner loops</small><h2>Agent Engines</h2></div><button class="primary" data-engine-create>Connect</button></header><div data-engine-list></div></aside><article><div data-engine-detail></div><section class="engine-session-list"><header><h3>Engine sessions</h3><span>${this.engineSessions.filter((item) => ["starting", "running", "waiting_approval"].includes(item.status)).length} active</span></header><div data-engine-sessions></div></section></article></section>`;
+    const list = root.querySelector("[data-engine-list]");
+    if (!this.engineConnections.length) list.innerHTML = `<div class="route-empty compact"><span>E</span><strong>No Engine connections</strong><p>Connect an OpenCode, Codex, or Claude runner. Native execution remains available.</p></div>`;
+    for (const connection of this.engineConnections) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "engine-connection-row";
+      button.classList.toggle("is-active", connection.id === this.selectedEngineConnectionId);
+      button.dataset.engineConnectionId = connection.id;
+      button.innerHTML = `<span>${connection.engine_type.slice(0, 1).toUpperCase()}</span><div><strong></strong><small></small></div><i data-state="${connection.status}"></i>`;
+      button.querySelector("strong").textContent = connection.name;
+      button.querySelector("small").textContent = `${connection.engine_type} · ${connection.capabilities?.length || 0} capabilities`;
+      list.append(button);
+    }
+    const detail = root.querySelector("[data-engine-detail]");
+    if (!selected) detail.innerHTML = `<div class="route-empty"><span>E</span><strong>Connect an Agent Engine</strong><p>Taroai governs the session while the selected runner owns its coding loop.</p><button data-engine-create>Connect Engine</button></div>`;
+    else {
+      detail.innerHTML = `<header class="engine-heading"><div><span>${selected.engine_type.slice(0, 1).toUpperCase()}</span><div><small>${selected.engine_type} runner</small><h2></h2><p></p></div></div><button class="danger" data-engine-disable ${selected.status !== "active" ? "disabled" : ""}>Disable</button></header><div class="engine-facts"><div><small>Status</small><strong>${selected.status}</strong></div><div><small>Authentication</small><strong>${selected.secret_ref_present ? "Secret Vault" : "None"}</strong></div><div><small>Capabilities</small><strong>${selected.capabilities?.length || 0}</strong></div></div><form class="engine-session-launch"><label><span>Task</span><textarea rows="3" data-engine-task placeholder="Implement the requested change and report diff, tests, and artifacts."></textarea></label><label><span>Working directory</span><input data-engine-cwd value="/workspace" /></label><button class="primary" type="button" data-engine-session-start ${selected.status !== "active" ? "disabled" : ""}>Start session</button></form>`;
+      detail.querySelector("h2").textContent = selected.name;
+      detail.querySelector(".engine-heading p").textContent = selected.endpoint_url || "Taroai native runtime";
+    }
+    const sessions = root.querySelector("[data-engine-sessions]");
+    if (!this.engineSessions.length) sessions.innerHTML = `<p class="route-note">No Engine sessions yet.</p>`;
+    for (const session of this.engineSessions) {
+      const row = document.createElement("article");
+      row.className = "engine-session-row";
+      row.innerHTML = `<i data-state="${session.status}"></i><div><strong></strong><small></small></div><input placeholder="Steer this session" data-engine-steer-input="${session.id}" /><div><button data-engine-session-events="${session.id}">Events</button><button data-engine-session-steer="${session.id}" ${session.status !== "running" ? "disabled" : ""}>Steer</button><button data-engine-session-cancel="${session.id}" ${!["starting", "running", "waiting_approval"].includes(session.status) ? "disabled" : ""}>Cancel</button><button data-engine-session-resume="${session.id}" ${session.status !== "cancelled" ? "disabled" : ""}>Resume</button><button data-engine-session-close="${session.id}" ${session.status === "closed" ? "disabled" : ""}>Close</button></div>`;
+      const connection = this.engineConnections.find((item) => item.id === session.connection_id);
+      row.querySelector("strong").textContent = connection?.name || session.engine_type;
+      row.querySelector("small").textContent = `${session.status} · ${session.external_session_id || session.id}`;
+      sessions.append(row);
+    }
+  }
+
+  openEngineEditor() {
+    const dialog = document.createElement("dialog");
+    dialog.className = "chat-dialog engine-dialog";
+    dialog.innerHTML = `<form class="chat-dialog-card"><header><div><small>Remote inner loop</small><h2>Connect Agent Engine</h2></div><button type="button" data-close>×</button></header><label><span>Name</span><input name="name" required /></label><label><span>Engine type</span><select name="engine_type"><option value="opencode">OpenCode Server</option><option value="codex">Codex app-server Runner</option><option value="claude">Claude Agent SDK Runner</option><option value="native">Taroai Native</option></select></label><label><span>Runner endpoint</span><input name="endpoint_url" type="url" placeholder="https://runner.example.com" /></label><label><span>Secret reference ID</span><input name="secret_ref_id" placeholder="Optional Secret Vault reference" /></label><label><span>Capabilities</span><input name="capabilities" placeholder="stream_events, approvals, steering, checkpoints" /></label><footer><button type="button" data-close>Cancel</button><button class="primary" type="submit">Connect</button></footer></form>`;
+    document.body.append(dialog);
+    dialog.querySelectorAll("[data-close]").forEach((button) => button.addEventListener("click", () => dialog.close()));
+    dialog.querySelector("form").addEventListener("submit", async (event) => {
+      event.preventDefault(); const form = new FormData(event.currentTarget); const submit = event.currentTarget.querySelector("[type='submit']"); submit.disabled = true;
+      try {
+        const created = await this.api.post("/api/agent-engines/connections", { workspace_id: this.api.settings().workspaceId, name: form.get("name"), engine_type: form.get("engine_type"), endpoint_url: String(form.get("endpoint_url") || "").trim() || null, secret_ref_id: String(form.get("secret_ref_id") || "").trim() || null, capabilities: String(form.get("capabilities") || "").split(",").map((item) => item.trim()).filter(Boolean) }, { scope: "engine-connect" });
+        this.selectedEngineConnectionId = created.id; dialog.close(); this.toast("Agent Engine connected", "success"); await this.load();
+      } catch (error) { submit.disabled = false; this.toast(error.message, "error"); }
+    });
+    dialog.addEventListener("close", () => dialog.remove()); dialog.showModal();
+  }
+
+  async updateEngineConnection(patch) {
+    const connection = this.selectedEngineConnection(); if (!connection) return;
+    try { await this.api.patch(`/api/agent-engines/connections/${encodeURIComponent(connection.id)}`, patch, { scope: "engine-update" }); this.toast("Engine connection updated", "success"); await this.load(); }
+    catch (error) { this.toast(error.message, "error"); }
+  }
+
+  async startEngineSession() {
+    const connection = this.selectedEngineConnection(); if (!connection) return;
+    const task = this.root.querySelector("[data-engine-task]")?.value.trim(); if (!task) return this.toast("Enter a task for the Engine", "error");
+    try { await this.api.post("/api/agent-engines/sessions", { workspace_id: this.api.settings().workspaceId, connection_id: connection.id, task, cwd: this.root.querySelector("[data-engine-cwd]")?.value.trim() || "/workspace" }, { scope: "engine-session" }); this.toast("Engine session started", "success"); await this.load(); }
+    catch (error) { this.toast(error.message, "error"); }
+  }
+
+  async steerEngineSession(sessionId) {
+    const input = this.root.querySelector(`[data-engine-steer-input="${CSS.escape(sessionId)}"]`); const message = input?.value.trim(); if (!message) return;
+    try { await this.api.post(`/api/agent-engines/sessions/${encodeURIComponent(sessionId)}/steer`, { message }, { scope: "engine-steer" }); input.value = ""; this.toast("Steering delivered", "success"); await this.load(); }
+    catch (error) { this.toast(error.message, "error"); }
+  }
+
+  async controlEngineSession(sessionId, operation) {
+    try { await this.api.post(`/api/agent-engines/sessions/${encodeURIComponent(sessionId)}/${operation}`, {}, { scope: `engine-${operation}` }); this.toast(`Engine session ${operation} accepted`, "success"); await this.load(); }
+    catch (error) { this.toast(error.message, "error"); }
+  }
+
+  async openEngineEvents(sessionId) {
+    try {
+      const payload = await this.api.get(`/api/agent-engines/sessions/${encodeURIComponent(sessionId)}/events?refresh=true`);
+      const events = asArray(payload, "events");
+      const dialog = document.createElement("dialog"); dialog.className = "chat-dialog engine-events-dialog";
+      dialog.innerHTML = `<div class="chat-dialog-card"><header><div><small>Normalized Runner stream</small><h2>Engine events</h2></div><button type="button" data-close>×</button></header><div data-engine-event-list></div><footer><button type="button" data-close>Done</button></footer></div>`;
+      const list = dialog.querySelector("[data-engine-event-list]");
+      for (const event of events) {
+        const row = document.createElement("article"); row.className = "engine-event-row";
+        const approvalId = event.payload?.approval_id || event.payload?.id;
+        row.innerHTML = `<header><strong></strong><small></small></header><pre></pre>${event.event_type.includes("approval") && approvalId ? `<div><button data-engine-approval="${approvalId}" data-engine-session="${sessionId}" data-engine-decision="approve">Approve</button><button data-engine-approval="${approvalId}" data-engine-session="${sessionId}" data-engine-decision="reject">Reject</button></div>` : ""}`;
+        row.querySelector("strong").textContent = event.event_type; row.querySelector("small").textContent = `#${event.sequence}`; row.querySelector("pre").textContent = JSON.stringify(event.payload || {}, null, 2); list.append(row);
+      }
+      if (!events.length) list.innerHTML = `<p class="route-note">The Runner has not emitted events yet.</p>`;
+      document.body.append(dialog); dialog.querySelectorAll("[data-close]").forEach((button) => button.addEventListener("click", () => dialog.close())); dialog.addEventListener("click", (event) => { const button = event.target.closest("[data-engine-approval]"); if (button) this.decideEngineApproval(button.dataset.engineSession, button.dataset.engineApproval, button.dataset.engineDecision); }); dialog.addEventListener("close", () => dialog.remove()); dialog.showModal();
+    } catch (error) { this.toast(error.message, "error"); }
+  }
+
+  async decideEngineApproval(sessionId, approvalId, decision) {
+    try { await this.api.post(`/api/agent-engines/sessions/${encodeURIComponent(sessionId)}/approvals/${encodeURIComponent(approvalId)}`, { decision }, { scope: `engine-approval-${decision}` }); this.toast(`Engine action ${decision}d`, "success"); document.querySelector(".engine-events-dialog")?.close(); await this.load(); }
+    catch (error) { this.toast(error.message, "error"); }
   }
 
   selectedBrowserProfile() {

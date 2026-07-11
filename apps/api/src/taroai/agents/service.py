@@ -33,11 +33,13 @@ class AgentRegistryService:
         store: Any,
         storage_catalog: Any | None = None,
         browser_profile_service: Any | None = None,
+        agent_engine_registry: Any | None = None,
     ) -> None:
         self.registry = registry
         self.store = store
         self.storage_catalog = storage_catalog
         self.browser_profile_service = browser_profile_service
+        self.agent_engine_registry = agent_engine_registry
 
     def create(
         self,
@@ -187,6 +189,20 @@ class AgentRegistryService:
             )
             if profile.workspace_id != target.workspace_id or profile.status != "active":
                 raise ValueError("Agent browser profile is not active in its workspace")
+        engine_type = str(target.spec.runtime_snapshot.get("engine_type") or "native")
+        connection_id = target.spec.runtime_snapshot.get("engine_connection_id")
+        if engine_type not in {"native", "opencode", "codex", "claude"}:
+            raise ValueError("Agent runtime snapshot contains an unsupported Engine type")
+        if engine_type != "native" and not connection_id:
+            raise ValueError("External Agent Engines require engine_connection_id")
+        if connection_id and self.agent_engine_registry is not None:
+            connection = self.agent_engine_registry.get_connection(tenant_id, str(connection_id))
+            if (
+                connection.workspace_id != target.workspace_id
+                or connection.status != "active"
+                or connection.engine_type.value != engine_type
+            ):
+                raise ValueError("Agent Engine connection is not active for this Agent version")
         model_policy = target.spec.model_policy
         if bool(model_policy.get("provider_id")) != bool(model_policy.get("model_id")):
             raise ValueError("Agent model policy must pin provider_id and model_id together")

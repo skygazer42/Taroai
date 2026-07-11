@@ -9,7 +9,7 @@ from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import BackgroundTasks, Body, Depends, FastAPI, Header, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,6 +17,17 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from taroai.agent import AgentRuntime, apply_agent_runtime_settings
+from taroai.agent_engines import (
+    AgentEngineApprovalDecision,
+    AgentEngineConnectionCreate,
+    AgentEngineConnectionPatch,
+    AgentEngineRegistry,
+    AgentEngineService,
+    AgentEngineSessionCreate,
+    AgentEngineTurn,
+    InMemoryAgentEngineRegistry,
+    SqlAgentEngineRegistry,
+)
 from taroai.agents import (
     AgentDefinitionCreate,
     AgentDefinitionPatch,
@@ -1287,6 +1298,7 @@ def create_app(
     skill_evaluation_runner: Any | None = None,
     agent_registry: InMemoryAgentRegistry | SqlAgentRegistry | None = None,
     browser_profile_registry: BrowserProfileRegistry | None = None,
+    agent_engine_registry: AgentEngineRegistry | None = None,
     thread_share_store: ThreadShareStore | None = None,
     speech_gateway: SpeechGateway | None = None,
     solution_pack_registry: (
@@ -1505,6 +1517,11 @@ def create_app(
     app.state.secret_service = secret_service or build_secret_service_from_settings(
         resolved_settings
     )
+    app.state.agent_engine_registry = agent_engine_registry or build_agent_engine_registry(resolved_settings)
+    app.state.agent_engine_service = AgentEngineService(
+        app.state.agent_engine_registry, app.state.secret_service, store=app.state.store
+    )
+    app.state.agent_registry_service.agent_engine_registry = app.state.agent_engine_registry
     app.state.browser_profile_registry = (
         browser_profile_registry or build_browser_profile_registry(resolved_settings)
     )
@@ -1624,6 +1641,7 @@ def create_app(
             connector_invocation_service=app.state.connector_invocation_service,
             agent_registry=app.state.agent_registry,
             browser_profile_service=app.state.browser_profile_service,
+            agent_engine_service=app.state.agent_engine_service,
         ),
         resolved_settings,
     )
@@ -1641,6 +1659,8 @@ def create_app(
         app.state.runtime.agent_registry = app.state.agent_registry
     if app.state.runtime.browser_profile_service is None:
         app.state.runtime.browser_profile_service = app.state.browser_profile_service
+    if app.state.runtime.agent_engine_service is None:
+        app.state.runtime.agent_engine_service = app.state.agent_engine_service
     app.state.chat_service = ChatService(
         store=app.state.store,
         model_policy_resolver=lambda: app.state.runtime.model_policy,
@@ -8846,6 +8866,162 @@ def create_app(
         )
         return destroyed.model_dump(mode="json")
 
+    @app.get("/api/agent-engines/connections")
+    def list_agent_engine_connections(
+        workspace_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "connectors.manage")
+        return {
+            "workspace_id": workspace_id,
+            "connections": [
+                agent_engine_connection_payload(item)
+                for item in app.state.agent_engine_registry.list_connections(
+                    context.tenant_id, workspace_id
+                )
+            ],
+        }
+
+    @app.post("/api/agent-engines/connections", status_code=status.HTTP_201_CREATED)
+    def create_agent_engine_connection(
+        payload: AgentEngineConnectionCreate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "connectors.manage")
+        connection = app.state.agent_engine_service.create_connection(
+            context.tenant_id, context.user_id, payload
+        )
+        record_audit_event(
+            app, tenant_id=context.tenant_id, workspace_id=connection.workspace_id,
+            user_id=context.user_id, run_id=None, event_type="agent_engine.connection.created",
+            metadata={"connection_id": connection.id, "engine_type": connection.engine_type.value, "secret_ref_present": connection.secret_ref_id is not None}, request=request,
+        )
+        return agent_engine_connection_payload(connection)
+
+    @app.patch("/api/agent-engines/connections/{connection_id}")
+    def update_agent_engine_connection(
+        connection_id: str,
+        payload: AgentEngineConnectionPatch,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "connectors.manage")
+        connection = app.state.agent_engine_service.update_connection(
+            context.tenant_id, connection_id, payload
+        )
+        record_audit_event(
+            app, tenant_id=context.tenant_id, workspace_id=connection.workspace_id,
+            user_id=context.user_id, run_id=None, event_type="agent_engine.connection.updated",
+            metadata={"connection_id": connection.id, "engine_type": connection.engine_type.value, "status": connection.status}, request=request,
+        )
+        return agent_engine_connection_payload(connection)
+
+    @app.get("/api/agent-engines/sessions")
+    def list_agent_engine_sessions(
+        workspace_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "sandbox.create")
+        return {
+            "workspace_id": workspace_id,
+            "sessions": [item.model_dump(mode="json") for item in app.state.agent_engine_registry.list_sessions(context.tenant_id, workspace_id)],
+        }
+
+    @app.post("/api/agent-engines/sessions", status_code=status.HTTP_201_CREATED)
+    def create_agent_engine_session(
+        payload: AgentEngineSessionCreate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "sandbox.create")
+        if payload.run_id is not None:
+            run = app.state.store.get_run(context.tenant_id, payload.run_id)
+            if run.workspace_id != payload.workspace_id:
+                raise TenantAccessError("Agent Engine Run is outside the workspace")
+        session = app.state.agent_engine_service.start_session(
+            context.tenant_id, context.user_id, payload
+        )
+        record_audit_event(
+            app, tenant_id=context.tenant_id, workspace_id=session.workspace_id,
+            user_id=context.user_id, run_id=session.run_id, event_type="agent_engine.session.started",
+            metadata={"session_id": session.id, "connection_id": session.connection_id, "engine_type": session.engine_type.value}, request=request,
+        )
+        return session.model_dump(mode="json")
+
+    @app.get("/api/agent-engines/sessions/{session_id}/events")
+    def list_agent_engine_events(
+        session_id: str,
+        request: Request,
+        refresh: bool = False,
+        after_sequence: int = Query(default=0, ge=0),
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "sandbox.create")
+        events = (
+            app.state.agent_engine_service.refresh_events(context.tenant_id, session_id)
+            if refresh
+            else app.state.agent_engine_registry.list_events(context.tenant_id, session_id, after_sequence)
+        )
+        return {"session_id": session_id, "events": [item.model_dump(mode="json") for item in events if item.sequence > after_sequence]}
+
+    @app.post("/api/agent-engines/sessions/{session_id}/turns")
+    def send_agent_engine_turn(
+        session_id: str,
+        payload: AgentEngineTurn,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "sandbox.create")
+        return app.state.agent_engine_service.operation(context.tenant_id, session_id, "turns", payload.model_dump()).model_dump(mode="json")
+
+    @app.post("/api/agent-engines/sessions/{session_id}/steer")
+    def steer_agent_engine_session(
+        session_id: str,
+        payload: AgentEngineTurn,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "sandbox.create")
+        return app.state.agent_engine_service.operation(context.tenant_id, session_id, "steer", payload.model_dump()).model_dump(mode="json")
+
+    @app.post("/api/agent-engines/sessions/{session_id}/approvals/{approval_id}")
+    def decide_agent_engine_approval(
+        session_id: str,
+        approval_id: str,
+        payload: AgentEngineApprovalDecision,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "sandbox.create")
+        session = app.state.agent_engine_service.operation(context.tenant_id, session_id, f"approvals/{approval_id}", payload.model_dump())
+        record_audit_event(
+            app, tenant_id=context.tenant_id, workspace_id=session.workspace_id,
+            user_id=context.user_id, run_id=session.run_id,
+            event_type=f"agent_engine.approval.{payload.decision}",
+            metadata={"session_id": session.id, "approval_id": approval_id}, request=request,
+        )
+        return session.model_dump(mode="json")
+
+    @app.post("/api/agent-engines/sessions/{session_id}/{operation}")
+    def control_agent_engine_session(
+        session_id: str,
+        operation: Literal["cancel", "resume", "close"],
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "sandbox.create")
+        session = app.state.agent_engine_service.operation(context.tenant_id, session_id, operation)
+        record_audit_event(
+            app, tenant_id=context.tenant_id, workspace_id=session.workspace_id,
+            user_id=context.user_id, run_id=session.run_id,
+            event_type=f"agent_engine.session.{operation}",
+            metadata={"session_id": session.id, "engine_type": session.engine_type.value}, request=request,
+        )
+        return session.model_dump(mode="json")
+
     @app.get("/api/browser/profiles")
     def list_browser_profiles(
         workspace_id: str,
@@ -9234,6 +9410,14 @@ def build_browser_profile_registry(settings: Settings) -> BrowserProfileRegistry
         MigrationRunner(config=config, migrations_path=Path("apps/api/migrations")).apply()
         return SqlBrowserProfileRegistry(config=config)
     return InMemoryBrowserProfileRegistry()
+
+
+def build_agent_engine_registry(settings: Settings) -> AgentEngineRegistry:
+    if settings.agent_engine_store_backend == "sql":
+        config = settings.database_config()
+        MigrationRunner(config=config, migrations_path=Path("apps/api/migrations")).apply()
+        return SqlAgentEngineRegistry(config=config)
+    return InMemoryAgentEngineRegistry()
 
 
 def build_thread_share_store(settings: Settings) -> ThreadShareStore:
@@ -10946,6 +11130,12 @@ def sandbox_snapshot_audit_metadata(snapshot) -> dict:
         "run_id": snapshot.run_id,
         "uri": snapshot.uri,
     }
+
+
+def agent_engine_connection_payload(connection) -> dict[str, Any]:
+    payload = connection.model_dump(mode="json", exclude={"secret_ref_id"})
+    payload["secret_ref_present"] = connection.secret_ref_id is not None
+    return payload
 
 
 def browser_profile_public_payload(profile) -> dict[str, Any]:

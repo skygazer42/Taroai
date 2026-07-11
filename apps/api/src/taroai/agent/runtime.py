@@ -9,6 +9,7 @@ from typing import Any
 from pydantic import BaseModel, Field, ValidationError
 
 from taroai.agent.graph import build_runtime_graph
+from taroai.agent_engines import AgentEngineSessionCreate
 from taroai.agent.planning import PlanStep
 from taroai.agent.state import AgentRetrievedContext, AgentRuntimeState
 from taroai.audit import AuditActor, AuditEventCreate, AuditService
@@ -135,6 +136,7 @@ class AgentRuntime(BaseModel):
     connector_invocation_service: Any | None = None
     agent_registry: Any | None = None
     browser_profile_service: Any | None = None
+    agent_engine_service: Any | None = None
     max_step_retries: int = 0
     runtime_mode: str = "legacy"
     loop_max_iterations: int = Field(default=12, ge=1)
@@ -154,11 +156,71 @@ class AgentRuntime(BaseModel):
         return build_runtime_graph()
 
     def execute_run(self, tenant_id: str, run_id: str) -> AgentRuntimeState:
+        run = self.store.get_run(tenant_id, run_id)
+        try:
+            probe = self._load_state(tenant_id, run_id)
+        except Exception:
+            probe = self._initial_state(run)
+        snapshot = self._agent_runtime_snapshot(probe)
+        if str(snapshot.get("engine_type") or "native") != "native":
+            return self._execute_external_engine(run, probe, snapshot)
         if self.runtime_mode == "loop_v2":
             from taroai.agent.loop import AgentLoopV2
 
             return AgentLoopV2(self).execute_run(tenant_id, run_id)
         return self._execute_legacy_run(tenant_id, run_id)
+
+    def _execute_external_engine(
+        self,
+        run: Run,
+        state: AgentRuntimeState,
+        snapshot: dict[str, Any],
+    ) -> AgentRuntimeState:
+        if self.agent_engine_service is None:
+            raise ToolExecutionError("Agent Engine service is not configured")
+        existing_session_id = state.runtime_metadata.get("engine_session_id")
+        if existing_session_id:
+            events = self.agent_engine_service.refresh_events(run.tenant_id, str(existing_session_id))
+            session = self.agent_engine_service.registry.get_session(run.tenant_id, str(existing_session_id))
+            state.runtime_metadata["engine_event_count"] = len(events)
+        else:
+            self.store.update_run_status(run.tenant_id, run.id, RunStatus.RUNNING)
+            self._save_state(state)
+            runtime_policy_decision = self._decide_runtime_execution(run)
+            if not runtime_policy_decision.allowed:
+                return self._pause_for_policy_block(
+                    state, run, runtime_policy_decision
+                )
+            session = self.agent_engine_service.start_session(
+                run.tenant_id,
+                run.user_id,
+                AgentEngineSessionCreate(
+                    workspace_id=run.workspace_id,
+                    connection_id=str(snapshot["engine_connection_id"]),
+                    run_id=run.id,
+                    task=run.message,
+                    cwd=str(snapshot.get("cwd") or "/workspace"),
+                    metadata={
+                        "agent_id": run.agent_id,
+                        "engine_type": snapshot.get("engine_type"),
+                    },
+                ),
+            )
+            state.runtime_metadata.update(
+                {
+                    "engine_session_id": session.id,
+                    "engine_connection_id": session.connection_id,
+                    "engine_type": session.engine_type.value,
+                }
+            )
+        status_map = {
+            "completed": RunStatus.SUCCEEDED,
+            "failed": RunStatus.FAILED,
+            "cancelled": RunStatus.CANCELLED,
+        }
+        state.status = status_map.get(session.status, RunStatus.RUNNING)
+        self._save_state(state)
+        return state
 
     def _execute_legacy_run(self, tenant_id: str, run_id: str) -> AgentRuntimeState:
         run = self.store.update_run_status(tenant_id, run_id, RunStatus.RUNNING)

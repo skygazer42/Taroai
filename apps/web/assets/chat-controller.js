@@ -2011,18 +2011,27 @@ export class ChatController {
       submit.disabled = true;
       submit.textContent = "Creating…";
       try {
-        const draft = await this.api.post(
-          `/api/threads/${encodeURIComponent(chatState.currentThreadId)}/agent-drafts`,
-          {
-            name: form.get("name"),
-            description: form.get("description"),
-            instructions: form.get("instructions"),
-            output_format: form.get("output_format"),
-          },
-          { scope: "agent-draft" },
+        const extracted = await this.api.post(
+          `/api/threads/${encodeURIComponent(chatState.currentThreadId)}/extract-agent`,
+          { name: form.get("name") },
+          { scope: "agent-extract" },
         );
+        const version = {
+          ...extracted.version,
+          instructions: String(form.get("instructions") || "").trim() || extracted.version.instructions,
+          output_contract: String(form.get("output_format") || "").trim()
+            ? { ...(extracted.version.output_contract || {}), type: "string", format: String(form.get("output_format")).trim() }
+            : extracted.version.output_contract,
+          change_note: "Reviewed and created from a successful Chat thread",
+        };
+        const created = await this.api.post("/api/agents", {
+          workspace_id: extracted.workspace_id,
+          name: String(form.get("name") || extracted.name).trim(),
+          description: String(form.get("description") || "").trim() || extracted.description,
+          version,
+        }, { scope: "agent-create-from-thread" });
         dialog.close();
-        this.renderInlineNotice("Agent draft created", `${draft.name || form.get("name")} is ready for review in Agents.`, "success");
+        this.renderInlineNotice("Agent draft created", `${created.agent?.name || form.get("name")} is ready for review in Agents.`, "success");
         this.network("Agent draft created", "success");
       } catch (error) {
         submit.disabled = false;

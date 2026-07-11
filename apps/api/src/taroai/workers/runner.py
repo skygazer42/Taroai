@@ -75,6 +75,11 @@ from taroai.browser_profiles import (
     InMemoryBrowserProfileRegistry,
     SqlBrowserProfileRegistry,
 )
+from taroai.agent_engines import (
+    AgentEngineService,
+    InMemoryAgentEngineRegistry,
+    SqlAgentEngineRegistry,
+)
 from taroai.skills.import_service import HttpsGithubArchiveFetcher
 from taroai.skills.service import SkillService
 from taroai.store import InMemoryControlPlaneStore
@@ -433,6 +438,10 @@ def build_agent_worker_runner(
         secret_service=secret_service,
         browser_controller=browser_controller,
     )
+    agent_engine_registry = build_worker_agent_engine_registry(settings)
+    agent_engine_service = AgentEngineService(
+        agent_engine_registry, secret_service, store=resolved_store
+    )
     policy_service = IdentityPolicyService(
         identity_service=build_worker_identity_service(settings, audit_service)
     )
@@ -480,6 +489,7 @@ def build_agent_worker_runner(
         connector_invocation_service=connector_invocation_service,
         agent_registry=agent_registry,
         browser_profile_service=browser_profile_service,
+        agent_engine_service=agent_engine_service,
     ), settings)
     if resolved_runtime.skill_service is None:
         resolved_runtime.skill_service = worker_skill_service
@@ -493,6 +503,8 @@ def build_agent_worker_runner(
         resolved_runtime.agent_registry = agent_registry
     if resolved_runtime.browser_profile_service is None:
         resolved_runtime.browser_profile_service = browser_profile_service
+    if resolved_runtime.agent_engine_service is None:
+        resolved_runtime.agent_engine_service = agent_engine_service
     chat_service = ChatService(
         store=resolved_store,
         model_policy_resolver=lambda: resolved_runtime.model_policy,
@@ -1024,6 +1036,17 @@ def build_worker_browser_profile_registry(settings: Settings):
         ).apply()
         return SqlBrowserProfileRegistry(config=config)
     return InMemoryBrowserProfileRegistry()
+
+
+def build_worker_agent_engine_registry(settings: Settings):
+    if settings.agent_engine_store_backend == "sql":
+        config = settings.database_config()
+        MigrationRunner(
+            config=config,
+            migrations_path=Path("apps/api/migrations"),
+        ).apply()
+        return SqlAgentEngineRegistry(config=config)
+    return InMemoryAgentEngineRegistry()
 
 
 def build_worker_queue(settings: Settings) -> JobQueue:

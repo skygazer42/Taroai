@@ -42,6 +42,7 @@ DURABLE_DEPLOYMENT_BACKENDS = {
     "skill_registry_backend": "sql",
     "agent_registry_backend": "sql",
     "browser_profile_store_backend": "sql",
+    "agent_engine_store_backend": "sql",
     "thread_share_store_backend": "sql",
     "solution_pack_registry_backend": "sql",
     "sso_provider_registry_backend": "sql",
@@ -199,6 +200,7 @@ class Settings(BaseSettings):
     )
     agent_registry_backend: Literal["memory", "sql"] = "memory"
     browser_profile_store_backend: Literal["memory", "sql"] = "memory"
+    agent_engine_store_backend: Literal["memory", "sql"] = "memory"
     external_share_links_enabled: bool = False
     external_share_link_token_hash_secret: str = Field(default="", repr=False)
     model_gateway_allowed_models: list[str] = Field(default_factory=list)
