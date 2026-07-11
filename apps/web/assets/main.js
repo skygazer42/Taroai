@@ -5,6 +5,7 @@ import { createArtifactsUI } from "./artifacts-ui.js";
 import { createSpeechUI } from "./speech-ui.js";
 import { createAgentBrainUI } from "./brain-ui.js";
 import { createFilesUI } from "./files-ui.js";
+import { createEvaluationsUI } from "./evaluations-ui.js";
 
 window.__taroaiThreadChat = true;
 
@@ -119,6 +120,12 @@ const ROUTE_DEFINITIONS = {
     eyebrow: "Workspace capabilities",
     title: "Skills",
     description: "Install, inspect, evaluate, and version reusable execution guidance.",
+    cards: [],
+  },
+  evaluations: {
+    eyebrow: "Quality gates",
+    title: "Evaluations",
+    description: "Run golden cases, compare baselines, and gate Agent releases.",
     cards: [],
   },
   workspaces: {
@@ -4369,3 +4376,4 @@ createArtifactsUI();
 createSpeechUI();
 createAgentBrainUI();
 createFilesUI();
+createEvaluationsUI();

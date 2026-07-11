@@ -35,6 +35,8 @@ class AgentRegistryService:
         browser_profile_service: Any | None = None,
         agent_engine_registry: Any | None = None,
         coding_workspace_registry: Any | None = None,
+        evaluation_service: Any | None = None,
+        evaluation_repository: Any | None = None,
     ) -> None:
         self.registry = registry
         self.store = store
@@ -42,6 +44,8 @@ class AgentRegistryService:
         self.browser_profile_service = browser_profile_service
         self.agent_engine_registry = agent_engine_registry
         self.coding_workspace_registry = coding_workspace_registry
+        self.evaluation_service = evaluation_service
+        self.evaluation_repository = evaluation_repository
 
     def create(
         self,
@@ -215,6 +219,31 @@ class AgentRegistryService:
         model_policy = target.spec.model_policy
         if bool(model_policy.get("provider_id")) != bool(model_policy.get("model_id")):
             raise ValueError("Agent model policy must pin provider_id and model_id together")
+        evaluation_suite_id = target.spec.runtime_snapshot.get("evaluation_suite_id")
+        evaluation_suite_version = target.spec.runtime_snapshot.get("evaluation_suite_version")
+        if bool(evaluation_suite_id) != bool(evaluation_suite_version):
+            raise ValueError("Agent evaluation binding must pin suite id and version together")
+        if evaluation_suite_id:
+            if self.evaluation_service is None or self.evaluation_repository is None:
+                raise ValueError("Agent evaluation service is not available")
+            from taroai.evaluation import EvaluationTargetKind, canonical_digest
+
+            target_digest = canonical_digest(target.spec.model_dump(mode="json"))
+            matching_runs = [
+                run
+                for run in self.evaluation_repository.list_runs(tenant_id, agent_id)
+                if run.target_kind == EvaluationTargetKind.AGENT
+                and run.target_version == str(version)
+                and run.target_digest == target_digest
+                and run.suite_id == str(evaluation_suite_id)
+                and run.suite_version == str(evaluation_suite_version)
+            ]
+            if not matching_runs:
+                raise ValueError(
+                    "Agent version must pass its pinned evaluation suite before publication"
+                )
+            latest_run = max(matching_runs, key=lambda item: item.completed_at)
+            self.evaluation_service.assert_publishable(latest_run)
         return self.registry.publish(tenant_id, agent_id, version)
 
     def run(

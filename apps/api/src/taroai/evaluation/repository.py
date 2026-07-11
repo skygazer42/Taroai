@@ -104,6 +104,8 @@ class EvaluationRepository(Protocol):
         self, tenant_id: str, suite_id: str, version: str
     ) -> EvaluationSuiteRecord: ...
 
+    def list_suites(self, tenant_id: str) -> list[EvaluationSuiteRecord]: ...
+
     def save_run(self, run: EvaluationRun) -> EvaluationRun: ...
 
     def get_run(self, tenant_id: str, run_id: str) -> EvaluationRun: ...
@@ -147,6 +149,12 @@ class InMemoryEvaluationRepository:
         if record is None:
             raise KeyError(f"evaluation suite not found: {suite_id}@{version}")
         return record
+
+    def list_suites(self, tenant_id: str) -> list[EvaluationSuiteRecord]:
+        return sorted(
+            [item for item in self.suites.values() if item.tenant_id == tenant_id],
+            key=lambda item: (item.suite.id, item.suite.version),
+        )
 
     def save_run(self, run: EvaluationRun) -> EvaluationRun:
         key = f"{run.tenant_id}:{run.id}"
@@ -239,6 +247,14 @@ class SqlEvaluationRepository(BaseModel):
         if row is None:
             raise KeyError(f"evaluation suite not found: {suite_id}@{version}")
         return EvaluationSuiteRecord.model_validate(self._loads(row["payload"]))
+
+    def list_suites(self, tenant_id: str) -> list[EvaluationSuiteRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT payload FROM evaluation_suites WHERE tenant_id = ? ORDER BY suite_id, version",
+                (tenant_id,),
+            ).fetchall()
+        return [EvaluationSuiteRecord.model_validate(self._loads(row["payload"])) for row in rows]
 
     def save_run(self, run: EvaluationRun) -> EvaluationRun:
         with self._connect() as connection:

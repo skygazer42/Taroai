@@ -163,6 +163,16 @@ from taroai.embeddings import (
     EmbeddingUsageRecorder,
     OpenAICompatibleEmbeddingGateway,
 )
+from taroai.evaluation import (
+    AgentEvaluationExecutor,
+    EvaluationRepository,
+    EvaluationService,
+    EvaluationSuite,
+    EvaluationTargetKind,
+    InMemoryEvaluationRepository,
+    SqlEvaluationRepository,
+    canonical_digest,
+)
 from taroai.guardrails import (
     GuardrailAction,
     GuardrailHttpDetector,
@@ -635,6 +645,11 @@ class SkillVersionMoveRequest(BaseModel):
 class SkillEvaluateRequest(BaseModel):
     workspace_id: str | None = Field(default=None, min_length=1)
     suite: SkillEvaluationSuite | None = None
+
+
+class AgentEvaluationRunRequest(BaseModel):
+    suite_id: str = Field(min_length=1)
+    suite_version: str = Field(min_length=1)
 
 
 class ApprovalResolveRequest(BaseModel):
@@ -1313,6 +1328,7 @@ def create_app(
     browser_profile_registry: BrowserProfileRegistry | None = None,
     agent_engine_registry: AgentEngineRegistry | None = None,
     coding_workspace_registry: CodingWorkspaceRegistry | None = None,
+    evaluation_repository: EvaluationRepository | None = None,
     thread_share_store: ThreadShareStore | None = None,
     speech_gateway: SpeechGateway | None = None,
     solution_pack_registry: (
@@ -1397,6 +1413,9 @@ def create_app(
         evaluation_runner=skill_evaluation_runner,
     )
     app.state.agent_registry = agent_registry or build_agent_registry(resolved_settings)
+    app.state.evaluation_repository = (
+        evaluation_repository or build_evaluation_repository(resolved_settings)
+    )
     app.state.agent_registry_service = AgentRegistryService(
         registry=app.state.agent_registry,
         store=app.state.store,
@@ -1683,6 +1702,16 @@ def create_app(
         app.state.runtime.agent_engine_service = app.state.agent_engine_service
     if app.state.runtime.coding_workspace_service is None:
         app.state.runtime.coding_workspace_service = app.state.coding_workspace_service
+    app.state.evaluation_service = EvaluationService(
+        repository=app.state.evaluation_repository,
+        executor=AgentEvaluationExecutor(
+            agent_service=app.state.agent_registry_service,
+            runtime=app.state.runtime,
+            store=app.state.store,
+        ),
+    )
+    app.state.agent_registry_service.evaluation_service = app.state.evaluation_service
+    app.state.agent_registry_service.evaluation_repository = app.state.evaluation_repository
     app.state.chat_service = ChatService(
         store=app.state.store,
         model_policy_resolver=lambda: app.state.runtime.model_policy,
@@ -2534,6 +2563,139 @@ def create_app(
         token: str = Header(alias="X-Share-Token", min_length=20),
     ) -> dict[str, Any]:
         return app.state.thread_share_service.read_public(public_id, token)
+
+    @app.get("/api/evaluations/suites")
+    def list_evaluation_suites(
+        target_kind: EvaluationTargetKind | None = None,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict[str, Any]]:
+        records = app.state.evaluation_repository.list_suites(context.tenant_id)
+        return [
+            record.model_dump(mode="json")
+            for record in records
+            if target_kind is None or record.suite.target_kind == target_kind
+        ]
+
+    @app.post("/api/evaluations/suites", status_code=status.HTTP_201_CREATED)
+    def register_evaluation_suite(
+        payload: EvaluationSuite,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        record = app.state.evaluation_service.register_suite(
+            tenant_id=context.tenant_id,
+            suite=payload,
+            created_by_user_id=context.user_id,
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=None,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="evaluation.suite.registered",
+            metadata={
+                "suite_id": payload.id,
+                "suite_version": payload.version,
+                "target_kind": payload.target_kind.value,
+                "suite_digest": record.suite_digest,
+            },
+            request=request,
+        )
+        return record.model_dump(mode="json")
+
+    @app.get("/api/evaluations/runs")
+    def list_evaluation_runs(
+        target_id: str = Query(min_length=1),
+        target_kind: EvaluationTargetKind | None = None,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict[str, Any]]:
+        runs = app.state.evaluation_repository.list_runs(context.tenant_id, target_id)
+        return [
+            run.model_dump(mode="json")
+            for run in reversed(runs)
+            if target_kind is None or run.target_kind == target_kind
+        ]
+
+    @app.get("/api/evaluations/runs/{run_id}")
+    def get_evaluation_run(
+        run_id: str,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        return app.state.evaluation_repository.get_run(
+            context.tenant_id, run_id
+        ).model_dump(mode="json")
+
+    @app.get("/api/evaluations/runs/{run_id}/evidence")
+    def get_evaluation_evidence(
+        run_id: str,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        return app.state.evaluation_service.evidence(
+            context.tenant_id, run_id
+        ).model_dump(mode="json")
+
+    @app.post("/api/evaluations/runs/{run_id}/baseline")
+    def promote_evaluation_baseline(
+        run_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        baseline = app.state.evaluation_service.promote_to_baseline(
+            tenant_id=context.tenant_id,
+            run_id=run_id,
+            created_by_user_id=context.user_id,
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=None,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="evaluation.baseline.promoted",
+            metadata={"evaluation_run_id": run_id, "target_id": baseline.target_id},
+            request=request,
+        )
+        return baseline.model_dump(mode="json")
+
+    @app.post("/api/evaluations/agents/{agent_id}/versions/{version}/run")
+    def run_agent_evaluation(
+        agent_id: str,
+        version: int,
+        payload: AgentEvaluationRunRequest,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        agent_version = app.state.agent_registry.get_version(
+            context.tenant_id, agent_id, version
+        )
+        evaluation_run = app.state.evaluation_service.run_registered_suite(
+            tenant_id=context.tenant_id,
+            target_kind=EvaluationTargetKind.AGENT,
+            target_id=agent_id,
+            target_version=str(version),
+            target_digest=canonical_digest(agent_version.spec.model_dump(mode="json")),
+            suite_id=payload.suite_id,
+            suite_version=payload.suite_version,
+            created_by_user_id=context.user_id,
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=agent_version.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="evaluation.run.completed",
+            metadata={
+                "evaluation_run_id": evaluation_run.id,
+                "agent_id": agent_id,
+                "agent_version": version,
+                "status": evaluation_run.status.value,
+                "promotion_allowed": evaluation_run.promotion_gate.allowed,
+            },
+            request=request,
+        )
+        return evaluation_run.model_dump(mode="json")
 
     @app.post("/api/agents", status_code=status.HTTP_201_CREATED)
     def create_agent_definition(
@@ -9586,6 +9748,14 @@ def build_agent_registry(settings: Settings):
         MigrationRunner(config=config, migrations_path=Path("apps/api/migrations")).apply()
         return SqlAgentRegistry(config=config)
     return InMemoryAgentRegistry()
+
+
+def build_evaluation_repository(settings: Settings) -> EvaluationRepository:
+    if settings.evaluation_repository_backend == "sql":
+        config = settings.database_config()
+        MigrationRunner(config=config, migrations_path=Path("apps/api/migrations")).apply()
+        return SqlEvaluationRepository(config=config)
+    return InMemoryEvaluationRepository()
 
 
 def build_browser_profile_registry(settings: Settings) -> BrowserProfileRegistry:

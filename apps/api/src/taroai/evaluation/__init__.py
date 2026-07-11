@@ -21,6 +21,7 @@ from taroai.evaluation.models import (
     RubricCriterion,
     ScorerKind,
     SideEffectPolicy,
+    canonical_digest,
 )
 from taroai.evaluation.repository import (
     EVALUATION_SCHEMA_SQL,
@@ -48,9 +49,11 @@ from taroai.evaluation.suite import (
     load_suite_json,
     validate_suite,
 )
+from taroai.evaluation.agent_executor import AgentEvaluationExecutor
 
 __all__ = [
     "BaselineComparison",
+    "AgentEvaluationExecutor",
     "EVALUATION_SCHEMA_SQL",
     "EvaluationBaseline",
     "EvaluationBudget",
@@ -83,6 +86,7 @@ __all__ = [
     "SideEffectPolicy",
     "SqlEvaluationRepository",
     "aggregate_metrics",
+    "canonical_digest",
     "compare_metrics",
     "evaluate_promotion_gate",
     "load_suite_json",

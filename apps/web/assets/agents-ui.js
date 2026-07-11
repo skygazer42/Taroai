@@ -27,6 +27,7 @@ export class AgentsUI {
     this.selected = null;
     this.detail = null;
     this.sessions = [];
+    this.evaluationRuns = [];
   }
 
   init() {
@@ -116,9 +117,10 @@ export class AgentsUI {
     this.renderCards(this.root.querySelector("[data-agent-search]")?.value || "");
     this.renderInspector(true);
     try {
-      const [detail, sessions] = await Promise.allSettled([
+      const [detail, sessions, evaluations] = await Promise.allSettled([
         this.api.get(`/api/agents/${encodeURIComponent(id)}`),
         this.api.get(`/api/agents/${encodeURIComponent(id)}/sessions`),
+        this.api.get(`/api/evaluations/runs?target_id=${encodeURIComponent(id)}&target_kind=agent`),
       ]);
       if (detail.status === "fulfilled") {
         const definition = detail.value.agent || detail.value;
@@ -129,9 +131,11 @@ export class AgentsUI {
         this.detail = { ...definition, ...(activeVersion?.spec || {}), version: activeVersion?.version, versions };
       } else this.detail = this.selected;
       this.sessions = sessions.status === "fulfilled" ? list(sessions.value, "sessions", "runs") : [];
+      this.evaluationRuns = evaluations.status === "fulfilled" ? list(evaluations.value, "runs") : [];
     } catch {
       this.detail = this.selected;
       this.sessions = [];
+      this.evaluationRuns = [];
     }
     this.renderInspector();
   }
@@ -149,9 +153,10 @@ export class AgentsUI {
     const versions = list(agent.versions, "items").length ? list(agent.versions, "items") : [{ version: agent.version || agent.latest_version || "1", status: agent.status || "published", created_at: agent.updated_at }];
     root.innerHTML = `
       <header class="agent-inspector-header"><div><span class="agent-monogram large">${(agent.name || "A").slice(0, 1).toUpperCase()}</span><div><small>${agent.status || "Published"}</small><h2></h2><p></p></div></div><div class="agent-inspector-actions"><button data-agent-export>Export</button><button data-agent-edit>Edit draft</button></div></header>
-      <nav class="agent-inspector-tabs"><button class="is-active" data-agent-tab="run">Run</button><button data-agent-tab="configuration">Configuration</button><button data-agent-tab="versions">Versions</button><button data-agent-tab="sessions">Sessions</button></nav>
+      <nav class="agent-inspector-tabs"><button class="is-active" data-agent-tab="run">Run</button><button data-agent-tab="configuration">Configuration</button><button data-agent-tab="evaluation">Evaluation</button><button data-agent-tab="versions">Versions</button><button data-agent-tab="sessions">Sessions</button></nav>
       <section data-agent-panel="run"><form class="agent-run-form" data-agent-run-form>${fields.map((field) => this.fieldMarkup(field)).join("")}<button class="primary" type="submit" ${loading ? "disabled" : ""}>Run agent</button></form></section>
       <section data-agent-panel="configuration" hidden><div class="agent-config-block"><small>Instructions</small><p></p></div><div class="agent-binding-grid"><div><small>Pinned skills</small><strong>${list(agent.skills, "items").length || list(agent.skill_bindings, "items").length}</strong></div><div><small>Reference files</small><strong>${list(agent.files, "items").length || list(agent.reference_files, "items").length}</strong></div><div><small>Runtime</small><strong>${agent.runtime_snapshot?.image || "Workspace default"}</strong></div><div><small>Autonomy</small><strong>${agent.runtime_snapshot?.autonomy_mode || "workflow"}</strong></div><div><small>Browser profile</small><strong data-agent-browser-profile></strong></div><div><small>Restored files</small><strong>${list(agent.runtime_snapshot?.files, "items").length}</strong></div><div><small>Output</small><strong>${agent.output_format || agent.output_contract?.type || "Structured result"}</strong></div></div></section>
+      <section data-agent-panel="evaluation" hidden><div class="agent-evaluation-head"><div><small>Release gate</small><strong>${agent.runtime_snapshot?.evaluation_suite_id ? `${agent.runtime_snapshot.evaluation_suite_id} · ${agent.runtime_snapshot.evaluation_suite_version}` : "No suite bound"}</strong></div>${agent.runtime_snapshot?.evaluation_suite_id ? `<button data-agent-evaluate-version="${agent.version}">Run evaluation</button>` : ""}</div><ol class="agent-evaluation-list">${this.evaluationRuns.length ? this.evaluationRuns.map((run) => `<li><span><strong>${Math.round((run.metrics?.weighted_score || 0) * 100)}% · ${run.status}</strong><small>${run.suite_id} ${run.suite_version} · ${run.completed_at ? new Date(run.completed_at).toLocaleString() : ""}</small></span><span class="evaluation-run-actions">${run.promotion_gate?.allowed ? `<button data-evaluation-baseline="${run.id}">Set baseline</button>` : ""}<button data-evaluation-evidence="${run.id}">Evidence</button></span></li>`).join("") : "<li class='route-note'>No evaluation runs yet.</li>"}</ol></section>
       <section data-agent-panel="versions" hidden><ol class="agent-version-list">${versions.map((version) => `<li><span><strong>v${version.version || version.number}</strong><small>${version.status || "published"} · ${version.created_at ? new Date(version.created_at).toLocaleDateString() : "current"}</small></span><button data-agent-restore="${version.version || version.number}">Restore</button></li>`).join("")}</ol></section>
       <section data-agent-panel="sessions" hidden><ol class="agent-session-list">${this.sessions.length ? this.sessions.map((session) => `<li><span><strong>${session.title || session.input_summary || "Agent session"}</strong><small>${session.status || "completed"} · ${session.created_at ? new Date(session.created_at).toLocaleString() : ""}</small></span><button data-agent-session="${session.thread_id || session.id}">Open</button></li>`).join("") : "<li class='route-note'>No sessions yet.</li>"}</ol></section>`;
     root.querySelector("h2").textContent = agent.name || "Untitled agent";
@@ -182,6 +187,9 @@ export class AgentsUI {
     if (button.dataset.agentSession) { window.location.hash = `chat/${encodeURIComponent(button.dataset.agentSession)}`; return; }
     if (button.matches("[data-agent-import]")) return this.root.querySelector("[data-agent-import-input]")?.click();
     if (button.matches("[data-agent-export]")) return this.exportAgent();
+    if (button.dataset.agentEvaluateVersion) return this.evaluateVersion(button.dataset.agentEvaluateVersion);
+    if (button.dataset.evaluationBaseline) return this.promoteBaseline(button.dataset.evaluationBaseline);
+    if (button.dataset.evaluationEvidence) return this.openEvidence(button.dataset.evaluationEvidence);
   }
 
   async change(event) {
@@ -250,16 +258,18 @@ export class AgentsUI {
 
   async openDraft(agent = {}) {
     const workspace = encodeURIComponent(this.api.settings().workspaceId);
-    const [files, browserProfiles, engineConnections, repositories] = await Promise.allSettled([
+    const [files, browserProfiles, engineConnections, repositories, evaluationSuites] = await Promise.allSettled([
       this.api.get(`/api/workspaces/${workspace}/files`),
       this.api.get(`/api/browser/profiles?workspace_id=${workspace}`),
       this.api.get(`/api/agent-engines/connections?workspace_id=${workspace}`),
       this.api.get(`/api/repositories?workspace_id=${workspace}`),
+      this.api.get(`/api/evaluations/suites?target_kind=agent`),
     ]);
     this.draftFiles = files.status === "fulfilled" ? list(files.value, "files") : [];
     this.draftBrowserProfiles = browserProfiles.status === "fulfilled" ? list(browserProfiles.value, "profiles").filter((item) => item.status === "active") : [];
     this.draftEngineConnections = engineConnections.status === "fulfilled" ? list(engineConnections.value, "connections").filter((item) => item.status === "active") : [];
     this.draftRepositories = repositories.status === "fulfilled" ? list(repositories.value, "repositories").filter((item) => item.status === "active") : [];
+    this.draftEvaluationSuites = evaluationSuites.status === "fulfilled" ? list(evaluationSuites.value, "suites") : [];
     const dialog = document.createElement("dialog");
     dialog.className = "chat-dialog agent-editor-dialog";
     dialog.innerHTML = `<form class="chat-dialog-card" data-agent-draft-form><header><div><small>Review before publish</small><h2>${agent.id ? "Edit agent draft" : "Create agent"}</h2></div><button type="button" data-close>×</button></header><label><span>Name</span><input name="name" required /></label><label><span>Description</span><textarea name="description" rows="2"></textarea></label><label><span>Instructions</span><textarea name="instructions" rows="6" required></textarea></label><label><span>Output format</span><input name="output_format" placeholder="Report, table, artifact set…" /></label><label><span>Input JSON schema</span><textarea name="input_schema" data-json-field rows="6">${JSON.stringify(agent.input_schema || { type: "object", properties: { request: { type: "string" } }, required: ["request"] }, null, 2)}</textarea></label><div class="agent-runtime-editor"><label><span>Autonomy</span><select name="autonomy_mode"><option value="workflow">Guarded workflow</option><option value="autonomous">Autonomous</option></select></label><label><span>Network policy</span><select name="network_mode"><option value="disabled">Disabled</option><option value="allowlist">Allowlist</option><option value="open">Open</option></select></label><label><span>Browser profile</span><select name="browser_profile_id" data-agent-browser-profile-options><option value="">Workspace default</option></select></label><label><span>Runtime image</span><input name="runtime_image" placeholder="python:3.12-slim" /></label><label><span>Timeout seconds</span><input name="timeout_seconds" type="number" min="1" max="86400" /></label></div><fieldset class="agent-reference-picker"><legend>Reference files <small>Materialized into every fresh run</small></legend><div data-agent-reference-options></div></fieldset><div class="agent-draft-bindings"><span>${list(agent.skill_bindings || agent.skills, "items").length} pinned skills</span><span data-agent-reference-count>${list(agent.reference_files || agent.files, "items").length} files</span><span>${agent.runtime_snapshot?.image || "Default runtime"}</span></div><footer><button type="button" data-close>Cancel</button><button class="primary" type="submit">Save & publish</button></footer></form>`;
@@ -282,6 +292,16 @@ export class AgentsUI {
     }
     const branchLabel = document.createElement("label"); branchLabel.innerHTML = `<span>Coding branch</span><input name="coding_branch" placeholder="Generated per Run" />`;
     dialog.querySelector(".agent-runtime-editor").prepend(repositoryLabel, branchLabel);
+    const evaluationLabel = document.createElement("label");
+    evaluationLabel.innerHTML = `<span>Release evaluation</span><select name="evaluation_suite"><option value="">No release gate</option></select>`;
+    for (const record of this.draftEvaluationSuites) {
+      const suite = record.suite || record;
+      const option = document.createElement("option");
+      option.value = `${suite.id}@@${suite.version}`;
+      option.textContent = `${suite.id} · ${suite.version} · ${suite.cases?.length || 0} cases`;
+      evaluationLabel.querySelector("select").append(option);
+    }
+    dialog.querySelector(".agent-runtime-editor").prepend(evaluationLabel);
     dialog.querySelector("[name='name']").value = agent.name || "";
     dialog.querySelector("[name='description']").value = agent.description || "";
     dialog.querySelector("[name='instructions']").value = agent.instructions || "";
@@ -301,6 +321,9 @@ export class AgentsUI {
     engineSelect.value = agent.runtime_snapshot?.engine_connection_id || "";
     repositoryLabel.querySelector("select").value = agent.runtime_snapshot?.repository_id || "";
     branchLabel.querySelector("input").value = agent.runtime_snapshot?.branch || "";
+    evaluationLabel.querySelector("select").value = agent.runtime_snapshot?.evaluation_suite_id
+      ? `${agent.runtime_snapshot.evaluation_suite_id}@@${agent.runtime_snapshot.evaluation_suite_version}`
+      : "";
     const selectedFiles = new Set(list(agent.reference_files || agent.files, "items").map((item) => item.storage_object_id || item.id));
     const options = dialog.querySelector("[data-agent-reference-options]");
     if (!this.draftFiles.length) {
@@ -347,6 +370,7 @@ export class AgentsUI {
         size_bytes: file.size_bytes || 0,
       };
     });
+    const [evaluationSuiteId, evaluationSuiteVersion] = String(data.get("evaluation_suite") || "").split("@@");
     const version = {
       input_schema,
       output_contract: { type: "string", format: data.get("output_format") || "markdown" },
@@ -367,6 +391,8 @@ export class AgentsUI {
         engine_type: form.elements.engine_connection_id?.selectedOptions?.[0]?.dataset.engineType || "native",
         repository_id: data.get("repository_id") || undefined,
         branch: data.get("coding_branch") || undefined,
+        evaluation_suite_id: evaluationSuiteId || undefined,
+        evaluation_suite_version: evaluationSuiteVersion || undefined,
       },
       source_thread_id: agent.source_thread_id || chatState.currentThreadId || null,
       source_run_id: agent.source_run_id || null,
@@ -393,6 +419,13 @@ export class AgentsUI {
         agentId = created.agent.id;
         versionNumber = created.version.version;
       }
+      if (evaluationSuiteId && evaluationSuiteVersion) {
+        const evaluation = await this.api.post(`/api/evaluations/agents/${encodeURIComponent(agentId)}/versions/${encodeURIComponent(versionNumber)}/run`, {
+          suite_id: evaluationSuiteId,
+          suite_version: evaluationSuiteVersion,
+        }, { scope: "agent-evaluation" });
+        if (!evaluation.promotion_gate?.allowed) throw new Error(`Evaluation blocked publication: ${(evaluation.promotion_gate?.reasons || []).join(", ")}`);
+      }
       await this.api.post(`/api/agents/${encodeURIComponent(agentId)}/versions/${encodeURIComponent(versionNumber)}/publish`, {}, { scope: "agent-publish" });
       dialog?.close(); this.toast("Agent published", "success"); await this.load();
     } catch (error) { submit.disabled = false; this.toast(error.message, "error"); }
@@ -404,6 +437,40 @@ export class AgentsUI {
       const id = this.selected.id || this.selected.agent_id;
       await this.api.post(`/api/agents/${encodeURIComponent(id)}/versions/${encodeURIComponent(version)}/restore`, {}, { scope: "agent-restore" });
       this.toast(`Version ${version} restored`, "success"); await this.select(id);
+    } catch (error) { this.toast(error.message, "error"); }
+  }
+
+  async evaluateVersion(version) {
+    const agent = this.detail || this.selected;
+    const suiteId = agent?.runtime_snapshot?.evaluation_suite_id;
+    const suiteVersion = agent?.runtime_snapshot?.evaluation_suite_version;
+    if (!suiteId || !suiteVersion) return this.toast("Bind an evaluation suite in the Agent draft first", "error");
+    try {
+      const id = this.selected.id || this.selected.agent_id;
+      await this.api.post(`/api/evaluations/agents/${encodeURIComponent(id)}/versions/${encodeURIComponent(version)}/run`, { suite_id: suiteId, suite_version: suiteVersion }, { scope: "agent-evaluation" });
+      this.toast("Evaluation completed", "success");
+      await this.select(id);
+      this.switchTab("evaluation");
+    } catch (error) { this.toast(error.message, "error"); }
+  }
+
+  async promoteBaseline(runId) {
+    try {
+      await this.api.post(`/api/evaluations/runs/${encodeURIComponent(runId)}/baseline`, {}, { scope: "evaluation-baseline" });
+      this.toast("Evaluation baseline promoted", "success");
+    } catch (error) { this.toast(error.message, "error"); }
+  }
+
+  async openEvidence(runId) {
+    try {
+      const evidence = await this.api.get(`/api/evaluations/runs/${encodeURIComponent(runId)}/evidence`);
+      const dialog = document.createElement("dialog");
+      dialog.className = "chat-dialog agent-editor-dialog";
+      dialog.innerHTML = `<div class="chat-dialog-card evaluation-evidence-dialog"><header><div><small>Redaction-safe record</small><h2>Evaluation evidence</h2></div><button type="button" data-close>×</button></header><pre></pre><footer><button type="button" data-close>Close</button></footer></div>`;
+      dialog.querySelector("pre").textContent = JSON.stringify(evidence, null, 2);
+      dialog.querySelectorAll("[data-close]").forEach((button) => button.addEventListener("click", () => dialog.close()));
+      dialog.addEventListener("close", () => dialog.remove());
+      document.body.append(dialog); dialog.showModal();
     } catch (error) { this.toast(error.message, "error"); }
   }
 
