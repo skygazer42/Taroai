@@ -1,3 +1,11 @@
+import { createChatController } from "./chat-controller.js";
+import { createSkillsUI } from "./skills-ui.js";
+import { createAgentsUI } from "./agents-ui.js";
+import { createArtifactsUI } from "./artifacts-ui.js";
+import { createSpeechUI } from "./speech-ui.js";
+
+window.__taroaiThreadChat = true;
+
 const state = {
   currentRunId: null,
   lastSequence: 0,
@@ -103,6 +111,12 @@ const ROUTE_DEFINITIONS = {
       { title: "Popular agents", description: "Browse ready-to-run workflow ideas.", meta: "Templates", action: "route:discover", actionLabel: "Browse" },
       { title: "Agent operations", description: "Review the current runtime and governed execution controls.", meta: "Run control", action: "operations", actionLabel: "Open" },
     ],
+  },
+  skills: {
+    eyebrow: "Workspace capabilities",
+    title: "Skills",
+    description: "Install, inspect, evaluate, and version reusable execution guidance.",
+    cards: [],
   },
   workspaces: {
     eyebrow: "Organize work",
@@ -428,7 +442,7 @@ function initializeControls() {
   loadCustomerSuccess();
   loadSolutionPacks();
   loadWorkspaceSkills();
-  loadRunHistory();
+  // Durable Thread history is owned by chat-controller.js.
 }
 
 function switchWorkbenchView(viewName) {
@@ -677,12 +691,16 @@ function setArtifactPanelOpen(open) {
   }
   elements.sidecar.classList.toggle("is-artifact-open", state.artifactPanelOpen);
   elements.sidecar.classList.toggle("is-operations-open", state.operationsOpen);
+  if (!state.artifactPanelOpen) {
+    elements.sidecar.classList.remove("is-chat-sidecar-open");
+  }
 }
 
 function setOperationsOpen(open) {
   state.operationsOpen = Boolean(open);
   if (state.operationsOpen) {
     state.artifactPanelOpen = false;
+    elements.sidecar.classList.remove("is-chat-sidecar-open");
   }
   elements.sidecar.classList.toggle("is-operations-open", state.operationsOpen);
   elements.sidecar.classList.toggle("is-artifact-open", state.artifactPanelOpen);
@@ -1778,6 +1796,7 @@ async function login() {
     await loadSolutionPacks();
     await loadWorkspaceSkills();
     await loadRunHistory();
+    window.dispatchEvent(new CustomEvent("taroai:auth-changed", { detail: { authenticated: true } }));
   } catch (error) {
     state.accessToken = "";
     sessionStorage.removeItem("taroai.accessToken");
@@ -1799,6 +1818,7 @@ async function logout() {
     sessionStorage.removeItem("taroai.accessToken");
     clearAuthenticatedWorkspaceState();
     renderAuth();
+    window.dispatchEvent(new CustomEvent("taroai:auth-changed", { detail: { authenticated: false } }));
   }
 }
 
@@ -1922,6 +1942,9 @@ async function loadWorkspaceSkills() {
 }
 
 async function loadRunHistory() {
+  if (window.__taroaiThreadChat) {
+    return window.taroaiChat?.loadThreads?.();
+  }
   renderRunHistory({ status: "loading" });
   try {
     const result = await apiFetch(
@@ -4204,11 +4227,9 @@ elements.apiBase.addEventListener("change", () => {
   loadCustomerSuccess();
   loadSolutionPacks();
   loadWorkspaceSkills();
-  loadRunHistory();
 });
 elements.workspaceId.addEventListener("change", () => {
   loadWorkspaceSkills();
-  loadRunHistory();
 });
 elements.customerSuccessRefresh.addEventListener("click", () => loadCustomerSuccess());
 elements.solutionPackRefresh.addEventListener("click", () => loadSolutionPacks());
@@ -4328,3 +4349,8 @@ elements.browserScreenshot.addEventListener("click", (event) => {
 
 initializeControls();
 fitComposer();
+createChatController();
+createSkillsUI();
+createAgentsUI();
+createArtifactsUI();
+createSpeechUI();

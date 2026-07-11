@@ -5,8 +5,9 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from taroai.agent import AgentRuntime
+from taroai.agent import AgentRuntime, apply_agent_runtime_settings
 from taroai.audit import AuditService
+from taroai.chat import ChatService
 from taroai.billing import (
     BillingPricingRule,
     BillingPricingRuleStore,
@@ -15,7 +16,12 @@ from taroai.billing import (
     SqlBillingPricingRuleStore,
 )
 from taroai.config import Settings, load_settings
-from taroai.connectors import InMemoryConnectorRegistry, SqlConnectorRegistry
+from taroai.connectors import (
+    ConnectorDispatchService,
+    ConnectorInvocationService,
+    InMemoryConnectorRegistry,
+    SqlConnectorRegistry,
+)
 from taroai.db import MigrationRunner, SqlControlPlaneRepository
 from taroai.embeddings import EmbeddingGateway, OpenAICompatibleEmbeddingGateway
 from taroai.guardrails import InMemoryGuardrailService
@@ -58,6 +64,9 @@ from taroai.sandbox import (
 from taroai.sandbox.tools import register_browser_tool_handlers, register_sandbox_tool_handlers
 from taroai.policy import IdentityPolicyService
 from taroai.secrets import build_secret_service_from_settings
+from taroai.skills import InMemorySkillRegistry, SqlSkillRegistry
+from taroai.skills.import_service import HttpsGithubArchiveFetcher
+from taroai.skills.service import SkillService
 from taroai.store import InMemoryControlPlaneStore
 from taroai.storage import (
     InMemoryStorageCatalog,
@@ -411,7 +420,10 @@ def build_agent_worker_runner(
     policy_service = IdentityPolicyService(
         identity_service=build_worker_identity_service(settings, audit_service)
     )
-    resolved_runtime = runtime or AgentRuntime(
+    connector_registry = build_worker_connector_registry(settings)
+    connector_dispatcher = ConnectorDispatchService(secret_service=secret_service)
+    connector_invocation_service = ConnectorInvocationService()
+    resolved_runtime = apply_agent_runtime_settings(runtime or AgentRuntime(
         store=resolved_store,
         model_gateway=build_worker_model_gateway(settings, secret_service),
         model_policy=build_model_policy(settings, build_model_policy_store(settings)),
@@ -442,14 +454,39 @@ def build_agent_worker_runner(
             build_billing_pricing_rule_store(settings),
         ),
         guardrail_service=guardrail_service,
+        skill_service=build_worker_skill_service(settings),
+        connector_registry=connector_registry,
+        connector_dispatcher=connector_dispatcher,
+        connector_invocation_service=connector_invocation_service,
+    ), settings)
+    if resolved_runtime.skill_service is None:
+        resolved_runtime.skill_service = build_worker_skill_service(settings)
+    if resolved_runtime.connector_registry is None:
+        resolved_runtime.connector_registry = connector_registry
+    if resolved_runtime.connector_dispatcher is None:
+        resolved_runtime.connector_dispatcher = connector_dispatcher
+    if resolved_runtime.connector_invocation_service is None:
+        resolved_runtime.connector_invocation_service = connector_invocation_service
+    chat_service = ChatService(
+        store=resolved_store,
+        model_policy_resolver=lambda: resolved_runtime.model_policy,
+        steering_available_resolver=lambda: resolved_runtime.runtime_mode == "loop_v2",
+        provider_registry_resolver=lambda: ModelProviderRegistry(
+            providers=effective_model_gateway_providers(
+                settings,
+                build_model_provider_store(settings),
+            )
+        ),
     )
     return AgentWorkerRunner(
         worker=AgentWorker(
             runtime=resolved_runtime,
             queue=resolved_queue,
             audit_service=audit_service,
+            chat_service=chat_service,
             lease_seconds=settings.worker_job_lease_seconds,
             retry_delay_seconds=settings.worker_job_retry_delay_seconds,
+            continuation_max_attempts=settings.worker_job_max_attempts,
         ),
     )
 
@@ -754,6 +791,18 @@ def build_worker_control_plane_store(
         repository.initialize_schema(Path("apps/api/migrations"))
         return repository
     return InMemoryControlPlaneStore()
+
+
+def build_worker_skill_service(settings: Settings) -> SkillService:
+    registry = (
+        SqlSkillRegistry(config=settings.database_config())
+        if settings.skill_registry_backend == "sql"
+        else InMemorySkillRegistry()
+    )
+    return SkillService(
+        registry=registry,
+        github_fetcher=HttpsGithubArchiveFetcher(),
+    )
 
 
 def build_worker_audit_service(

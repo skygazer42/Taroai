@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import json
-from typing import Any
+from collections.abc import Iterator
+from typing import Any, Literal
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -28,6 +31,17 @@ from taroai.provider_errors import redact_provider_error_detail
 
 class ModelGateway(BaseModel):
     def create_plan(self, request: ModelGatewayRequest) -> ModelGatewayResponse:
+        raise NotImplementedError
+
+    def decide_next_action(self, request: ModelGatewayRequest) -> AgentDecision:
+        raise NotImplementedError
+
+    def verify_completion(
+        self, request: ModelGatewayRequest
+    ) -> AgentVerificationResult:
+        raise NotImplementedError
+
+    def stream_response(self, request: ModelGatewayRequest) -> Iterator[str]:
         raise NotImplementedError
 
 
@@ -60,6 +74,46 @@ class OpenAICompatibleModelGateway(ModelGateway):
         response_body = self._post_chat_completions(payload, api_key)
         return self._parse_chat_response(response_body)
 
+    def decide_next_action(self, request: ModelGatewayRequest) -> AgentDecision:
+        model, response_body = self._complete_operation(request, "decide")
+        del model
+        return self._parse_agent_decision(response_body)
+
+    def verify_completion(
+        self, request: ModelGatewayRequest
+    ) -> AgentVerificationResult:
+        model, response_body = self._complete_operation(request, "verify")
+        del model
+        return self._parse_agent_verification(response_body)
+
+    def stream_response(self, request: ModelGatewayRequest) -> Iterator[str]:
+        model = request.model or self.default_model
+        if not model:
+            raise ModelGatewayConfigurationError("model gateway model is not configured")
+        api_key = self._resolve_api_key(
+            request.model_copy(
+                update={"metadata": {**request.metadata, "operation": "respond"}}
+            )
+        )
+        payload = self._build_chat_payload(request=request, model=model)
+        payload["stream"] = True
+        yield from self._post_chat_completions_stream(payload, api_key)
+
+    def _complete_operation(
+        self,
+        request: ModelGatewayRequest,
+        operation: Literal["decide", "verify"],
+    ) -> tuple[str, dict[str, Any]]:
+        model = request.model or self.default_model
+        if not model:
+            raise ModelGatewayConfigurationError("model gateway model is not configured")
+        operation_request = request.model_copy(
+            update={"metadata": {**request.metadata, "operation": operation}}
+        )
+        api_key = self._resolve_api_key(operation_request)
+        payload = self._build_chat_payload(request=operation_request, model=model)
+        return model, self._post_chat_completions(payload, api_key)
+
     def _build_chat_payload(self, request: ModelGatewayRequest, model: str) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": model,
@@ -81,6 +135,8 @@ class OpenAICompatibleModelGateway(ModelGateway):
         )
         if max_output_tokens is not None:
             payload["max_tokens"] = max_output_tokens
+        if request.reasoning_effort not in {None, "none"}:
+            payload["reasoning_effort"] = request.reasoning_effort
         payload.update(self.chat_request_options)
         return payload
 
@@ -93,7 +149,8 @@ class OpenAICompatibleModelGateway(ModelGateway):
             raise ModelGatewayConfigurationError(
                 "model gateway secret service is required for api key secret ref"
             )
-        step_id = "model_gateway:plan"
+        operation = str(request.metadata.get("operation") or "plan")
+        step_id = f"model_gateway:{operation}"
         try:
             lease = self.secret_service.create_lease(
                 tenant_id=request.tenant_id,
@@ -145,6 +202,116 @@ class OpenAICompatibleModelGateway(ModelGateway):
             raise ModelGatewayResponseError(f"model gateway request failed: {error}") from error
         except json.JSONDecodeError as error:
             raise ModelGatewayResponseError("model gateway returned invalid JSON") from error
+
+    def _post_chat_completions_stream(
+        self,
+        payload: dict[str, Any],
+        api_key: str,
+    ) -> Iterator[str]:
+        endpoint = f"{self.base_url.rstrip('/')}/chat/completions"
+        body = json.dumps(payload).encode("utf-8")
+        request = Request(
+            endpoint,
+            data=body,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self.timeout_seconds) as response:
+                for raw_line in response:
+                    line = raw_line.decode("utf-8").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if not data or data == "[DONE]":
+                        continue
+                    try:
+                        event = json.loads(data)
+                    except json.JSONDecodeError as error:
+                        raise ModelGatewayResponseError(
+                            "model gateway stream returned invalid JSON"
+                        ) from error
+                    choices = event.get("choices")
+                    if not isinstance(choices, list) or not choices:
+                        continue
+                    delta = choices[0].get("delta")
+                    if not isinstance(delta, dict):
+                        continue
+                    content = delta.get("content")
+                    if isinstance(content, str) and content:
+                        yield content
+        except HTTPError as error:
+            detail = error.read().decode("utf-8")
+            safe_detail = redact_provider_error_detail(detail, api_key=api_key)
+            raise ModelGatewayResponseError(
+                f"model gateway returned HTTP {error.code}: {safe_detail}"
+            ) from error
+        except (URLError, TimeoutError) as error:
+            raise ModelGatewayResponseError(f"model gateway request failed: {error}") from error
+
+    def _assistant_message(self, body: dict[str, Any]) -> dict[str, Any]:
+        choices = body.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise ModelGatewayResponseError("model gateway response did not include choices")
+        message = choices[0].get("message")
+        if not isinstance(message, dict):
+            raise ModelGatewayResponseError("model gateway response did not include a message")
+        return message
+
+    def _parse_agent_decision(self, body: dict[str, Any]) -> AgentDecision:
+        from taroai.agent.models import AgentDecision
+
+        message = self._assistant_message(body)
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            tool_call = tool_calls[0] if isinstance(tool_calls[0], dict) else {}
+            function = tool_call.get("function")
+            if not isinstance(function, dict):
+                raise ModelGatewayResponseError("model tool call did not include a function")
+            arguments = function.get("arguments") or "{}"
+            try:
+                tool_input = json.loads(arguments) if isinstance(arguments, str) else arguments
+            except json.JSONDecodeError as error:
+                raise ModelGatewayResponseError(
+                    "model tool call arguments were not valid JSON"
+                ) from error
+            try:
+                return AgentDecision(
+                    kind="action",
+                    action_key=str(tool_call.get("id") or new_id("action_key")),
+                    tool_name=str(function.get("name") or ""),
+                    tool_input=tool_input if isinstance(tool_input, dict) else {},
+                )
+            except ValidationError as error:
+                raise ModelGatewayResponseError(
+                    "model decision did not match the expected schema"
+                ) from error
+        content = message.get("content") or ""
+        parsed = self._parse_plan_json(str(content))
+        try:
+            return AgentDecision.model_validate(parsed)
+        except ValidationError as error:
+            raise ModelGatewayResponseError(
+                "model decision did not match the expected schema"
+            ) from error
+
+    def _parse_agent_verification(
+        self, body: dict[str, Any]
+    ) -> AgentVerificationResult:
+        from taroai.agent.models import AgentVerificationResult
+
+        content = self._assistant_message(body).get("content") or ""
+        parsed = self._parse_plan_json(str(content))
+        try:
+            return AgentVerificationResult.model_validate(parsed)
+        except ValidationError as error:
+            raise ModelGatewayResponseError(
+                "model verification did not match the expected schema"
+            ) from error
 
     def _parse_chat_response(self, body: dict[str, Any]) -> ModelGatewayResponse:
         choices = body.get("choices")
@@ -328,6 +495,82 @@ class ModelGatewayRouter(ModelGateway):
             raise last_error
         raise ModelGatewayConfigurationError("no model provider could create a plan")
 
+    def decide_next_action(self, request: ModelGatewayRequest) -> AgentDecision:
+        return self._route_structured_operation(request, "decide_next_action")
+
+    def verify_completion(
+        self, request: ModelGatewayRequest
+    ) -> AgentVerificationResult:
+        return self._route_structured_operation(request, "verify_completion")
+
+    def stream_response(self, request: ModelGatewayRequest) -> Iterator[str]:
+        candidates = self.provider_registry.candidates(request)
+        if not candidates:
+            raise ModelGatewayConfigurationError("no model provider matches request")
+        last_error: ModelGatewayError | None = None
+        for provider in candidates:
+            routed_request = self._request_for_provider(provider, request)
+            try:
+                reservation = self.rate_limiter.reserve(provider, routed_request)
+                gateway = self._provider_gateway(provider)
+                yielded = False
+                for delta in gateway.stream_response(routed_request):
+                    yielded = True
+                    yield delta
+                self.rate_limiter.record_success(
+                    provider_id=provider.id,
+                    usage=None,
+                    request=routed_request,
+                    reservation=reservation,
+                )
+                return
+            except ModelProviderRateLimitError as error:
+                last_error = error
+                if not provider.allows_fallback("rate_limit"):
+                    raise
+            except ModelGatewayResponseError as error:
+                last_error = error
+                if yielded or not provider.allows_fallback("response_error"):
+                    raise
+        if last_error is not None:
+            raise last_error
+        raise ModelGatewayConfigurationError("no model provider could stream a response")
+
+    def _route_structured_operation(
+        self,
+        request: ModelGatewayRequest,
+        operation: Literal["decide_next_action", "verify_completion"],
+    ) -> AgentDecision | AgentVerificationResult:
+        candidates = self.provider_registry.candidates(request)
+        if not candidates:
+            raise ModelGatewayConfigurationError("no model provider matches request")
+        last_error: ModelGatewayError | None = None
+        for provider in candidates:
+            routed_request = self._request_for_provider(provider, request)
+            try:
+                reservation = self.rate_limiter.reserve(provider, routed_request)
+                result = getattr(self._provider_gateway(provider), operation)(routed_request)
+                self.rate_limiter.record_success(
+                    provider_id=provider.id,
+                    usage=None,
+                    request=routed_request,
+                    reservation=reservation,
+                )
+                return result
+            except ModelProviderRateLimitError as error:
+                last_error = error
+                if not provider.allows_fallback("rate_limit"):
+                    raise
+            except ModelGatewayResponseError as error:
+                last_error = error
+                if not provider.allows_fallback("response_error"):
+                    raise
+        if last_error is not None:
+            raise last_error
+        raise ModelGatewayConfigurationError(
+            f"no model provider could execute {operation}"
+        )
+
     def _request_for_provider(
         self,
         provider: ModelProviderConfig,
@@ -347,6 +590,16 @@ class ModelGatewayRouter(ModelGateway):
             raise ModelGatewayConfigurationError(
                 f"unsupported model provider type: {provider.provider_type}"
             )
+        return self._provider_gateway(provider).create_plan(request)
+
+    def _provider_gateway(
+        self,
+        provider: ModelProviderConfig,
+    ) -> OpenAICompatibleModelGateway:
+        if provider.provider_type != "openai_compatible":
+            raise ModelGatewayConfigurationError(
+                f"unsupported model provider type: {provider.provider_type}"
+            )
         return OpenAICompatibleModelGateway(
             base_url=provider.base_url,
             api_key=provider.api_key,
@@ -356,4 +609,4 @@ class ModelGatewayRouter(ModelGateway):
             default_model=provider.default_model,
             timeout_seconds=provider.timeout_seconds,
             chat_request_options=provider.chat_request_options,
-        ).create_plan(request)
+        )

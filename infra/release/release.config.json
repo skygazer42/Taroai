@@ -1,0 +1,44 @@
+{
+  "schemaVersion": "1.0",
+  "product": "taroai",
+  "images": [
+    {
+      "name": "api",
+      "repository": "taroai-api",
+      "context": "apps/api",
+      "dockerfile": "apps/api/Dockerfile"
+    },
+    {
+      "name": "web",
+      "repository": "taroai-web",
+      "context": "apps/web",
+      "dockerfile": "apps/web/Dockerfile"
+    },
+    {
+      "name": "sandbox-controller",
+      "repository": "taroai-sandbox-controller",
+      "context": "apps/api",
+      "dockerfile": "apps/api/Dockerfile.sandbox"
+    },
+    {
+      "name": "browser-controller",
+      "repository": "taroai-browser-controller",
+      "context": "apps/api",
+      "dockerfile": "apps/api/Dockerfile.browser"
+    }
+  ],
+  "externalImages": [
+    {
+      "name": "postgresql",
+      "reference": "postgres:16-alpine"
+    },
+    {
+      "name": "redis",
+      "reference": "redis:7-alpine"
+    },
+    {
+      "name": "object-storage",
+      "reference": "minio/minio:RELEASE.2025-06-13T11-33-47Z"
+    }
+  ]
+}

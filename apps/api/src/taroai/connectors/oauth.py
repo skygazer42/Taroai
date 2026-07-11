@@ -43,6 +43,9 @@ class OAuthAuthorizationSession(BaseModel):
     connector_id: str
     requested_by_user_id: str
     expires_at: datetime
+    reconnect_thread_id: str | None = None
+    reconnect_run_id: str | None = None
+    reconnect_action_id: str | None = None
 
 
 class ConnectorOAuthAuthorizeResult(BaseModel):
@@ -50,6 +53,9 @@ class ConnectorOAuthAuthorizeResult(BaseModel):
     authorization_url: str
     state: str
     expires_at: datetime
+    reconnect_thread_id: str | None = None
+    reconnect_run_id: str | None = None
+    reconnect_action_id: str | None = None
 
 
 class ConnectorOAuthCallbackRequest(BaseModel):
@@ -88,6 +94,9 @@ class ConnectorOAuthTokenResult(BaseModel):
     refresh_token_secret_ref_id: str | None = None
     expires_in: int | None = None
     token_type: str | None = None
+    reconnect_thread_id: str | None = None
+    reconnect_run_id: str | None = None
+    reconnect_action_id: str | None = None
 
 
 class UrlLibOAuthTokenClient(BaseModel):
@@ -136,10 +145,22 @@ class ConnectorOAuthService(BaseModel):
     token_client: Any = Field(default_factory=UrlLibOAuthTokenClient)
     pending_states: dict[str, OAuthAuthorizationSession] = Field(default_factory=dict)
 
+    def pending_authorization(self, state: str) -> OAuthAuthorizationSession:
+        session = self.pending_states.get(state)
+        if session is None:
+            raise ConnectorOAuthError("OAuth state is invalid or already consumed")
+        if session.expires_at <= utc_now():
+            self.pending_states.pop(state, None)
+            raise ConnectorOAuthError("OAuth state has expired")
+        return session.model_copy(deep=True)
+
     def build_authorization_url(
         self,
         connector: ConnectorDefinition,
         requested_by_user_id: str,
+        reconnect_thread_id: str | None = None,
+        reconnect_run_id: str | None = None,
+        reconnect_action_id: str | None = None,
         now: datetime | None = None,
     ) -> ConnectorOAuthAuthorizeResult:
         config = self._config(connector)
@@ -151,6 +172,9 @@ class ConnectorOAuthService(BaseModel):
             connector_id=connector.id,
             requested_by_user_id=requested_by_user_id,
             expires_at=resolved_now + timedelta(seconds=config.state_ttl_seconds),
+            reconnect_thread_id=reconnect_thread_id,
+            reconnect_run_id=reconnect_run_id,
+            reconnect_action_id=reconnect_action_id,
         )
         client_id = self._secret_value(
             connector=connector,
@@ -172,6 +196,9 @@ class ConnectorOAuthService(BaseModel):
             authorization_url=f"{config.authorize_url}?{query}",
             state=state,
             expires_at=self.pending_states[state].expires_at,
+            reconnect_thread_id=reconnect_thread_id,
+            reconnect_run_id=reconnect_run_id,
+            reconnect_action_id=reconnect_action_id,
         )
 
     def complete_callback(
@@ -181,7 +208,7 @@ class ConnectorOAuthService(BaseModel):
         now: datetime | None = None,
     ) -> ConnectorOAuthTokenResult:
         config = self._config(connector)
-        self._consume_state(connector, request.state, now or utc_now())
+        session = self._consume_state(connector, request.state, now or utc_now())
         client_id, client_secret = self._client_credentials(connector, config)
         response = OAuthTokenResponse.model_validate(
             self.token_client.exchange_code(
@@ -194,11 +221,18 @@ class ConnectorOAuthService(BaseModel):
                 )
             )
         )
-        return self._store_tokens(
+        result = self._store_tokens(
             connector=connector,
             config=config,
             response=response,
             status="completed",
+        )
+        return result.model_copy(
+            update={
+                "reconnect_thread_id": session.reconnect_thread_id,
+                "reconnect_run_id": session.reconnect_run_id,
+                "reconnect_action_id": session.reconnect_action_id,
+            }
         )
 
     def refresh(
@@ -299,7 +333,7 @@ class ConnectorOAuthService(BaseModel):
         connector: ConnectorDefinition,
         state: str,
         now: datetime,
-    ) -> None:
+    ) -> OAuthAuthorizationSession:
         session = self.pending_states.pop(state, None)
         if session is None:
             raise ConnectorOAuthError("OAuth state is invalid")
@@ -311,6 +345,7 @@ class ConnectorOAuthService(BaseModel):
             raise ConnectorOAuthError("OAuth state does not match connector")
         if session.expires_at <= now:
             raise ConnectorOAuthError("OAuth state expired")
+        return session
 
     def _store_tokens(
         self,

@@ -11,6 +11,7 @@ class AgentObservation(BaseModel):
     success: bool
     output: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None
+    safe_error: str | None = None
     failure_class: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
 
@@ -18,15 +19,20 @@ class AgentObservation(BaseModel):
 class AgentDecision(BaseModel):
     kind: Literal["action", "respond", "request_input", "replan"]
     rationale_summary: str = ""
+    action_key: str | None = None
     tool_name: str | None = None
     skill_id: str | None = None
     tool_input: dict[str, Any] = Field(default_factory=dict)
+    approval_required: bool = False
+    expected_outcome: str | None = None
     response_text: str | None = None
 
 
 class AgentVerificationResult(BaseModel):
     outcome: Literal["complete", "repair", "replan", "wait_user", "fail"]
     feedback: str = ""
+    evidence: list[str] = Field(default_factory=list)
+    confidence: float | None = Field(default=None, ge=0, le=1)
 
 
 class AgentCycle(BaseModel):

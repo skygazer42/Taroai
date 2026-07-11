@@ -1,0 +1,10 @@
+Taroai Enterprise Agent Platform
+
+Copyright (c) Taroai contributors and licensors. All rights reserved unless an
+applicable written agreement states otherwise.
+
+The authoritative product license is the agreement supplied to the customer.
+This notice does not replace that agreement and does not grant additional
+rights. Third-party components remain subject to their respective licenses;
+use the release SBOM and approved attribution report for the exact delivered
+image set.

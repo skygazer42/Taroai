@@ -47,6 +47,7 @@ MODEL_PROVIDER_CHAT_REQUEST_OPTION_RESERVED_KEYS = {
     "tool_choice",
     "temperature",
     "max_tokens",
+    "reasoning_effort",
 }
 
 

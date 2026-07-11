@@ -1,3 +1,5 @@
+import base64
+import binascii
 from datetime import datetime
 from enum import Enum
 from typing import Any
@@ -16,6 +18,14 @@ class SandboxNetworkMode(str, Enum):
 class SandboxSessionStatus(str, Enum):
     ACTIVE = "active"
     DESTROYED = "destroyed"
+
+
+class SandboxCommandStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class SandboxCreateRequest(BaseModel):
@@ -52,6 +62,7 @@ class SandboxSession(BaseModel):
 
 
 class SandboxCommand(BaseModel):
+    id: str = Field(default_factory=lambda: new_id("sandbox_command"))
     tenant_id: str = Field(min_length=1)
     workspace_id: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
@@ -76,6 +87,7 @@ class SandboxCommandResult(BaseModel):
     session_id: str
     command: str
     exit_code: int
+    status: SandboxCommandStatus = SandboxCommandStatus.SUCCEEDED
     stdout: str = ""
     stderr: str = ""
     output_uri: str | None = None
@@ -89,12 +101,24 @@ class SandboxFileWrite(BaseModel):
     session_id: str = Field(min_length=1)
     path: str = Field(min_length=1)
     content: str = ""
+    content_base64: str | None = None
     content_type: str = "text/plain"
+
+    def content_bytes(self) -> bytes:
+        if self.content_base64 is None:
+            return self.content.encode("utf-8")
+        if self.content:
+            raise ValueError("sandbox file write cannot include text and base64 content together")
+        try:
+            return base64.b64decode(self.content_base64, validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise ValueError("sandbox file write content_base64 is invalid") from error
 
 
 class SandboxFileWriteRequest(BaseModel):
     path: str = Field(min_length=1)
     content: str = ""
+    content_base64: str | None = None
     content_type: str = "text/plain"
 
 
@@ -126,6 +150,7 @@ class SandboxControllerCapabilities(BaseModel):
     filesystem_isolation: bool = False
     resource_limits: bool = False
     destroy_supported: bool = False
+    command_cancellation_supported: bool = False
     session_ttl_enforced: bool = False
     runtime_isolation: bool = False
     image_policy_enforced: bool = False

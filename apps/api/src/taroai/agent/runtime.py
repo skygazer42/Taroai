@@ -2,6 +2,7 @@ import base64
 import json
 import re
 import time
+from datetime import timedelta
 from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError
@@ -126,7 +127,19 @@ class AgentRuntime(BaseModel):
     )
     long_term_memory_service: Any | None = None
     guardrail_service: Any | None = None
+    skill_service: Any | None = None
+    connector_registry: Any | None = None
+    connector_dispatcher: Any | None = None
+    connector_invocation_service: Any | None = None
     max_step_retries: int = 0
+    runtime_mode: str = "legacy"
+    loop_max_iterations: int = Field(default=12, ge=1)
+    loop_max_repairs: int = Field(default=4, ge=0)
+    loop_timeout_seconds: int = Field(default=1800, ge=1)
+    loop_cost_limit: float = Field(default=0, ge=0)
+    loop_action_lease_seconds: int = Field(default=600, ge=1)
+    loop_worker_id: str = "agent-loop-v2"
+    full_auto_requires_isolation: bool = True
     pending_states: dict[str, AgentRuntimeState] = Field(default_factory=dict)
     model_plan_metadata: dict[str, dict[str, Any]] = Field(
         default_factory=dict,
@@ -137,6 +150,13 @@ class AgentRuntime(BaseModel):
         return build_runtime_graph()
 
     def execute_run(self, tenant_id: str, run_id: str) -> AgentRuntimeState:
+        if self.runtime_mode == "loop_v2":
+            from taroai.agent.loop import AgentLoopV2
+
+            return AgentLoopV2(self).execute_run(tenant_id, run_id)
+        return self._execute_legacy_run(tenant_id, run_id)
+
+    def _execute_legacy_run(self, tenant_id: str, run_id: str) -> AgentRuntimeState:
         run = self.store.update_run_status(tenant_id, run_id, RunStatus.RUNNING)
         state = self._initial_state(run)
         self._save_state(state)
@@ -221,11 +241,36 @@ class AgentRuntime(BaseModel):
             }:
                 return self._resume_planning_after_guardrail_approval(state)
             if pending_guardrail_stage == GuardrailStage.ARTIFACT.value:
+                if self.runtime_mode == "loop_v2":
+                    from taroai.agent.loop import AgentLoopV2
+
+                    run = self.store.get_run(tenant_id, run_id)
+                    return AgentLoopV2(self)._finalize(state, run)
                 if self._has_pending_sandbox_artifact_promotion(state):
                     return self._resume_sandbox_artifact_promotion_after_guardrail_approval(
                         state
                     )
                 return self._finalize_success(state)
+        if self.runtime_mode == "loop_v2":
+            approved_tool_names = list(
+                state.runtime_metadata.get("approved_tool_names", [])
+            )
+            current_step = self._planned_step_by_id(
+                state,
+                state.current_step_id or "",
+            )
+            if (
+                current_step is not None
+                and current_step.tool_name not in approved_tool_names
+            ):
+                approved_tool_names.append(current_step.tool_name)
+                state.runtime_metadata["approved_tool_names"] = approved_tool_names
+            state.approval_id = None
+            state.status = RunStatus.RUNNING
+            self._save_state(state)
+            from taroai.agent.loop import AgentLoopV2
+
+            return AgentLoopV2(self).execute_run(tenant_id, run_id)
         state.approval_id = None
         self._save_state(state)
         return self._execute_planned_steps(state)
@@ -267,6 +312,18 @@ class AgentRuntime(BaseModel):
         state.pending_guardrail_approval_stage = None
         state.failure_reason = "Approval rejected"
         self._save_state(state)
+        if self.runtime_mode == "loop_v2":
+            from taroai.agent.loop import AgentLoopV2
+
+            loop = AgentLoopV2(self)
+            loop._complete_trigger_message(run, succeeded=False)
+            loop._emit_terminal_once(
+                state,
+                run,
+                "agent.loop.completed",
+                {"outcome": "failed", "reason": "approval_rejected"},
+            )
+            self._save_state(state)
         self._destroy_runtime_sandbox_session(
             state,
             reason="approval_rejected",
@@ -300,13 +357,41 @@ class AgentRuntime(BaseModel):
             except NotFoundError:
                 state = None
         if state is not None:
+            active_step_id = state.current_step_id
             state.status = RunStatus.CANCELLED
             state.approval_id = None
-            state.current_step_id = None
             state.pending_guardrail_approval_key = None
             state.pending_guardrail_approval_stage = None
             state.failure_reason = "Run cancelled"
+            if (
+                self.sandbox_adapter is not None
+                and state.sandbox_session_id is not None
+                and active_step_id is not None
+                and hasattr(self.sandbox_adapter, "cancel_command")
+            ):
+                try:
+                    self.sandbox_adapter.cancel_command(
+                        state.tenant_id,
+                        state.sandbox_session_id,
+                        active_step_id,
+                    )
+                except Exception:
+                    pass
+            state.current_step_id = None
             self._save_state(state)
+            if self.runtime_mode == "loop_v2":
+                from taroai.agent.loop import AgentLoopV2
+
+                loop = AgentLoopV2(self)
+                loop.checkpoint_cancel(state, run)
+                loop._complete_trigger_message(run, succeeded=False)
+                loop._emit_terminal_once(
+                    state,
+                    run,
+                    "agent.loop.completed",
+                    {"outcome": "cancelled", "reason": reason_code},
+                )
+                self._save_state(state)
             self._destroy_runtime_sandbox_session(
                 state,
                 reason="cancelled",
@@ -323,7 +408,7 @@ class AgentRuntime(BaseModel):
         reason_code: str,
     ) -> AgentRuntimeState:
         self.pending_states.pop(run_id, None)
-        self.store.request_run_retry(
+        run = self.store.request_run_retry(
             tenant_id=tenant_id,
             run_id=run_id,
             requested_by_user_id=requested_by_user_id,
@@ -334,6 +419,39 @@ class AgentRuntime(BaseModel):
             run_id=run_id,
             cancelled_by_user_id=requested_by_user_id,
         )
+        if self.runtime_mode == "loop_v2":
+            from taroai.agent.loop import AgentLoopV2
+
+            try:
+                state = self._load_state(tenant_id, run_id)
+            except NotFoundError:
+                state = self._initial_state(run)
+            state.status = RunStatus.RUNNING
+            state.max_iterations = state.iteration + self.loop_max_iterations
+            state.repair_attempts = 0
+            state.replan_count = 0
+            state.failure_reason = None
+            state.waiting_reason = None
+            state.pending_uncertain_action_id = None
+            state.terminal_event_emitted = False
+            state.runtime_metadata["execution_attempt"] = (
+                int(state.runtime_metadata.get("execution_attempt", 0)) + 1
+            )
+            state.runtime_metadata["attempt_start_iteration"] = state.iteration
+            state.deadline_at = utc_now() + timedelta(seconds=self.loop_timeout_seconds)
+            AgentLoopV2(self)._persist_checkpoint(state, run)
+            if run.trigger_message_id is not None:
+                from taroai.domain import (
+                    ChatMessageDeliveryStatus,
+                    ChatMessageDispatchStatus,
+                )
+
+                self.store.update_chat_message(
+                    tenant_id,
+                    run.trigger_message_id,
+                    dispatch_status=ChatMessageDispatchStatus.INFLIGHT,
+                    delivery_status=ChatMessageDeliveryStatus.PENDING,
+                )
         return self.execute_run(tenant_id, run_id)
 
     def _initial_state(self, run: Run) -> AgentRuntimeState:
@@ -344,6 +462,10 @@ class AgentRuntime(BaseModel):
             run_id=run.id,
             goal=run.message,
             status=run.status,
+            max_iterations=self.loop_max_iterations,
+            max_repairs=self.loop_max_repairs,
+            cost_limit=self.loop_cost_limit,
+            deadline_at=utc_now() + timedelta(seconds=self.loop_timeout_seconds),
         )
 
     def _decide_runtime_execution(self, run: Run) -> PolicyDecision:
@@ -1855,7 +1977,11 @@ class AgentRuntime(BaseModel):
                 tenant_id=state.tenant_id,
                 workspace_id=state.workspace_id,
                 run_id=state.run_id,
-                image=self.sandbox_runtime_image,
+                image=str(
+                    state.runtime_metadata.get(
+                        "skill_runtime_image", self.sandbox_runtime_image
+                    )
+                ),
                 network_mode=self.sandbox_network_mode,
                 timeout_seconds=self.sandbox_timeout_seconds,
                 metadata={"created_by": "agent_runtime"},

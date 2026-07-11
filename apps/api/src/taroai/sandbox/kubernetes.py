@@ -264,7 +264,7 @@ class KubernetesSandboxAdapter(SandboxAdapter):
         display_path = self._workspace_display_path(file_write.path)
         local_path = self._local_workspace_path(session, display_path)
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        content_bytes = file_write.content.encode("utf-8")
+        content_bytes = file_write.content_bytes()
         local_path.write_bytes(content_bytes)
         directory = str(Path(display_path).parent)
         mkdir_result = self._run_workspace_shell(
@@ -302,7 +302,7 @@ class KubernetesSandboxAdapter(SandboxAdapter):
             path=display_path,
             content_type=file_write.content_type,
             size_bytes=len(content_bytes),
-            content=file_write.content,
+            content=file_write.content if file_write.content_base64 is None else None,
         )
 
     def download_file(

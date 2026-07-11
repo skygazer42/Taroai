@@ -1,0 +1,222 @@
+name: taroai
+
+x-runtime-environment: &runtime-environment
+  TAROAI_ENVIRONMENT: production
+  TAROAI_DATABASE_URL: ${TAROAI_DATABASE_URL:?required}
+  TAROAI_CONTROL_PLANE_STORE_BACKEND: sql
+  TAROAI_IDENTITY_SERVICE_BACKEND: sql
+  TAROAI_CONNECTOR_REGISTRY_BACKEND: sql
+  TAROAI_SKILL_REGISTRY_BACKEND: sql
+  TAROAI_KNOWLEDGE_SERVICE_BACKEND: sql
+  TAROAI_LONG_TERM_MEMORY_BACKEND: sql
+  TAROAI_TRIGGER_STORE_BACKEND: sql
+  TAROAI_STORAGE_CATALOG_BACKEND: sql
+  TAROAI_JOB_QUEUE_BACKEND: redis
+  TAROAI_SHORT_TERM_MEMORY_BACKEND: redis
+  TAROAI_REDIS_URL: ${TAROAI_REDIS_URL:?required}
+  TAROAI_OBJECT_STORAGE_ENDPOINT: ${TAROAI_OBJECT_STORAGE_ENDPOINT:?required}
+  TAROAI_OBJECT_STORAGE_BUCKET: ${TAROAI_OBJECT_STORAGE_BUCKET:?required}
+  TAROAI_OBJECT_STORAGE_REGION: ${TAROAI_OBJECT_STORAGE_REGION:?required}
+  TAROAI_OBJECT_STORAGE_ACCESS_KEY_ID: ${TAROAI_OBJECT_STORAGE_ACCESS_KEY_ID:?required}
+  TAROAI_OBJECT_STORAGE_SECRET_ACCESS_KEY: ${TAROAI_OBJECT_STORAGE_SECRET_ACCESS_KEY:?required}
+  TAROAI_ACCESS_TOKEN_SECRET: ${TAROAI_ACCESS_TOKEN_SECRET:?required}
+  TAROAI_PASSWORD_HASH_SALT: ${TAROAI_PASSWORD_HASH_SALT:?required}
+  TAROAI_TENANT_BOOTSTRAP_TOKEN: ${TAROAI_TENANT_BOOTSTRAP_TOKEN:?required}
+  TAROAI_SANDBOX_PROVIDER: http
+  TAROAI_SANDBOX_CONTROLLER_BASE_URL: http://sandbox-controller:8002
+  TAROAI_SANDBOX_CONTROLLER_API_KEY: ${TAROAI_SANDBOX_CONTROLLER_API_KEY:?required}
+  TAROAI_BROWSER_PROVIDER: playwright
+  TAROAI_BROWSER_CONTROLLER_BASE_URL: http://browser-controller:8001
+  TAROAI_BROWSER_CONTROLLER_API_KEY: ${TAROAI_BROWSER_CONTROLLER_API_KEY:?required}
+  TAROAI_MODEL_GATEWAY_BASE_URL: ${TAROAI_MODEL_GATEWAY_BASE_URL:-https://api.openai.com/v1}
+  TAROAI_MODEL_GATEWAY_API_KEY: ${TAROAI_MODEL_GATEWAY_API_KEY:-}
+  TAROAI_MODEL_GATEWAY_API_KEY_SECRET_REF_ID: ${TAROAI_MODEL_GATEWAY_API_KEY_SECRET_REF_ID:-}
+  TAROAI_MODEL_GATEWAY_MODEL: ${TAROAI_MODEL_GATEWAY_MODEL:-}
+  TAROAI_RUN_EXECUTION_DISPATCH_MODE: queue
+  TAROAI_RUN_MIGRATIONS: "false"
+
+services:
+  migration:
+    image: ${TAROAI_API_IMAGE:?required}
+    restart: "no"
+    environment:
+      <<: *runtime-environment
+    command:
+      - python
+      - -m
+      - taroai.db.migration_cli
+      - --database-url
+      - ${TAROAI_DATABASE_URL:?required}
+      - --migrations-path
+      - /app/migrations
+      - --apply
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [control]
+
+  api:
+    image: ${TAROAI_API_IMAGE:?required}
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,noexec,nosuid
+    environment:
+      <<: *runtime-environment
+    volumes:
+      - runtime-data:/data/taroai
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      sandbox-controller:
+        condition: service_healthy
+      browser-controller:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    networks: [control]
+
+  worker:
+    image: ${TAROAI_API_IMAGE:?required}
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,noexec,nosuid
+    environment:
+      <<: *runtime-environment
+    command:
+      - python
+      - -m
+      - taroai.workers.runner
+      - --worker-kind
+      - agent
+      - --poll-interval-seconds
+      - "1"
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    networks: [control]
+
+  sandbox-controller:
+    image: ${TAROAI_SANDBOX_IMAGE:?required}
+    restart: unless-stopped
+    environment:
+      TAROAI_SANDBOX_CONTROLLER_API_KEY: ${TAROAI_SANDBOX_CONTROLLER_API_KEY:?required}
+      TAROAI_SANDBOX_CONTROLLER_PROVIDER: ${TAROAI_SANDBOX_CONTROLLER_PROVIDER:-docker}
+      TAROAI_SANDBOX_CONTROLLER_MAX_SESSIONS: ${TAROAI_SANDBOX_CONTROLLER_MAX_SESSIONS:-50}
+      TAROAI_SANDBOX_CONTROLLER_DOCKER_READ_ONLY_ROOTFS: "true"
+      TAROAI_SANDBOX_CONTROLLER_DOCKER_DROP_ALL_CAPABILITIES: "true"
+      TAROAI_SANDBOX_CONTROLLER_DOCKER_SECURITY_OPTS: '["no-new-privileges:true"]'
+    volumes:
+      - sandbox-data:/data/taroai
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/healthz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    security_opt: ["no-new-privileges:true"]
+    networks: [control]
+
+  browser-controller:
+    image: ${TAROAI_BROWSER_IMAGE:?required}
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,noexec,nosuid
+    environment:
+      TAROAI_BROWSER_CONTROLLER_API_KEY: ${TAROAI_BROWSER_CONTROLLER_API_KEY:?required}
+      TAROAI_BROWSER_CONTROLLER_MAX_SESSIONS: ${TAROAI_BROWSER_CONTROLLER_MAX_SESSIONS:-50}
+      TAROAI_BROWSER_CONTROLLER_NAVIGATION_ALLOWED_HOSTS: ${TAROAI_BROWSER_CONTROLLER_NAVIGATION_ALLOWED_HOSTS:-[]}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/healthz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    networks: [control]
+
+  web:
+    image: ${TAROAI_WEB_IMAGE:?required}
+    restart: unless-stopped
+    read_only: true
+    ports:
+      - "${TAROAI_WEB_PORT:-3000}:8080"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    networks: [control]
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-taroai}
+      POSTGRES_USER: ${POSTGRES_USER:-taroai_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks: [control]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    networks: [control]
+
+  minio:
+    image: minio/minio:RELEASE.2025-06-13T11-33-47Z
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${TAROAI_OBJECT_STORAGE_ACCESS_KEY_ID:?required}
+      MINIO_ROOT_PASSWORD: ${TAROAI_OBJECT_STORAGE_SECRET_ACCESS_KEY:?required}
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks: [control]
+
+volumes:
+  runtime-data:
+  sandbox-data:
+  postgres-data:
+  redis-data:
+  minio-data:
+
+networks:
+  control:
+    driver: bridge

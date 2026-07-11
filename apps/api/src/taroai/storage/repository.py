@@ -17,7 +17,10 @@ class SqlStorageCatalog(BaseModel):
         storage_object = StorageObject(
             **request.model_dump(),
             bucket=self.bucket,
-            key=self._build_key(request),
+            key="pending",
+        )
+        storage_object = storage_object.model_copy(
+            update={"key": self._build_key(request, storage_object.id)}
         )
         with self._connect() as connection:
             connection.execute(
@@ -154,15 +157,15 @@ class SqlStorageCatalog(BaseModel):
     def _connect(self):
         return connect_database(self.config)
 
-    def _build_key(self, request: StorageObjectCreate) -> str:
+    def _build_key(self, request: StorageObjectCreate, object_id: str) -> str:
         purpose_path = request.purpose.value
         if request.workspace_id is None:
-            return f"{request.tenant_id}/{purpose_path}/{request.filename}"
+            return f"{request.tenant_id}/{purpose_path}/{object_id}/{request.filename}"
         if request.run_id is None:
-            return f"{request.tenant_id}/{request.workspace_id}/{purpose_path}/{request.filename}"
+            return f"{request.tenant_id}/{request.workspace_id}/{purpose_path}/{object_id}/{request.filename}"
         return (
             f"{request.tenant_id}/{request.workspace_id}/runs/"
-            f"{request.run_id}/{purpose_path}/{request.filename}"
+            f"{request.run_id}/{purpose_path}/{object_id}/{request.filename}"
         )
 
     def _from_row(self, row) -> StorageObject:

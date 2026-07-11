@@ -46,6 +46,7 @@
           <a class="sidebar-item" href="#discover" data-app-route="discover"><span class="nav-icon" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"></circle><path d="m14.5 9.5-1.6 3.4-3.4 1.6 1.6-3.4z"></path></svg></span><span>Discover</span></a>
           <a class="sidebar-item" href="#feed" data-app-route="feed"><span class="nav-icon" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24"><rect x="5" y="4" width="14" height="16" rx="2"></rect><path d="M8 8h8M8 12h8M8 16h5"></path></svg></span><span>Feed</span></a>
           <a class="sidebar-item" href="#agents" data-app-route="agents"><span class="nav-icon" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="7"></circle><path d="M12 8v8M8 12h8"></path></svg></span><span>Agents</span></a>
+          <a class="sidebar-item" href="#skills" data-app-route="skills"><span class="nav-icon" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24"><path d="M7 5h10v4H7zM5 11h14v8H5z"></path><path d="M9 15h6"></path></svg></span><span>Skills</span></a>
           <a class="sidebar-item" href="#workspaces" data-app-route="workspaces"><span class="nav-icon" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24"><path d="m13 3-7 10h6l-1 8 7-11h-6z"></path></svg></span><span>Workspaces</span></a>
           <a class="sidebar-item" href="#files" data-app-route="files"><span class="nav-icon" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24"><path d="M4 9h16l-1.5 9h-13zM7 9l1.5-3h7L17 9"></path></svg></span><span>Files</span></a>
           <button class="sidebar-item" type="button" data-app-route="brain">
@@ -55,13 +56,17 @@
           </button>
         </nav>
 
-        <section class="sidebar-recents" data-testid="run-history" aria-label="Run history">
+        <section class="sidebar-recents thread-recents" data-testid="run-history" aria-label="Chat threads">
           <div class="sidebar-section-heading">
-            <h2>Recents</h2>
-            <button class="icon-button" data-run-history-refresh type="button" title="Refresh runs" aria-label="Refresh runs">↻</button>
+            <h2>Threads</h2>
+            <button class="icon-button" data-run-history-refresh data-thread-refresh type="button" title="Refresh threads" aria-label="Refresh threads">↻</button>
           </div>
+          <label class="thread-search" aria-label="Search threads">
+            <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5"></circle><path d="m15 15 4 4"></path></svg>
+            <input type="search" data-thread-search placeholder="Search threads" autocomplete="off" />
+          </label>
           <div class="run-history-status visually-hidden" data-run-history-status>No runs loaded</div>
-          <ul class="run-history-list" data-run-history-list><li>No runs.</li></ul>
+          <ul class="run-history-list thread-list" data-run-history-list data-thread-list><li>No threads yet.</li></ul>
         </section>
 
         <footer class="sidebar-footer">
@@ -151,10 +156,19 @@
           </div>
 
           <div class="chat-topbar-actions">
-            <span class="status-pill" data-status-pill>Upgrade</span>
+            <span class="status-pill thread-presence" data-status-pill data-thread-presence>Ready</span>
+            <button class="topbar-action" type="button" data-open-queue aria-expanded="false">Queue <span data-queue-count>0</span></button>
+            <button class="topbar-action" type="button" data-open-artifacts>Artifacts</button>
             <button class="topbar-pill" type="button" data-open-operations>Operations</button>
             <button class="topbar-action" type="button" data-open-files-dialog>Files</button>
-            <button class="topbar-action" type="button" disabled title="Thread sharing is not available yet">Share</button>
+            <button class="topbar-action" type="button" data-thread-share>Share</button>
+            <button class="topbar-action thread-more" type="button" data-thread-more aria-label="Thread actions" aria-expanded="false">•••</button>
+            <div class="thread-actions-menu" data-thread-actions-menu hidden>
+              <button type="button" data-thread-rename>Rename</button>
+              <button type="button" data-thread-pin>Pin thread</button>
+              <button type="button" data-thread-archive>Archive</button>
+              <button type="button" data-thread-delete>Delete</button>
+            </div>
           </div>
         </header>
 
@@ -170,11 +184,12 @@
             <div class="product-route-search-results" data-route-search-results></div>
           </div>
           <div class="product-route-grid" data-route-cards></div>
+          <div class="product-route-experience" data-product-route-experience hidden></div>
         </section>
 
         <div class="chat-scroll-region">
           <section class="chat-empty-state" data-testid="chat-empty-state"><h1>How can I help, luke?</h1></section>
-          <div class="conversation" data-testid="conversation-log" aria-live="polite">
+          <div class="conversation" data-testid="conversation-log" data-thread-conversation aria-live="polite">
             <article class="message message-agent"><p>Start a governed run. I will stream timeline events, terminal output, approvals, and artifacts from the Taroai backend.</p></article>
             <div class="quick-row" aria-label="Suggested follow-ups">
               <button type="button" data-prompt="Generate a hello report in the sandbox.">Generate a hello report</button>
@@ -185,20 +200,28 @@
         </div>
 
         <div class="composer-shell" data-testid="chat-composer">
-          <div class="composer-surface">
+          <div class="composer-surface" data-chat-dropzone>
+            <div class="composer-resource-row" data-resource-chips aria-live="polite"></div>
+            <div class="composer-upload-row" data-upload-list aria-live="polite"></div>
             <div class="composer-row">
               <textarea id="composer-input" rows="1" placeholder="Ask anything... Type @ to mention skills or connectors, or / for commands" aria-label="Message"></textarea>
+              <div class="mention-menu" data-mention-menu role="listbox" aria-label="Mention a workspace resource" hidden>
+                <div class="mention-menu-header"><span>Reference</span><small>Skills, connectors, agents, knowledge</small></div>
+                <div data-mention-results></div>
+              </div>
             </div>
             <div class="composer-actions">
               <div class="composer-action-group">
                 <button id="composer-add-button" class="composer-icon-button" type="button" aria-label="Add files, create media, and more" aria-haspopup="menu" aria-controls="composer-add-menu" aria-expanded="false"><span aria-hidden="true">+</span></button>
                 <input id="composer-file-input" type="file" multiple hidden />
                 <div data-attachment-chips class="attachment-chips" aria-live="polite"></div>
+                <button class="delivery-mode-button" type="button" data-delivery-mode value="queue" aria-label="Send behavior">Queue next</button>
               </div>
               <div class="composer-action-group">
-                <button class="composer-icon-button" type="button" aria-label="Voice input" title="Voice input is not available yet">
+                <button class="composer-icon-button" type="button" aria-label="Voice input" data-voice-input title="Start voice input">
                   <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="12" rx="3"></rect><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3"></path></svg>
                 </button>
+                <button class="stop-button" type="button" data-thread-stop hidden aria-label="Stop agent"><span aria-hidden="true"></span> Stop</button>
                 <button id="send-button" class="send-button" type="button" aria-label="Send message" disabled>
                   <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M6.5 10.5 12 5l5.5 5.5"></path></svg>
                 </button>
@@ -221,6 +244,7 @@
           </div>
           <div class="composer-hint">
             <span class="visually-hidden">Press Enter to send, Shift+Enter for a new line.</span>
+            <span class="composer-network-state" data-chat-network-state>Ready</span>
             <button type="button" class="create-agent-prompt" data-create-agent-prompt><span aria-hidden="true">⌘</span><span>Go beyond prompts — create an agent and build systems</span></button>
             <button type="button" class="create-agent-button" data-create-agent><span class="sparkle-icon" aria-hidden="true">✣</span> Create an agent</button>
           </div>
@@ -253,6 +277,38 @@
           </div>
           <button class="icon-button" type="button" aria-label="Close artifact panel" data-artifact-panel-close>×</button>
         </header>
+        <div class="chat-sidecar" data-chat-sidecar>
+          <nav class="sidecar-tabs" aria-label="Thread details">
+            <button type="button" class="is-active" data-sidecar-tab="artifacts">Artifacts</button>
+            <button type="button" data-sidecar-tab="queue">Queue <span data-sidecar-queue-count>0</span></button>
+            <button type="button" data-sidecar-tab="details">Details</button>
+          </nav>
+          <section class="sidecar-view is-active" data-sidecar-view="artifacts">
+            <div class="sidecar-empty" data-thread-artifacts-empty>
+              <span aria-hidden="true">◇</span>
+              <strong>No artifacts yet</strong>
+              <p>Files, reports, previews, and dashboards created in this thread will appear here.</p>
+            </div>
+            <div class="thread-artifact-list" data-thread-artifacts></div>
+            <div class="artifact-stage" data-artifact-stage hidden>
+              <header><strong data-artifact-stage-title>Artifact</strong><div><button type="button" data-artifact-copy>Copy</button><button type="button" data-artifact-download>Download</button></div></header>
+              <pre data-artifact-stage-content></pre>
+            </div>
+          </section>
+          <section class="sidecar-view" data-sidecar-view="queue" data-testid="message-queue" hidden>
+            <header class="queue-header"><div><strong>Message queue</strong><small>Continues even if this tab closes</small></div><button type="button" data-queue-dispatch>Run next</button></header>
+            <ol class="message-queue" data-message-queue><li class="queue-empty">Nothing queued.</li></ol>
+          </section>
+          <section class="sidecar-view thread-details" data-sidecar-view="details" hidden>
+            <dl>
+              <div><dt>Thread</dt><dd data-thread-detail-id>Not started</dd></div>
+              <div><dt>Model</dt><dd data-thread-detail-model>Default</dd></div>
+              <div><dt>Run</dt><dd data-thread-detail-run>Idle</dd></div>
+              <div><dt>Stream</dt><dd data-thread-detail-stream>Disconnected</dd></div>
+            </dl>
+            <button type="button" class="sidecar-create-agent" data-thread-create-agent>Create agent from this thread</button>
+          </section>
+        </div>
         <div class="operations-drawer" data-testid="operations-drawer">
           <header class="operations-header">
             <div><span class="panel-kicker">Workspace</span><h2>Operations</h2></div>

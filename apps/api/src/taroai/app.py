@@ -1,17 +1,29 @@
+import base64
+import binascii
 import hashlib
 import hmac
 import json
+import time
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import Body, Depends, FastAPI, Header, Query, Request, Response, status
+from fastapi import BackgroundTasks, Body, Depends, FastAPI, Header, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from taroai.agent import AgentRuntime
+from taroai.agent import AgentRuntime, apply_agent_runtime_settings
+from taroai.agents import (
+    AgentDefinitionCreate,
+    AgentExtractRequest,
+    AgentRegistryService,
+    AgentRunRequest,
+    AgentVersionCreate,
+    InMemoryAgentRegistry,
+    SqlAgentRegistry,
+)
 from taroai.api import ApiExceptionManager
 from taroai.api.idempotency import (
     build_idempotency_request,
@@ -57,12 +69,15 @@ from taroai.billing import (
     SqlBillingPricingRuleStore,
 )
 from taroai.chat import (
+    ChatMessageEdit,
     ChatMessageSubmit,
     ChatService,
+    ChatSteerSubmit,
     ChatThreadApiCreate,
     ChatThreadPatch,
     MessageDispatch,
 )
+from taroai.artifacts import ArtifactService, RichArtifactCreate
 from taroai.config import ENTERPRISE_SANDBOX_PROVIDERS, Settings, load_settings
 from taroai.connectors import (
     ConnectorCreateRequest,
@@ -96,6 +111,7 @@ from taroai.db import MigrationRunner, SqlControlPlaneRepository, close_database
 from taroai.domain import (
     ApprovalRequest,
     ApprovalStatus,
+    ChatMessageDispatchStatus,
     RunCreate,
     RunMode,
     RunStatus,
@@ -275,6 +291,17 @@ from taroai.sharing import (
     ShareSubjectType,
     SqlShareGrantStore,
     share_grant_audit_metadata,
+    InMemoryThreadShareStore,
+    SqlThreadShareStore,
+    ThreadShareCreate,
+    ThreadShareService,
+    ThreadShareStore,
+)
+from taroai.speech import (
+    SpeechGateway,
+    SpeechSummaryRequest,
+    TextToSpeechRequest,
+    TranscriptionRequest,
 )
 from taroai.skills import (
     InMemorySkillRegistry,
@@ -284,6 +311,9 @@ from taroai.skills import (
     SkillType,
     SqlSkillRegistry,
 )
+from taroai.skills.import_service import GithubSkillSource, HttpsGithubArchiveFetcher
+from taroai.skills.evaluation import SkillEvaluationSuite
+from taroai.skills.service import SkillService
 from taroai.solution_packs import (
     InMemorySolutionPackRegistry,
     SolutionPackInstallRequest,
@@ -503,6 +533,68 @@ class RunRetryRequest(BaseModel):
         max_length=64,
         pattern=r"^[a-z0-9_.-]+$",
     )
+
+
+class UncertainActionResolutionRequest(BaseModel):
+    resolution: str = Field(pattern=r"^(succeeded|failed|retry)$")
+    note: str = Field(default="", max_length=1000)
+
+
+class ConnectorReconnectRequest(BaseModel):
+    thread_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    action_id: str = Field(min_length=1)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class AtomicUploadRequest(BaseModel):
+    workspace_id: str = Field(min_length=1)
+    filename: str = Field(min_length=1, max_length=255)
+    content_type: str = Field(min_length=1, max_length=120)
+    content_base64: str = Field(min_length=1, max_length=34_000_000)
+    acl_subjects: list[str] = Field(default_factory=list)
+    sensitivity_level: int = Field(default=0, ge=0)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ThreadSuggestionRequest(BaseModel):
+    limit: int = Field(default=3, ge=1, le=6)
+
+
+class SkillZipImportRequest(BaseModel):
+    archive_base64: str = Field(min_length=1, max_length=45_000_000)
+    workspace_id: str | None = Field(default=None, min_length=1)
+    manifest: SkillManifest | None = None
+    source_url: str | None = Field(default=None, max_length=2000)
+    source_ref: str | None = Field(default=None, max_length=500)
+    subdirectory: str | None = Field(default=None, max_length=500)
+
+
+class SkillGithubImportRequest(BaseModel):
+    source: GithubSkillSource
+    manifest: SkillManifest | None = None
+    workspace_id: str | None = Field(default=None, min_length=1)
+
+
+class SkillPackagePublishRequest(BaseModel):
+    evaluation_run_id: str | None = None
+
+
+class SkillExactInstallRequest(BaseModel):
+    version: str = Field(min_length=1)
+    package_digest: str = Field(min_length=64, max_length=64)
+
+
+class SkillVersionMoveRequest(BaseModel):
+    target_version: str = Field(min_length=1)
+    expected_package_digest: str | None = Field(default=None, min_length=64, max_length=64)
+
+
+class SkillEvaluateRequest(BaseModel):
+    workspace_id: str | None = Field(default=None, min_length=1)
+    suite: SkillEvaluationSuite | None = None
 
 
 class ApprovalResolveRequest(BaseModel):
@@ -1098,7 +1190,7 @@ def resolve_event_replay_sequence(
         return int(last_event_id)
     except ValueError as error:
         raise ValueError(
-            "Last-Event-ID must be an integer run event sequence"
+            "Last-Event-ID must be an integer event sequence"
         ) from error
 
 
@@ -1135,6 +1227,11 @@ def create_app(
     connector_oauth_service: ConnectorOAuthService | None = None,
     secret_service: SecretService | None = None,
     skill_registry: InMemorySkillRegistry | SqlSkillRegistry | None = None,
+    skill_service: Any | None = None,
+    skill_evaluation_runner: Any | None = None,
+    agent_registry: InMemoryAgentRegistry | SqlAgentRegistry | None = None,
+    thread_share_store: ThreadShareStore | None = None,
+    speech_gateway: SpeechGateway | None = None,
     solution_pack_registry: (
         InMemorySolutionPackRegistry | SqlSolutionPackRegistry | None
     ) = None,
@@ -1197,6 +1294,11 @@ def create_app(
     app.state.object_storage = (
         object_storage or S3CompatibleObjectStorage.from_settings(resolved_settings)
     )
+    app.state.artifact_service = ArtifactService(
+        store=app.state.store,
+        storage_catalog=app.state.storage_catalog,
+        object_storage=app.state.object_storage,
+    )
     app.state.storage_content_scanner = build_storage_content_scanner(resolved_settings)
     app.state.audit_service = audit_service or AuditService(
         store=app.state.store,
@@ -1206,6 +1308,25 @@ def create_app(
         resolved_settings
     )
     app.state.skill_registry = skill_registry or build_skill_registry(resolved_settings)
+    app.state.skill_service = skill_service or SkillService(
+        registry=app.state.skill_registry,
+        github_fetcher=HttpsGithubArchiveFetcher(),
+        evaluation_runner=skill_evaluation_runner,
+    )
+    app.state.agent_registry = agent_registry or build_agent_registry(resolved_settings)
+    app.state.agent_registry_service = AgentRegistryService(
+        registry=app.state.agent_registry,
+        store=app.state.store,
+    )
+    app.state.speech_gateway = speech_gateway or SpeechGateway()
+    app.state.thread_share_store = (
+        thread_share_store or build_thread_share_store(resolved_settings)
+    )
+    app.state.thread_share_service = ThreadShareService(
+        store=app.state.store,
+        link_store=app.state.thread_share_store,
+        hash_secret=resolved_settings.thread_share_token_hash_secret,
+    )
     app.state.solution_pack_registry = (
         solution_pack_registry or build_solution_pack_registry(resolved_settings)
     )
@@ -1392,40 +1513,58 @@ def create_app(
     )
     register_sandbox_tool_handlers(tool_gateway, app.state.sandbox_adapter)
     register_browser_tool_handlers(tool_gateway, app.state.browser_controller)
-    app.state.runtime = runtime or AgentRuntime(
-        store=app.state.store,
-        model_gateway=build_model_gateway(
-            resolved_settings,
-            app.state.secret_service,
-            app.state.model_provider_store,
+    app.state.runtime = apply_agent_runtime_settings(
+        runtime or AgentRuntime(
+            store=app.state.store,
+            model_gateway=build_model_gateway(
+                resolved_settings,
+                app.state.secret_service,
+                app.state.model_provider_store,
+            ),
+            model_policy=build_model_policy(
+                resolved_settings, app.state.model_policy_store
+            ),
+            model_budget_guard=build_model_budget_guard(resolved_settings),
+            tool_gateway=tool_gateway,
+            policy_service=app.state.policy_service,
+            audit_service=app.state.audit_service,
+            license_service=app.state.license_service,
+            knowledge_service=app.state.knowledge_service,
+            sandbox_adapter=app.state.sandbox_adapter,
+            browser_controller=app.state.browser_controller,
+            storage_catalog=app.state.storage_catalog,
+            object_storage=app.state.object_storage,
+            storage_content_scanner=app.state.storage_content_scanner,
+            sandbox_runtime_image=app.state.settings.sandbox_runtime_image,
+            sandbox_network_mode=SandboxNetworkMode(
+                app.state.settings.sandbox_network_mode
+            ),
+            sandbox_timeout_seconds=app.state.settings.sandbox_timeout_seconds,
+            embedding_gateway=app.state.embedding_gateway,
+            billing_pricing_service=app.state.billing_pricing_service,
+            long_term_memory_service=app.state.long_term_memory_service,
+            guardrail_service=app.state.guardrail_service,
+            skill_service=app.state.skill_service,
+            connector_registry=app.state.connector_registry,
+            connector_dispatcher=app.state.connector_dispatcher,
+            connector_invocation_service=app.state.connector_invocation_service,
         ),
-        model_policy=build_model_policy(
-            resolved_settings, app.state.model_policy_store
-        ),
-        model_budget_guard=build_model_budget_guard(resolved_settings),
-        tool_gateway=tool_gateway,
-        policy_service=app.state.policy_service,
-        audit_service=app.state.audit_service,
-        license_service=app.state.license_service,
-        knowledge_service=app.state.knowledge_service,
-        sandbox_adapter=app.state.sandbox_adapter,
-        browser_controller=app.state.browser_controller,
-        storage_catalog=app.state.storage_catalog,
-        object_storage=app.state.object_storage,
-        storage_content_scanner=app.state.storage_content_scanner,
-        sandbox_runtime_image=app.state.settings.sandbox_runtime_image,
-        sandbox_network_mode=SandboxNetworkMode(
-            app.state.settings.sandbox_network_mode
-        ),
-        sandbox_timeout_seconds=app.state.settings.sandbox_timeout_seconds,
-        embedding_gateway=app.state.embedding_gateway,
-        billing_pricing_service=app.state.billing_pricing_service,
-        long_term_memory_service=app.state.long_term_memory_service,
-        guardrail_service=app.state.guardrail_service,
+        resolved_settings,
     )
+    if app.state.runtime.skill_service is None:
+        app.state.runtime.skill_service = app.state.skill_service
+    if app.state.runtime.connector_registry is None:
+        app.state.runtime.connector_registry = app.state.connector_registry
+    if app.state.runtime.connector_dispatcher is None:
+        app.state.runtime.connector_dispatcher = app.state.connector_dispatcher
+    if app.state.runtime.connector_invocation_service is None:
+        app.state.runtime.connector_invocation_service = (
+            app.state.connector_invocation_service
+        )
     app.state.chat_service = ChatService(
         store=app.state.store,
         model_policy_resolver=lambda: app.state.runtime.model_policy,
+        steering_available_resolver=lambda: app.state.runtime.runtime_mode == "loop_v2",
         provider_registry_resolver=lambda: ModelProviderRegistry(
             providers=effective_model_gateway_providers(
                 app.state.settings,
@@ -1433,6 +1572,95 @@ def create_app(
             )
         ),
     )
+
+    def execute_chat_run_chain(tenant_id: str, run_id: str) -> None:
+        current_run_id = run_id
+        for _ in range(100):
+            state = app.state.runtime.execute_run(tenant_id, current_run_id)
+            current_run = app.state.store.get_run(tenant_id, current_run_id)
+            if current_run.thread_id is None or state.status not in {
+                RunStatus.SUCCEEDED,
+                RunStatus.FAILED,
+                RunStatus.CANCELLED,
+                RunStatus.TIMED_OUT,
+            }:
+                return
+            continuation = app.state.chat_service.continue_thread(
+                tenant_id,
+                current_run.thread_id,
+            )
+            if continuation is None or not continuation.run_started:
+                return
+            current_run_id = continuation.run_id
+
+    def dispatch_chat_run(
+        tenant_id: str,
+        dispatch: MessageDispatch,
+        requested_by_user_id: str,
+        background_tasks: BackgroundTasks,
+    ) -> None:
+        run = app.state.store.get_run(tenant_id, dispatch.run_id)
+        should_resume_waiting_run = (
+            dispatch.dispatch_status.value == "steering"
+            and run.status == RunStatus.WAITING_FOR_USER
+        )
+        if not dispatch.run_started and not should_resume_waiting_run:
+            return
+        if app.state.settings.run_execution_dispatch_mode == "queue":
+            queue = app.state.job_queue
+            if queue is None:
+                raise RedisQueueConfigurationError("job queue backend is disabled")
+            job = queue.enqueue(
+                JobType.RUN_EXECUTION,
+                RunExecutionJob(
+                    tenant_id=run.tenant_id,
+                    workspace_id=run.workspace_id,
+                    user_id=run.user_id,
+                    run_id=run.id,
+                    requested_by_user_id=requested_by_user_id,
+                ),
+                max_attempts=app.state.settings.worker_job_max_attempts,
+            )
+            app.state.store.append_run_event(
+                run,
+                "run.execution_queued",
+                {
+                    "job_id": job.id,
+                    "queue": app.state.settings.run_execution_queue_name,
+                },
+            )
+            return
+        background_tasks.add_task(
+            execute_chat_run_chain,
+            run.tenant_id,
+            run.id,
+        )
+
+    def dispatch_next_after_terminal_run(
+        tenant_id: str,
+        run_id: str,
+        requested_by_user_id: str,
+        background_tasks: BackgroundTasks,
+    ) -> None:
+        run = app.state.store.get_run(tenant_id, run_id)
+        if run.thread_id is None or run.status not in {
+            RunStatus.SUCCEEDED,
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+            RunStatus.TIMED_OUT,
+        }:
+            return
+        dispatch = app.state.chat_service.continue_thread(
+            tenant_id,
+            run.thread_id,
+        )
+        if dispatch is not None:
+            dispatch_chat_run(
+                tenant_id,
+                dispatch,
+                requested_by_user_id,
+                background_tasks,
+            )
     app.state.exception_manager = ApiExceptionManager()
     app.state.exception_manager.register(app)
     app.add_event_handler("shutdown", close_database_pools)
@@ -1666,6 +1894,137 @@ def create_app(
             )
         ]
 
+    @app.patch("/api/threads/{thread_id}/messages/{message_id}")
+    def edit_chat_message(
+        thread_id: str,
+        message_id: str,
+        payload: ChatMessageEdit,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        message = app.state.chat_service.edit_message(
+            context.tenant_id,
+            context.user_id,
+            thread_id,
+            message_id,
+            payload,
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=message.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="chat.message.edited",
+            metadata={"thread_id": thread_id, "message_id": message_id},
+            request=request,
+        )
+        return message.model_dump(mode="json")
+
+    @app.delete(
+        "/api/threads/{thread_id}/messages/{message_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    def delete_chat_message(
+        thread_id: str,
+        message_id: str,
+        context: RequestContext = Depends(get_request_context),
+    ) -> Response:
+        app.state.chat_service.delete_message(
+            context.tenant_id,
+            context.user_id,
+            thread_id,
+            message_id,
+        )
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @app.post(
+        "/api/threads/{thread_id}/steer",
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def steer_chat_thread(
+        thread_id: str,
+        payload: ChatSteerSubmit,
+        background_tasks: BackgroundTasks,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        dispatch = app.state.chat_service.steer(
+            context.tenant_id,
+            context.user_id,
+            thread_id,
+            payload,
+        )
+        dispatch_chat_run(
+            context.tenant_id,
+            dispatch,
+            context.user_id,
+            background_tasks,
+        )
+        return dispatch.model_dump(mode="json")
+
+    @app.post(
+        "/api/threads/{thread_id}/continue",
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def continue_chat_thread(
+        thread_id: str,
+        background_tasks: BackgroundTasks,
+        response: Response,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        dispatch = app.state.chat_service.continue_thread(
+            context.tenant_id,
+            thread_id,
+        )
+        if dispatch is None:
+            response.status_code = status.HTTP_204_NO_CONTENT
+            return {}
+        dispatch_chat_run(
+            context.tenant_id,
+            dispatch,
+            context.user_id,
+            background_tasks,
+        )
+        return dispatch.model_dump(mode="json")
+
+    @app.get("/api/threads/{thread_id}/events")
+    def get_chat_thread_events(
+        thread_id: str,
+        after_sequence: int | None = None,
+        follow: bool = False,
+        last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+        context: RequestContext = Depends(get_request_context),
+    ) -> StreamingResponse:
+        replay_after_sequence = resolve_event_replay_sequence(
+            after_sequence, last_event_id
+        )
+
+        def stream() -> Iterator[str]:
+            cursor = replay_after_sequence or 0
+            deadline = time.monotonic() + app.state.settings.event_stream_follow_seconds
+            while True:
+                events = app.state.store.list_thread_events(
+                    context.tenant_id,
+                    thread_id,
+                    after_sequence=cursor,
+                )
+                for event in events:
+                    cursor = event.thread_sequence or cursor
+                    payload = json.dumps(
+                        event.model_dump(mode="json"), separators=(",", ":")
+                    )
+                    yield f"id: {cursor}\n"
+                    yield f"event: {event.type}\n"
+                    yield f"data: {payload}\n\n"
+                if not follow or time.monotonic() >= deadline:
+                    return
+                yield "event: heartbeat\ndata: {}\n\n"
+                time.sleep(app.state.settings.event_stream_heartbeat_seconds)
+
+        return StreamingResponse(
+            stream(), media_type=app.state.settings.event_stream_media_type
+        )
+
     @app.post(
         "/api/threads/{thread_id}/messages",
         status_code=status.HTTP_202_ACCEPTED,
@@ -1673,6 +2032,7 @@ def create_app(
     def post_chat_message(
         thread_id: str,
         payload: ChatMessageSubmit,
+        background_tasks: BackgroundTasks,
         response: Response,
         request: Request,
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
@@ -1731,6 +2091,12 @@ def create_app(
                     },
                     request=request,
                 )
+            dispatch_chat_run(
+                context.tenant_id,
+                dispatch,
+                context.user_id,
+                background_tasks,
+            )
             return dispatch
 
         status_code, response_body = app.state.chat_service.execute_idempotently(
@@ -1753,6 +2119,398 @@ def create_app(
                 context.user_id,
             )
         ]
+
+    @app.get("/api/workspaces/{workspace_id}/capabilities")
+    def get_workspace_capabilities(
+        workspace_id: str,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        installed_skills = [
+            {
+                "id": summary.skill_id,
+                "name": summary.name,
+                "description": summary.description,
+                "version": summary.version,
+                "package_digest": summary.package_digest,
+                "source_digest": summary.source_digest,
+                "required_scopes": summary.required_scopes,
+                "risk_level": summary.risk_level,
+            }
+            for summary in app.state.skill_service.discover(
+                tenant_id=context.tenant_id,
+                workspace_id=workspace_id,
+                user_id=context.user_id,
+            )
+        ]
+        connectors = [
+            {
+                "id": connector.id,
+                "name": connector.display_name,
+                "type": connector.type.value,
+                "capabilities": [
+                    capability.model_dump(mode="json")
+                    for capability in connector.capabilities
+                    if capability.enabled
+                ],
+            }
+            for connector in app.state.connector_registry.list_connectors(
+                context.tenant_id, workspace_id
+            )
+            if connector.status.value == "enabled"
+        ]
+        agents = [
+            {
+                "id": agent.id,
+                "name": agent.name,
+                "description": agent.description,
+                "version": agent.published_version,
+            }
+            for agent in app.state.agent_registry.list(
+                context.tenant_id, workspace_id
+            )
+            if agent.status == "published" and agent.published_version is not None
+        ]
+        knowledge = [
+            {"id": item.id, "name": item.name, "description": item.description}
+            for item in app.state.knowledge_service.list_bases_for_workspace(
+                context.tenant_id, workspace_id
+            )
+        ]
+        return {
+            "workspace_id": workspace_id,
+            "skills": installed_skills,
+            "connectors": connectors,
+            "agents": agents,
+            "knowledge": knowledge,
+            "skill_service_available": app.state.skill_service is not None,
+        }
+
+    @app.get("/api/workspaces/{workspace_id}/skill-runtime")
+    def get_workspace_skill_runtime_hook(
+        workspace_id: str,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        service = app.state.skill_service
+        if service is None:
+            return {
+                "available": False,
+                "workspace_id": workspace_id,
+                "reason": "Skill Runtime service is not configured",
+            }
+        if hasattr(service, "capability_snapshot"):
+            snapshot = service.capability_snapshot(
+                tenant_id=context.tenant_id,
+                workspace_id=workspace_id,
+                user_id=context.user_id,
+            )
+            return {
+                "available": True,
+                "workspace_id": workspace_id,
+                "capabilities": (
+                    snapshot.model_dump(mode="json")
+                    if hasattr(snapshot, "model_dump")
+                    else snapshot
+                ),
+            }
+        return {
+            "available": True,
+            "workspace_id": workspace_id,
+            "capabilities": {},
+        }
+
+    @app.get("/api/threads/{thread_id}/suggestions")
+    def get_thread_suggestions(
+        thread_id: str,
+        limit: int = Query(default=3, ge=1, le=6),
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        app.state.chat_service.get_thread(context.tenant_id, thread_id)
+        messages = app.state.chat_service.list_messages(context.tenant_id, thread_id)
+        safe_messages = [
+            message for message in messages
+            if message.role.value in {"user", "assistant"}
+        ][-6:]
+        last_text = safe_messages[-1].content[:500] if safe_messages else ""
+        candidates = [
+            "继续完善这个结果，并说明下一步。",
+            "检查当前结果是否遗漏关键条件。",
+            "把当前结果整理成可复用的 Agent。",
+            "基于现有上下文生成一份简洁总结。",
+            "列出当前产物和仍待处理的问题。",
+            "继续执行下一个排队任务。",
+        ]
+        if "error" in last_text.lower() or "失败" in last_text:
+            candidates.insert(0, "分析刚才的失败原因并尝试修复。")
+        return {
+            "thread_id": thread_id,
+            "context_summary": last_text,
+            "suggestions": candidates[:limit],
+        }
+
+    @app.get("/api/threads/{thread_id}/bootstrap")
+    def bootstrap_chat_thread(
+        thread_id: str,
+        event_limit: int = Query(default=100, ge=1, le=500),
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        thread = app.state.chat_service.get_thread(context.tenant_id, thread_id)
+        messages = app.state.chat_service.list_messages(context.tenant_id, thread_id)
+        active_run = app.state.store.get_active_thread_run(context.tenant_id, thread_id)
+        events = app.state.store.list_thread_events(context.tenant_id, thread_id)
+        return {
+            "thread": thread.model_dump(mode="json"),
+            "messages": [message.model_dump(mode="json") for message in messages],
+            "active_run": active_run.model_dump(mode="json") if active_run else None,
+            "events": [event.model_dump(mode="json") for event in events[-event_limit:]],
+            "last_event_id": events[-1].thread_sequence if events else 0,
+            "reconnect": {
+                "events_url": f"/api/threads/{thread.id}/events",
+                "after_sequence": events[-1].thread_sequence if events else 0,
+            },
+        }
+
+    @app.post("/api/threads/{thread_id}/shares", status_code=status.HTTP_201_CREATED)
+    def create_thread_share(
+        thread_id: str,
+        payload: ThreadShareCreate,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        link, token = app.state.thread_share_service.create(
+            context.tenant_id, context.user_id, thread_id, payload
+        )
+        return {
+            "id": link.id,
+            "public_id": link.public_id,
+            "token": token,
+            "url": f"/public/threads/{link.public_id}#token={token}",
+            "expires_at": link.expires_at.isoformat(),
+            "redaction_policy": link.redaction_policy,
+        }
+
+    @app.get("/api/threads/{thread_id}/shares")
+    def list_thread_shares(
+        thread_id: str,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict[str, Any]]:
+        app.state.chat_service.get_thread(context.tenant_id, thread_id)
+        return [
+            link.model_dump(mode="json", exclude={"token_hash"})
+            for link in app.state.thread_share_store.list(context.tenant_id, thread_id)
+        ]
+
+    @app.delete("/api/threads/{thread_id}/shares/{share_id}")
+    def revoke_thread_share(
+        thread_id: str,
+        share_id: str,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        link = app.state.thread_share_store.get(context.tenant_id, share_id)
+        if link.thread_id != thread_id:
+            raise NotFoundError(f"Thread share link not found: {share_id}")
+        return app.state.thread_share_store.revoke(
+            context.tenant_id, share_id, context.user_id
+        ).model_dump(mode="json", exclude={"token_hash"})
+
+    @app.get("/public/threads/{public_id}")
+    def read_public_thread(
+        public_id: str,
+        token: str = Header(alias="X-Share-Token", min_length=20),
+    ) -> dict[str, Any]:
+        return app.state.thread_share_service.read_public(public_id, token)
+
+    @app.post("/api/agents", status_code=status.HTTP_201_CREATED)
+    def create_agent_definition(
+        payload: AgentDefinitionCreate,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        definition, version = app.state.agent_registry_service.create(
+            context.tenant_id, context.user_id, payload
+        )
+        return {
+            "agent": definition.model_dump(mode="json"),
+            "version": version.model_dump(mode="json"),
+        }
+
+    @app.get("/api/agents")
+    def list_agent_definitions(
+        workspace_id: str | None = None,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict[str, Any]]:
+        return [
+            item.model_dump(mode="json")
+            for item in app.state.agent_registry.list(context.tenant_id, workspace_id)
+        ]
+
+    @app.get("/api/agents/{agent_id}")
+    def get_agent_definition(
+        agent_id: str,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        definition = app.state.agent_registry.get(context.tenant_id, agent_id)
+        return {
+            "agent": definition.model_dump(mode="json"),
+            "versions": [
+                item.model_dump(mode="json")
+                for item in app.state.agent_registry.list_versions(context.tenant_id, agent_id)
+            ],
+        }
+
+    @app.post("/api/threads/{thread_id}/extract-agent")
+    def extract_agent_draft(
+        thread_id: str,
+        payload: AgentExtractRequest | None = None,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        request_payload = payload or AgentExtractRequest()
+        return app.state.agent_registry_service.extract(
+            context.tenant_id, thread_id, request_payload.name
+        ).model_dump(mode="json")
+
+    @app.post("/api/agents/{agent_id}/versions", status_code=status.HTTP_201_CREATED)
+    def create_agent_version(
+        agent_id: str,
+        payload: AgentVersionCreate,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        return app.state.agent_registry_service.create_version(
+            context.tenant_id, context.user_id, agent_id, payload.version
+        ).model_dump(mode="json")
+
+    @app.get("/api/agents/{agent_id}/versions")
+    def list_agent_versions(
+        agent_id: str,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict[str, Any]]:
+        return [
+            item.model_dump(mode="json")
+            for item in app.state.agent_registry.list_versions(context.tenant_id, agent_id)
+        ]
+
+    @app.get("/api/agents/{agent_id}/history")
+    def get_agent_history(
+        agent_id: str,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        definition = app.state.agent_registry.get(context.tenant_id, agent_id)
+        return {
+            "agent_id": agent_id,
+            "published_version": definition.published_version,
+            "versions": [
+                item.model_dump(mode="json")
+                for item in app.state.agent_registry.list_versions(
+                    context.tenant_id, agent_id
+                )
+            ],
+        }
+
+    @app.post("/api/agents/{agent_id}/versions/{version}/publish")
+    def publish_agent_version(
+        agent_id: str,
+        version: int,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        definition, published = app.state.agent_registry_service.publish(
+            context.tenant_id, agent_id, version
+        )
+        return {
+            "agent": definition.model_dump(mode="json"),
+            "version": published.model_dump(mode="json"),
+        }
+
+    @app.post("/api/agents/{agent_id}/versions/{version}/restore")
+    def restore_agent_version(
+        agent_id: str,
+        version: int,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        return app.state.agent_registry_service.restore_as_new(
+            context.tenant_id, context.user_id, agent_id, version
+        ).model_dump(mode="json")
+
+    @app.post("/api/agents/{agent_id}/runs", status_code=status.HTTP_202_ACCEPTED)
+    def run_agent_definition(
+        agent_id: str,
+        payload: AgentRunRequest,
+        background_tasks: BackgroundTasks,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        invocation = app.state.agent_registry_service.run(
+            context.tenant_id, context.user_id, agent_id, payload
+        )
+        dispatch_chat_run(
+            context.tenant_id,
+            MessageDispatch(
+                message_id=invocation.message_id,
+                run_id=invocation.run_id,
+                dispatch_status=ChatMessageDispatchStatus.INFLIGHT,
+                events_url=invocation.events_url,
+                run_started=True,
+            ),
+            context.user_id,
+            background_tasks,
+        )
+        return invocation.model_dump(mode="json")
+
+    @app.get("/api/speech/capabilities")
+    def get_speech_capabilities() -> dict[str, Any]:
+        capability = app.state.speech_gateway.capabilities().model_copy(
+            update={"max_audio_bytes": app.state.settings.speech_max_audio_bytes}
+        )
+        return capability.model_dump(mode="json")
+
+    @app.post("/api/speech/transcribe")
+    def transcribe_speech(
+        payload: TranscriptionRequest,
+        response: Response,
+    ) -> dict[str, Any]:
+        capability = app.state.speech_gateway.capabilities()
+        if not capability.transcription:
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+            return {"capability": get_speech_capabilities(), "transcript": None}
+        max_audio_bytes = app.state.settings.speech_max_audio_bytes
+        if len(payload.audio_base64) > ((max_audio_bytes + 2) // 3) * 4 + 8:
+            raise ValueError("Audio exceeds the configured speech size limit")
+        try:
+            audio = base64.b64decode(payload.audio_base64, validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise ValueError("audio_base64 is not valid base64") from error
+        if not audio or len(audio) > max_audio_bytes:
+            raise ValueError("Audio is empty or exceeds the configured speech size limit")
+        return {
+            "transcript": app.state.speech_gateway.transcribe(
+                audio=audio, content_type=payload.content_type, language=payload.language
+            )
+        }
+
+    @app.post("/api/speech/summarize")
+    def summarize_speech_text(
+        payload: SpeechSummaryRequest,
+        response: Response,
+    ) -> dict[str, Any]:
+        if not app.state.speech_gateway.capabilities().summarization:
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+            return {"capability": get_speech_capabilities(), "summary": None}
+        return {
+            "summary": app.state.speech_gateway.summarize(
+                text=payload.text, max_characters=payload.max_characters
+            )
+        }
+
+    @app.post("/api/speech/synthesize")
+    def synthesize_speech(
+        payload: TextToSpeechRequest,
+        response: Response,
+    ) -> dict[str, Any]:
+        if not app.state.speech_gateway.capabilities().text_to_speech:
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+            return {"capability": get_speech_capabilities(), "audio_base64": None}
+        audio, content_type = app.state.speech_gateway.synthesize(
+            text=payload.text, voice=payload.voice, format=payload.format
+        )
+        return {
+            "audio_base64": base64.b64encode(audio).decode("ascii"),
+            "content_type": content_type,
+        }
 
     @app.post("/api/runs", status_code=status.HTTP_201_CREATED)
     def create_run(
@@ -2016,6 +2774,50 @@ def create_app(
         )
         return connector.model_dump(mode="json")
 
+    def resume_reconnected_connector_action(
+        connector: ConnectorDefinition,
+        oauth_result: Any,
+        resolved_by_user_id: str,
+        background_tasks: BackgroundTasks,
+    ) -> None:
+        if not oauth_result.reconnect_action_id or not oauth_result.reconnect_run_id:
+            return
+        app.state.connector_registry.update_connector_status(
+            connector.tenant_id,
+            connector.id,
+            ConnectorStatus.ENABLED,
+        )
+        app.state.store.retry_connector_action_after_reconnect(
+            connector.tenant_id,
+            oauth_result.reconnect_action_id,
+            connector_id=connector.id,
+            resolved_by_user_id=resolved_by_user_id,
+        )
+        run = app.state.store.get_run(
+            connector.tenant_id, oauth_result.reconnect_run_id
+        )
+        if app.state.settings.run_execution_dispatch_mode == "queue":
+            queue = app.state.job_queue
+            if queue is None:
+                raise RedisQueueConfigurationError("job queue backend is disabled")
+            queue.enqueue(
+                JobType.RUN_EXECUTION,
+                RunExecutionJob(
+                    tenant_id=run.tenant_id,
+                    workspace_id=run.workspace_id,
+                    user_id=run.user_id,
+                    run_id=run.id,
+                    requested_by_user_id=resolved_by_user_id,
+                ),
+                max_attempts=app.state.settings.worker_job_max_attempts,
+            )
+            return
+        background_tasks.add_task(
+            execute_chat_run_chain,
+            run.tenant_id,
+            run.id,
+        )
+
     @app.post("/api/connectors/{connector_id}/oauth/authorize")
     def authorize_connector_oauth(
         connector_id: str,
@@ -2043,11 +2845,59 @@ def create_app(
         )
         return result.model_dump(mode="json")
 
+    @app.post("/api/connectors/{connector_id}/reconnect")
+    def reconnect_connector_action(
+        connector_id: str,
+        payload: ConnectorReconnectRequest,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "connectors.manage")
+        connector = app.state.connector_registry.get_connector(
+            context.tenant_id,
+            connector_id,
+        )
+        run = app.state.store.get_run(context.tenant_id, payload.run_id)
+        action = app.state.store.get_agent_action(context.tenant_id, payload.action_id)
+        if (
+            run.thread_id != payload.thread_id
+            or action.run_id != run.id
+            or action.thread_id != payload.thread_id
+            or action.status != "uncertain"
+            or action.failure_class != "connector_reconnect_required"
+            or action.observation is None
+            or action.observation.output.get("connector_id") != connector.id
+        ):
+            raise NotFoundError("Connector reconnect action is no longer available")
+        result = app.state.connector_oauth_service.build_authorization_url(
+            connector=connector,
+            requested_by_user_id=context.user_id,
+            reconnect_thread_id=payload.thread_id,
+            reconnect_run_id=payload.run_id,
+            reconnect_action_id=payload.action_id,
+        )
+        record_audit_event(
+            app=app,
+            tenant_id=context.tenant_id,
+            workspace_id=connector.workspace_id,
+            user_id=context.user_id,
+            run_id=run.id,
+            event_type="connector.reconnect_started",
+            metadata={
+                "connector_id": connector.id,
+                "action_id": action.id,
+                "thread_id": payload.thread_id,
+            },
+            request=request,
+        )
+        return result.model_dump(mode="json")
+
     @app.post("/api/connectors/{connector_id}/oauth/callback")
     def complete_connector_oauth(
         connector_id: str,
         payload: ConnectorOAuthCallbackRequest,
         request: Request,
+        background_tasks: BackgroundTasks,
         context: RequestContext = Depends(get_request_context),
     ) -> dict:
         require_permission(request, context, "connectors.manage")
@@ -2069,7 +2919,76 @@ def create_app(
             metadata=connector_oauth_audit_metadata(connector, result),
             request=request,
         )
+        resume_reconnected_connector_action(
+            connector,
+            result,
+            context.user_id,
+            background_tasks,
+        )
         return result.model_dump(mode="json")
+
+    @app.get(
+        "/api/connectors/{connector_id}/oauth/callback",
+        response_class=HTMLResponse,
+    )
+    def complete_connector_oauth_redirect(
+        connector_id: str,
+        background_tasks: BackgroundTasks,
+        request: Request,
+        code: str = Query(min_length=1),
+        state: str = Query(min_length=1),
+    ) -> HTMLResponse:
+        session = app.state.connector_oauth_service.pending_authorization(state)
+        if session.connector_id != connector_id:
+            raise NotFoundError("Connector OAuth state does not match callback")
+        connector = app.state.connector_registry.get_connector(
+            session.tenant_id,
+            connector_id,
+        )
+        result = app.state.connector_oauth_service.complete_callback(
+            connector=connector,
+            request=ConnectorOAuthCallbackRequest(code=code, state=state),
+        )
+        record_audit_event(
+            app=app,
+            tenant_id=session.tenant_id,
+            workspace_id=session.workspace_id,
+            user_id=session.requested_by_user_id,
+            run_id=result.reconnect_run_id,
+            event_type="connector.oauth_completed",
+            metadata=connector_oauth_audit_metadata(connector, result),
+            request=request,
+        )
+        resume_reconnected_connector_action(
+            connector,
+            result,
+            session.requested_by_user_id,
+            background_tasks,
+        )
+        message = (
+            "Connector reconnected. The agent action is resuming."
+            if result.reconnect_action_id
+            else "Connector connected successfully."
+        )
+        payload = json.dumps(
+            {
+                "type": "taroai.connector.oauth.completed",
+                "connector_id": connector.id,
+                "run_id": result.reconnect_run_id,
+                "action_id": result.reconnect_action_id,
+            }
+        )
+        return HTMLResponse(
+            "<!doctype html><meta charset='utf-8'>"
+            f"<title>{message}</title>"
+            "<style>body{font:15px system-ui;margin:0;display:grid;place-items:center;"
+            "min-height:100vh;background:#f7f6f2;color:#242421}main{max-width:28rem;"
+            "padding:2rem;border:1px solid #deddd7;border-radius:16px;background:white}"
+            "h1{font-size:20px}p{color:#62625d}</style>"
+            f"<main><h1>{message}</h1><p>You can close this window.</p></main>"
+            f"<script>window.opener?.postMessage({payload}, window.location.origin);"
+            "window.setTimeout(()=>window.close(),900);</script>"
+        )
 
     @app.post("/api/connectors/{connector_id}/oauth/refresh")
     def refresh_connector_oauth(
@@ -2809,6 +3728,7 @@ def create_app(
     @app.post("/api/runs/{run_id}/execute")
     def execute_run(
         run_id: str,
+        background_tasks: BackgroundTasks,
         response: Response,
         payload: RunExecutionRequest | None = None,
         context: RequestContext = Depends(get_request_context),
@@ -2849,11 +3769,18 @@ def create_app(
                 queue=app.state.settings.run_execution_queue_name,
             ).model_dump(mode="json")
         state = app.state.runtime.execute_run(context.tenant_id, run_id)
+        dispatch_next_after_terminal_run(
+            context.tenant_id,
+            run_id,
+            context.user_id,
+            background_tasks,
+        )
         return state.model_dump(mode="json")
 
     @app.post("/api/runs/{run_id}/cancel")
     def cancel_run(
         run_id: str,
+        background_tasks: BackgroundTasks,
         payload: RunCancelRequest | None = None,
         context: RequestContext = Depends(get_request_context),
     ) -> dict:
@@ -2864,11 +3791,60 @@ def create_app(
             cancelled_by_user_id=context.user_id,
             reason_code=resolved_payload.reason_code,
         )
+        dispatch_next_after_terminal_run(
+            context.tenant_id,
+            run_id,
+            context.user_id,
+            background_tasks,
+        )
         return run.model_dump(mode="json")
+
+    @app.post("/api/runs/{run_id}/actions/{action_id}/resolve")
+    def resolve_uncertain_agent_action(
+        run_id: str,
+        action_id: str,
+        payload: UncertainActionResolutionRequest,
+        background_tasks: BackgroundTasks,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        run = app.state.store.get_run(context.tenant_id, run_id)
+        action = app.state.store.get_agent_action(context.tenant_id, action_id)
+        if action.run_id != run.id:
+            raise NotFoundError(f"Agent action not found: {action_id}")
+        resolved = app.state.store.resolve_uncertain_agent_action(
+            context.tenant_id,
+            action_id,
+            resolution=payload.resolution,
+            resolved_by_user_id=context.user_id,
+            note=payload.note,
+        )
+        if app.state.settings.run_execution_dispatch_mode == "queue":
+            queue = app.state.job_queue
+            if queue is None:
+                raise RedisQueueConfigurationError("job queue backend is disabled")
+            queue.enqueue(
+                JobType.RUN_EXECUTION,
+                RunExecutionJob(
+                    tenant_id=run.tenant_id,
+                    workspace_id=run.workspace_id,
+                    user_id=run.user_id,
+                    run_id=run.id,
+                    requested_by_user_id=context.user_id,
+                ),
+                max_attempts=app.state.settings.worker_job_max_attempts,
+            )
+        else:
+            background_tasks.add_task(
+                execute_chat_run_chain,
+                run.tenant_id,
+                run.id,
+            )
+        return resolved.model_dump(mode="json")
 
     @app.post("/api/runs/{run_id}/retry")
     def retry_run(
         run_id: str,
+        background_tasks: BackgroundTasks,
         response: Response,
         payload: RunRetryRequest | None = None,
         context: RequestContext = Depends(get_request_context),
@@ -2926,12 +3902,19 @@ def create_app(
             requested_by_user_id=context.user_id,
             reason_code=resolved_payload.reason_code,
         )
+        dispatch_next_after_terminal_run(
+            context.tenant_id,
+            run_id,
+            context.user_id,
+            background_tasks,
+        )
         return state.model_dump(mode="json")
 
     @app.post("/api/runs/{run_id}/approvals")
     def resolve_approval(
         run_id: str,
         payload: ApprovalResolveRequest,
+        background_tasks: BackgroundTasks,
         response: Response,
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
         context: RequestContext = Depends(get_request_context),
@@ -2974,6 +3957,12 @@ def create_app(
                 approved_by_user_id=context.user_id,
             )
             response_body = state.model_dump(mode="json")
+            dispatch_next_after_terminal_run(
+                context.tenant_id,
+                run_id,
+                context.user_id,
+                background_tasks,
+            )
         save_idempotent_response(
             app.state.store,
             idempotency_request,
@@ -2986,6 +3975,7 @@ def create_app(
     def reject_approval(
         run_id: str,
         payload: ApprovalRejectRequest,
+        background_tasks: BackgroundTasks,
         response: Response,
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
         context: RequestContext = Depends(get_request_context),
@@ -3028,6 +4018,12 @@ def create_app(
                 rejected_by_user_id=context.user_id,
             )
             response_body = state.model_dump(mode="json")
+            dispatch_next_after_terminal_run(
+                context.tenant_id,
+                run_id,
+                context.user_id,
+                background_tasks,
+            )
         save_idempotent_response(
             app.state.store,
             idempotency_request,
@@ -3047,6 +4043,82 @@ def create_app(
             app.state.store.list_artifacts(context.tenant_id, run_id),
             request,
             page,
+        )
+
+    @app.post("/api/runs/{run_id}/artifacts", status_code=status.HTTP_201_CREATED)
+    def create_rich_artifact(
+        run_id: str,
+        payload: RichArtifactCreate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "storage.write")
+        if payload.run_id != run_id:
+            raise ValueError("Artifact Run path and payload must match")
+        return app.state.artifact_service.create(
+            context.tenant_id, payload
+        ).model_dump(mode="json")
+
+    @app.get("/api/artifacts/{artifact_id}")
+    def get_artifact(
+        artifact_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "storage.read")
+        artifact = app.state.store.get_artifact(context.tenant_id, artifact_id)
+        if artifact.storage_object_id:
+            storage_object = app.state.storage_catalog.get(
+                context.tenant_id, artifact.storage_object_id
+            )
+            require_storage_read_access(request, context, storage_object)
+        return artifact.model_dump(mode="json")
+
+    @app.get("/api/artifacts/{artifact_id}/preview")
+    def preview_artifact(
+        artifact_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "storage.read")
+        artifact = app.state.store.get_artifact(context.tenant_id, artifact_id)
+        if artifact.storage_object_id:
+            require_storage_read_access(
+                request,
+                context,
+                app.state.storage_catalog.get(context.tenant_id, artifact.storage_object_id),
+            )
+        return app.state.artifact_service.preview(
+            context.tenant_id, artifact_id
+        ).model_dump(mode="json")
+
+    @app.get("/api/artifacts/{artifact_id}/download")
+    def download_artifact(
+        artifact_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> Response:
+        require_permission(request, context, "storage.read")
+        artifact_record = app.state.store.get_artifact(context.tenant_id, artifact_id)
+        if artifact_record.storage_object_id:
+            require_storage_read_access(
+                request,
+                context,
+                app.state.storage_catalog.get(
+                    context.tenant_id, artifact_record.storage_object_id
+                ),
+            )
+        artifact, download = app.state.artifact_service.download(
+            context.tenant_id, artifact_id
+        )
+        safe_filename = Path(artifact.name).name.replace('"', "").replace("\r", "").replace("\n", "")
+        return Response(
+            content=download.content,
+            media_type=download.content_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="{safe_filename}"',
+                "X-Content-Type-Options": "nosniff",
+            },
         )
 
     @app.get("/api/runs/{run_id}/trace")
@@ -5151,6 +6223,340 @@ def create_app(
         )
         return entry.model_dump(mode="json")
 
+    @app.post("/api/skills/import/zip", status_code=status.HTTP_201_CREATED)
+    def import_skill_zip(
+        payload: SkillZipImportRequest,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "skills.publish")
+        try:
+            archive = base64.b64decode(payload.archive_base64, validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise ValueError("archive_base64 must be valid base64") from error
+        package = app.state.skill_service.import_zip(
+            tenant_id=context.tenant_id,
+            created_by_user_id=context.user_id,
+            archive_bytes=archive,
+            manifest=payload.manifest,
+            source_url=payload.source_url,
+            source_ref=payload.source_ref,
+            subdirectory=payload.subdirectory,
+        )
+        metadata = {
+            "skill_id": package.skill_id,
+            "version": package.version,
+            "package_digest": package.package_digest,
+            "source_digest": package.provenance.source_digest,
+            "source_type": package.provenance.source_type.value,
+            "file_count": len(package.files),
+            "size_bytes": sum(item.size_bytes for item in package.files),
+        }
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=payload.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="skill.package_imported",
+            metadata=metadata,
+            request=request,
+        )
+        if payload.workspace_id is not None:
+            app.state.store.record_billing_meter(
+                tenant_id=context.tenant_id,
+                run_id=None,
+                workspace_id=payload.workspace_id,
+                user_id=context.user_id,
+                skill_id=package.skill_id,
+                meter_type="skill_package_storage_bytes",
+                quantity=float(metadata["size_bytes"]),
+                unit="byte",
+                metadata={key: metadata[key] for key in (
+                    "version", "package_digest", "source_digest", "source_type"
+                )},
+            )
+        return package.model_dump(mode="json")
+
+    @app.post("/api/skills/import/github", status_code=status.HTTP_201_CREATED)
+    def import_skill_github(
+        payload: SkillGithubImportRequest,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "skills.publish")
+        package = app.state.skill_service.import_github(
+            tenant_id=context.tenant_id,
+            created_by_user_id=context.user_id,
+            source=payload.source,
+            manifest=payload.manifest,
+        )
+        metadata = {
+            "skill_id": package.skill_id,
+            "version": package.version,
+            "package_digest": package.package_digest,
+            "source_digest": package.provenance.source_digest,
+            "source_type": package.provenance.source_type.value,
+            "source_url": package.provenance.source_url,
+            "source_ref": package.provenance.source_ref,
+            "file_count": len(package.files),
+            "size_bytes": sum(item.size_bytes for item in package.files),
+        }
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=payload.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="skill.package_imported",
+            metadata=metadata,
+            request=request,
+        )
+        if payload.workspace_id is not None:
+            app.state.store.record_billing_meter(
+                tenant_id=context.tenant_id,
+                run_id=None,
+                workspace_id=payload.workspace_id,
+                user_id=context.user_id,
+                skill_id=package.skill_id,
+                meter_type="skill_package_storage_bytes",
+                quantity=float(metadata["size_bytes"]),
+                unit="byte",
+                metadata={key: metadata[key] for key in (
+                    "version", "package_digest", "source_digest", "source_type"
+                )},
+            )
+        return package.model_dump(mode="json")
+
+    @app.get("/api/skills/{skill_id}/packages")
+    def list_skill_packages(
+        skill_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict]:
+        require_permission(request, context, "skills.read")
+        return [
+            item.model_dump(mode="json")
+            for item in app.state.skill_service.list_package_versions(
+                tenant_id=context.tenant_id,
+                skill_id=skill_id,
+            )
+        ]
+
+    @app.get("/api/skills/{skill_id}/packages/{version}")
+    def get_skill_package(
+        skill_id: str,
+        version: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "skills.read")
+        return app.state.skill_service.get_package(
+            tenant_id=context.tenant_id,
+            skill_id=skill_id,
+            version=version,
+        ).model_dump(mode="json")
+
+    @app.get("/api/skills/{skill_id}/packages/{version}/skill-md")
+    def get_skill_package_instructions(
+        skill_id: str,
+        version: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "skills.read")
+        package = app.state.skill_service.get_package(
+            tenant_id=context.tenant_id,
+            skill_id=skill_id,
+            version=version,
+        )
+        return {
+            "skill_id": skill_id,
+            "version": version,
+            "package_digest": package.package_digest,
+            "source_digest": package.provenance.source_digest,
+            "skill_md": package.skill_md,
+        }
+
+    @app.get("/api/skills/{skill_id}/packages/{version}/files")
+    def list_skill_package_files(
+        skill_id: str,
+        version: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict]:
+        require_permission(request, context, "skills.read")
+        return [
+            item.model_dump(mode="json")
+            for item in app.state.skill_service.list_files(
+                context.tenant_id, skill_id, version
+            )
+        ]
+
+    @app.get("/api/skills/{skill_id}/packages/{version}/files/{path:path}")
+    def get_skill_package_file(
+        skill_id: str,
+        version: str,
+        path: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "skills.read")
+        item = app.state.skill_service.get_file(
+            context.tenant_id, skill_id, version, path
+        )
+        try:
+            text_content = item.content.decode("utf-8")
+        except UnicodeDecodeError:
+            text_content = None
+        return {
+            "path": item.path,
+            "kind": item.kind.value,
+            "size_bytes": item.size_bytes,
+            "content_digest": item.content_digest,
+            "content": text_content,
+            "content_base64": base64.b64encode(item.content).decode("ascii"),
+        }
+
+    @app.get("/api/skills/{skill_id}/packages/{version}/source")
+    def get_skill_package_source(
+        skill_id: str,
+        version: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "skills.read")
+        package = app.state.skill_service.get_package(
+            tenant_id=context.tenant_id,
+            skill_id=skill_id,
+            version=version,
+        )
+        return {
+            "skill_id": skill_id,
+            "version": version,
+            "package_digest": package.package_digest,
+            **package.provenance.model_dump(mode="json"),
+        }
+
+    @app.post("/api/skills/{skill_id}/packages/{version}/evaluate")
+    def evaluate_skill_package(
+        skill_id: str,
+        version: str,
+        payload: SkillEvaluateRequest,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "skills.publish")
+        evaluation = app.state.skill_service.evaluate(
+            tenant_id=context.tenant_id,
+            workspace_id=payload.workspace_id,
+            skill_id=skill_id,
+            version=version,
+            created_by_user_id=context.user_id,
+            suite=payload.suite,
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=payload.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="skill.package_evaluated",
+            metadata={
+                "skill_id": skill_id,
+                "version": version,
+                "evaluation_run_id": evaluation.id,
+                "package_digest": evaluation.package_digest,
+                "suite_digest": evaluation.suite_digest,
+                "status": evaluation.status.value,
+                "score": evaluation.score,
+                "passed": evaluation.passed,
+            },
+            request=request,
+        )
+        return evaluation.model_dump(mode="json")
+
+    @app.get("/api/skills/{skill_id}/packages/{version}/evaluations")
+    def list_skill_package_evaluations(
+        skill_id: str,
+        version: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict]:
+        require_permission(request, context, "skills.read")
+        return [
+            item.model_dump(mode="json")
+            for item in app.state.skill_registry.list_evaluation_runs(
+                context.tenant_id, skill_id, version
+            )
+        ]
+
+    @app.post("/api/skills/{skill_id}/packages/{version}/publish")
+    def publish_skill_package(
+        skill_id: str,
+        version: str,
+        payload: SkillPackagePublishRequest,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "skills.publish")
+        record = app.state.skill_service.publish(
+            tenant_id=context.tenant_id,
+            skill_id=skill_id,
+            version=version,
+            evaluation_run_id=payload.evaluation_run_id,
+        )
+        metadata = {
+            "skill_id": skill_id,
+            "version": version,
+            "package_digest": record.package.package_digest,
+            "source_digest": record.package.provenance.source_digest,
+            "evaluation_run_id": payload.evaluation_run_id,
+            "status": record.status.value,
+        }
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=None,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="skill.package_published",
+            metadata=metadata,
+            request=request,
+        )
+        return record.model_dump(mode="json")
+
+    @app.post("/api/skills/{skill_id}/packages/{version}/disable")
+    def disable_skill_package(
+        skill_id: str,
+        version: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "skills.publish")
+        record = app.state.skill_service.disable(
+            tenant_id=context.tenant_id,
+            skill_id=skill_id,
+            version=version,
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=None,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="skill.package_disabled",
+            metadata={
+                "skill_id": skill_id,
+                "version": version,
+                "package_digest": record.package.package_digest,
+                "source_digest": record.package.provenance.source_digest,
+                "status": record.status.value,
+            },
+            request=request,
+        )
+        return record.model_dump(mode="json")
+
     @app.get("/api/skills")
     def list_skills(
         request: Request,
@@ -5260,15 +6666,210 @@ def create_app(
         workspace_id: str,
         skill_id: str,
         request: Request,
+        payload: SkillExactInstallRequest | None = Body(default=None),
         context: RequestContext = Depends(get_request_context),
     ) -> dict:
         require_permission(request, context, "skills.install")
-        return app.state.skill_registry.install_for_workspace(
+        if payload is None:
+            installation = app.state.skill_registry.install_for_workspace(
+                tenant_id=context.tenant_id,
+                workspace_id=workspace_id,
+                skill_id=skill_id,
+                installed_by_user_id=context.user_id,
+            )
+        else:
+            installation = app.state.skill_service.install(
+                tenant_id=context.tenant_id,
+                workspace_id=workspace_id,
+                skill_id=skill_id,
+                version=payload.version,
+                package_digest=payload.package_digest,
+                installed_by_user_id=context.user_id,
+            )
+        metadata = {
+            "skill_id": skill_id,
+            "version": installation.installed_version,
+            "package_digest": installation.package_digest,
+            "source_digest": installation.source_digest,
+            "package_kind": installation.package_kind.value,
+            "status": installation.status.value,
+        }
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="skill.installed",
+            metadata=metadata,
+            request=request,
+        )
+        app.state.store.record_billing_meter(
+            tenant_id=context.tenant_id,
+            run_id=None,
+            workspace_id=workspace_id,
+            user_id=context.user_id,
+            skill_id=skill_id,
+            meter_type="skill_management_operation_count",
+            quantity=1,
+            unit="operation",
+            metadata={"operation": "install", **metadata},
+        )
+        return installation.model_dump(mode="json")
+
+    @app.post("/api/workspaces/{workspace_id}/skills/{skill_id}/upgrade")
+    def upgrade_workspace_skill(
+        workspace_id: str,
+        skill_id: str,
+        payload: SkillVersionMoveRequest,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "skills.install")
+        installation = app.state.skill_service.upgrade(
             tenant_id=context.tenant_id,
             workspace_id=workspace_id,
             skill_id=skill_id,
-            installed_by_user_id=context.user_id,
-        ).model_dump(mode="json")
+            target_version=payload.target_version,
+            expected_package_digest=payload.expected_package_digest,
+            updated_by_user_id=context.user_id,
+        )
+        metadata = {
+            "skill_id": skill_id,
+            "version": installation.installed_version,
+            "package_digest": installation.package_digest,
+            "source_digest": installation.source_digest,
+            "operation": "upgrade",
+        }
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="skill.upgraded",
+            metadata=metadata,
+            request=request,
+        )
+        app.state.store.record_billing_meter(
+            tenant_id=context.tenant_id, run_id=None, workspace_id=workspace_id,
+            user_id=context.user_id, skill_id=skill_id,
+            meter_type="skill_management_operation_count", quantity=1,
+            unit="operation", metadata=metadata,
+        )
+        return installation.model_dump(mode="json")
+
+    @app.post("/api/workspaces/{workspace_id}/skills/{skill_id}/rollback")
+    def rollback_workspace_skill(
+        workspace_id: str,
+        skill_id: str,
+        payload: SkillVersionMoveRequest,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "skills.install")
+        installation = app.state.skill_service.rollback(
+            tenant_id=context.tenant_id,
+            workspace_id=workspace_id,
+            skill_id=skill_id,
+            target_version=payload.target_version,
+            expected_package_digest=payload.expected_package_digest,
+            rolled_back_by_user_id=context.user_id,
+        )
+        metadata = {
+            "skill_id": skill_id,
+            "version": installation.installed_version,
+            "package_digest": installation.package_digest,
+            "source_digest": installation.source_digest,
+            "operation": "rollback",
+        }
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="skill.rolled_back",
+            metadata=metadata,
+            request=request,
+        )
+        app.state.store.record_billing_meter(
+            tenant_id=context.tenant_id, run_id=None, workspace_id=workspace_id,
+            user_id=context.user_id, skill_id=skill_id,
+            meter_type="skill_management_operation_count", quantity=1,
+            unit="operation", metadata=metadata,
+        )
+        return installation.model_dump(mode="json")
+
+    @app.delete("/api/workspaces/{workspace_id}/skills/{skill_id}")
+    def uninstall_workspace_skill(
+        workspace_id: str,
+        skill_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "skills.install")
+        installation = app.state.skill_service.uninstall(
+            tenant_id=context.tenant_id,
+            workspace_id=workspace_id,
+            skill_id=skill_id,
+        )
+        metadata = {
+            "skill_id": skill_id,
+            "version": installation.installed_version,
+            "package_digest": installation.package_digest,
+            "source_digest": installation.source_digest,
+        }
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="skill.uninstalled",
+            metadata=metadata,
+            request=request,
+        )
+        app.state.store.record_billing_meter(
+            tenant_id=context.tenant_id, run_id=None, workspace_id=workspace_id,
+            user_id=context.user_id, skill_id=skill_id,
+            meter_type="skill_management_operation_count", quantity=1,
+            unit="operation", metadata={"operation": "uninstall", **metadata},
+        )
+        return installation.model_dump(mode="json")
+
+    @app.get("/api/workspaces/{workspace_id}/skills/{skill_id}/materialization")
+    def preview_workspace_skill_materialization(
+        workspace_id: str,
+        skill_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "skills.read")
+        plan = app.state.skill_service.materialization_plan(
+            tenant_id=context.tenant_id,
+            workspace_id=workspace_id,
+            skill_id=skill_id,
+        )
+        return {
+            "skill_id": plan.skill_id,
+            "version": plan.version,
+            "root_path": plan.root_path,
+            "package_digest": plan.package_digest,
+            "source_digest": plan.source_digest,
+            "runtime_sandbox": plan.runtime_sandbox,
+            "timeout_seconds": plan.timeout_seconds,
+            "resolved_dependencies": plan.resolved_dependencies,
+            "writes": [
+                {
+                    "path": item.path,
+                    "content_digest": item.content_digest,
+                    "size_bytes": item.size_bytes,
+                    "mode": item.mode,
+                }
+                for item in plan.writes
+            ],
+        }
 
     @app.get("/api/workspaces/{workspace_id}/skills")
     def list_workspace_skills(
@@ -5336,11 +6937,30 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> dict:
         require_permission(request, context, "skills.install")
-        return app.state.skill_registry.enable_for_workspace(
-            context.tenant_id,
-            workspace_id,
-            skill_id,
-        ).model_dump(mode="json")
+        installation = app.state.skill_service.enable(
+            tenant_id=context.tenant_id,
+            workspace_id=workspace_id,
+            skill_id=skill_id,
+        )
+        metadata = {
+            "skill_id": skill_id,
+            "version": installation.installed_version,
+            "package_digest": installation.package_digest,
+            "source_digest": installation.source_digest,
+            "status": installation.status.value,
+        }
+        record_audit_event(
+            app, tenant_id=context.tenant_id, workspace_id=workspace_id,
+            user_id=context.user_id, run_id=None, event_type="skill.enabled",
+            metadata=metadata, request=request,
+        )
+        app.state.store.record_billing_meter(
+            tenant_id=context.tenant_id, run_id=None, workspace_id=workspace_id,
+            user_id=context.user_id, skill_id=skill_id,
+            meter_type="skill_management_operation_count", quantity=1,
+            unit="operation", metadata={"operation": "enable", **metadata},
+        )
+        return installation.model_dump(mode="json")
 
     @app.post("/api/workspaces/{workspace_id}/skills/{skill_id}/disable")
     def disable_workspace_skill(
@@ -5350,11 +6970,30 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> dict:
         require_permission(request, context, "skills.install")
-        return app.state.skill_registry.disable_for_workspace(
+        installation = app.state.skill_registry.disable_for_workspace(
             context.tenant_id,
             workspace_id,
             skill_id,
-        ).model_dump(mode="json")
+        )
+        metadata = {
+            "skill_id": skill_id,
+            "version": installation.installed_version,
+            "package_digest": installation.package_digest,
+            "source_digest": installation.source_digest,
+            "status": installation.status.value,
+        }
+        record_audit_event(
+            app, tenant_id=context.tenant_id, workspace_id=workspace_id,
+            user_id=context.user_id, run_id=None, event_type="skill.disabled",
+            metadata=metadata, request=request,
+        )
+        app.state.store.record_billing_meter(
+            tenant_id=context.tenant_id, run_id=None, workspace_id=workspace_id,
+            user_id=context.user_id, skill_id=skill_id,
+            meter_type="skill_management_operation_count", quantity=1,
+            unit="operation", metadata={"operation": "disable", **metadata},
+        )
+        return installation.model_dump(mode="json")
 
     @app.post("/api/workspaces/{workspace_id}/skills/{skill_id}/invoke")
     def invoke_workspace_skill(
@@ -5514,6 +7153,82 @@ def create_app(
             "skill_id": entry.manifest.id,
             "tool_name": result.tool_name,
             "output": result.output,
+        }
+
+    @app.post("/api/uploads", status_code=status.HTTP_201_CREATED)
+    def create_atomic_upload(
+        payload: AtomicUploadRequest,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "storage.write")
+        if Path(payload.filename).name != payload.filename or payload.filename in {".", ".."}:
+            raise ValueError("Upload filename must not contain a path")
+        if payload.content_type not in app.state.settings.upload_allowed_content_types:
+            raise ValueError("Upload content type is not allowed")
+        max_bytes = app.state.settings.upload_max_bytes
+        if len(payload.content_base64) > ((max_bytes + 2) // 3) * 4 + 8:
+            raise ValueError("Upload exceeds the configured size limit")
+        try:
+            content = base64.b64decode(payload.content_base64, validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise ValueError("content_base64 is not valid base64") from error
+        if not content or len(content) > max_bytes:
+            raise ValueError("Upload is empty or exceeds the configured size limit")
+        storage_object = app.state.storage_catalog.register(
+            StorageObjectCreate(
+                tenant_id=context.tenant_id,
+                workspace_id=payload.workspace_id,
+                purpose=StoragePurpose.UPLOAD,
+                filename=payload.filename,
+                content_type=payload.content_type,
+                size_bytes=len(content),
+                acl_subjects=payload.acl_subjects,
+                sensitivity_level=payload.sensitivity_level,
+            )
+        )
+        try:
+            scan = app.state.storage_content_scanner.scan(
+                StorageContentScanRequest(storage_object=storage_object, content=content)
+            )
+            if not scan.allowed:
+                raise StorageContentRejectedError(
+                    "Upload content was rejected by the scanner"
+                )
+            upload = app.state.object_storage.upload(storage_object, content)
+            uploaded = app.state.storage_catalog.mark_uploaded(
+                context.tenant_id, storage_object.id, len(content)
+            )
+        except Exception:
+            try:
+                app.state.object_storage.delete(storage_object)
+            except Exception:
+                pass
+            try:
+                app.state.storage_catalog.mark_deleted(
+                    context.tenant_id, storage_object.id, utc_now()
+                )
+            except Exception:
+                pass
+            raise
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=payload.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="storage.uploaded",
+            metadata={
+                "storage_object_id": uploaded.id,
+                "filename": uploaded.filename,
+                "content_type": uploaded.content_type,
+                "size_bytes": uploaded.size_bytes,
+            },
+            request=request,
+        )
+        return {
+            "storage_object": uploaded.model_dump(mode="json"),
+            "upload": upload.model_dump(mode="json"),
         }
 
     @app.post("/api/storage/objects", status_code=status.HTTP_201_CREATED)
@@ -6569,6 +8284,22 @@ def build_share_grant_store(settings: Settings) -> ShareGrantStore:
         ).apply()
         return SqlShareGrantStore(config=config)
     return InMemoryShareGrantStore()
+
+
+def build_agent_registry(settings: Settings):
+    if settings.agent_registry_backend == "sql":
+        config = settings.database_config()
+        MigrationRunner(config=config, migrations_path=Path("apps/api/migrations")).apply()
+        return SqlAgentRegistry(config=config)
+    return InMemoryAgentRegistry()
+
+
+def build_thread_share_store(settings: Settings) -> ThreadShareStore:
+    if settings.thread_share_store_backend == "sql":
+        config = settings.database_config()
+        MigrationRunner(config=config, migrations_path=Path("apps/api/migrations")).apply()
+        return SqlThreadShareStore(config=config)
+    return InMemoryThreadShareStore()
 
 
 def build_billing_pricing_service(

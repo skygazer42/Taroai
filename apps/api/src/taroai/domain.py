@@ -23,6 +23,7 @@ class RunStatus(str, Enum):
     AWAITING_POLICY = "awaiting_policy"
     RUNNING = "running"
     AWAITING_APPROVAL = "awaiting_approval"
+    WAITING_FOR_USER = "waiting_for_user"
     RETRYING = "retrying"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
@@ -198,6 +199,16 @@ class Artifact(BaseModel):
     artifact_type: str
     uri: str
     created_at: datetime
+    workspace_id: str | None = None
+    thread_id: str | None = None
+    message_id: str | None = None
+    storage_object_id: str | None = None
+    content_type: str | None = None
+    size_bytes: int = Field(default=0, ge=0)
+    preview_payload: dict[str, Any] = Field(default_factory=dict)
+    dashboard_payload: dict[str, Any] | None = None
+    render_policy: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class BillingMeterEvent(BaseModel):

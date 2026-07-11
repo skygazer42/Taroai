@@ -1,4 +1,5 @@
 from taroai.connectors.dispatch import (
+    ConnectorCredentialExpiredError,
     ConnectorDispatchError,
     ConnectorDispatchResult,
     ConnectorDispatchService,
@@ -71,6 +72,7 @@ __all__ = [
     "ConnectorCapabilityRisk",
     "ConnectorCreateRequest",
     "ConnectorCredentialCreate",
+    "ConnectorCredentialExpiredError",
     "ConnectorCredentialRef",
     "ConnectorDefinition",
     "ConnectorDefinitionCreate",

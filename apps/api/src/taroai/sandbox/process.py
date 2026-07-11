@@ -113,7 +113,7 @@ class LocalProcessSandboxAdapter(SandboxAdapter):
         self._assert_scope(session, file_write.workspace_id, file_write.run_id)
         path = self._resolve_workspace_path(session, file_write.path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        content_bytes = file_write.content.encode("utf-8")
+        content_bytes = file_write.content_bytes()
         path.write_bytes(content_bytes)
         return SandboxFileRef(
             tenant_id=file_write.tenant_id,
@@ -123,7 +123,7 @@ class LocalProcessSandboxAdapter(SandboxAdapter):
             path=self._workspace_display_path(path, session),
             content_type=file_write.content_type,
             size_bytes=len(content_bytes),
-            content=file_write.content,
+            content=file_write.content if file_write.content_base64 is None else None,
         )
 
     def download_file(

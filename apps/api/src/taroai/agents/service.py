@@ -1,0 +1,267 @@
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from taroai.agents.models import (
+    AgentDefinition,
+    AgentDefinitionCreate,
+    AgentDraft,
+    AgentInvocation,
+    AgentRunRequest,
+    AgentVersion,
+    AgentVersionSpec,
+)
+from taroai.domain import (
+    ChatMessageCreate,
+    ChatMessageDispatchStatus,
+    ChatThreadCreate,
+    RunCreate,
+    RunStatus,
+    ResourceReference,
+    new_id,
+    utc_now,
+)
+
+
+class AgentRegistryService:
+    def __init__(self, *, registry: Any, store: Any) -> None:
+        self.registry = registry
+        self.store = store
+
+    def create(
+        self,
+        tenant_id: str,
+        user_id: str,
+        payload: AgentDefinitionCreate,
+    ):
+        now = utc_now()
+        definition = AgentDefinition(
+            id=new_id("agent"), tenant_id=tenant_id,
+            workspace_id=payload.workspace_id, name=payload.name,
+            description=payload.description, latest_version=1,
+            created_by_user_id=user_id, created_at=now, updated_at=now,
+        )
+        version = AgentVersion(
+            id=new_id("agent_version"), tenant_id=tenant_id,
+            workspace_id=payload.workspace_id, agent_id=definition.id,
+            version=1, spec=payload.version, created_by_user_id=user_id,
+            created_at=now,
+        )
+        return self.registry.create(definition, version)
+
+    def extract(self, tenant_id: str, thread_id: str, name: str | None = None) -> AgentDraft:
+        thread = self.store.get_chat_thread(tenant_id, thread_id)
+        runs = [
+            run for run in self.store.list_runs(tenant_id, thread.workspace_id)
+            if run.thread_id == thread_id and run.status == RunStatus.SUCCEEDED
+        ]
+        if not runs:
+            raise ValueError("A successful Thread Run is required to extract an Agent")
+        source_run = sorted(runs, key=lambda item: (item.updated_at, item.id))[-1]
+        messages = self.store.list_chat_messages(tenant_id, thread_id)
+        user_messages = [message.content for message in messages if message.role.value == "user"]
+        resource_refs = [
+            ref.model_dump(mode="json")
+            for message in messages
+            for ref in message.resource_refs
+        ]
+        runtime_state = self._runtime_snapshot(tenant_id, source_run.id)
+        used_skills = runtime_state.get("runtime_metadata", {}).get("used_skills", [])
+        skill_bindings = {
+            str(item.get("id") or item.get("skill_id")): dict(item)
+            for item in resource_refs
+            if item.get("type") == "skill" and (item.get("id") or item.get("skill_id"))
+        }
+        for item in used_skills:
+            skill_id = item.get("skill_id") or item.get("id")
+            if not skill_id:
+                continue
+            skill_bindings[str(skill_id)] = {
+                "id": str(skill_id),
+                "version": item.get("version"),
+                "package_digest": item.get("package_digest"),
+                "source_digest": item.get("source_digest"),
+            }
+        return AgentDraft(
+            workspace_id=thread.workspace_id,
+            name=name or thread.title or "Agent from conversation",
+            description=f"Reusable Agent extracted from Thread {thread.id}",
+            version=AgentVersionSpec(
+                input_schema={
+                    "type": "object",
+                    "properties": {"request": {"type": "string"}},
+                    "required": ["request"],
+                },
+                output_contract={"type": "string", "format": "markdown"},
+                instructions=(
+                    "Reproduce the successful workflow from this conversation.\n\n"
+                    + "\n".join(f"- {item}" for item in user_messages[-8:])
+                ),
+                skill_bindings=list(skill_bindings.values()),
+                connector_bindings=[item for item in resource_refs if item.get("type") == "connector"],
+                knowledge_bindings=[item for item in resource_refs if item.get("type") == "knowledge"],
+                reference_files=[{"storage_object_id": item} for item in source_run.attachments],
+                model_policy={
+                    "provider_id": source_run.provider_id,
+                    "model_id": source_run.model_id,
+                    "reasoning_effort": source_run.reasoning_effort,
+                },
+                runtime_snapshot={
+                    "sandbox_session_id": thread.sandbox_session_id,
+                    "runtime_state": runtime_state,
+                },
+                source_thread_id=thread.id,
+                source_run_id=source_run.id,
+                change_note="Extracted from a successful conversation",
+            ),
+            source_thread_id=thread.id,
+            source_run_id=source_run.id,
+        )
+
+    def create_version(self, tenant_id: str, user_id: str, agent_id: str, spec: AgentVersionSpec):
+        definition = self.registry.get(tenant_id, agent_id)
+        version = AgentVersion(
+            id=new_id("agent_version"), tenant_id=tenant_id,
+            workspace_id=definition.workspace_id, agent_id=agent_id,
+            version=definition.latest_version + 1, spec=spec,
+            created_by_user_id=user_id,
+        )
+        return self.registry.add_version(version)
+
+    def restore_as_new(self, tenant_id: str, user_id: str, agent_id: str, version: int):
+        source = self.registry.get_version(tenant_id, agent_id, version)
+        spec = source.spec.model_copy(
+            update={"change_note": f"Restored from version {version}"}, deep=True
+        )
+        return self.create_version(tenant_id, user_id, agent_id, spec)
+
+    def publish(self, tenant_id: str, agent_id: str, version: int):
+        target = self.registry.get_version(tenant_id, agent_id, version)
+        for binding in target.spec.skill_bindings:
+            if not (binding.get("id") or binding.get("skill_id")) or not binding.get("version"):
+                raise ValueError("Published Agent skill bindings must pin id and version")
+        for reference in target.spec.reference_files:
+            storage_object_id = reference.get("storage_object_id")
+            if not storage_object_id:
+                raise ValueError("Published Agent reference files must pin storage_object_id")
+        model_policy = target.spec.model_policy
+        if bool(model_policy.get("provider_id")) != bool(model_policy.get("model_id")):
+            raise ValueError("Agent model policy must pin provider_id and model_id together")
+        return self.registry.publish(tenant_id, agent_id, version)
+
+    def run(
+        self,
+        tenant_id: str,
+        user_id: str,
+        agent_id: str,
+        payload: AgentRunRequest,
+    ) -> AgentInvocation:
+        definition = self.registry.get(tenant_id, agent_id)
+        version_number = payload.version or definition.published_version
+        if version_number is None:
+            raise ValueError("Agent must have a published version before it can run")
+        version = self.registry.get_version(tenant_id, agent_id, version_number)
+        if version.status != "published" and payload.version is None:
+            raise ValueError("Agent version is not published")
+        self._validate_input(version.spec.input_schema, payload.input)
+        model_policy = version.spec.model_policy
+        thread = self.store.create_chat_thread(
+            tenant_id,
+            user_id,
+            ChatThreadCreate(
+                workspace_id=definition.workspace_id,
+                title=f"{definition.name} run",
+                provider_id=model_policy.get("provider_id"),
+                model_id=model_policy.get("model_id"),
+                reasoning_effort=model_policy.get("reasoning_effort"),
+                resource_refs=self._resource_refs(version.spec),
+            ),
+        )
+        content = json.dumps(payload.input, ensure_ascii=False)
+        message = self.store.append_chat_message(
+            tenant_id,
+            thread.id,
+            user_id,
+            ChatMessageCreate(
+                content=content,
+                dispatch_status=ChatMessageDispatchStatus.INFLIGHT,
+                attachments=[
+                    item["storage_object_id"]
+                    for item in version.spec.reference_files
+                    if item.get("storage_object_id")
+                ],
+                resource_refs=self._resource_refs(version.spec),
+            ),
+        )
+        run, _ = self.store.create_queued_thread_run_if_absent(
+            tenant_id,
+            user_id,
+            RunCreate(
+                workspace_id=definition.workspace_id,
+                agent_id=definition.id,
+                message=(
+                    version.spec.instructions
+                    + "\n\nStructured input:\n"
+                    + content
+                ),
+                attachments=[
+                    item["storage_object_id"]
+                    for item in version.spec.reference_files
+                    if item.get("storage_object_id")
+                ],
+                thread_id=thread.id,
+                trigger_message_id=message.id,
+                provider_id=model_policy.get("provider_id"),
+                model_id=model_policy.get("model_id"),
+                reasoning_effort=model_policy.get("reasoning_effort"),
+                resource_refs=self._resource_refs(version.spec),
+            ),
+        )
+        return AgentInvocation(
+            agent_id=definition.id, agent_version=version.version,
+            thread_id=thread.id, message_id=message.id, run_id=run.id,
+            events_url=f"/api/threads/{thread.id}/events",
+        )
+
+    def _validate_input(self, schema: dict[str, Any], value: dict[str, Any]) -> None:
+        if schema.get("type") not in {None, "object"}:
+            raise ValueError("Agent input schema root must be an object")
+        for required in schema.get("required", []):
+            if required not in value:
+                raise ValueError(f"Missing required Agent input field: {required}")
+        properties = schema.get("properties", {})
+        python_types = {
+            "string": str, "number": (int, float), "integer": int,
+            "boolean": bool, "array": list, "object": dict,
+        }
+        for key, item in value.items():
+            expected_name = properties.get(key, {}).get("type")
+            expected = python_types.get(expected_name)
+            if expected is not None and not isinstance(item, expected):
+                raise ValueError(f"Agent input field {key} must be {expected_name}")
+
+    def _runtime_snapshot(self, tenant_id: str, run_id: str) -> dict[str, Any]:
+        try:
+            return self.store.get_runtime_state(tenant_id, run_id).state_payload
+        except Exception:
+            return {}
+
+    def _resource_refs(self, spec: AgentVersionSpec) -> list[ResourceReference]:
+        refs: list[ResourceReference] = []
+        for kind, bindings in (
+            ("skill", spec.skill_bindings),
+            ("connector", spec.connector_bindings),
+            ("knowledge", spec.knowledge_bindings),
+        ):
+            for binding in bindings:
+                resource_id = binding.get("id") or binding.get(f"{kind}_id")
+                if resource_id:
+                    refs.append(
+                        ResourceReference(
+                            type=kind,
+                            id=str(resource_id),
+                            version=(str(binding["version"]) if binding.get("version") else None),
+                        )
+                    )
+        return refs

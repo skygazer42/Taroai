@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -54,3 +55,12 @@ class AgentRuntimeState(BaseModel):
     started_at: datetime = Field(default_factory=utc_now)
     deadline_at: datetime | None = None
     checkpoint_sequence: int = Field(default=0, ge=0)
+    max_repairs: int = Field(default=4, ge=0)
+    cost_limit: float = Field(default=0, ge=0)
+    cost_consumed: float = Field(default=0, ge=0)
+    last_decision: AgentDecision | None = None
+    final_response_text: str | None = None
+    pending_uncertain_action_id: str | None = None
+    waiting_reason: str | None = None
+    terminal_event_emitted: bool = False
+    runtime_metadata: dict[str, Any] = Field(default_factory=dict)

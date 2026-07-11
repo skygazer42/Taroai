@@ -363,7 +363,13 @@ class InMemoryControlPlaneStore(BaseModel):
         message_id: str,
         **changes: Any,
     ) -> ChatMessage:
-        allowed_fields = {"content", "dispatch_status", "delivery_status"}
+        allowed_fields = {
+            "content",
+            "dispatch_status",
+            "delivery_status",
+            "attachments",
+            "resource_refs",
+        }
         unknown_fields = set(changes) - allowed_fields
         if unknown_fields:
             raise ValueError(f"Unsupported chat message fields: {sorted(unknown_fields)}")
@@ -519,6 +525,173 @@ class InMemoryControlPlaneStore(BaseModel):
                     f"Agent action {action_id} is not in tenant {tenant_id}"
                 )
             return action.model_copy(deep=True)
+
+    def list_agent_actions(
+        self,
+        tenant_id: str,
+        run_id: str,
+    ) -> list[AgentAction]:
+        with self._repository_lock:
+            self.get_run(tenant_id, run_id)
+            return sorted(
+                [
+                    action.model_copy(deep=True)
+                    for action in self.agent_actions.values()
+                    if action.tenant_id == tenant_id and action.run_id == run_id
+                ],
+                key=lambda action: (action.started_at or utc_now(), action.id),
+            )
+
+    def resolve_uncertain_agent_action(
+        self,
+        tenant_id: str,
+        action_id: str,
+        *,
+        resolution: str,
+        resolved_by_user_id: str,
+        note: str = "",
+    ) -> AgentAction:
+        from taroai.agent.models import AgentObservation
+
+        if resolution not in {"succeeded", "failed", "retry"}:
+            raise ValueError(f"Unsupported uncertain action resolution: {resolution}")
+        with self._repository_lock:
+            action = self.get_agent_action(tenant_id, action_id)
+            if action.status != "uncertain":
+                raise ValueError(f"Agent action {action_id} is not uncertain")
+            if resolution == "retry":
+                updated = action.model_copy(
+                    update={
+                        "status": "pending",
+                        "lease_owner_id": None,
+                        "lease_expires_at": None,
+                        "started_at": None,
+                        "completed_at": None,
+                        "observation": None,
+                        "failure_class": None,
+                    },
+                    deep=True,
+                )
+            else:
+                observation = AgentObservation(
+                    action_id=action.id,
+                    success=resolution == "succeeded",
+                    output={
+                        "human_resolution": resolution,
+                        "resolved_by_user_id": resolved_by_user_id,
+                    },
+                    error=note or None if resolution == "failed" else None,
+                    safe_error=note or None if resolution == "failed" else None,
+                    failure_class=(
+                        "human_confirmed_failed" if resolution == "failed" else None
+                    ),
+                )
+                updated = action.model_copy(
+                    update={
+                        "status": resolution,
+                        "observation": observation,
+                        "failure_class": observation.failure_class,
+                        "lease_owner_id": None,
+                        "lease_expires_at": None,
+                        "completed_at": utc_now(),
+                    },
+                    deep=True,
+                )
+            self.agent_actions[action_id] = updated.model_copy(deep=True)
+            run = self.get_run(tenant_id, action.run_id)
+            self.append_run_event(
+                run,
+                "agent.action.resolved",
+                {
+                    "action_id": action.id,
+                    "resolution": resolution,
+                    "resolved_by_user_id": resolved_by_user_id,
+                    "note": note,
+                },
+            )
+            return updated.model_copy(deep=True)
+
+    def pause_connector_action_for_reconnect(
+        self,
+        tenant_id: str,
+        action_id: str,
+        *,
+        connector_id: str,
+    ) -> AgentAction:
+        with self._repository_lock:
+            action = self.get_agent_action(tenant_id, action_id)
+            retry_count = int(action.usage.get("connector_reconnect_retry_count", 0))
+            if (
+                action.status != "failed"
+                or action.failure_class != "connector_reconnect_required"
+                or retry_count > 0
+            ):
+                raise ValueError("connector action is not eligible for reconnect")
+            updated = action.model_copy(update={"status": "uncertain"}, deep=True)
+            self.agent_actions[action_id] = updated.model_copy(deep=True)
+            run = self.get_run(tenant_id, action.run_id)
+            self.append_run_event(
+                run,
+                "connector.reconnect_required",
+                {
+                    "connector_id": connector_id,
+                    "action_id": action.id,
+                    "run_id": action.run_id,
+                    "thread_id": action.thread_id,
+                },
+            )
+            return updated.model_copy(deep=True)
+
+    def retry_connector_action_after_reconnect(
+        self,
+        tenant_id: str,
+        action_id: str,
+        *,
+        connector_id: str,
+        resolved_by_user_id: str,
+    ) -> AgentAction:
+        with self._repository_lock:
+            action = self.get_agent_action(tenant_id, action_id)
+            observed_connector = (
+                action.observation.output.get("connector_id")
+                if action.observation is not None
+                else None
+            )
+            retry_count = int(action.usage.get("connector_reconnect_retry_count", 0))
+            if (
+                action.status != "uncertain"
+                or action.failure_class != "connector_reconnect_required"
+                or observed_connector != connector_id
+                or retry_count != 0
+            ):
+                raise ValueError("connector action reconnect retry is no longer available")
+            usage = dict(action.usage)
+            usage["connector_reconnect_retry_count"] = 1
+            updated = action.model_copy(
+                update={
+                    "status": "pending",
+                    "observation": None,
+                    "failure_class": None,
+                    "lease_owner_id": None,
+                    "lease_expires_at": None,
+                    "started_at": None,
+                    "completed_at": None,
+                    "usage": usage,
+                },
+                deep=True,
+            )
+            self.agent_actions[action_id] = updated.model_copy(deep=True)
+            run = self.get_run(tenant_id, action.run_id)
+            self.append_run_event(
+                run,
+                "connector.reconnect_resumed",
+                {
+                    "connector_id": connector_id,
+                    "action_id": action.id,
+                    "resolved_by_user_id": resolved_by_user_id,
+                },
+            )
+            return updated.model_copy(deep=True)
 
     def claim_agent_action(
         self,
@@ -968,6 +1141,33 @@ class InMemoryControlPlaneStore(BaseModel):
                 return events
             return [event for event in events if event.sequence > after_sequence]
 
+    def list_thread_events(
+        self,
+        tenant_id: str,
+        thread_id: str,
+        after_sequence: int | None = None,
+    ) -> list[RunEvent]:
+        with self._repository_lock:
+            self.get_chat_thread(tenant_id, thread_id)
+            events = sorted(
+                [
+                    event.model_copy(deep=True)
+                    for run_events in self.run_events.values()
+                    for event in run_events
+                    if event.tenant_id == tenant_id
+                    and event.thread_id == thread_id
+                    and event.thread_sequence is not None
+                ],
+                key=lambda event: (event.thread_sequence or 0, event.id),
+            )
+            if after_sequence is None:
+                return events
+            return [
+                event
+                for event in events
+                if (event.thread_sequence or 0) > after_sequence
+            ]
+
     def update_run_status(
         self,
         tenant_id: str,
@@ -1057,8 +1257,11 @@ class InMemoryControlPlaneStore(BaseModel):
         name: str,
         artifact_type: str,
         uri: str,
+        **rich_fields: Any,
     ) -> Artifact:
         run = self.get_run(tenant_id, run_id)
+        rich_fields.setdefault("workspace_id", run.workspace_id)
+        rich_fields.setdefault("thread_id", run.thread_id)
         artifact = Artifact(
             id=new_id("artifact"),
             tenant_id=tenant_id,
@@ -1067,6 +1270,7 @@ class InMemoryControlPlaneStore(BaseModel):
             artifact_type=artifact_type,
             uri=uri,
             created_at=utc_now(),
+            **rich_fields,
         )
         self.artifacts.setdefault(run_id, []).append(artifact)
         self._append_run_event(
@@ -1079,6 +1283,13 @@ class InMemoryControlPlaneStore(BaseModel):
     def list_artifacts(self, tenant_id: str, run_id: str) -> list[Artifact]:
         self.get_run(tenant_id, run_id)
         return list(self.artifacts.get(run_id, []))
+
+    def get_artifact(self, tenant_id: str, artifact_id: str) -> Artifact:
+        for artifacts in self.artifacts.values():
+            for artifact in artifacts:
+                if artifact.id == artifact_id and artifact.tenant_id == tenant_id:
+                    return artifact.model_copy(deep=True)
+        raise NotFoundError(f"Artifact not found: {artifact_id}")
 
     def create_approval_request(
         self,

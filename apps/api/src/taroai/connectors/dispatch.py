@@ -23,6 +23,14 @@ class ConnectorDispatchError(RuntimeError):
     pass
 
 
+class ConnectorCredentialExpiredError(ConnectorDispatchError):
+    """Signals that an OAuth connector must be re-authorized before retrying."""
+
+    def __init__(self, connector_id: str) -> None:
+        super().__init__("connector authorization has expired")
+        self.connector_id = connector_id
+
+
 class InternalApiAuthConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -170,6 +178,11 @@ class ConnectorDispatchService(BaseModel):
                 tool_name=resolved_tool_name,
             )
             response = self._send(request)
+            if (
+                connector.auth_mode == ConnectorAuthMode.OAUTH2
+                and response.status_code in {401, 403}
+            ):
+                raise ConnectorCredentialExpiredError(connector.id)
             return self._build_result(response, request.max_response_bytes)
         if connector.type == ConnectorType.DATABASE:
             return self._dispatch_database_connector(
@@ -286,11 +299,11 @@ class ConnectorDispatchService(BaseModel):
                 tenant_id=connector.tenant_id,
                 lease_token=lease.lease_token,
             )
-        except (
-            SecretAccessDeniedError,
-            SecretLeaseExpiredError,
-            SecretNotFoundError,
-        ) as error:
+        except (SecretLeaseExpiredError, SecretNotFoundError) as error:
+            if connector.auth_mode == ConnectorAuthMode.OAUTH2:
+                raise ConnectorCredentialExpiredError(connector.id) from error
+            raise ConnectorDispatchError("connector credential is not available") from error
+        except SecretAccessDeniedError as error:
             raise ConnectorDispatchError("connector credential is not available") from error
 
         if config.auth.mode == "api_key_header":

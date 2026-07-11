@@ -527,6 +527,8 @@ class SqlControlPlaneRepository(BaseModel):
             "content": "content",
             "dispatch_status": "dispatch_status",
             "delivery_status": "delivery_status",
+            "attachments": "attachments",
+            "resource_refs": "resource_refs",
         }
         unknown_fields = set(changes) - set(field_columns)
         if unknown_fields:
@@ -547,14 +549,21 @@ class SqlControlPlaneRepository(BaseModel):
                 }
             )
             assignments = [f"{field_columns[field]} = ?" for field in changes]
-            values = [
-                (
-                    getattr(updated, field).value
-                    if hasattr(getattr(updated, field), "value")
-                    else getattr(updated, field)
-                )
-                for field in changes
-            ]
+            values = []
+            for field in changes:
+                value = getattr(updated, field)
+                if hasattr(value, "value"):
+                    value = value.value
+                elif field in {"attachments", "resource_refs"}:
+                    value = self._json(
+                        [
+                            item.model_dump(mode="json")
+                            if hasattr(item, "model_dump")
+                            else item
+                            for item in value
+                        ]
+                    )
+                values.append(value)
             assignments.append("updated_at = ?")
             values.append(self._dt(updated.updated_at))
             connection.execute(
@@ -901,6 +910,223 @@ class SqlControlPlaneRepository(BaseModel):
         if row is None:
             raise NotFoundError(f"Agent action not found: {action_id}")
         return self._agent_action_from_row(row)
+
+    def list_agent_actions(
+        self,
+        tenant_id: str,
+        run_id: str,
+    ) -> list[AgentAction]:
+        self.get_run(tenant_id, run_id)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM agent_actions
+                WHERE tenant_id = ? AND run_id = ?
+                ORDER BY COALESCE(started_at, completed_at), id
+                """,
+                (tenant_id, run_id),
+            ).fetchall()
+        return [self._agent_action_from_row(row) for row in rows]
+
+    def resolve_uncertain_agent_action(
+        self,
+        tenant_id: str,
+        action_id: str,
+        *,
+        resolution: str,
+        resolved_by_user_id: str,
+        note: str = "",
+    ) -> AgentAction:
+        from taroai.agent.models import AgentObservation
+
+        if resolution not in {"succeeded", "failed", "retry"}:
+            raise ValueError(f"Unsupported uncertain action resolution: {resolution}")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM agent_actions WHERE tenant_id = ? AND id = ?",
+                (tenant_id, action_id),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"Agent action not found: {action_id}")
+            action = self._agent_action_from_row(row)
+            if action.status != "uncertain":
+                raise ValueError(f"Agent action {action_id} is not uncertain")
+            if resolution == "retry":
+                updated_row = connection.execute(
+                    """
+                    UPDATE agent_actions
+                    SET status = 'pending', observation = NULL, failure_class = NULL,
+                        lease_owner_id = NULL, lease_expires_at = NULL,
+                        started_at = NULL, completed_at = NULL
+                    WHERE tenant_id = ? AND id = ? AND status = 'uncertain'
+                    RETURNING *
+                    """,
+                    (tenant_id, action_id),
+                ).fetchone()
+            else:
+                observation = AgentObservation(
+                    action_id=action.id,
+                    success=resolution == "succeeded",
+                    output={
+                        "human_resolution": resolution,
+                        "resolved_by_user_id": resolved_by_user_id,
+                    },
+                    error=(note or None) if resolution == "failed" else None,
+                    safe_error=(note or None) if resolution == "failed" else None,
+                    failure_class=(
+                        "human_confirmed_failed" if resolution == "failed" else None
+                    ),
+                )
+                updated_row = connection.execute(
+                    """
+                    UPDATE agent_actions
+                    SET status = ?, observation = ?, failure_class = ?,
+                        lease_owner_id = NULL, lease_expires_at = NULL, completed_at = ?
+                    WHERE tenant_id = ? AND id = ? AND status = 'uncertain'
+                    RETURNING *
+                    """,
+                    (
+                        resolution,
+                        self._json(observation.model_dump(mode="json")),
+                        observation.failure_class,
+                        self._dt(utc_now()),
+                        tenant_id,
+                        action_id,
+                    ),
+                ).fetchone()
+            if updated_row is None:
+                raise ValueError(f"Agent action {action_id} resolution raced")
+            updated = self._agent_action_from_row(updated_row)
+            run_row = connection.execute(
+                "SELECT * FROM runs WHERE tenant_id = ? AND id = ?",
+                (tenant_id, action.run_id),
+            ).fetchone()
+            if run_row is not None:
+                self._append_run_event(
+                    connection,
+                    self._run_from_row(run_row),
+                    "agent.action.resolved",
+                    {
+                        "action_id": action.id,
+                        "resolution": resolution,
+                        "resolved_by_user_id": resolved_by_user_id,
+                        "note": note,
+                    },
+                )
+        return updated
+
+    def pause_connector_action_for_reconnect(
+        self,
+        tenant_id: str,
+        action_id: str,
+        *,
+        connector_id: str,
+    ) -> AgentAction:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM agent_actions WHERE tenant_id = ? AND id = ?",
+                (tenant_id, action_id),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"Agent action not found: {action_id}")
+            action = self._agent_action_from_row(row)
+            retry_count = int(action.usage.get("connector_reconnect_retry_count", 0))
+            if (
+                action.status != "failed"
+                or action.failure_class != "connector_reconnect_required"
+                or retry_count > 0
+            ):
+                raise ValueError("connector action is not eligible for reconnect")
+            updated_row = connection.execute(
+                """
+                UPDATE agent_actions SET status = 'uncertain'
+                WHERE tenant_id = ? AND id = ? AND status = 'failed'
+                  AND failure_class = 'connector_reconnect_required'
+                RETURNING *
+                """,
+                (tenant_id, action_id),
+            ).fetchone()
+            if updated_row is None:
+                raise ValueError("connector action reconnect pause raced")
+            run_row = connection.execute(
+                "SELECT * FROM runs WHERE tenant_id = ? AND id = ?",
+                (tenant_id, action.run_id),
+            ).fetchone()
+            if run_row is not None:
+                self._append_run_event(
+                    connection,
+                    self._run_from_row(run_row),
+                    "connector.reconnect_required",
+                    {
+                        "connector_id": connector_id,
+                        "action_id": action.id,
+                        "run_id": action.run_id,
+                        "thread_id": action.thread_id,
+                    },
+                )
+            return self._agent_action_from_row(updated_row)
+
+    def retry_connector_action_after_reconnect(
+        self,
+        tenant_id: str,
+        action_id: str,
+        *,
+        connector_id: str,
+        resolved_by_user_id: str,
+    ) -> AgentAction:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM agent_actions WHERE tenant_id = ? AND id = ?",
+                (tenant_id, action_id),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"Agent action not found: {action_id}")
+            action = self._agent_action_from_row(row)
+            observed_connector = (
+                action.observation.output.get("connector_id")
+                if action.observation is not None
+                else None
+            )
+            retry_count = int(action.usage.get("connector_reconnect_retry_count", 0))
+            if (
+                action.status != "uncertain"
+                or action.failure_class != "connector_reconnect_required"
+                or observed_connector != connector_id
+                or retry_count != 0
+            ):
+                raise ValueError("connector action reconnect retry is no longer available")
+            usage = dict(action.usage)
+            usage["connector_reconnect_retry_count"] = 1
+            updated_row = connection.execute(
+                """
+                UPDATE agent_actions
+                SET status = 'pending', observation = NULL, failure_class = NULL,
+                    usage = ?, lease_owner_id = NULL, lease_expires_at = NULL,
+                    started_at = NULL, completed_at = NULL
+                WHERE tenant_id = ? AND id = ? AND status = 'uncertain'
+                  AND failure_class = 'connector_reconnect_required'
+                RETURNING *
+                """,
+                (self._json(usage), tenant_id, action_id),
+            ).fetchone()
+            if updated_row is None:
+                raise ValueError("connector action reconnect retry raced")
+            run_row = connection.execute(
+                "SELECT * FROM runs WHERE tenant_id = ? AND id = ?",
+                (tenant_id, action.run_id),
+            ).fetchone()
+            if run_row is not None:
+                self._append_run_event(
+                    connection,
+                    self._run_from_row(run_row),
+                    "connector.reconnect_resumed",
+                    {
+                        "connector_id": connector_id,
+                        "action_id": action.id,
+                        "resolved_by_user_id": resolved_by_user_id,
+                    },
+                )
+            return self._agent_action_from_row(updated_row)
 
     def claim_agent_action(
         self,
@@ -1498,6 +1724,40 @@ class SqlControlPlaneRepository(BaseModel):
             for row in rows
         ]
 
+    def list_thread_events(
+        self,
+        tenant_id: str,
+        thread_id: str,
+        after_sequence: int | None = None,
+    ) -> list[RunEvent]:
+        self.get_chat_thread(tenant_id, thread_id)
+        query = """
+            SELECT * FROM run_events
+            WHERE tenant_id = ? AND thread_id = ? AND thread_sequence IS NOT NULL
+        """
+        parameters: list[Any] = [tenant_id, thread_id]
+        if after_sequence is not None:
+            query += " AND thread_sequence > ?"
+            parameters.append(after_sequence)
+        query += " ORDER BY thread_sequence, id"
+        with self._connect() as connection:
+            rows = connection.execute(query, tuple(parameters)).fetchall()
+        return [
+            RunEvent(
+                id=row["id"],
+                sequence=int(row["sequence"]),
+                tenant_id=row["tenant_id"],
+                workspace_id=row["workspace_id"],
+                run_id=row["run_id"],
+                type=row["type"],
+                payload=self._loads(row["payload"]),
+                created_at=self._parse_dt(row["created_at"]),
+                thread_id=self._row_value(row, "thread_id"),
+                thread_sequence=int(self._row_value(row, "thread_sequence")),
+            )
+            for row in rows
+        ]
+
     def update_run_status(
         self,
         tenant_id: str,
@@ -1629,8 +1889,11 @@ class SqlControlPlaneRepository(BaseModel):
         name: str,
         artifact_type: str,
         uri: str,
+        **rich_fields: Any,
     ) -> Artifact:
         run = self.get_run(tenant_id, run_id)
+        rich_fields.setdefault("workspace_id", run.workspace_id)
+        rich_fields.setdefault("thread_id", run.thread_id)
         artifact = Artifact(
             id=new_id("artifact"),
             tenant_id=tenant_id,
@@ -1639,14 +1902,18 @@ class SqlControlPlaneRepository(BaseModel):
             artifact_type=artifact_type,
             uri=uri,
             created_at=utc_now(),
+            **rich_fields,
         )
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO artifacts (
-                    id, tenant_id, run_id, name, artifact_type, uri, created_at
+                    id, tenant_id, run_id, name, artifact_type, uri, created_at,
+                    workspace_id, thread_id, message_id, storage_object_id,
+                    content_type, size_bytes, preview_payload, dashboard_payload,
+                    render_policy, metadata
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     artifact.id,
@@ -1656,6 +1923,16 @@ class SqlControlPlaneRepository(BaseModel):
                     artifact.artifact_type,
                     artifact.uri,
                     self._dt(artifact.created_at),
+                    artifact.workspace_id,
+                    artifact.thread_id,
+                    artifact.message_id,
+                    artifact.storage_object_id,
+                    artifact.content_type,
+                    artifact.size_bytes,
+                    self._json(artifact.preview_payload),
+                    self._json(artifact.dashboard_payload) if artifact.dashboard_payload is not None else None,
+                    self._json(artifact.render_policy),
+                    self._json(artifact.metadata),
                 ),
             )
             self._append_run_event(
@@ -1682,6 +1959,16 @@ class SqlControlPlaneRepository(BaseModel):
                 (tenant_id, run_id),
             ).fetchall()
         return [self._artifact_from_row(row) for row in rows]
+
+    def get_artifact(self, tenant_id: str, artifact_id: str) -> Artifact:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM artifacts WHERE tenant_id = ? AND id = ?",
+                (tenant_id, artifact_id),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError(f"Artifact not found: {artifact_id}")
+        return self._artifact_from_row(row)
 
     def create_approval_request(
         self,
@@ -2573,6 +2860,20 @@ class SqlControlPlaneRepository(BaseModel):
             artifact_type=row["artifact_type"],
             uri=row["uri"],
             created_at=self._parse_dt(row["created_at"]),
+            workspace_id=self._row_value(row, "workspace_id"),
+            thread_id=self._row_value(row, "thread_id"),
+            message_id=self._row_value(row, "message_id"),
+            storage_object_id=self._row_value(row, "storage_object_id"),
+            content_type=self._row_value(row, "content_type"),
+            size_bytes=int(self._row_value(row, "size_bytes") or 0),
+            preview_payload=self._loads(self._row_value(row, "preview_payload") or "{}"),
+            dashboard_payload=(
+                self._loads(self._row_value(row, "dashboard_payload"))
+                if self._row_value(row, "dashboard_payload") is not None
+                else None
+            ),
+            render_policy=self._loads(self._row_value(row, "render_policy") or "{}"),
+            metadata=self._loads(self._row_value(row, "metadata") or "{}"),
         )
 
     def _approval_from_row(self, row) -> ApprovalRequest:

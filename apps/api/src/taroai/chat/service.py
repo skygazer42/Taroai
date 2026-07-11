@@ -71,6 +71,22 @@ class ChatMessageSubmit(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class ChatMessageEdit(BaseModel):
+    content: str | None = Field(default=None, min_length=1)
+    attachments: list[str] | None = None
+    resource_refs: list[ResourceReference] | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ChatSteerSubmit(BaseModel):
+    content: str = Field(min_length=1)
+    attachments: list[str] = Field(default_factory=list)
+    resource_refs: list[ResourceReference] = Field(default_factory=list)
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class MessageDispatch(BaseModel):
     message_id: str
     run_id: str
@@ -101,10 +117,14 @@ class ChatService:
         store: Any,
         model_policy_resolver: Callable[[], ModelPolicy],
         provider_registry_resolver: Callable[[], ModelProviderRegistry],
+        steering_available_resolver: Callable[[], bool] | None = None,
     ) -> None:
         self.store = store
         self._model_policy_resolver = model_policy_resolver
         self._provider_registry_resolver = provider_registry_resolver
+        self._steering_available_resolver = (
+            steering_available_resolver or (lambda: True)
+        )
         self._lock_guard = Lock()
         self._locks: dict[str, _NamedLockEntry] = {}
 
@@ -191,6 +211,132 @@ class ChatService:
     def list_messages(self, tenant_id: str, thread_id: str) -> list[ChatMessage]:
         self.get_thread(tenant_id, thread_id)
         return self.store.list_chat_messages(tenant_id, thread_id)
+
+    def edit_message(
+        self,
+        tenant_id: str,
+        user_id: str,
+        thread_id: str,
+        message_id: str,
+        payload: ChatMessageEdit,
+    ) -> ChatMessage:
+        self.get_thread(tenant_id, thread_id)
+        message = self.store.get_chat_message(tenant_id, message_id)
+        if message.thread_id != thread_id:
+            raise NotFoundError(f"Chat message not found: {message_id}")
+        if message.created_by_user_id != user_id:
+            raise TenantAccessError("Only the author can edit a chat message")
+        if message.dispatch_status not in {
+            ChatMessageDispatchStatus.READY,
+            ChatMessageDispatchStatus.QUEUED,
+            ChatMessageDispatchStatus.STEERING,
+        }:
+            raise ValueError("Only queued or pending steering messages can be edited")
+        changes = payload.model_dump(exclude_unset=True)
+        return self.store.update_chat_message(tenant_id, message_id, **changes)
+
+    def delete_message(
+        self,
+        tenant_id: str,
+        user_id: str,
+        thread_id: str,
+        message_id: str,
+    ) -> None:
+        self.get_thread(tenant_id, thread_id)
+        message = self.store.get_chat_message(tenant_id, message_id)
+        if message.thread_id != thread_id:
+            raise NotFoundError(f"Chat message not found: {message_id}")
+        if message.created_by_user_id != user_id:
+            raise TenantAccessError("Only the author can delete a chat message")
+        if message.dispatch_status not in {
+            ChatMessageDispatchStatus.READY,
+            ChatMessageDispatchStatus.QUEUED,
+            ChatMessageDispatchStatus.STEERING,
+            ChatMessageDispatchStatus.CANCELLED,
+        }:
+            raise ValueError("An inflight or completed message cannot be deleted")
+        self.store.delete_chat_message(tenant_id, message_id)
+
+    def steer(
+        self,
+        tenant_id: str,
+        user_id: str,
+        thread_id: str,
+        payload: ChatSteerSubmit,
+    ) -> MessageDispatch:
+        return self.post_message(
+            tenant_id,
+            user_id,
+            thread_id,
+            ChatMessageSubmit(
+                content=payload.content,
+                delivery_mode="steer",
+                attachments=payload.attachments,
+                resource_refs=payload.resource_refs,
+            ),
+        )
+
+    def continue_thread(
+        self,
+        tenant_id: str,
+        thread_id: str,
+    ) -> MessageDispatch | None:
+        with self._named_lock(f"thread:{tenant_id}:{thread_id}"):
+            thread = self.get_thread(tenant_id, thread_id)
+            if thread.status != ChatThreadStatus.ACTIVE:
+                return None
+            if self.store.get_active_thread_run(tenant_id, thread_id) is not None:
+                return None
+            for steering in self.store.list_pending_steering_messages(
+                tenant_id, thread_id
+            ):
+                self.store.update_chat_message(
+                    tenant_id,
+                    steering.id,
+                    dispatch_status=ChatMessageDispatchStatus.QUEUED,
+                )
+            message = self.store.claim_next_queued_message(tenant_id, thread_id)
+            if message is None:
+                return None
+            try:
+                selection = self.resolve_selection(
+                    tenant_id=tenant_id,
+                    workspace_id=thread.workspace_id,
+                    user_id=message.created_by_user_id or thread.created_by_user_id,
+                    provider_id=thread.provider_id,
+                    model_id=thread.model_id,
+                    reasoning_effort=thread.reasoning_effort,
+                )
+                run, started = self.store.create_queued_thread_run_if_absent(
+                    tenant_id,
+                    message.created_by_user_id or thread.created_by_user_id,
+                    RunCreate(
+                        workspace_id=thread.workspace_id,
+                        message=message.content,
+                        attachments=message.attachments,
+                        thread_id=thread.id,
+                        trigger_message_id=message.id,
+                        provider_id=selection.provider_id,
+                        model_id=selection.model_id,
+                        reasoning_effort=selection.reasoning_effort,
+                        resource_refs=message.resource_refs,
+                    ),
+                )
+            except Exception:
+                self.store.update_chat_message(
+                    tenant_id,
+                    message.id,
+                    dispatch_status=ChatMessageDispatchStatus.QUEUED,
+                )
+                raise
+            if not started:
+                self.store.update_chat_message(
+                    tenant_id,
+                    message.id,
+                    dispatch_status=ChatMessageDispatchStatus.QUEUED,
+                )
+                return None
+            return self._dispatch_response(message, run, run_started=True)
 
     def post_message(
         self,
@@ -392,7 +538,14 @@ class ChatService:
     ) -> MessageDispatch:
         dispatch_status = (
             ChatMessageDispatchStatus.STEERING
-            if payload.delivery_mode == "steer"
+            if self._steering_available_resolver()
+            and (
+                payload.delivery_mode == "steer"
+                or (
+                    payload.delivery_mode == "auto"
+                    and run.status.value == "waiting_for_user"
+                )
+            )
             else ChatMessageDispatchStatus.QUEUED
         )
         message = self.store.append_chat_message(

@@ -1,5 +1,7 @@
 from taroai.chat.service import (
+    ChatMessageEdit,
     ChatMessageSubmit,
+    ChatSteerSubmit,
     ChatService,
     ChatThreadApiCreate,
     ChatThreadPatch,
@@ -7,7 +9,9 @@ from taroai.chat.service import (
 )
 
 __all__ = [
+    "ChatMessageEdit",
     "ChatMessageSubmit",
+    "ChatSteerSubmit",
     "ChatService",
     "ChatThreadApiCreate",
     "ChatThreadPatch",

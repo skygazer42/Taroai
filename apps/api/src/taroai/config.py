@@ -40,6 +40,8 @@ DURABLE_DEPLOYMENT_BACKENDS = {
     "connector_registry_backend": "sql",
     "customer_feedback_service_backend": "sql",
     "skill_registry_backend": "sql",
+    "agent_registry_backend": "sql",
+    "thread_share_store_backend": "sql",
     "solution_pack_registry_backend": "sql",
     "sso_provider_registry_backend": "sql",
     "scim_provisioning_store_backend": "sql",
@@ -116,6 +118,15 @@ class Settings(BaseSettings):
     object_storage_secret_access_key: str = ""
     object_storage_signed_url_ttl_seconds: int = 3600
     object_storage_content_scan_blocked_terms: list[str] = Field(default_factory=list)
+    upload_max_bytes: int = Field(default=25_000_000, ge=1)
+    upload_allowed_content_types: list[str] = Field(
+        default_factory=lambda: [
+            "text/plain", "text/markdown", "text/csv", "application/json",
+            "application/pdf", "image/png", "image/jpeg", "image/webp",
+            "audio/mpeg", "audio/mp4", "audio/wav", "audio/webm", "audio/ogg",
+            "application/zip",
+        ]
+    )
     secret_service_backend: Literal["memory", "aws_secrets_manager"] = "memory"
     secret_service_region: str = "us-east-1"
     secret_service_endpoint_url: str = ""
@@ -179,6 +190,13 @@ class Settings(BaseSettings):
     billing_pricing_rule_store_backend: Literal["memory", "sql"] = "memory"
     billing_invoice_store_backend: Literal["memory", "sql"] = "memory"
     share_grant_store_backend: Literal["memory", "sql"] = "memory"
+    thread_share_store_backend: Literal["memory", "sql"] = "memory"
+    thread_share_token_hash_secret: str = Field(
+        default="local_thread_share_token_hash_secret_change_me",
+        min_length=32,
+        repr=False,
+    )
+    agent_registry_backend: Literal["memory", "sql"] = "memory"
     external_share_links_enabled: bool = False
     external_share_link_token_hash_secret: str = Field(default="", repr=False)
     model_gateway_allowed_models: list[str] = Field(default_factory=list)
@@ -267,6 +285,13 @@ class Settings(BaseSettings):
     tenant_quota_profile: Literal["trial", "poc", "business", "enterprise"] = "poc"
     job_queue_backend: Literal["disabled", "redis"] = "disabled"
     run_execution_dispatch_mode: Literal["inline", "queue"] = "inline"
+    agent_runtime_mode: Literal["legacy", "loop_v2"] = "legacy"
+    agent_loop_max_iterations: int = Field(default=12, ge=1)
+    agent_loop_max_repairs: int = Field(default=4, ge=0)
+    agent_loop_timeout_seconds: int = Field(default=1800, ge=1)
+    agent_loop_cost_limit: float = Field(default=0, ge=0)
+    agent_loop_action_lease_seconds: int = Field(default=600, ge=1)
+    agent_loop_full_auto_requires_isolation: bool = True
     run_execution_queue_name: str = "runs.execute"
     billing_queue_name: str = "billing.aggregate"
     cleanup_queue_name: str = "system.cleanup"
@@ -284,6 +309,10 @@ class Settings(BaseSettings):
     worker_job_max_attempts: int = 3
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
     event_stream_media_type: str = "text/event-stream"
+    event_stream_heartbeat_seconds: float = Field(default=10.0, gt=0)
+    event_stream_follow_seconds: int = Field(default=30, ge=1)
+    speech_provider: Literal["disabled"] = "disabled"
+    speech_max_audio_bytes: int = Field(default=10_000_000, ge=1)
 
     @field_validator("data_residency_allowed_regions")
     @classmethod
