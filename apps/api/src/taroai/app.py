@@ -102,6 +102,19 @@ from taroai.chat import (
     ChatThreadPatch,
     MessageDispatch,
 )
+from taroai.coding_workspaces import (
+    CodingActionRequest,
+    CodingChangesSubmit,
+    CodingCheckpointCreate,
+    CodingDeliveryCreate,
+    CodingTestResultCreate,
+    CodingWorkspaceCreate,
+    CodingWorkspaceRegistry,
+    CodingWorkspaceService,
+    SqlCodingWorkspaceRegistry,
+    RepositoryBindingCreate,
+    RepositoryBindingPatch,
+)
 from taroai.artifacts import ArtifactService, ArtifactShareCreate, RichArtifactCreate
 from taroai.config import ENTERPRISE_SANDBOX_PROVIDERS, Settings, load_settings
 from taroai.connectors import (
@@ -1299,6 +1312,7 @@ def create_app(
     agent_registry: InMemoryAgentRegistry | SqlAgentRegistry | None = None,
     browser_profile_registry: BrowserProfileRegistry | None = None,
     agent_engine_registry: AgentEngineRegistry | None = None,
+    coding_workspace_registry: CodingWorkspaceRegistry | None = None,
     thread_share_store: ThreadShareStore | None = None,
     speech_gateway: SpeechGateway | None = None,
     solution_pack_registry: (
@@ -1521,6 +1535,11 @@ def create_app(
     app.state.agent_engine_service = AgentEngineService(
         app.state.agent_engine_registry, app.state.secret_service, store=app.state.store
     )
+    app.state.coding_workspace_registry = coding_workspace_registry or build_coding_workspace_registry(resolved_settings)
+    app.state.coding_workspace_service = CodingWorkspaceService(
+        app.state.coding_workspace_registry, app.state.store
+    )
+    app.state.agent_registry_service.coding_workspace_registry = app.state.coding_workspace_registry
     app.state.agent_registry_service.agent_engine_registry = app.state.agent_engine_registry
     app.state.browser_profile_registry = (
         browser_profile_registry or build_browser_profile_registry(resolved_settings)
@@ -1642,6 +1661,7 @@ def create_app(
             agent_registry=app.state.agent_registry,
             browser_profile_service=app.state.browser_profile_service,
             agent_engine_service=app.state.agent_engine_service,
+            coding_workspace_service=app.state.coding_workspace_service,
         ),
         resolved_settings,
     )
@@ -1661,6 +1681,8 @@ def create_app(
         app.state.runtime.browser_profile_service = app.state.browser_profile_service
     if app.state.runtime.agent_engine_service is None:
         app.state.runtime.agent_engine_service = app.state.agent_engine_service
+    if app.state.runtime.coding_workspace_service is None:
+        app.state.runtime.coding_workspace_service = app.state.coding_workspace_service
     app.state.chat_service = ChatService(
         store=app.state.store,
         model_policy_resolver=lambda: app.state.runtime.model_policy,
@@ -2355,6 +2377,19 @@ def create_app(
             )
             if profile.status == "active"
         ]
+        repositories = [
+            {
+                "id": item.id,
+                "name": item.name,
+                "description": f"{item.provider} · {item.default_branch}",
+                "repository_url": item.repository_url,
+                "default_branch": item.default_branch,
+            }
+            for item in app.state.coding_workspace_registry.list_repositories(
+                context.tenant_id, workspace_id
+            )
+            if item.status == "active"
+        ]
         return {
             "workspace_id": workspace_id,
             "skills": installed_skills,
@@ -2363,6 +2398,7 @@ def create_app(
             "knowledge": knowledge,
             "files": files,
             "browser_profiles": browser_profiles,
+            "repositories": repositories,
             "skill_service_available": app.state.skill_service is not None,
         }
 
@@ -8866,6 +8902,154 @@ def create_app(
         )
         return destroyed.model_dump(mode="json")
 
+    @app.get("/api/repositories")
+    def list_repository_bindings(
+        workspace_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "connectors.manage")
+        return {"workspace_id": workspace_id, "repositories": [item.model_dump(mode="json") for item in app.state.coding_workspace_registry.list_repositories(context.tenant_id, workspace_id)]}
+
+    @app.post("/api/repositories", status_code=status.HTTP_201_CREATED)
+    def create_repository_binding(
+        payload: RepositoryBindingCreate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "connectors.manage")
+        item = app.state.coding_workspace_service.create_repository(context.tenant_id, context.user_id, payload)
+        record_audit_event(app, tenant_id=context.tenant_id, workspace_id=item.workspace_id, user_id=context.user_id, run_id=None, event_type="coding.repository.connected", metadata={"repository_id": item.id, "provider": item.provider, "connector_id_present": item.connector_id is not None}, request=request)
+        return item.model_dump(mode="json")
+
+    @app.patch("/api/repositories/{repository_id}")
+    def update_repository_binding(
+        repository_id: str,
+        payload: RepositoryBindingPatch,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "connectors.manage")
+        return app.state.coding_workspace_service.update_repository(context.tenant_id, repository_id, payload).model_dump(mode="json")
+
+    @app.get("/api/coding-workspaces")
+    def list_coding_workspaces(
+        workspace_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "sandbox.create")
+        return {"workspace_id": workspace_id, "coding_workspaces": [item.model_dump(mode="json") for item in app.state.coding_workspace_registry.list_workspaces(context.tenant_id, workspace_id)]}
+
+    @app.post("/api/coding-workspaces", status_code=status.HTTP_201_CREATED)
+    def create_coding_workspace(
+        payload: CodingWorkspaceCreate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "sandbox.create")
+        item = app.state.coding_workspace_service.create_workspace(context.tenant_id, context.user_id, payload)
+        record_audit_event(app, tenant_id=context.tenant_id, workspace_id=item.workspace_id, user_id=context.user_id, run_id=item.run_id, event_type="coding.workspace.created", metadata={"coding_workspace_id": item.id, "repository_id": item.repository_id, "branch": item.branch, "engine_session_id": item.engine_session_id}, request=request)
+        return item.model_dump(mode="json")
+
+    @app.get("/api/coding-workspaces/{coding_workspace_id}")
+    def get_coding_workspace(
+        coding_workspace_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "sandbox.create")
+        return app.state.coding_workspace_service.detail(context.tenant_id, coding_workspace_id)
+
+    @app.get("/api/runs/{run_id}/coding-workspace")
+    def get_run_coding_workspace(
+        run_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "sandbox.create")
+        run = app.state.store.get_run(context.tenant_id, run_id)
+        item = next((candidate for candidate in app.state.coding_workspace_registry.list_workspaces(context.tenant_id, run.workspace_id) if candidate.run_id == run_id), None)
+        return {"run_id": run_id, "available": item is not None, "detail": app.state.coding_workspace_service.detail(context.tenant_id, item.id) if item is not None else None}
+
+    @app.put("/api/coding-workspaces/{coding_workspace_id}/changes")
+    def submit_coding_changes(
+        coding_workspace_id: str,
+        payload: CodingChangesSubmit,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "sandbox.create")
+        item = app.state.coding_workspace_service.submit_changes(context.tenant_id, coding_workspace_id, payload)
+        run = app.state.store.get_run(context.tenant_id, item.run_id)
+        app.state.store.append_run_event(run, "coding.changes.updated", {"coding_workspace_id": item.id, "file_count": len(payload.changes), "head_revision": payload.head_revision})
+        return item.model_dump(mode="json")
+
+    @app.post("/api/coding-workspaces/{coding_workspace_id}/tests", status_code=status.HTTP_201_CREATED)
+    def add_coding_test_result(
+        coding_workspace_id: str,
+        payload: CodingTestResultCreate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "sandbox.create")
+        result = app.state.coding_workspace_service.add_test(context.tenant_id, coding_workspace_id, payload)
+        workspace = app.state.coding_workspace_registry.get_workspace(context.tenant_id, coding_workspace_id)
+        run = app.state.store.get_run(context.tenant_id, workspace.run_id)
+        app.state.store.append_run_event(run, "coding.test.completed", {"coding_workspace_id": workspace.id, "test_result_id": result.id, "status": result.status, "command": result.command, "duration_seconds": result.duration_seconds})
+        return result.model_dump(mode="json")
+
+    @app.post("/api/coding-workspaces/{coding_workspace_id}/checkpoints", status_code=status.HTTP_201_CREATED)
+    def add_coding_checkpoint(
+        coding_workspace_id: str,
+        payload: CodingCheckpointCreate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "sandbox.create")
+        checkpoint = app.state.coding_workspace_service.add_checkpoint(context.tenant_id, context.user_id, coding_workspace_id, payload)
+        workspace = app.state.coding_workspace_registry.get_workspace(context.tenant_id, coding_workspace_id)
+        run = app.state.store.get_run(context.tenant_id, workspace.run_id)
+        app.state.store.append_run_event(run, "coding.checkpoint.created", {"coding_workspace_id": workspace.id, "checkpoint_id": checkpoint.id, "revision": checkpoint.revision, "label": checkpoint.label})
+        return checkpoint.model_dump(mode="json")
+
+    @app.post("/api/coding-workspaces/{coding_workspace_id}/deliveries", status_code=status.HTTP_201_CREATED)
+    def add_coding_delivery(
+        coding_workspace_id: str,
+        payload: CodingDeliveryCreate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "sandbox.create")
+        item = app.state.coding_workspace_service.add_delivery(context.tenant_id, context.user_id, coding_workspace_id, payload)
+        workspace = app.state.coding_workspace_registry.get_workspace(context.tenant_id, coding_workspace_id)
+        run = app.state.store.get_run(context.tenant_id, workspace.run_id)
+        app.state.store.append_run_event(run, "coding.delivery.updated", {"coding_workspace_id": workspace.id, "delivery_id": item.id, "status": item.status, "commit_sha": item.commit_sha, "pull_request_url": item.pull_request_url})
+        record_audit_event(app, tenant_id=context.tenant_id, workspace_id=workspace.workspace_id, user_id=context.user_id, run_id=workspace.run_id, event_type="coding.delivery.recorded", metadata={"coding_workspace_id": workspace.id, "delivery_id": item.id, "status": item.status, "commit_sha_present": item.commit_sha is not None, "pull_request_present": item.pull_request_url is not None}, request=request)
+        return item.model_dump(mode="json")
+
+    @app.post("/api/coding-workspaces/{coding_workspace_id}/actions")
+    def request_coding_workspace_action(
+        coding_workspace_id: str,
+        payload: CodingActionRequest,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "sandbox.create")
+        workspace = app.state.coding_workspace_registry.get_workspace(context.tenant_id, coding_workspace_id)
+        if workspace.engine_session_id is None:
+            raise ValueError("Coding Workspace is not attached to an Agent Engine session")
+        session = app.state.agent_engine_service.operation(
+            context.tenant_id,
+            workspace.engine_session_id,
+            "coding/actions",
+            {"coding_workspace_id": workspace.id, **payload.model_dump(mode="json")},
+        )
+        run = app.state.store.get_run(context.tenant_id, workspace.run_id)
+        app.state.store.append_run_event(run, "coding.action.requested", {"coding_workspace_id": workspace.id, "engine_session_id": session.id, "action": payload.action, "message_present": payload.message is not None, "command_present": payload.command is not None})
+        record_audit_event(app, tenant_id=context.tenant_id, workspace_id=workspace.workspace_id, user_id=context.user_id, run_id=workspace.run_id, event_type="coding.action.requested", metadata={"coding_workspace_id": workspace.id, "engine_session_id": session.id, "action": payload.action}, request=request)
+        return {"accepted": True, "coding_workspace_id": workspace.id, "engine_session": session.model_dump(mode="json")}
+
     @app.get("/api/agent-engines/connections")
     def list_agent_engine_connections(
         workspace_id: str,
@@ -9418,6 +9602,14 @@ def build_agent_engine_registry(settings: Settings) -> AgentEngineRegistry:
         MigrationRunner(config=config, migrations_path=Path("apps/api/migrations")).apply()
         return SqlAgentEngineRegistry(config=config)
     return InMemoryAgentEngineRegistry()
+
+
+def build_coding_workspace_registry(settings: Settings) -> CodingWorkspaceRegistry:
+    if settings.coding_workspace_store_backend == "sql":
+        config = settings.database_config()
+        MigrationRunner(config=config, migrations_path=Path("apps/api/migrations")).apply()
+        return SqlCodingWorkspaceRegistry(config=config)
+    return CodingWorkspaceRegistry()
 
 
 def build_thread_share_store(settings: Settings) -> ThreadShareStore:

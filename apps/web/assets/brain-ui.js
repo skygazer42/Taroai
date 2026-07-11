@@ -16,9 +16,12 @@ export class AgentBrainUI {
     this.browserSessions = [];
     this.engineConnections = [];
     this.engineSessions = [];
+    this.repositories = [];
+    this.codingWorkspaces = [];
     this.selectedConnectorId = null;
     this.selectedBrowserProfileId = null;
     this.selectedEngineConnectionId = null;
+    this.selectedRepositoryId = null;
     this.tab = "connectors";
     this.boundRoute = () => this.route();
     this.boundMessage = (event) => this.oauthCompleted(event);
@@ -63,6 +66,7 @@ export class AgentBrainUI {
           <button data-brain-tab="secrets">Secrets</button>
           <button data-brain-tab="browser">Browser</button>
           <button data-brain-tab="engines">Engines</button>
+          <button data-brain-tab="repositories">Repositories</button>
         </nav>
         <section data-brain-panel="connectors" class="capability-split brain-connectors">
           <aside class="capability-list" data-connector-list><div class="route-loading">Loading connectors…</div></aside>
@@ -73,6 +77,7 @@ export class AgentBrainUI {
         <section data-brain-panel="secrets" hidden></section>
         <section data-brain-panel="browser" hidden></section>
         <section data-brain-panel="engines" hidden></section>
+        <section data-brain-panel="repositories" hidden></section>
         <div class="route-toast" data-brain-toast hidden></div>
       </section>`;
     this.renderStaticPanels();
@@ -80,13 +85,15 @@ export class AgentBrainUI {
 
   async load() {
     const workspace = encodeURIComponent(this.api.settings().workspaceId);
-    const [connectors, skills, browserProfiles, browserSessions, engineConnections, engineSessions] = await Promise.allSettled([
+    const [connectors, skills, browserProfiles, browserSessions, engineConnections, engineSessions, repositories, codingWorkspaces] = await Promise.allSettled([
       this.api.get(`/api/connectors?workspace_id=${workspace}`),
       this.api.get(`/api/workspaces/${workspace}/skills`),
       this.api.get(`/api/browser/profiles?workspace_id=${workspace}`),
       this.api.get(`/api/browser/profile-sessions?workspace_id=${workspace}`),
       this.api.get(`/api/agent-engines/connections?workspace_id=${workspace}`),
       this.api.get(`/api/agent-engines/sessions?workspace_id=${workspace}`),
+      this.api.get(`/api/repositories?workspace_id=${workspace}`),
+      this.api.get(`/api/coding-workspaces?workspace_id=${workspace}`),
     ]);
     this.connectors = connectors.status === "fulfilled" ? asArray(connectors.value, "connectors") : [];
     this.skills = skills.status === "fulfilled" ? asArray(skills.value, "skills") : [];
@@ -94,6 +101,8 @@ export class AgentBrainUI {
     this.browserSessions = browserSessions.status === "fulfilled" ? asArray(browserSessions.value, "sessions") : [];
     this.engineConnections = engineConnections.status === "fulfilled" ? asArray(engineConnections.value, "connections") : [];
     this.engineSessions = engineSessions.status === "fulfilled" ? asArray(engineSessions.value, "sessions") : [];
+    this.repositories = repositories.status === "fulfilled" ? asArray(repositories.value, "repositories") : [];
+    this.codingWorkspaces = codingWorkspaces.status === "fulfilled" ? asArray(codingWorkspaces.value, "coding_workspaces") : [];
     if (!this.selectedConnectorId || !this.connectors.some((item) => item.id === this.selectedConnectorId)) {
       this.selectedConnectorId = this.connectors[0]?.id || null;
     }
@@ -103,6 +112,7 @@ export class AgentBrainUI {
     if (!this.selectedEngineConnectionId || !this.engineConnections.some((item) => item.id === this.selectedEngineConnectionId)) {
       this.selectedEngineConnectionId = this.engineConnections[0]?.id || null;
     }
+    if (!this.selectedRepositoryId || !this.repositories.some((item) => item.id === this.selectedRepositoryId)) this.selectedRepositoryId = this.repositories[0]?.id || null;
     this.renderConnectors();
     this.renderStaticPanels();
     if (connectors.status === "rejected") this.toast(connectors.reason?.message || "Connectors are unavailable", "error");
@@ -161,11 +171,13 @@ export class AgentBrainUI {
     const secrets = this.root.querySelector("[data-brain-panel='secrets']");
     const browser = this.root.querySelector("[data-brain-panel='browser']");
     const engines = this.root.querySelector("[data-brain-panel='engines']");
+    const repositories = this.root.querySelector("[data-brain-panel='repositories']");
     if (skills) skills.innerHTML = `<div class="brain-summary-card"><span>S</span><div><h2>${this.skills.length} workspace skills</h2><p>Inspect SKILL.md, package files, evaluations, and pinned versions.</p><button data-open-skills>Manage skills</button></div></div>`;
     if (memory) memory.innerHTML = `<div class="brain-summary-card"><span>M</span><div><h2>Memory</h2><p>Long-term facts and reviewed memories are governed by the workspace memory service.</p><button data-open-operations>Open memory operations</button></div></div>`;
     if (secrets) secrets.innerHTML = `<div class="brain-summary-card"><span>K</span><div><h2>Secrets</h2><p>Connector credentials remain in the Secret Vault and are issued to tools as short-lived leases.</p></div></div>`;
     if (browser) this.renderBrowser(browser);
     if (engines) this.renderEngines(engines);
+    if (repositories) this.renderRepositories(repositories);
   }
 
   click(event) {
@@ -203,6 +215,42 @@ export class AgentBrainUI {
     if (button.dataset.engineSessionSteer) return this.steerEngineSession(button.dataset.engineSessionSteer);
     if (button.dataset.engineSessionEvents) return this.openEngineEvents(button.dataset.engineSessionEvents);
     if (button.dataset.engineApproval) return this.decideEngineApproval(button.dataset.engineSession, button.dataset.engineApproval, button.dataset.engineDecision);
+    if (button.matches("[data-repository-create]")) return this.openRepositoryEditor();
+    if (button.dataset.repositoryId) { this.selectedRepositoryId = button.dataset.repositoryId; return this.renderStaticPanels(); }
+    if (button.matches("[data-repository-disable]")) return this.updateRepository({ status: "disabled" });
+  }
+
+  renderRepositories(root) {
+    const selected = this.repositories.find((item) => item.id === this.selectedRepositoryId) || null;
+    root.innerHTML = `<section class="repository-workspace"><aside><header><div><small>Source control</small><h2>Repositories</h2></div><button class="primary" data-repository-create>Connect</button></header><div data-repository-list></div></aside><article data-repository-detail></article></section>`;
+    const list = root.querySelector("[data-repository-list]");
+    if (!this.repositories.length) list.innerHTML = `<div class="route-empty compact"><span>R</span><strong>No repositories</strong><p>Connect a governed Git repository for coding Agents.</p></div>`;
+    for (const repository of this.repositories) {
+      const button = document.createElement("button"); button.type = "button"; button.className = "repository-row"; button.classList.toggle("is-active", repository.id === this.selectedRepositoryId); button.dataset.repositoryId = repository.id;
+      button.innerHTML = `<span>R</span><div><strong></strong><small></small></div><i data-state="${repository.status}"></i>`; button.querySelector("strong").textContent = repository.name; button.querySelector("small").textContent = `${repository.provider} · ${repository.default_branch}`; list.append(button);
+    }
+    const detail = root.querySelector("[data-repository-detail]");
+    if (!selected) { detail.innerHTML = `<div class="route-empty"><span>R</span><strong>Connect a repository</strong><p>Credentials stay in the selected Connector; Coding Workspaces receive a run-scoped checkout.</p><button data-repository-create>Connect repository</button></div>`; return; }
+    const sessions = this.codingWorkspaces.filter((item) => item.repository_id === selected.id);
+    detail.innerHTML = `<header class="repository-heading"><div><span>R</span><div><small>${selected.provider}</small><h2></h2><p></p></div></div><button class="danger" data-repository-disable ${selected.status !== "active" ? "disabled" : ""}>Disable</button></header><div class="engine-facts"><div><small>Default branch</small><strong>${selected.default_branch}</strong></div><div><small>Authentication</small><strong>${selected.connector_id ? "Connector" : "Public HTTPS"}</strong></div><div><small>Coding sessions</small><strong>${sessions.length}</strong></div></div><section class="repository-session-list"><header><h3>Recent worktrees</h3></header><div data-repository-sessions></div></section>`;
+    detail.querySelector("h2").textContent = selected.name; detail.querySelector(".repository-heading p").textContent = selected.repository_url;
+    const sessionList = detail.querySelector("[data-repository-sessions]");
+    for (const item of sessions) { const row = document.createElement("article"); row.className = "coding-evidence-row"; const title = document.createElement("strong"); title.textContent = item.branch; const meta = document.createElement("small"); meta.textContent = `${item.status} · ${item.run_id}`; const body = document.createElement("p"); body.textContent = item.worktree_path; row.append(title, meta, body); sessionList.append(row); }
+    if (!sessions.length) sessionList.innerHTML = `<p class="route-note">No Coding Workspaces have used this repository.</p>`;
+  }
+
+  openRepositoryEditor() {
+    const dialog = document.createElement("dialog"); dialog.className = "chat-dialog repository-dialog";
+    dialog.innerHTML = `<form class="chat-dialog-card"><header><div><small>Governed source</small><h2>Connect repository</h2></div><button type="button" data-close>×</button></header><label><span>Name</span><input name="name" required /></label><label><span>Provider</span><select name="provider"><option value="github">GitHub</option><option value="gitlab">GitLab</option><option value="bitbucket">Bitbucket</option><option value="generic">Generic Git</option></select></label><label><span>HTTPS repository URL</span><input name="repository_url" type="url" required placeholder="https://github.com/org/repository" /></label><label><span>Default branch</span><input name="default_branch" value="main" required /></label><label><span>Connector ID</span><input name="connector_id" placeholder="Optional GitHub/GitLab Connector" /></label><footer><button type="button" data-close>Cancel</button><button class="primary" type="submit">Connect</button></footer></form>`;
+    document.body.append(dialog); dialog.querySelectorAll("[data-close]").forEach((button) => button.addEventListener("click", () => dialog.close()));
+    dialog.querySelector("form").addEventListener("submit", async (event) => { event.preventDefault(); const data = new FormData(event.currentTarget); const submit = event.currentTarget.querySelector("[type='submit']"); submit.disabled = true; try { const created = await this.api.post("/api/repositories", { workspace_id: this.api.settings().workspaceId, name: data.get("name"), provider: data.get("provider"), repository_url: data.get("repository_url"), default_branch: data.get("default_branch"), connector_id: String(data.get("connector_id") || "").trim() || null }, { scope: "repository-connect" }); this.selectedRepositoryId = created.id; dialog.close(); this.toast("Repository connected", "success"); await this.load(); await window.taroaiChat?.loadCapabilities?.(); } catch (error) { submit.disabled = false; this.toast(error.message, "error"); } });
+    dialog.addEventListener("close", () => dialog.remove()); dialog.showModal();
+  }
+
+  async updateRepository(patch) {
+    if (!this.selectedRepositoryId) return;
+    try { await this.api.patch(`/api/repositories/${encodeURIComponent(this.selectedRepositoryId)}`, patch, { scope: "repository-update" }); this.toast("Repository updated", "success"); await this.load(); await window.taroaiChat?.loadCapabilities?.(); }
+    catch (error) { this.toast(error.message, "error"); }
   }
 
   selectedEngineConnection() {

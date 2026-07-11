@@ -16,6 +16,8 @@ export const chatState = {
   queue: [],
   events: [],
   artifacts: [],
+  codingWorkspace: null,
+  activeCodingChange: null,
   modelCatalog: [],
   selectedModel: null,
   capabilities: [],
@@ -215,6 +217,13 @@ export class ChatController {
       artifactStage: query("[data-artifact-stage]"),
       artifactStageTitle: query("[data-artifact-stage-title]"),
       artifactStageContent: query("[data-artifact-stage-content]"),
+      codingEmpty: query("[data-coding-empty]"),
+      codingRoot: query("[data-coding-workspace]"),
+      codingChanges: query("[data-coding-changes]"),
+      codingDiff: query("[data-coding-diff]"),
+      codingTests: query("[data-coding-tests]"),
+      codingCheckpoints: query("[data-coding-checkpoints]"),
+      codingDeliveries: query("[data-coding-deliveries]"),
       detailId: query("[data-thread-detail-id]"),
       detailModel: query("[data-thread-detail-model]"),
       detailRun: query("[data-thread-detail-run]"),
@@ -256,11 +265,12 @@ export class ChatController {
     return target?.closest?.(
       "[data-new-chat], #send-button, #model-selector-button, [data-chat-model], [data-model-effort], " +
         "[data-run-history-refresh], [data-thread-id], [data-thread-action], #composer-add-button, [data-add-command], " +
-        "[data-open-queue], [data-open-artifacts], [data-sidecar-tab], [data-queue-action], [data-queue-dispatch], " +
+        "[data-open-queue], [data-open-artifacts], [data-open-code], [data-sidecar-tab], [data-queue-action], [data-queue-dispatch], " +
         "[data-thread-stop], [data-thread-share], [data-thread-more], [data-thread-rename], [data-thread-pin], " +
         "[data-thread-archive], [data-thread-delete], [data-remove-upload], [data-remove-resource], [data-mention-id], " +
         "[data-delivery-mode], [data-voice-input], [data-thread-create-agent], [data-create-agent], " +
         "[data-create-agent-prompt], [data-thread-artifact], [data-artifact-copy], [data-artifact-download], " +
+        "[data-coding-tab], [data-coding-change], [data-coding-action], " +
         "[data-message-copy], [data-message-retry], [data-message-speak], [data-message-summarize], [data-suggestion]",
     );
   }
@@ -287,6 +297,7 @@ export class ChatController {
     if (control.matches("[data-add-command]")) return this.handleAddCommand(control.dataset.addCommand);
     if (control.matches("[data-open-queue]")) return this.openSidecar("queue");
     if (control.matches("[data-open-artifacts]")) return this.openSidecar("artifacts");
+    if (control.matches("[data-open-code]")) return this.openSidecar("code");
     if (control.matches("[data-sidecar-tab]")) return this.openSidecar(control.dataset.sidecarTab);
     if (control.matches("[data-queue-action]")) return this.handleQueueAction(control);
     if (control.matches("[data-queue-dispatch]")) return this.dispatchQueue();
@@ -306,6 +317,9 @@ export class ChatController {
     if (control.matches("[data-thread-artifact]")) return this.openArtifact(control.dataset.threadArtifact);
     if (control.matches("[data-artifact-copy]")) return this.copyArtifact();
     if (control.matches("[data-artifact-download]")) return this.downloadArtifact();
+    if (control.matches("[data-coding-tab]")) return this.switchCodingTab(control.dataset.codingTab);
+    if (control.matches("[data-coding-change]")) return this.selectCodingChange(control.dataset.codingChange);
+    if (control.matches("[data-coding-action]")) return this.requestCodingAction(control.dataset.codingAction);
     if (control.matches("[data-message-copy]")) return this.copyMessage(control.dataset.messageCopy);
     if (control.matches("[data-message-retry]")) return this.retryMessage(control.dataset.messageRetry);
     if (control.matches("[data-message-speak]")) return this.speakMessage(control.dataset.messageSpeak, control);
@@ -524,6 +538,8 @@ export class ChatController {
       chatState.artifacts = arrayFrom(payload, "artifacts", "outputs").length
         ? arrayFrom(payload, "artifacts", "outputs")
         : arrayFrom(thread, "artifacts", "outputs");
+      chatState.codingWorkspace = null;
+      chatState.activeCodingChange = null;
       chatState.running =
         Boolean(thread.running) ||
         ACTIVE_RUN_STATES.has(String(thread.run_status || thread.current_run_status || "").toLowerCase()) ||
@@ -556,6 +572,7 @@ export class ChatController {
       if (updateHash) updateThreadHash(thread.id);
       this.restoreDraft();
       this.renderAll();
+      await this.loadCodingWorkspace();
       await this.maybePromoteManualMessage();
       this.network(chatState.running ? "Agent is working" : "Thread ready", chatState.running ? "active" : "idle");
       this.startEventStream();
@@ -582,6 +599,8 @@ export class ChatController {
     chatState.queue = [];
     chatState.events = [];
     chatState.artifacts = [];
+    chatState.codingWorkspace = null;
+    chatState.activeCodingChange = null;
     chatState.resourceRefs = [];
     chatState.uploads = [];
     chatState.running = false;
@@ -1492,6 +1511,7 @@ export class ChatController {
       }
     }
     if (type.includes("artifact")) this.captureArtifactFromEvent(event);
+    if (type.startsWith("coding.")) this.loadCodingWorkspace();
     if (!chatState.events.some((item) => eventSequence(item) && eventSequence(item) === sequence)) {
       chatState.events.push({ ...event, thread_sequence: sequence || eventSequence(event) });
       this.persistEventCache();
@@ -1886,6 +1906,91 @@ export class ChatController {
     setTimeout(() => URL.revokeObjectURL(url), 0);
   }
 
+  async loadCodingWorkspace() {
+    if (!chatState.currentRunId) {
+      chatState.codingWorkspace = null;
+      this.renderCodingWorkspace();
+      return;
+    }
+    try {
+      const payload = await this.api.get(`/api/runs/${encodeURIComponent(chatState.currentRunId)}/coding-workspace`);
+      chatState.codingWorkspace = payload.available ? payload.detail : null;
+      const changes = chatState.codingWorkspace?.changes || [];
+      if (!chatState.activeCodingChange || !changes.some((item) => item.id === chatState.activeCodingChange.id)) chatState.activeCodingChange = changes[0] || null;
+    } catch {
+      chatState.codingWorkspace = null;
+      chatState.activeCodingChange = null;
+    }
+    this.renderCodingWorkspace();
+  }
+
+  renderCodingWorkspace() {
+    if (!this.refs.codingRoot) return;
+    const detail = chatState.codingWorkspace;
+    this.refs.codingRoot.hidden = !detail;
+    if (this.refs.codingEmpty) this.refs.codingEmpty.hidden = Boolean(detail);
+    if (!detail) return;
+    const workspace = detail.coding_workspace || {};
+    const repository = detail.repository || {};
+    const changes = arrayFrom(detail, "changes");
+    const tests = arrayFrom(detail, "tests");
+    const checkpoints = arrayFrom(detail, "checkpoints");
+    const deliveries = arrayFrom(detail, "deliveries");
+    setText(query("[data-coding-repository]"), repository.name || repository.repository_url || "Repository");
+    setText(query("[data-coding-branch]"), workspace.branch || "Branch pending");
+    setText(query("[data-coding-status]"), workspace.status || "preparing");
+    queryAll("[data-coding-action]").forEach((button) => { button.disabled = !workspace.engine_session_id; button.title = workspace.engine_session_id ? "" : "Attach an external Agent Engine to request this action"; });
+    setText(query("[data-coding-files]"), `${changes.length} file${changes.length === 1 ? "" : "s"}`);
+    setText(query("[data-coding-additions]"), `+${changes.reduce((sum, item) => sum + Number(item.additions || 0), 0)}`);
+    setText(query("[data-coding-deletions]"), `−${changes.reduce((sum, item) => sum + Number(item.deletions || 0), 0)}`);
+    this.refs.codingChanges.replaceChildren();
+    for (const change of changes) {
+      const button = document.createElement("button"); button.type = "button"; button.dataset.codingChange = change.id; button.className = "coding-change-row"; button.classList.toggle("is-active", change.id === chatState.activeCodingChange?.id);
+      const status = document.createElement("span"); status.textContent = { added: "A", modified: "M", deleted: "D", renamed: "R", untracked: "?" }[change.status] || "M"; status.dataset.status = change.status;
+      const path = document.createElement("strong"); path.textContent = change.path;
+      const stats = document.createElement("small"); stats.textContent = `+${change.additions || 0} −${change.deletions || 0}`;
+      button.append(status, path, stats); this.refs.codingChanges.append(button);
+    }
+    if (!changes.length) this.refs.codingChanges.innerHTML = `<p class="route-note">No file changes reported by the Runner.</p>`;
+    setText(this.refs.codingDiff, chatState.activeCodingChange?.binary ? "Binary file changed" : chatState.activeCodingChange?.patch || "Select a changed file.");
+    this.renderCodingEvidence(this.refs.codingTests, tests, (item) => [item.command, `${item.status} · ${Number(item.duration_seconds || 0).toFixed(2)}s`, item.summary]);
+    this.renderCodingEvidence(this.refs.codingCheckpoints, checkpoints, (item) => [item.label, item.revision, item.snapshot_id ? `Snapshot ${item.snapshot_id}` : "Revision checkpoint"]);
+    this.renderCodingEvidence(this.refs.codingDeliveries, deliveries, (item) => [item.status, item.commit_sha || item.pull_request_number || "Delivery", item.pull_request_url || item.commit_message || ""]);
+  }
+
+  renderCodingEvidence(root, values, describe) {
+    if (!root) return; root.replaceChildren();
+    for (const item of values) {
+      const row = document.createElement("article"); row.className = "coding-evidence-row";
+      const [title, meta, body] = describe(item); const strong = document.createElement("strong"); strong.textContent = title; const small = document.createElement("small"); small.textContent = meta; const paragraph = document.createElement("p"); paragraph.textContent = body; row.append(strong, small, paragraph); root.append(row);
+    }
+    if (!values.length) root.innerHTML = `<p class="route-note">No evidence reported yet.</p>`;
+  }
+
+  switchCodingTab(tab) {
+    queryAll("[data-coding-tab]").forEach((button) => button.classList.toggle("is-active", button.dataset.codingTab === tab));
+    queryAll("[data-coding-panel]").forEach((panel) => { panel.hidden = panel.dataset.codingPanel !== tab; });
+  }
+
+  selectCodingChange(changeId) {
+    chatState.activeCodingChange = (chatState.codingWorkspace?.changes || []).find((item) => item.id === changeId) || null;
+    this.renderCodingWorkspace();
+  }
+
+  async requestCodingAction(action) {
+    const workspace = chatState.codingWorkspace?.coding_workspace;
+    if (!workspace) return;
+    let message = null; let command = null;
+    if (action === "test") command = window.prompt("Test command", "npm test") || null;
+    if (["checkpoint", "commit", "pull_request"].includes(action)) message = window.prompt(action === "pull_request" ? "Pull request title" : action === "commit" ? "Commit message" : "Checkpoint label") || null;
+    if ((action === "test" && !command) || (["checkpoint", "commit", "pull_request"].includes(action) && !message)) return;
+    try {
+      await this.api.post(`/api/coding-workspaces/${encodeURIComponent(workspace.id)}/actions`, { action, message, command }, { scope: `coding-${action}` });
+      this.network(`Coding action requested · ${action.replaceAll("_", " ")}`, "success");
+      window.setTimeout(() => this.loadCodingWorkspace(), 800);
+    } catch (error) { this.network(error.message, "error"); }
+  }
+
   openSidecar(view = "artifacts") {
     chatState.activeSidecar = view;
     this.refs.sidecar?.classList.remove("is-operations-open");
@@ -1898,8 +2003,9 @@ export class ChatController {
       section.hidden = !active;
       section.classList.toggle("is-active", active);
     });
-    setText(this.refs.sidecarTitle, { artifacts: "Artifacts", queue: "Queue", details: "Thread details" }[view] || "Thread");
+    setText(this.refs.sidecarTitle, { artifacts: "Artifacts", code: "Coding Workspace", queue: "Queue", details: "Thread details" }[view] || "Thread");
     query("[data-open-queue]")?.setAttribute("aria-expanded", String(view === "queue"));
+    if (view === "code") this.loadCodingWorkspace();
   }
 
   renderDetails() {
@@ -1920,6 +2026,7 @@ export class ChatController {
     this.renderConversation();
     this.renderQueue();
     this.renderArtifacts();
+    this.renderCodingWorkspace();
     this.renderResourceChips();
     this.renderUploads();
     this.renderDetails();

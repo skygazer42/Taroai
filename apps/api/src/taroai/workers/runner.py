@@ -80,6 +80,7 @@ from taroai.agent_engines import (
     InMemoryAgentEngineRegistry,
     SqlAgentEngineRegistry,
 )
+from taroai.coding_workspaces import CodingWorkspaceRegistry, CodingWorkspaceService, SqlCodingWorkspaceRegistry
 from taroai.skills.import_service import HttpsGithubArchiveFetcher
 from taroai.skills.service import SkillService
 from taroai.store import InMemoryControlPlaneStore
@@ -442,6 +443,9 @@ def build_agent_worker_runner(
     agent_engine_service = AgentEngineService(
         agent_engine_registry, secret_service, store=resolved_store
     )
+    coding_workspace_service = CodingWorkspaceService(
+        build_worker_coding_workspace_registry(settings), resolved_store
+    )
     policy_service = IdentityPolicyService(
         identity_service=build_worker_identity_service(settings, audit_service)
     )
@@ -490,6 +494,7 @@ def build_agent_worker_runner(
         agent_registry=agent_registry,
         browser_profile_service=browser_profile_service,
         agent_engine_service=agent_engine_service,
+        coding_workspace_service=coding_workspace_service,
     ), settings)
     if resolved_runtime.skill_service is None:
         resolved_runtime.skill_service = worker_skill_service
@@ -505,6 +510,8 @@ def build_agent_worker_runner(
         resolved_runtime.browser_profile_service = browser_profile_service
     if resolved_runtime.agent_engine_service is None:
         resolved_runtime.agent_engine_service = agent_engine_service
+    if resolved_runtime.coding_workspace_service is None:
+        resolved_runtime.coding_workspace_service = coding_workspace_service
     chat_service = ChatService(
         store=resolved_store,
         model_policy_resolver=lambda: resolved_runtime.model_policy,
@@ -1047,6 +1054,14 @@ def build_worker_agent_engine_registry(settings: Settings):
         ).apply()
         return SqlAgentEngineRegistry(config=config)
     return InMemoryAgentEngineRegistry()
+
+
+def build_worker_coding_workspace_registry(settings: Settings):
+    if settings.coding_workspace_store_backend == "sql":
+        config = settings.database_config()
+        MigrationRunner(config=config, migrations_path=Path("apps/api/migrations")).apply()
+        return SqlCodingWorkspaceRegistry(config=config)
+    return CodingWorkspaceRegistry()
 
 
 def build_worker_queue(settings: Settings) -> JobQueue:

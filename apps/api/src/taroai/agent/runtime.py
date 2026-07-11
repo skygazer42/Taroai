@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from taroai.agent.graph import build_runtime_graph
 from taroai.agent_engines import AgentEngineSessionCreate
+from taroai.coding_workspaces import CodingWorkspaceCreate
 from taroai.agent.planning import PlanStep
 from taroai.agent.state import AgentRetrievedContext, AgentRuntimeState
 from taroai.audit import AuditActor, AuditEventCreate, AuditService
@@ -137,6 +138,7 @@ class AgentRuntime(BaseModel):
     agent_registry: Any | None = None
     browser_profile_service: Any | None = None
     agent_engine_service: Any | None = None
+    coding_workspace_service: Any | None = None
     max_step_retries: int = 0
     runtime_mode: str = "legacy"
     loop_max_iterations: int = Field(default=12, ge=1)
@@ -191,6 +193,7 @@ class AgentRuntime(BaseModel):
                 return self._pause_for_policy_block(
                     state, run, runtime_policy_decision
                 )
+            coding_workspace = self._ensure_coding_workspace(run, state)
             session = self.agent_engine_service.start_session(
                 run.tenant_id,
                 run.user_id,
@@ -203,9 +206,13 @@ class AgentRuntime(BaseModel):
                     metadata={
                         "agent_id": run.agent_id,
                         "engine_type": snapshot.get("engine_type"),
+                        "coding_workspace": coding_workspace.model_dump(mode="json") if coding_workspace is not None else None,
                     },
                 ),
             )
+            if coding_workspace is not None:
+                coding_workspace = coding_workspace.model_copy(update={"engine_session_id": session.id, "updated_at": utc_now()})
+                self.coding_workspace_service.registry.save_workspace(coding_workspace)
             state.runtime_metadata.update(
                 {
                     "engine_session_id": session.id,
@@ -221,6 +228,32 @@ class AgentRuntime(BaseModel):
         state.status = status_map.get(session.status, RunStatus.RUNNING)
         self._save_state(state)
         return state
+
+    def _ensure_coding_workspace(self, run: Run, state: AgentRuntimeState):
+        if self.coding_workspace_service is None:
+            return None
+        repository_refs = [item for item in run.resource_refs if item.type == "repository"]
+        snapshot_repository_id = self._agent_runtime_snapshot(state).get("repository_id")
+        repository_id = repository_refs[0].id if repository_refs else snapshot_repository_id
+        if not repository_id:
+            return None
+        for item in self.coding_workspace_service.registry.list_workspaces(run.tenant_id, run.workspace_id):
+            if item.run_id == run.id:
+                state.runtime_metadata["coding_workspace_id"] = item.id
+                return item
+        item = self.coding_workspace_service.create_workspace(
+            run.tenant_id,
+            run.user_id,
+            CodingWorkspaceCreate(
+                workspace_id=run.workspace_id,
+                repository_id=str(repository_id),
+                run_id=run.id,
+                branch=str(self._agent_runtime_snapshot(state).get("branch") or f"taroai/{run.id}"),
+            ),
+        )
+        state.runtime_metadata["coding_workspace_id"] = item.id
+        self.store.append_run_event(run, "coding.workspace.created", {"coding_workspace_id": item.id, "repository_id": item.repository_id, "branch": item.branch, "worktree_path": item.worktree_path})
+        return item
 
     def _execute_legacy_run(self, tenant_id: str, run_id: str) -> AgentRuntimeState:
         run = self.store.update_run_status(tenant_id, run_id, RunStatus.RUNNING)
@@ -2041,6 +2074,9 @@ class AgentRuntime(BaseModel):
             self._materialize_runtime_snapshot_files(
                 state, session, self._agent_runtime_snapshot(state)
             )
+            self._ensure_coding_workspace(
+                self.store.get_run(state.tenant_id, state.run_id), state
+            )
             return session
         self._enforce_sandbox_concurrency_license(state)
         runtime_snapshot = self._agent_runtime_snapshot(state)
@@ -2090,6 +2126,7 @@ class AgentRuntime(BaseModel):
         )
         self._materialize_run_attachments(state, session)
         self._materialize_runtime_snapshot_files(state, session, runtime_snapshot)
+        self._ensure_coding_workspace(run, state)
         self._save_state(state)
         return session
 

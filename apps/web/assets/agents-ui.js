@@ -250,14 +250,16 @@ export class AgentsUI {
 
   async openDraft(agent = {}) {
     const workspace = encodeURIComponent(this.api.settings().workspaceId);
-    const [files, browserProfiles, engineConnections] = await Promise.allSettled([
+    const [files, browserProfiles, engineConnections, repositories] = await Promise.allSettled([
       this.api.get(`/api/workspaces/${workspace}/files`),
       this.api.get(`/api/browser/profiles?workspace_id=${workspace}`),
       this.api.get(`/api/agent-engines/connections?workspace_id=${workspace}`),
+      this.api.get(`/api/repositories?workspace_id=${workspace}`),
     ]);
     this.draftFiles = files.status === "fulfilled" ? list(files.value, "files") : [];
     this.draftBrowserProfiles = browserProfiles.status === "fulfilled" ? list(browserProfiles.value, "profiles").filter((item) => item.status === "active") : [];
     this.draftEngineConnections = engineConnections.status === "fulfilled" ? list(engineConnections.value, "connections").filter((item) => item.status === "active") : [];
+    this.draftRepositories = repositories.status === "fulfilled" ? list(repositories.value, "repositories").filter((item) => item.status === "active") : [];
     const dialog = document.createElement("dialog");
     dialog.className = "chat-dialog agent-editor-dialog";
     dialog.innerHTML = `<form class="chat-dialog-card" data-agent-draft-form><header><div><small>Review before publish</small><h2>${agent.id ? "Edit agent draft" : "Create agent"}</h2></div><button type="button" data-close>×</button></header><label><span>Name</span><input name="name" required /></label><label><span>Description</span><textarea name="description" rows="2"></textarea></label><label><span>Instructions</span><textarea name="instructions" rows="6" required></textarea></label><label><span>Output format</span><input name="output_format" placeholder="Report, table, artifact set…" /></label><label><span>Input JSON schema</span><textarea name="input_schema" data-json-field rows="6">${JSON.stringify(agent.input_schema || { type: "object", properties: { request: { type: "string" } }, required: ["request"] }, null, 2)}</textarea></label><div class="agent-runtime-editor"><label><span>Autonomy</span><select name="autonomy_mode"><option value="workflow">Guarded workflow</option><option value="autonomous">Autonomous</option></select></label><label><span>Network policy</span><select name="network_mode"><option value="disabled">Disabled</option><option value="allowlist">Allowlist</option><option value="open">Open</option></select></label><label><span>Browser profile</span><select name="browser_profile_id" data-agent-browser-profile-options><option value="">Workspace default</option></select></label><label><span>Runtime image</span><input name="runtime_image" placeholder="python:3.12-slim" /></label><label><span>Timeout seconds</span><input name="timeout_seconds" type="number" min="1" max="86400" /></label></div><fieldset class="agent-reference-picker"><legend>Reference files <small>Materialized into every fresh run</small></legend><div data-agent-reference-options></div></fieldset><div class="agent-draft-bindings"><span>${list(agent.skill_bindings || agent.skills, "items").length} pinned skills</span><span data-agent-reference-count>${list(agent.reference_files || agent.files, "items").length} files</span><span>${agent.runtime_snapshot?.image || "Default runtime"}</span></div><footer><button type="button" data-close>Cancel</button><button class="primary" type="submit">Save & publish</button></footer></form>`;
@@ -273,6 +275,13 @@ export class AgentsUI {
       engineSelect.append(option);
     }
     dialog.querySelector(".agent-runtime-editor").prepend(engineLabel);
+    const repositoryLabel = document.createElement("label");
+    repositoryLabel.innerHTML = `<span>Repository</span><select name="repository_id"><option value="">No repository</option></select>`;
+    for (const repository of this.draftRepositories) {
+      const option = document.createElement("option"); option.value = repository.id; option.textContent = `${repository.name} · ${repository.default_branch}`; repositoryLabel.querySelector("select").append(option);
+    }
+    const branchLabel = document.createElement("label"); branchLabel.innerHTML = `<span>Coding branch</span><input name="coding_branch" placeholder="Generated per Run" />`;
+    dialog.querySelector(".agent-runtime-editor").prepend(repositoryLabel, branchLabel);
     dialog.querySelector("[name='name']").value = agent.name || "";
     dialog.querySelector("[name='description']").value = agent.description || "";
     dialog.querySelector("[name='instructions']").value = agent.instructions || "";
@@ -290,6 +299,8 @@ export class AgentsUI {
     }
     profileSelect.value = agent.runtime_snapshot?.browser_profile_id || "";
     engineSelect.value = agent.runtime_snapshot?.engine_connection_id || "";
+    repositoryLabel.querySelector("select").value = agent.runtime_snapshot?.repository_id || "";
+    branchLabel.querySelector("input").value = agent.runtime_snapshot?.branch || "";
     const selectedFiles = new Set(list(agent.reference_files || agent.files, "items").map((item) => item.storage_object_id || item.id));
     const options = dialog.querySelector("[data-agent-reference-options]");
     if (!this.draftFiles.length) {
@@ -354,6 +365,8 @@ export class AgentsUI {
         browser_profile_id: data.get("browser_profile_id") || undefined,
         engine_connection_id: data.get("engine_connection_id") || undefined,
         engine_type: form.elements.engine_connection_id?.selectedOptions?.[0]?.dataset.engineType || "native",
+        repository_id: data.get("repository_id") || undefined,
+        branch: data.get("coding_branch") || undefined,
       },
       source_thread_id: agent.source_thread_id || chatState.currentThreadId || null,
       source_run_id: agent.source_run_id || null,

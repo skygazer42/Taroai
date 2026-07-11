@@ -34,12 +34,14 @@ class AgentRegistryService:
         storage_catalog: Any | None = None,
         browser_profile_service: Any | None = None,
         agent_engine_registry: Any | None = None,
+        coding_workspace_registry: Any | None = None,
     ) -> None:
         self.registry = registry
         self.store = store
         self.storage_catalog = storage_catalog
         self.browser_profile_service = browser_profile_service
         self.agent_engine_registry = agent_engine_registry
+        self.coding_workspace_registry = coding_workspace_registry
 
     def create(
         self,
@@ -203,6 +205,13 @@ class AgentRegistryService:
                 or connection.engine_type.value != engine_type
             ):
                 raise ValueError("Agent Engine connection is not active for this Agent version")
+        repository_id = target.spec.runtime_snapshot.get("repository_id")
+        if repository_id and self.coding_workspace_registry is not None:
+            repository = self.coding_workspace_registry.get_repository(
+                tenant_id, str(repository_id)
+            )
+            if repository.workspace_id != target.workspace_id or repository.status != "active":
+                raise ValueError("Agent repository binding is not active in its workspace")
         model_policy = target.spec.model_policy
         if bool(model_policy.get("provider_id")) != bool(model_policy.get("model_id")):
             raise ValueError("Agent model policy must pin provider_id and model_id together")

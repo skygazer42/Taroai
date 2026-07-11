@@ -159,6 +159,7 @@
             <span class="status-pill thread-presence" data-status-pill data-thread-presence>Ready</span>
             <button class="topbar-action" type="button" data-open-queue aria-expanded="false">Queue <span data-queue-count>0</span></button>
             <button class="topbar-action" type="button" data-open-artifacts>Artifacts</button>
+            <button class="topbar-action" type="button" data-open-code>Code</button>
             <button class="topbar-pill" type="button" data-open-operations>Operations</button>
             <button class="topbar-action" type="button" data-open-files-dialog>Files</button>
             <button class="topbar-action" type="button" data-thread-share>Share</button>
@@ -280,6 +281,7 @@
         <div class="chat-sidecar" data-chat-sidecar>
           <nav class="sidecar-tabs" aria-label="Thread details">
             <button type="button" class="is-active" data-sidecar-tab="artifacts">Artifacts</button>
+            <button type="button" data-sidecar-tab="code">Code</button>
             <button type="button" data-sidecar-tab="queue">Queue <span data-sidecar-queue-count>0</span></button>
             <button type="button" data-sidecar-tab="details">Details</button>
           </nav>
@@ -293,6 +295,19 @@
             <div class="artifact-stage" data-artifact-stage hidden>
               <header><strong data-artifact-stage-title>Artifact</strong><div><button type="button" data-artifact-copy>Copy</button><button type="button" data-artifact-download>Download</button></div></header>
               <pre data-artifact-stage-content></pre>
+            </div>
+          </section>
+          <section class="sidecar-view coding-sidecar" data-sidecar-view="code" hidden>
+            <div class="sidecar-empty" data-coding-empty><span aria-hidden="true">⌘</span><strong>No Coding Workspace</strong><p>Mention a repository or run an Agent pinned to one.</p></div>
+            <div data-coding-workspace hidden>
+              <header class="coding-sidecar-header"><div><small data-coding-repository>Repository</small><strong data-coding-branch>Branch</strong></div><span data-coding-status>Preparing</span></header>
+              <div class="coding-sidecar-metrics"><span data-coding-files>0 files</span><span data-coding-additions>+0</span><span data-coding-deletions>−0</span></div>
+              <div class="coding-sidecar-actions"><button data-coding-action="refresh">Refresh</button><button data-coding-action="test">Run tests</button><button data-coding-action="checkpoint">Checkpoint</button><button data-coding-action="commit">Commit</button><button class="primary" data-coding-action="pull_request">Open PR</button></div>
+              <nav class="coding-sidecar-tabs"><button class="is-active" data-coding-tab="changes">Changes</button><button data-coding-tab="tests">Tests</button><button data-coding-tab="checkpoints">Checkpoints</button><button data-coding-tab="delivery">Delivery</button></nav>
+              <section data-coding-panel="changes"><div class="coding-file-list" data-coding-changes></div><pre class="coding-diff" data-coding-diff>Select a changed file.</pre></section>
+              <section data-coding-panel="tests" hidden><div data-coding-tests></div></section>
+              <section data-coding-panel="checkpoints" hidden><div data-coding-checkpoints></div></section>
+              <section data-coding-panel="delivery" hidden><div data-coding-deliveries></div></section>
             </div>
           </section>
           <section class="sidecar-view" data-sidecar-view="queue" data-testid="message-queue" hidden>
