@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -13,6 +13,22 @@ from taroai.agent.tools import ToolResult
 from taroai.domain import RunStatus, utc_now
 from taroai.knowledge import RetrievalResult
 from taroai.memory import MemoryRecord
+
+
+AgentGraphRoute = Literal[
+    "observe",
+    "decide",
+    "policy",
+    "act",
+    "observe_result",
+    "verify",
+    "repair",
+    "replan",
+    "complete",
+    "wait_user",
+    "fail",
+    "end",
+]
 
 
 class AgentRetrievedContext(BaseModel):
@@ -63,4 +79,10 @@ class AgentRuntimeState(BaseModel):
     pending_uncertain_action_id: str | None = None
     waiting_reason: str | None = None
     terminal_event_emitted: bool = False
+    # LangGraph 节点之间的显式控制状态。
+    graph_route: AgentGraphRoute = "observe"
+    current_cycle_id: str | None = None
+    current_action_id: str | None = None
+    graph_failure_code: str | None = None
+    graph_failure_detail: str | None = None
     runtime_metadata: dict[str, Any] = Field(default_factory=dict)

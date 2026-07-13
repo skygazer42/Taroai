@@ -350,6 +350,12 @@ class OpenAICompatibleModelGateway(ModelGateway):
             value = normalized.get(key)
             if value is not None and not isinstance(value, str):
                 normalized[key] = str(value)
+        tool_input = normalized.get("tool_input")
+        if (
+            isinstance(tool_input, str)
+            and normalized.get("tool_name") == "sandbox.command"
+        ):
+            normalized["tool_input"] = {"command": tool_input}
         return normalized
 
     def _parse_plan_json(self, output_text: str) -> Any:

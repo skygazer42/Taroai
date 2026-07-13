@@ -616,9 +616,16 @@ class AgentLoopV2:
             raise ValueError("A chat turn can bind only one reusable agent")
         registry = self.runtime.agent_registry
         if registry is None:
-            raise ValueError("agent registry is not configured")
+            if references:
+                raise ValueError("agent registry is not configured")
+            return None
         agent_id = next(iter(agent_ids))
-        definition = registry.get(run.tenant_id, agent_id)
+        try:
+            definition = registry.get(run.tenant_id, agent_id)
+        except NotFoundError:
+            if references:
+                raise
+            return None
         if definition.workspace_id != run.workspace_id:
             raise ValueError("agent is not available in this workspace")
         reference = next((item for item in references if item.id == agent_id), None)

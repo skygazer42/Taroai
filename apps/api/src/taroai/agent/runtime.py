@@ -155,7 +155,7 @@ class AgentRuntime(BaseModel):
     )
 
     def build_graph(self):
-        return build_runtime_graph()
+        return build_runtime_graph(self)
 
     def execute_run(self, tenant_id: str, run_id: str) -> AgentRuntimeState:
         run = self.store.get_run(tenant_id, run_id)
@@ -166,11 +166,14 @@ class AgentRuntime(BaseModel):
         snapshot = self._agent_runtime_snapshot(probe)
         if str(snapshot.get("engine_type") or "native") != "native":
             return self._execute_external_engine(run, probe, snapshot)
-        if self.runtime_mode == "loop_v2":
-            from taroai.agent.loop import AgentLoopV2
+        from taroai.agent.loop import AgentLoopV2
 
-            return AgentLoopV2(self).execute_run(tenant_id, run_id)
-        return self._execute_legacy_run(tenant_id, run_id)
+        state = AgentLoopV2(self)._restore_state(run)
+        result = self.build_graph().compile().invoke(
+            state,
+            config={"recursion_limit": self.loop_max_iterations * 8 + 32},
+        )
+        return AgentRuntimeState.model_validate(result)
 
     def _execute_external_engine(
         self,
@@ -626,7 +629,11 @@ class AgentRuntime(BaseModel):
                 content=(
                     "You are Taroai's enterprise agent planner. Return strict JSON with "
                     "a top-level steps array. Each step must include id, title, tool_name, "
-                    "tool_input, and approval_required. Available built-in tools include "
+                    "tool_input, and approval_required. tool_input must always be a JSON "
+                    "object, never a string. For sandbox.command use a shape such as "
+                    '{"command":"mkdir -p /workspace/artifacts && ...",'
+                    '"artifact_path":"/workspace/artifacts/report.md"}. '
+                    "Available built-in tools include "
                     "sandbox.command for shell or Python work in the run workspace and "
                     "browser.action for browser navigation, extraction, typing, clicking, "
                     "and screenshots. Do not invent session_id values for sandbox.command "

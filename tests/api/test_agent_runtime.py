@@ -8,7 +8,8 @@ from pydantic import Field
 
 import taroai.agent.runtime as runtime_module
 from taroai.domain import ApprovalStatus, RunCreate, RunStatus, utc_now
-from taroai.agent import AgentRuntime, PlanStep
+from taroai.agent import AgentRuntime, AgentRuntimeState, PlanStep
+from taroai.agent.models import AgentDecision, AgentVerificationResult
 from taroai.billing import BillingPricingRule, BillingPricingService
 from taroai.guardrails import (
     GuardrailAction,
@@ -85,6 +86,26 @@ class RecordingPlanGateway(ModelGateway):
             output_text=self.output_text,
             planned_steps=self.plan,
         )
+
+
+class RecordingGraphGateway(ModelGateway):
+    decisions: list[AgentDecision] = Field(default_factory=list)
+    verifications: list[AgentVerificationResult] = Field(default_factory=list)
+
+    def decide_next_action(self, request: ModelGatewayRequest) -> AgentDecision:
+        del request
+        return self.decisions.pop(0)
+
+    def verify_completion(
+        self,
+        request: ModelGatewayRequest,
+    ) -> AgentVerificationResult:
+        del request
+        return self.verifications.pop(0)
+
+    def stream_response(self, request: ModelGatewayRequest):
+        del request
+        yield "任务已完成。"
 
 
 class RecordingObjectStorage(ObjectStorageAdapter):
@@ -2882,3 +2903,66 @@ def test_agent_runtime_builds_langgraph_graph():
     compiled = graph.compile()
 
     assert compiled is not None
+    assert graph.state_schema is AgentRuntimeState
+
+
+def test_agent_runtime_executes_native_run_through_compiled_langgraph(monkeypatch):
+    store, run = create_runtime_run()
+    invocations: list[AgentRuntimeState] = []
+
+    class RecordingCompiledGraph:
+        def invoke(self, state, *args, **kwargs):
+            del args, kwargs
+            invocations.append(state)
+            return state.model_dump(mode="python")
+
+    class RecordingGraph:
+        def compile(self):
+            return RecordingCompiledGraph()
+
+    monkeypatch.setattr(
+        runtime_module,
+        "build_runtime_graph",
+        lambda executor: RecordingGraph(),
+    )
+    runtime = AgentRuntime(
+        store=store,
+        model_gateway=DeterministicModelGateway(),
+        tool_gateway=DeterministicToolGateway(),
+    )
+
+    state = runtime.execute_run("tenant_acme", run.id)
+
+    assert len(invocations) == 1
+    assert invocations[0].run_id == run.id
+    assert isinstance(state, AgentRuntimeState)
+
+
+def test_langgraph_executes_action_and_verification_nodes():
+    store, run = create_runtime_run()
+    runtime = AgentRuntime(
+        store=store,
+        model_gateway=RecordingGraphGateway(
+            decisions=[
+                AgentDecision(
+                    kind="action",
+                    tool_name="research.lookup",
+                    tool_input={"query": "prospect"},
+                )
+            ],
+            verifications=[AgentVerificationResult(outcome="complete")],
+        ),
+        tool_gateway=DeterministicToolGateway(),
+        full_auto_requires_isolation=False,
+    )
+
+    state = runtime.execute_run("tenant_acme", run.id)
+
+    assert state.status == RunStatus.SUCCEEDED
+    assert state.graph_route == "end"
+    assert len(state.observations) == 1
+    assert state.verifier_result is not None
+    assert state.verifier_result.outcome == "complete"
+    events = store.list_run_events("tenant_acme", run.id)
+    started = next(event for event in events if event.type == "agent.loop.started")
+    assert started.payload["mode"] == "langgraph"
