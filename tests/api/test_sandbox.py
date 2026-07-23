@@ -422,8 +422,8 @@ def test_sandbox_tool_gateway_handler_executes_command_with_scope():
 
     policy = gateway.policies["sandbox.command"]
     assert "python3 -c" in policy.description
-    assert "straightforward arithmetic" in policy.description
-    assert "explicitly requests code" in policy.description
+    assert "Writing or explaining code alone" in policy.description
+    assert "run, test, or debug code" in policy.description
     assert policy.input_schema["properties"]["result_mode"]["enum"] == [
         "raw_stdout",
         "summarize",

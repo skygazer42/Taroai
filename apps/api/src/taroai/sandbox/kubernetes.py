@@ -294,6 +294,16 @@ class KubernetesSandboxAdapter(SandboxAdapter):
             raise SandboxExecutionError(
                 f"kubernetes sandbox provider failed to upload file: {message}"
             )
+        if file_write.mode is not None:
+            chmod_result = self._run_workspace_shell(
+                session,
+                f"chmod {file_write.mode:o} {shlex.quote(display_path)}",
+                timeout_seconds=self.pod_ready_timeout_seconds,
+            )
+            if chmod_result.returncode != 0:
+                raise SandboxExecutionError(
+                    "kubernetes sandbox provider failed to set uploaded file mode"
+                )
         return SandboxFileRef.from_bytes(
             content_bytes,
             tenant_id=file_write.tenant_id,

@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -17,6 +18,38 @@ class AuthRegisterRequest(BaseModel):
         max_length=320,
         pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$",
     )
+    password: str = Field(min_length=8, max_length=1024)
+
+
+AuthActionPurpose = Literal["email_verification", "password_reset"]
+
+
+class AuthActionTokenClaims(BaseModel):
+    purpose: AuthActionPurpose
+    tenant_id: str = Field(min_length=1)
+    user_id: str = Field(min_length=1)
+    credential_fingerprint: str = Field(min_length=64, max_length=64)
+    expires_at: datetime
+
+
+class AuthEmailVerificationRequest(BaseModel):
+    token: str = Field(min_length=1)
+
+
+class AuthEmailVerificationSendRequest(BaseModel):
+    email: str = Field(
+        min_length=3,
+        max_length=320,
+        pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$",
+    )
+
+
+class AuthPasswordForgotRequest(AuthEmailVerificationSendRequest):
+    tenant_id: str | None = Field(default=None, min_length=1)
+
+
+class AuthPasswordResetRequest(BaseModel):
+    token: str = Field(min_length=1)
     password: str = Field(min_length=8, max_length=1024)
 
 

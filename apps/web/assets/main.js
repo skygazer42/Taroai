@@ -1,9 +1,9 @@
-import { createChatController } from "./chat-controller.js?v=20260722-flow115";
-import { createSkillsUI } from "./skills-ui.js?v=20260722-flow115";
-import { createAgentsUI } from "./agents-ui.js?v=20260722-flow115";
+import { createChatController } from "./chat-controller.js?v=20260723-flow131";
+import { createSkillsUI } from "./skills-ui.js?v=20260723-flow127";
+import { createAgentsUI } from "./agents-ui.js?v=20260723-flow132";
 import { createArtifactsUI } from "./artifacts-ui.js?v=20260722-flow115";
-import { createSpeechUI } from "./speech-ui.js?v=20260722-flow115";
-import { createAgentBrainUI } from "./brain-ui.js?v=20260722-flow115";
+import { createSpeechUI } from "./speech-ui.js?v=20260723-flow127";
+import { createAgentBrainUI } from "./brain-ui.js?v=20260723-flow121";
 import { createFilesUI } from "./files-ui.js?v=20260722-flow115";
 import { createEvaluationsUI } from "./evaluations-ui.js?v=20260722-flow115";
 import { createWorkspaceUI } from "./workspace-ui.js?v=20260722-flow115";
@@ -66,8 +66,11 @@ const state = {
   authDisplayName: "",
   accessToken: sessionStorage.getItem("taroai.accessToken") || localStorage.getItem("taroai.accessToken") || "",
   authMode: "login",
+  authCapabilities: { registration_enabled: true, password_reset_enabled: false },
   invitationToken: "",
   invitationTenantId: "",
+  emailVerificationToken: "",
+  passwordResetToken: "",
 };
 
 applyUrlConfiguration();
@@ -75,6 +78,9 @@ const invitationParams = new URLSearchParams(window.location.search);
 state.invitationToken = invitationParams.get("invite") || "";
 state.invitationTenantId = invitationParams.get("tenantId") || invitationParams.get("tenant_id") || state.tenantId;
 if (state.invitationToken) state.authMode = "invite";
+state.emailVerificationToken = invitationParams.get("verifyEmail") || "";
+state.passwordResetToken = invitationParams.get("resetPassword") || "";
+if (state.passwordResetToken) state.authMode = "reset";
 
 const ACTIVE_RUN_STATUSES = [
   "created",
@@ -170,6 +176,14 @@ const elements = {
   accountAvatar: document.querySelector("[data-account-avatar]"),
   accountName: document.querySelector("[data-account-name]"),
   accountMeta: document.querySelector("[data-account-meta]"),
+  accountButton: document.querySelector("[data-account-menu-toggle]"),
+  accountMenu: document.querySelector("[data-account-menu]"),
+  accountMenuName: document.querySelector("[data-account-menu-name]"),
+  accountMenuMeta: document.querySelector("[data-account-menu-meta]"),
+  accountSignIn: document.querySelector("[data-account-sign-in]"),
+  accountSettings: document.querySelector("[data-account-settings]"),
+  accountSignOut: document.querySelector("[data-account-sign-out]"),
+  localeChoices: document.querySelectorAll("[data-locale-choice]"),
   authDialog: document.querySelector("#auth-dialog"),
   authDialogTitle: document.querySelector("#auth-dialog-title"),
   authSubtitle: document.querySelector("[data-auth-subtitle]"),
@@ -179,6 +193,12 @@ const elements = {
   authSwitch: document.querySelector("[data-auth-switch]"),
   authSwitchPrompt: document.querySelector("[data-auth-switch-prompt]"),
   authModeToggle: document.querySelector("[data-auth-mode-toggle]"),
+  authForgot: document.querySelector("[data-auth-forgot]"),
+  settingsDialog: document.querySelector("#settings-dialog"),
+  settingsDialogClose: document.querySelector("[data-settings-dialog-close]"),
+  settingsApiKeysState: document.querySelector("[data-settings-api-keys-state]"),
+  settingsApiKeysList: document.querySelector("[data-settings-api-keys-list]"),
+  settingsOpenAgents: document.querySelector("[data-settings-open-agents]"),
   developerOnly: document.querySelectorAll("[data-developer-only]"),
   newChat: document.querySelector("[data-new-chat]"),
   routeLinks: document.querySelectorAll("[data-app-route]"),
@@ -559,15 +579,22 @@ function routeCards(routeName, definition) {
           actionLabel: "Open",
         }))
       : [{ title: "No published agents", description: "Publish an agent before sharing it from Discover.", meta: "Workspace", action: "route:agents", actionLabel: "Open Agents" }];
-    return [...agents, {
-      title: "Built-in Store",
-      description: state.storeItems.length
-        ? "Install verified Taroai capabilities into this workspace."
-        : "Browse verified capabilities bundled with this deployment.",
-      meta: `${state.storeItems.length} available`,
-      action: "route:skills",
-      actionLabel: "Open Store",
-    }, {
+    const storeItems = state.storeItems.length
+      ? state.storeItems.map((item) => ({
+          title: item.name || item.id,
+          description: item.description || "Verified capability bundled with this deployment.",
+          meta: `${item.publisher || "Taroai"} · ${item.skill_count || 0} skill${item.skill_count === 1 ? "" : "s"}`,
+          action: `store:${item.id}`,
+          actionLabel: "View & install",
+        }))
+      : [{
+          title: "Built-in Store",
+          description: "No built-in capabilities are available in this deployment.",
+          meta: "0 available",
+          action: "route:skills",
+          actionLabel: "Open Skills",
+        }];
+    return [...agents, ...storeItems, {
       title: "Skills",
       description: state.workspaceSkills.length
         ? "Inspect, enable, or try the skills installed in this workspace."
@@ -887,6 +914,10 @@ function handleRouteAction(action) {
     window.location.hash = `agents/${encodeURIComponent(action.slice("agent:".length))}`;
     return;
   }
+  if (action.startsWith("store:")) {
+    window.location.hash = `skills/${encodeURIComponent(action.slice("store:".length))}`;
+    return;
+  }
   if (action.startsWith("prompt:")) {
     prefillChatMessage(action.slice("prompt:".length));
     return;
@@ -926,7 +957,7 @@ function setMobileNavOpen(open) {
 }
 
 function setActivePopover(popoverName, trigger = null) {
-  const allowed = ["model", "add"];
+  const allowed = ["model", "add", "account"];
   const activePopover = allowed.includes(popoverName) ? popoverName : null;
   state.activePopover = activePopover;
   if (activePopover && trigger) {
@@ -935,13 +966,20 @@ function setActivePopover(popoverName, trigger = null) {
 
   const modelOpen = activePopover === "model";
   const addOpen = activePopover === "add";
+  const accountOpen = activePopover === "account";
   elements.modelSelectorMenu.hidden = !modelOpen;
   elements.modelSelectorButton.setAttribute("aria-expanded", String(modelOpen));
   elements.composerAddMenu.hidden = !addOpen;
   elements.composerAddButton.setAttribute("aria-expanded", String(addOpen));
+  elements.accountMenu.hidden = !accountOpen;
+  elements.accountButton.setAttribute("aria-expanded", String(accountOpen));
 
   const firstItem = activePopover
-    ? (activePopover === "model" ? elements.modelSelectorMenu : elements.composerAddMenu)
+    ? (activePopover === "model"
+        ? elements.modelSelectorMenu
+        : activePopover === "add"
+          ? elements.composerAddMenu
+          : elements.accountMenu)
         .querySelector('[role^="menuitem"]')
     : null;
   if (firstItem) {
@@ -1064,11 +1102,157 @@ function updateFilesSelectionStatus() {
   elements.filesConfirm.closest(".files-dialog-footer").hidden = count === 0;
 }
 
-function openAuthDialog() {
+function openAuthDialog(status = "") {
+  closeActivePopover(false);
   window.taroaiChat?.closeModelMenu();
-  renderAuth();
+  renderAuth(status);
   if (!elements.authDialog.open) elements.authDialog.showModal();
   if (!state.accessToken) (elements.loginEmail.value ? elements.loginPassword : elements.loginEmail).focus();
+}
+
+function renderSettingsApiKeys(keys = [], agents = [], mode = "ready") {
+  elements.settingsApiKeysList.replaceChildren();
+  elements.settingsApiKeysState.dataset.state = mode;
+  elements.settingsApiKeysState.hidden = mode === "ready";
+  elements.settingsApiKeysState.textContent = mode === "loading"
+    ? "Loading API keys…"
+    : mode === "error"
+      ? "Could not load API keys."
+      : "";
+
+  if (mode === "loading") return;
+  if (mode === "error" || !keys.length) {
+    const empty = document.createElement("div");
+    empty.className = "settings-api-keys-empty";
+    const title = document.createElement("strong");
+    title.textContent = mode === "error" ? "API keys unavailable" : "No API keys yet";
+    const copy = document.createElement("p");
+    copy.textContent = mode === "error"
+      ? "Check the API connection and try again."
+      : "Create a scoped key from a published Agent.";
+    const action = document.createElement("button");
+    action.type = "button";
+    if (mode === "error") {
+      action.dataset.settingsApiKeysRetry = "";
+      action.textContent = "Retry";
+    } else {
+      action.dataset.settingsOpenAgents = "";
+      action.textContent = "Open Agents";
+    }
+    empty.append(title, copy, action);
+    elements.settingsApiKeysList.append(empty);
+    return;
+  }
+
+  const agentNames = new Map(
+    agents.map((agent) => [agent.id || agent.agent_id, agent.name || "Untitled agent"]),
+  );
+  for (const key of keys) {
+    const revoked = Boolean(key.revoked_at);
+    const row = document.createElement("article");
+    row.className = "settings-api-key-row";
+    row.dataset.state = revoked ? "revoked" : "active";
+
+    const heading = document.createElement("header");
+    const identity = document.createElement("div");
+    const name = document.createElement("strong");
+    name.className = "settings-api-key-name";
+    name.textContent = key.name || "Unnamed key";
+    const prefix = document.createElement("code");
+    prefix.textContent = key.token_prefix || "--";
+    identity.append(name, prefix);
+    const badge = document.createElement("span");
+    badge.className = "settings-api-key-status";
+    badge.textContent = revoked ? "Revoked" : "Active";
+    heading.append(identity, badge);
+
+    const facts = document.createElement("dl");
+    const addFact = (label, value) => {
+      const fact = document.createElement("div");
+      const term = document.createElement("dt");
+      const description = document.createElement("dd");
+      term.textContent = label;
+      description.textContent = value;
+      fact.append(term, description);
+      facts.append(fact);
+    };
+    addFact("Agent", agentNames.get(key.agent_id) || key.agent_id || "Unknown Agent");
+    addFact("Created", shortDateTime(key.created_at));
+    addFact("Last used", key.last_used_at ? shortDateTime(key.last_used_at) : "Never");
+    if (revoked) addFact("Revoked", shortDateTime(key.revoked_at));
+
+    const actions = document.createElement("footer");
+    const openAgent = document.createElement("button");
+    openAgent.type = "button";
+    openAgent.dataset.settingsOpenAgent = key.agent_id || "";
+    openAgent.textContent = "Open Agent";
+    actions.append(openAgent);
+    if (!revoked) {
+      const revoke = document.createElement("button");
+      revoke.type = "button";
+      revoke.className = "danger";
+      revoke.dataset.settingsRevokeKey = key.id;
+      revoke.textContent = "Revoke";
+      actions.append(revoke);
+    }
+    row.append(heading, facts, actions);
+    elements.settingsApiKeysList.append(row);
+  }
+}
+
+async function loadSettingsApiKeys() {
+  renderSettingsApiKeys([], [], "loading");
+  const agentsRequest = state.homepageAgents.length
+    ? Promise.resolve(state.homepageAgents)
+    : apiFetch(`/api/agents?workspace_id=${encodeURIComponent(state.workspaceId)}`);
+  const [keysResult, agentsResult] = await Promise.allSettled([
+    apiFetch("/api/api-keys"),
+    agentsRequest,
+  ]);
+  if (keysResult.status === "rejected") {
+    renderSettingsApiKeys([], state.homepageAgents, "error");
+    return;
+  }
+  const keyPayload = keysResult.value;
+  const keys = Array.isArray(keyPayload) ? keyPayload : keyPayload.items || [];
+  if (agentsResult.status === "fulfilled") {
+    const payload = agentsResult.value;
+    state.homepageAgents = Array.isArray(payload) ? payload : payload.agents || payload.items || [];
+  }
+  renderSettingsApiKeys(keys, state.homepageAgents);
+}
+
+async function openSettingsDialog() {
+  if (!state.accessToken) return openAuthDialog();
+  closeActivePopover(false);
+  if (!elements.settingsDialog.open) elements.settingsDialog.showModal();
+  window.requestAnimationFrame(() => elements.settingsDialogClose.focus());
+  await loadSettingsApiKeys();
+}
+
+async function revokeSettingsApiKey(button) {
+  const message = "Revoke this API key? Existing integrations will stop working.";
+  if (!window.confirm(window.TaroaiI18n?.t(message) || message)) return;
+  button.disabled = true;
+  button.textContent = "Revoking…";
+  try {
+    await apiFetch(`/api/api-keys/${encodeURIComponent(button.dataset.settingsRevokeKey)}`, {
+      method: "DELETE",
+    });
+    await loadSettingsApiKeys();
+  } catch {
+    elements.settingsApiKeysState.hidden = false;
+    elements.settingsApiKeysState.dataset.state = "error";
+    elements.settingsApiKeysState.textContent = "Could not revoke API key. Retry.";
+    button.disabled = false;
+    button.textContent = "Revoke";
+  }
+}
+
+function openAgentFromSettings(agentId = "") {
+  if (elements.settingsDialog.open) elements.settingsDialog.close();
+  if (agentId) window.location.hash = `agents/${encodeURIComponent(agentId)}`;
+  else renderAppRoute("agents", true);
 }
 
 async function openFilesDialog() {
@@ -1284,10 +1468,11 @@ function setStatus(status) {
 
 function fitComposer() {
   elements.input.style.height = "auto";
-  elements.input.style.height = `${Math.min(elements.input.scrollHeight, 180)}px`;
+  elements.input.style.height = `${Math.min(elements.input.scrollHeight, 150)}px`;
 }
 
 function syncComposerState() {
+  if (window.__taroaiThreadChat) return;
   elements.send.disabled = !elements.input.value.trim();
 }
 
@@ -1295,11 +1480,23 @@ function renderAuth(status) {
   const hasToken = Boolean(state.accessToken);
   const registering = !hasToken && state.authMode === "register";
   const acceptingInvitation = !hasToken && state.authMode === "invite";
+  const resettingPassword = !hasToken && state.authMode === "reset";
   const email = elements.loginEmail.value.trim() || state.authEmail;
   elements.authStatus.textContent = status || (hasToken ? "Signed in" : "");
   elements.accountName.textContent = hasToken ? email : "Sign in";
   elements.accountMeta.textContent = hasToken ? "Workspace" : "Connect your workspace";
   elements.accountAvatar.textContent = hasToken ? email.slice(0, 1).toUpperCase() : "→";
+  elements.accountMenuName.textContent = hasToken ? email : "Sign in";
+  elements.accountMenuMeta.textContent = hasToken ? "Workspace" : "Connect your workspace";
+  elements.accountSignIn.hidden = hasToken;
+  elements.accountSettings.hidden = !hasToken;
+  elements.accountSignOut.hidden = !hasToken;
+  elements.accountButton.setAttribute("aria-haspopup", hasToken ? "menu" : "dialog");
+  elements.accountButton.setAttribute("aria-controls", hasToken ? "sidebar-account-menu" : "auth-dialog");
+  if (!hasToken && elements.settingsDialog.open) elements.settingsDialog.close();
+  for (const button of elements.localeChoices) {
+    button.setAttribute("aria-pressed", String(button.dataset.localeChoice === window.TaroaiI18n?.locale));
+  }
   if (elements.planPill) elements.planPill.hidden = !hasToken;
   if (elements.heroGreeting) {
     const firstName = hasToken
@@ -1309,38 +1506,54 @@ function renderAuth(status) {
     elements.heroGreeting.textContent = greetingName ? `How can I help, ${greetingName}?` : "How can I help?";
   }
   elements.loginButton.hidden = hasToken;
-  elements.loginButton.textContent = acceptingInvitation ? "Join workspace" : registering ? "Sign up" : "Login";
+  elements.loginButton.textContent = acceptingInvitation
+    ? "Join workspace"
+    : registering
+    ? "Sign up"
+    : resettingPassword
+    ? "Reset password"
+    : "Login";
   elements.logoutButton.hidden = !hasToken;
-  elements.authDialogTitle.textContent = acceptingInvitation ? "Join this workspace" : registering ? "Create your account" : "Welcome";
+  elements.authDialogTitle.textContent = acceptingInvitation
+    ? "Join this workspace"
+    : registering
+    ? "Create your account"
+    : resettingPassword
+    ? "Choose a new password"
+    : "Welcome";
   elements.authSubtitle.textContent = acceptingInvitation
     ? "Choose your display name and password to accept the invitation."
     : registering
-    ? "Create a local workspace to get started."
+    ? "Create your workspace to get started."
+    : resettingPassword
+    ? "Enter a new password of at least 8 characters."
     : "Please enter your details to login.";
   elements.signupNameField.hidden = !(registering || acceptingInvitation);
   elements.signupName.required = registering || acceptingInvitation;
-  elements.authEmailField.hidden = acceptingInvitation;
-  elements.loginEmail.required = !acceptingInvitation;
-  elements.loginPassword.autocomplete = registering || acceptingInvitation ? "new-password" : "current-password";
-  elements.authSwitch.hidden = hasToken || acceptingInvitation;
+  elements.authEmailField.hidden = acceptingInvitation || resettingPassword;
+  elements.loginEmail.required = !(acceptingInvitation || resettingPassword);
+  elements.loginPassword.autocomplete = registering || acceptingInvitation || resettingPassword ? "new-password" : "current-password";
+  elements.authSwitch.hidden = hasToken || acceptingInvitation || resettingPassword || (!registering && !state.authCapabilities.registration_enabled);
   elements.authSwitchPrompt.textContent = registering
     ? "Already have an account?"
     : "Don't have an account?";
   elements.authModeToggle.textContent = registering ? "Login" : "Register";
   elements.authDialogClose.hidden = !hasToken;
-  elements.loginEmail.disabled = hasToken || acceptingInvitation;
+  elements.loginEmail.disabled = hasToken || acceptingInvitation || resettingPassword;
   elements.loginPassword.disabled = hasToken;
   elements.rememberLogin.disabled = hasToken || acceptingInvitation;
-  elements.rememberLogin.closest("label").hidden = acceptingInvitation;
+  elements.rememberLogin.closest("label").hidden = acceptingInvitation || resettingPassword;
+  elements.authForgot.hidden = hasToken || state.authMode !== "login" || !state.authCapabilities.password_reset_enabled;
   elements.passwordToggle.disabled = hasToken;
   syncLoginButton();
 }
 
 function syncLoginButton() {
   const acceptingInvitation = !state.accessToken && state.authMode === "invite";
+  const resettingPassword = !state.accessToken && state.authMode === "reset";
   elements.loginButton.disabled =
     Boolean(state.accessToken) ||
-    (!acceptingInvitation && !elements.loginEmail.value.trim()) ||
+    (!(acceptingInvitation || resettingPassword) && !elements.loginEmail.value.trim()) ||
     !elements.loginPassword.value ||
     ((state.authMode === "register" || acceptingInvitation) && !elements.signupName.value.trim());
 }
@@ -2162,6 +2375,15 @@ async function syncStoredSession() {
   return true;
 }
 
+async function loadAuthCapabilities() {
+  try {
+    state.authCapabilities = await apiFetch("/api/auth/capabilities");
+  } catch {
+    state.authCapabilities = { registration_enabled: false, password_reset_enabled: false };
+  }
+  renderAuth();
+}
+
 async function login(tenantId = null) {
   syncSettings();
   const email = elements.loginEmail.value.trim();
@@ -2251,6 +2473,12 @@ async function registerAccount() {
       method: "POST",
       body: JSON.stringify({ display_name: displayName, email, password }),
     });
+    if (result.verification_required) {
+      state.authMode = "login";
+      elements.loginPassword.value = "";
+      renderAuth("Check your email to verify the account, then sign in.");
+      return;
+    }
     await login(result.tenant_id);
   } catch (error) {
     renderAuth(
@@ -2265,6 +2493,69 @@ async function registerAccount() {
     syncLoginButton();
     elements.loginPassword.focus();
   }
+}
+
+async function requestPasswordReset() {
+  const email = elements.loginEmail.value.trim();
+  if (!email) {
+    renderAuth("Enter your email first.");
+    elements.loginEmail.focus();
+    return;
+  }
+  try {
+    await apiFetch("/api/auth/password/forgot", {
+      method: "POST",
+      body: JSON.stringify({ email }),
+    });
+    renderAuth("If the account exists, a password reset link has been sent.");
+  } catch {
+    renderAuth("Password reset email is temporarily unavailable.");
+  }
+}
+
+async function resetPassword() {
+  const password = elements.loginPassword.value;
+  if (!state.passwordResetToken || password.length < 8) {
+    renderAuth("Enter a password of at least 8 characters.");
+    return;
+  }
+  try {
+    await apiFetch("/api/auth/password/reset", {
+      method: "POST",
+      body: JSON.stringify({ token: state.passwordResetToken, password }),
+    });
+    state.passwordResetToken = "";
+    state.authMode = "login";
+    elements.loginPassword.value = "";
+    clearAuthActionQuery("resetPassword");
+    renderAuth("Password updated. Sign in with your new password.");
+  } catch {
+    renderAuth("This password reset link is invalid or expired.");
+  }
+}
+
+async function confirmEmailFromLink() {
+  if (!state.emailVerificationToken) return "";
+  let status;
+  try {
+    await apiFetch("/api/auth/email-verification/confirm", {
+      method: "POST",
+      body: JSON.stringify({ token: state.emailVerificationToken }),
+    });
+    status = "Email verified. You can now sign in.";
+  } catch {
+    status = "This email verification link is invalid or expired.";
+  } finally {
+    state.emailVerificationToken = "";
+    clearAuthActionQuery("verifyEmail");
+  }
+  return status;
+}
+
+function clearAuthActionQuery(parameter) {
+  const url = new URL(window.location.href);
+  url.searchParams.delete(parameter);
+  window.history.replaceState({}, document.title, `${url.pathname}${url.search}${url.hash}`);
 }
 
 async function acceptInvitation() {
@@ -4754,6 +5045,31 @@ document.addEventListener("click", (event) => {
 document.addEventListener("click", (event) => {
   if (event.target?.closest?.("[data-auth-dialog-open]")) openAuthDialog();
 });
+elements.accountButton.addEventListener("click", () => {
+  if (!state.accessToken) return openAuthDialog();
+  window.taroaiChat?.closeModelMenu();
+  setActivePopover(state.activePopover === "account" ? null : "account", elements.accountButton);
+});
+elements.accountSignIn.addEventListener("click", () => openAuthDialog());
+elements.accountSettings.addEventListener("click", () => void openSettingsDialog());
+elements.accountSignOut.addEventListener("click", () => {
+  closeActivePopover(false);
+  logout();
+});
+elements.settingsApiKeysList.addEventListener("click", (event) => {
+  const retry = event.target?.closest?.("[data-settings-api-keys-retry]");
+  if (retry) return void loadSettingsApiKeys();
+  const openAgent = event.target?.closest?.("[data-settings-open-agent]");
+  if (openAgent) return openAgentFromSettings(openAgent.dataset.settingsOpenAgent);
+  const openAgents = event.target?.closest?.("[data-settings-open-agents]");
+  if (openAgents) return openAgentFromSettings();
+  const revoke = event.target?.closest?.("[data-settings-revoke-key]");
+  if (revoke) void revokeSettingsApiKey(revoke);
+});
+elements.settingsOpenAgents.addEventListener("click", () => openAgentFromSettings());
+elements.localeChoices.forEach((button) => {
+  button.addEventListener("click", () => window.TaroaiI18n?.setLocale(button.dataset.localeChoice));
+});
 elements.authForm.addEventListener("input", () => {
   elements.signupName.removeAttribute("aria-invalid");
   elements.loginEmail.removeAttribute("aria-invalid");
@@ -4767,6 +5083,7 @@ elements.passwordToggle.addEventListener("click", () => {
   elements.loginPassword.type = visible ? "password" : "text";
   elements.passwordToggle.setAttribute("aria-label", visible ? "Show password" : "Hide password");
 });
+elements.authForgot.addEventListener("click", () => requestPasswordReset());
 elements.authModeToggle.addEventListener("click", () => {
   state.authMode = state.authMode === "register" ? "login" : "register";
   elements.signupName.removeAttribute("aria-invalid");
@@ -4779,6 +5096,7 @@ elements.authModeToggle.addEventListener("click", () => {
 elements.authForm.addEventListener("submit", (event) => {
   event.preventDefault();
   if (state.authMode === "invite") return acceptInvitation();
+  if (state.authMode === "reset") return resetPassword();
   if (state.authMode === "register") registerAccount();
   else login();
 });
@@ -4788,10 +5106,16 @@ document.addEventListener("click", (event) => {
     return;
   }
   const target = event.target;
-  const activeMenu =
-    state.activePopover === "model" ? elements.modelSelectorMenu : elements.composerAddMenu;
-  const activeButton =
-    state.activePopover === "model" ? elements.modelSelectorButton : elements.composerAddButton;
+  const activeMenu = state.activePopover === "model"
+    ? elements.modelSelectorMenu
+    : state.activePopover === "add"
+      ? elements.composerAddMenu
+      : elements.accountMenu;
+  const activeButton = state.activePopover === "model"
+    ? elements.modelSelectorButton
+    : state.activePopover === "add"
+      ? elements.composerAddButton
+      : elements.accountButton;
   if (activeMenu.contains(target) || activeButton.contains(target)) {
     return;
   }
@@ -4829,6 +5153,7 @@ elements.input.addEventListener("input", () => {
   syncComposerState();
 });
 elements.input.addEventListener("keydown", (event) => {
+  if (window.__taroaiThreadChat || event.isComposing || event.keyCode === 229) return;
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
     submitRun();
@@ -4965,6 +5290,8 @@ elements.browserScreenshot.addEventListener("click", (event) => {
 async function startApp() {
   initializeControls();
   fitComposer();
+  await loadAuthCapabilities();
+  const emailVerificationStatus = await confirmEmailFromLink();
   await syncStoredSession();
   createChatController();
   createSkillsUI();
@@ -4976,11 +5303,12 @@ async function startApp() {
   createEvaluationsUI();
   createWorkspaceUI();
   if (state.accessToken) {
+    if (emailVerificationStatus) renderAuth(emailVerificationStatus);
     await Promise.all([loadHomepageAgents(), loadNotifications()]);
     startNotificationPolling();
     refreshRouteData(state.appRoute);
   } else {
-    openAuthDialog();
+    openAuthDialog(emailVerificationStatus);
   }
 }
 

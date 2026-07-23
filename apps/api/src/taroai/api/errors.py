@@ -6,7 +6,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from taroai.api.idempotency import IdempotencyConflictError
 from taroai.api.pagination import InvalidPageCursorError
-from taroai.auth import AuthInvalidCredentialsError, AuthRequiredError
+from taroai.auth import (
+    AuthActionTokenError,
+    AuthEmailDeliveryError,
+    AuthInvalidCredentialsError,
+    AuthRequiredError,
+)
 from taroai.connectors import (
     ConnectorAccessDeniedError,
     ConnectorDispatchError,
@@ -77,6 +82,19 @@ class ApiExceptionRule(BaseModel):
 
 def default_exception_rules() -> list[ApiExceptionRule]:
     return [
+        ApiExceptionRule(
+            exception_type=AuthActionTokenError,
+            status_code=status.HTTP_400_BAD_REQUEST,
+            code="invalid_auth_action_token",
+            message="invalid or expired authentication link",
+        ),
+        ApiExceptionRule(
+            exception_type=AuthEmailDeliveryError,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            code="auth_email_unavailable",
+            message="authentication email delivery is unavailable",
+            retryable=True,
+        ),
         ApiExceptionRule(
             exception_type=AuthRequiredError,
             status_code=status.HTTP_401_UNAUTHORIZED,

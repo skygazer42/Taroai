@@ -1,20 +1,20 @@
 ---
-name: CSV Signal Brief
-description: Turn an attached CSV into a concise, evidence-backed quality, trend, and anomaly brief.
+name: Spreadsheet Signal Brief
+description: Analyze an attached CSV or Excel XLSX file and produce an evidence-backed data quality, range, duplicate, missing-value, and anomaly brief.
 license: Apache-2.0
 ---
 
-# CSV Signal Brief
+# Spreadsheet Signal Brief
 
-Analyze CSV data supplied by the user and produce a compact decision brief.
+Analyze CSV or XLSX data supplied by the user and produce a compact decision brief.
 
 ## Procedure
 
-1. If no CSV or tabular content is available, ask the user to attach or identify it. Do not invent a dataset.
-2. Inspect headers, row count, missing values, duplicate rows, obvious type inconsistencies, and numeric ranges.
-3. Use `sandbox.command` only when calculation is needed. Prefer Python's standard `csv` and `statistics` modules; do not install packages or use the network.
-4. Identify useful distributions, comparisons, trends, or outliers. Name the method used and distinguish observed facts from interpretations.
-5. Avoid reproducing sensitive row-level values. Quote column names and aggregate values that support each finding.
+1. If no CSV or XLSX attachment is available, ask the user to attach one. Do not invent a dataset.
+2. Run `python3 scripts/analyze_spreadsheet.py "<sandbox_path>" --output /workspace/artifacts/data_quality_report.md` from this Skill directory, using the attachment's declared `sandbox_path` exactly.
+3. Do not install packages or rewrite the parser; the bundled script uses only Python's standard library.
+4. Read the generated report and distinguish observed aggregates from interpretations.
+5. Avoid reproducing sensitive row-level values. Quote only column names and aggregate values that support each finding.
 
 ## Response format
 
@@ -24,4 +24,4 @@ Analyze CSV data supplied by the user and produce a compact decision brief.
 - Caveats
 - Suggested next steps
 
-For small or incomplete datasets, state the limitation prominently. Never imply causation from correlation alone.
+Return `data_quality_report.md` as the output artifact. For small or incomplete datasets, state the limitation prominently. Never imply causation from correlation alone.

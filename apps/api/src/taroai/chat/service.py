@@ -443,7 +443,7 @@ class ChatService:
     def execute_idempotently(
         self,
         request: IdempotencyRequest | None,
-        operation: Callable[[], MessageDispatch],
+        operation: Callable[[], BaseModel],
     ) -> tuple[int, dict[str, Any]]:
         if request is None:
             result = operation()

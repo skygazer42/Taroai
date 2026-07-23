@@ -83,11 +83,11 @@ def register_memory_tool_handler(
                 },
             },
         ),
-        lambda request: _save_user_memory(memory_service, request, store),
+        lambda request: _save_memory(memory_service, request, store),
     )
 
 
-def _save_user_memory(
+def _save_memory(
     memory_service: Any,
     request: ToolGatewayRequest,
     store: Any | None = None,
@@ -96,18 +96,25 @@ def _save_user_memory(
     memory_key = str(request.tool_input["memory_key"]).strip()
     if not content:
         raise ValueError("Memory content cannot be blank")
-    if (
-        re.fullmatch(r"[a-z0-9_.-]{1,120}", memory_key) is None
-        or memory_key in {"fact", "general", "legacy", "memory"}
-    ):
+    if re.fullmatch(r"[a-z0-9_.-]{1,120}", memory_key) is None or memory_key in {
+        "fact",
+        "general",
+        "legacy",
+        "memory",
+    }:
         raise ValueError(
             "memory_key must identify the specific fact, for example profile.demo_code"
         )
-    active = memory_service.list_by_scope(
-        request.tenant_id,
-        MemoryScopeType.USER,
-        request.user_id,
+    run = (
+        store.get_run(request.tenant_id, request.run_id) if store is not None else None
     )
+    if run is not None and (
+        run.workspace_id != request.workspace_id or run.user_id != request.user_id
+    ):
+        raise ValueError("Memory run does not belong to the current user and workspace")
+    scope_type = MemoryScopeType.AGENT if run and run.agent_id else MemoryScopeType.USER
+    scope_id = run.agent_id if run and run.agent_id else request.user_id
+    active = memory_service.list_by_scope(request.tenant_id, scope_type, scope_id)
     active_by_id = {record.id: record for record in active}
     requested_superseded_ids = {
         str(memory_id)
@@ -115,7 +122,7 @@ def _save_user_memory(
     }
     unknown_ids = requested_superseded_ids - active_by_id.keys()
     if unknown_ids:
-        raise ValueError("Can only supersede active memories owned by the current user")
+        raise ValueError("Can only supersede active memories in the current scope")
     expires_in_days = request.tool_input.get("expires_in_days")
     expires_at = (
         utc_now() + timedelta(days=int(expires_in_days))
@@ -123,18 +130,14 @@ def _save_user_memory(
         else None
     )
     indexed_terms = (
-        sorted(
-            retrieval_terms(store.get_run(request.tenant_id, request.run_id).message)
-        )[:256]
-        if store is not None
-        else []
+        sorted(retrieval_terms(run.message))[:256] if run is not None else []
     )
     memory = memory_service.write(
         MemoryWriteRequest(
             tenant_id=request.tenant_id,
             workspace_id=request.workspace_id,
-            scope_type=MemoryScopeType.USER,
-            scope_id=request.user_id,
+            scope_type=scope_type,
+            scope_id=scope_id,
             source_run_id=request.run_id,
             content=content,
             created_by=request.user_id,

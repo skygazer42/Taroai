@@ -270,6 +270,7 @@ def test_e2b_adapter_executes_the_existing_sandbox_contract(monkeypatch):
     class FakeSandbox:
         instances = {}
         infos = {}
+        templates = []
         allow_internet_access = None
         paused = set()
         pause_api_key = None
@@ -287,9 +288,10 @@ def test_e2b_adapter_executes_the_existing_sandbox_contract(monkeypatch):
             sandbox = cls("e2b_sandbox_1")
             cls.instances[sandbox.sandbox_id] = sandbox
             cls.allow_internet_access = allow_internet_access
+            cls.templates.append(_kwargs.get("template"))
             cls.infos[sandbox.sandbox_id] = SimpleNamespace(
                 sandbox_id=sandbox.sandbox_id,
-                template_id="base",
+                template_id=_kwargs.get("template") or "base",
                 metadata=metadata,
                 started_at=datetime.now(timezone.utc),
             )
@@ -327,7 +329,12 @@ def test_e2b_adapter_executes_the_existing_sandbox_contract(monkeypatch):
             FakeSandbox.pause_request_timeout = _kwargs.get("request_timeout")
 
     monkeypatch.setattr(e2b_module, "Sandbox", FakeSandbox)
-    settings = Settings(sandbox_provider="e2b", e2b_api_key="secret-e2b-key")
+    settings = Settings(
+        sandbox_provider="e2b",
+        e2b_api_key="secret-e2b-key",
+        e2b_template="global-template",
+        sandbox_runtime_image="configured-runtime-image",
+    )
     adapter = build_sandbox_adapter(settings)
     assert isinstance(adapter, E2BSandboxAdapter)
     assert adapter.get_capabilities().command_cancellation_supported is True
@@ -363,6 +370,8 @@ def test_e2b_adapter_executes_the_existing_sandbox_contract(monkeypatch):
     )
 
     assert result.exit_code == 0
+    assert FakeSandbox.templates == ["global-template"]
+    assert session.image == "global-template"
     assert Commands.timeouts[-1] == session.timeout_seconds == 300
     assert session.tenant_id == "tenant_1"
     assert result.stdout == "ran:printf ok"
@@ -473,6 +482,18 @@ def test_e2b_adapter_executes_the_existing_sandbox_contract(monkeypatch):
             )
         )
     assert adapter.destroy("tenant_1", session.id).status.value == "destroyed"
+
+    skill_session = adapter.create(
+        SandboxCreateRequest(
+            tenant_id="tenant_1",
+            workspace_id="workspace_1",
+            run_id="run_skill",
+            image="skill-template",
+        )
+    )
+    assert FakeSandbox.templates[-1] == "skill-template"
+    assert skill_session.image == "skill-template"
+    adapter.destroy("tenant_1", skill_session.id)
 
     stale = FakeSandbox("stale_sandbox")
     FakeSandbox.instances[stale.sandbox_id] = stale

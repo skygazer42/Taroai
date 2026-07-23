@@ -24,7 +24,11 @@ class SecretScope(BaseModel):
             return False
         if self.workspace_id is not None and self.workspace_id != workspace_id:
             return False
-        if self.allowed_tool_names and tool_name not in self.allowed_tool_names:
+        if self.allowed_tool_names and not any(
+            tool_name == allowed
+            or (allowed.endswith("*") and tool_name.startswith(allowed[:-1]))
+            for allowed in self.allowed_tool_names
+        ):
             return False
         return set(actions).issubset(set(self.actions))
 

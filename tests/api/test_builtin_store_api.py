@@ -16,6 +16,15 @@ from taroai.store import InMemoryControlPlaneStore
 STORE_ITEM_ID = "taroai.data-signal-starter"
 
 
+def test_builtin_document_formats_are_allowed_for_upload():
+    allowed = set(Settings(_env_file=None).upload_allowed_content_types)
+
+    assert {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    } <= allowed
+
+
 def store_client():
     tenant_id = "tenant_store"
     workspace_id = "workspace_store"
@@ -93,7 +102,7 @@ def test_builtin_store_lists_details_and_installs_an_exact_package():
     assert installed.json()["skills"] == [
         {
             "skill_id": "taroai.csv-signal-brief",
-            "version": "1.0.0",
+            "version": "1.0.1",
             "package_digest": detail.json()["packages"][0]["package_digest"],
             "status": "enabled",
             "requires_approval": False,
@@ -105,12 +114,35 @@ def test_builtin_store_lists_details_and_installs_an_exact_package():
         user_id=headers["X-User-ID"],
     )
     assert [skill.skill_id for skill in discovered] == ["taroai.csv-signal-brief"]
+    package = app.state.skill_registry.get_installed_package(
+        tenant_id, workspace_id, "taroai.csv-signal-brief"
+    )
+    assert package.manifest.name == "Spreadsheet Signal Brief"
+    assert "scripts/analyze_spreadsheet.py" in {file.path for file in package.files}
     packs = client.get("/api/solution-packs", headers=headers)
     pack_installations = client.get(
         "/api/solution-pack-installations", headers=headers
     )
     assert [entry["manifest"]["id"] for entry in packs.json()] == [STORE_ITEM_ID]
     assert pack_installations.json()[0]["workspace_ids"] == [workspace_id]
+
+
+def test_builtin_public_catalog_routes_need_no_workspace_session():
+    _, client, _, _, _ = store_client()
+
+    store = client.get("/api/store")
+    featured = client.get("/api/store/featured")
+    builtin = client.get("/api/skills/builtin")
+    discovered = client.get("/api/discover/skills")
+
+    assert store.status_code == featured.status_code == 200
+    assert builtin.status_code == discovered.status_code == 200
+    assert store.json()["nextCursor"] is None
+    assert len(store.json()["items"]) == len(featured.json()) == 4
+    assert {skill["id"] for skill in builtin.json()} == {
+        skill["id"] for skill in discovered.json()
+    }
+    assert all(skill["origin"] == "builtin" for skill in discovered.json())
 
 
 def test_builtin_store_rejects_a_tenant_package_digest_conflict():

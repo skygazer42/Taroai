@@ -33,6 +33,11 @@ def _can_read(chunk: DocumentChunk, request: RetrievalRequest) -> bool:
         return False
     if request.allowed_workspace_ids and chunk.workspace_id not in request.allowed_workspace_ids:
         return False
+    if (
+        request.allowed_knowledge_base_ids
+        and chunk.knowledge_base_id not in request.allowed_knowledge_base_ids
+    ):
+        return False
     if chunk.sensitivity_level > request.clearance_level:
         return False
     if not chunk.acl_subjects:

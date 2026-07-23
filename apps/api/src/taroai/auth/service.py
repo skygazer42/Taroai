@@ -2,12 +2,22 @@ import base64
 import hashlib
 import hmac
 import json
+import smtplib
+import ssl
 from datetime import datetime, timedelta
+from email.message import EmailMessage
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 from pydantic import BaseModel, Field
 
-from taroai.auth.models import AuthLoginResult, AuthLogoutResult, AuthTokenClaims
+from taroai.auth.models import (
+    AuthActionPurpose,
+    AuthActionTokenClaims,
+    AuthLoginResult,
+    AuthLogoutResult,
+    AuthTokenClaims,
+)
 from taroai.auth.sessions import AuthSessionStore, InMemoryAuthSessionStore
 from taroai.domain import utc_now
 from taroai.identity import InMemoryIdentityService, SqlIdentityService, UserAccount
@@ -19,6 +29,14 @@ class AuthRequiredError(PermissionError):
 
 
 class AuthInvalidCredentialsError(PermissionError):
+    pass
+
+
+class AuthActionTokenError(PermissionError):
+    pass
+
+
+class AuthEmailDeliveryError(RuntimeError):
     pass
 
 
@@ -104,6 +122,53 @@ class AuthService(BaseModel):
         )
         return AuthLogoutResult(revoked=revoked)
 
+    def issue_action_token(
+        self,
+        account: UserAccount,
+        purpose: AuthActionPurpose,
+        ttl_seconds: int,
+        now: datetime | None = None,
+    ) -> str:
+        claims = AuthActionTokenClaims(
+            purpose=purpose,
+            tenant_id=account.tenant_id,
+            user_id=account.id,
+            credential_fingerprint=self._credential_fingerprint(account),
+            expires_at=(now or utc_now()) + timedelta(seconds=ttl_seconds),
+        )
+        payload = self._encode_json(claims.model_dump(mode="json"))
+        return f"{payload}.{self._sign_action(payload, account)}"
+
+    def verify_email_action(self, token: str, now: datetime | None = None) -> UserAccount:
+        account = self._validate_action_token(token, "email_verification", now)
+        if account.status == "active":
+            return account
+        if account.status != "pending":
+            raise AuthActionTokenError("invalid or expired email verification token")
+        return self.identity_service.activate_user(account.tenant_id, account.id)
+
+    def reset_password_action(
+        self,
+        token: str,
+        password: str,
+        now: datetime | None = None,
+    ) -> UserAccount:
+        reset_at = now or utc_now()
+        account = self._validate_action_token(token, "password_reset", reset_at)
+        if account.status != "active":
+            raise AuthActionTokenError("invalid or expired password reset token")
+        updated = self.identity_service.update_password(
+            account.tenant_id,
+            account.id,
+            password,
+        )
+        self.session_store.revoke_user_sessions(
+            account.tenant_id,
+            account.id,
+            reset_at,
+        )
+        return updated
+
     def issue_token(self, claims: AuthTokenClaims) -> str:
         payload = self._encode_json(claims.model_dump(mode="json"))
         signature = self._sign(payload)
@@ -172,6 +237,45 @@ class AuthService(BaseModel):
         ).digest()
         return self._encode_bytes(digest)
 
+    def _validate_action_token(
+        self,
+        token: str,
+        purpose: AuthActionPurpose,
+        now: datetime | None,
+    ) -> UserAccount:
+        try:
+            payload, signature = token.split(".", 1)
+            claims = AuthActionTokenClaims.model_validate_json(
+                self._decode_text(payload)
+            )
+            account = self.identity_service.get_user(
+                claims.tenant_id,
+                claims.user_id,
+            )
+        except (ValueError, NotFoundError) as error:
+            raise AuthActionTokenError("invalid or expired auth action token") from error
+        expected_signature = self._sign_action(payload, account)
+        if (
+            not hmac.compare_digest(signature, expected_signature)
+            or claims.purpose != purpose
+            or claims.credential_fingerprint != self._credential_fingerprint(account)
+            or claims.expires_at <= (now or utc_now())
+        ):
+            raise AuthActionTokenError("invalid or expired auth action token")
+        return account
+
+    def _sign_action(self, payload: str, account: UserAccount) -> str:
+        digest = hmac.new(
+            f"{self.access_token_secret}\0{account.password_hash}".encode("utf-8"),
+            f"auth_action:{payload}".encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+        return self._encode_bytes(digest)
+
+    @staticmethod
+    def _credential_fingerprint(account: UserAccount) -> str:
+        return hashlib.sha256(account.password_hash.encode("utf-8")).hexdigest()
+
     def _encode_json(self, value: dict[str, Any]) -> str:
         return self._encode_bytes(json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8"))
 
@@ -181,3 +285,36 @@ class AuthService(BaseModel):
     def _decode_text(self, value: str) -> str:
         padding = "=" * (-len(value) % 4)
         return base64.urlsafe_b64decode(f"{value}{padding}").decode("utf-8")
+
+
+def send_auth_email(
+    smtp_url: str,
+    sender: str,
+    recipient: str,
+    subject: str,
+    body: str,
+) -> None:
+    parsed = urlparse(smtp_url)
+    if parsed.scheme not in {"smtp", "smtps"} or not parsed.hostname:
+        raise AuthEmailDeliveryError("auth email delivery is not configured")
+    try:
+        port = parsed.port or (465 if parsed.scheme == "smtps" else 587)
+        message = EmailMessage()
+        message["From"] = sender
+        message["To"] = recipient
+        message["Subject"] = subject
+        message.set_content(body)
+        tls_context = ssl.create_default_context()
+        client_type = smtplib.SMTP_SSL if parsed.scheme == "smtps" else smtplib.SMTP
+        client_kwargs = {"context": tls_context} if parsed.scheme == "smtps" else {}
+        with client_type(parsed.hostname, port, timeout=10, **client_kwargs) as client:
+            if parsed.scheme == "smtp":
+                client.starttls(context=tls_context)
+            if parsed.username is not None:
+                client.login(
+                    unquote(parsed.username),
+                    unquote(parsed.password or ""),
+                )
+            client.send_message(message)
+    except (OSError, ValueError, smtplib.SMTPException) as error:
+        raise AuthEmailDeliveryError("auth email delivery failed") from error

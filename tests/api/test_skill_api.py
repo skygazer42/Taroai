@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from taroai.agent import AgentRuntime
 from taroai.app import create_app
 from taroai.config import Settings
+from taroai.domain import RunMode, RunStatus
 from taroai.model_gateway import PlannedToolCall
 from taroai.store import InMemoryControlPlaneStore
 from taroai.identity import (
@@ -122,7 +123,7 @@ license: MIT
     assert body == "# Ponytail\n"
 
 
-def test_portable_skill_zip_import_evaluate_publish_and_install():
+def test_portable_skill_zip_import_evaluate_publish_install_and_invoke(monkeypatch):
     identity, account = create_skill_admin_identity()
     app = create_app(
         identity_service=identity,
@@ -184,6 +185,39 @@ description: A portable test skill.
     )
     assert installed.status_code == 201
     assert installed.json()["status"] == "enabled"
+
+    listed = client.get(
+        "/api/workspaces/workspace_sales/skills",
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": account.id},
+    )
+    assert listed.json()[0]["invocation_mode"] == "agent_skill"
+    assert listed.json()[0]["invocation_ready"] is True
+
+    captured = {}
+
+    def execute_run(runtime, tenant_id, run_id):
+        run = runtime.store.get_run(tenant_id, run_id)
+        captured["run"] = run
+        state = runtime._initial_state(run)
+        state.status = RunStatus.SUCCEEDED
+        state.final_response_text = "Skill completed."
+        return state
+
+    monkeypatch.setattr(AgentRuntime, "execute_run", execute_run)
+    invoked = client.post(
+        "/api/workspaces/workspace_sales/skills/portable-skill/invoke",
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": account.id},
+        json={"input": {}},
+    )
+
+    assert invoked.status_code == 200
+    assert invoked.json()["tool_name"] == "agent.skill"
+    assert invoked.json()["output"]["response"] == "Skill completed."
+    assert captured["run"].mode == RunMode.CHAT
+    assert captured["run"].agent_id is None
+    assert [reference.model_dump() for reference in captured["run"].resource_refs] == [
+        {"type": "skill", "id": "portable-skill", "version": "0.0.0"}
+    ]
 
 
 def login_skill_admin(client: TestClient) -> dict[str, str]:

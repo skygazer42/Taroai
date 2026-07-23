@@ -112,6 +112,7 @@ class SandboxFileWrite(BaseModel):
     content: str = ""
     content_base64: str | None = None
     content_type: str = "text/plain"
+    mode: int | None = Field(default=None, ge=0, le=0o777)
 
     def content_bytes(self) -> bytes:
         if self.content_base64 is None:

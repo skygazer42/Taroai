@@ -36,6 +36,7 @@ def build_sandbox_adapter(settings: Any) -> SandboxAdapter:
         return E2BSandboxAdapter(
             api_key=settings.e2b_api_key,
             template=settings.e2b_template,
+            default_runtime_image=settings.sandbox_runtime_image,
             request_timeout_seconds=settings.e2b_request_timeout_seconds,
             max_session_ttl_seconds=settings.e2b_max_session_ttl_seconds,
             max_sessions=settings.sandbox_max_sessions,

@@ -1,4 +1,6 @@
+import hashlib
 import json
+import stat
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Literal
@@ -58,6 +60,7 @@ from taroai.licensing import (
 from taroai.memory import (
     InMemoryLongTermMemoryService,
     MemoryScopeType,
+    MemoryStatus,
     MemoryWriteRequest,
 )
 from taroai.model_gateway import (
@@ -87,7 +90,11 @@ from taroai.sandbox import (
     register_sandbox_tool_handlers,
 )
 from taroai.sandbox.models import SandboxSessionStatus
-from taroai.skills import InMemorySkillRegistry
+from taroai.skills import (
+    InMemorySkillRegistry,
+    SkillPackageFile,
+    SkillPackageFileKind,
+)
 from taroai.skills.service import SkillService
 from taroai.storage import (
     InMemoryStorageCatalog,
@@ -801,7 +808,7 @@ def test_agent_runtime_planning_prompt_guides_real_models_to_publish_artifacts()
     assert "strict JSON" in system_prompt
 
 
-def test_agent_runtime_completes_run_and_creates_artifact():
+def test_agent_runtime_completes_run_without_inventing_an_artifact():
     store, run = create_runtime_run()
     runtime = AgentRuntime(
         store=store,
@@ -822,9 +829,7 @@ def test_agent_runtime_completes_run_and_creates_artifact():
 
     assert state.status == RunStatus.SUCCEEDED
     assert store.get_run("tenant_acme", run.id).status == RunStatus.SUCCEEDED
-    assert [
-        artifact.name for artifact in store.list_artifacts("tenant_acme", run.id)
-    ] == ["agent-result.md"]
+    assert store.list_artifacts("tenant_acme", run.id) == []
 
     events = store.list_run_events("tenant_acme", run.id)
     event_types = [event.type for event in events]
@@ -835,7 +840,6 @@ def test_agent_runtime_completes_run_and_creates_artifact():
         "agent.action.started",
         "agent.observation.recorded",
         "agent.verification.completed",
-        "artifact.created",
         "run.succeeded",
         "agent.loop.completed",
     ):
@@ -2437,10 +2441,10 @@ def test_agent_runtime_resolves_tool_gateway_scopes_from_policy_service():
     assert captured_requests[0].granted_scopes == ["sandbox.execute"]
 
 
-def test_agent_runtime_blocks_guarded_artifact_publication():
+def test_agent_runtime_does_not_apply_artifact_guardrails_without_an_artifact():
     store, run = create_runtime_run()
     guardrail_service = InMemoryGuardrailService()
-    rule = guardrail_service.add_rule(
+    guardrail_service.add_rule(
         GuardrailRule(
             tenant_id="tenant_acme",
             workspace_id="workspace_sales",
@@ -2476,21 +2480,17 @@ def test_agent_runtime_blocks_guarded_artifact_publication():
     ]
     run_events = store.list_run_events("tenant_acme", run.id)
 
-    assert state.status == RunStatus.FAILED
+    assert state.status == RunStatus.SUCCEEDED
     assert store.list_artifacts("tenant_acme", run.id) == []
-    assert [event.metadata["guardrail_rule_ids"] for event in guardrail_audits] == [
-        [rule.id]
-    ]
-    assert guardrail_audits[0].metadata["guardrail_action"] == "block"
+    assert guardrail_audits == []
     assert run_events[-1].type == "agent.loop.completed"
-    assert run_events[-1].payload["reason"] == "artifact_guardrail_blocked"
-    assert "agent-result.md" not in str(guardrail_audits[0].metadata)
+    assert run_events[-1].payload["outcome"] == "complete"
 
 
-def test_agent_runtime_redacts_guarded_artifact_metadata_before_publication():
+def test_agent_runtime_does_not_invent_artifact_metadata_for_redaction():
     store, run = create_runtime_run()
     guardrail_service = InMemoryGuardrailService()
-    rule = guardrail_service.add_rule(
+    guardrail_service.add_rule(
         GuardrailRule(
             tenant_id="tenant_acme",
             workspace_id="workspace_sales",
@@ -2520,7 +2520,7 @@ def test_agent_runtime_redacts_guarded_artifact_metadata_before_publication():
 
     state = runtime.execute_run("tenant_acme", run.id)
 
-    artifact = store.list_artifacts("tenant_acme", run.id)[0]
+    artifacts = store.list_artifacts("tenant_acme", run.id)
     guardrail_audits = [
         event
         for event in store.list_audit_events("tenant_acme")
@@ -2529,20 +2529,16 @@ def test_agent_runtime_redacts_guarded_artifact_metadata_before_publication():
     run_events = store.list_run_events("tenant_acme", run.id)
 
     assert state.status == RunStatus.SUCCEEDED
-    assert artifact.name == "governed-result.md"
-    assert artifact.uri.endswith("/governed-result.md")
-    assert [event.metadata["guardrail_rule_ids"] for event in guardrail_audits] == [
-        [rule.id]
-    ]
+    assert artifacts == []
+    assert guardrail_audits == []
     succeeded = next(event for event in run_events if event.type == "run.succeeded")
-    assert succeeded.payload["artifact_name"] == "governed-result.md"
-    assert "agent-result" not in str(guardrail_audits[0].metadata)
+    assert succeeded.payload == {}
 
 
-def test_agent_runtime_resumes_artifact_guardrail_approval_after_worker_restart():
+def test_agent_runtime_does_not_request_artifact_approval_without_an_artifact():
     store, run = create_runtime_run()
     guardrail_service = InMemoryGuardrailService()
-    rule = guardrail_service.add_rule(
+    guardrail_service.add_rule(
         GuardrailRule(
             tenant_id="tenant_acme",
             workspace_id="workspace_sales",
@@ -2569,42 +2565,11 @@ def test_agent_runtime_resumes_artifact_guardrail_approval_after_worker_restart(
         guardrail_service=guardrail_service,
     )
 
-    paused_state = runtime.execute_run("tenant_acme", run.id)
-    approval = store.list_approval_requests("tenant_acme", run.id)[0]
-    snapshot = store.get_runtime_state("tenant_acme", run.id)
+    state = runtime.execute_run("tenant_acme", run.id)
 
-    assert paused_state.status == RunStatus.AWAITING_APPROVAL
+    assert state.status == RunStatus.SUCCEEDED
     assert store.list_artifacts("tenant_acme", run.id) == []
-    assert approval.step_id == "guardrail:artifact"
-    assert approval.reason == "Artifact publication requires approval"
-    assert snapshot.pending_guardrail_approval_stage == "artifact"
-
-    restarted_runtime = AgentRuntime(
-        store=store,
-        model_gateway=DeterministicModelGateway(),
-        tool_gateway=DeterministicToolGateway(),
-        guardrail_service=guardrail_service,
-    )
-
-    resumed_state = restarted_runtime.resume_after_approval(
-        tenant_id="tenant_acme",
-        run_id=run.id,
-        approval_id=approval.id,
-        approved_by_user_id="manager_1",
-    )
-
-    artifacts = store.list_artifacts("tenant_acme", run.id)
-
-    assert resumed_state.status == RunStatus.SUCCEEDED
-    assert [artifact.name for artifact in artifacts] == ["agent-result.md"]
-    assert resumed_state.approved_guardrail_keys == [f"artifact:{rule.id}"]
-    assert (
-        store.list_approval_requests("tenant_acme", run.id)[0].status
-        == ApprovalStatus.APPROVED
-    )
-    assert store.get_runtime_state("tenant_acme", run.id).approved_guardrail_keys == [
-        f"artifact:{rule.id}"
-    ]
+    assert store.list_approval_requests("tenant_acme", run.id) == []
 
 
 def test_agent_runtime_records_tool_call_audit_and_billing():
@@ -4219,8 +4184,8 @@ def test_chat_run_decides_directly_without_agent_graph():
     assert gateway.response_requests == []
     assert {
         tool["function"]["name"] for tool in gateway.decision_requests[0].tools
-    } == {"respond", "request_user_input", "ui__render"}
-    assert gateway.decision_requests[0].tool_choice == "required"
+    } == {"request_user_input", "ui__render"}
+    assert gateway.decision_requests[0].tool_choice == "auto"
     assert gateway.decision_requests[0].temperature == 0
     assert gateway.decision_requests[0].sensitivity_level == 2
     system_prompt = gateway.decision_requests[0].messages[0].content
@@ -4321,11 +4286,9 @@ def test_chat_verifies_an_external_action_claim_before_completing():
         for tool in gateway.decision_requests[0].tools
     }
     assert (
-        "use respond to state that limitation"
+        "return a direct answer stating that limitation"
         in tools["request_user_input"]["description"]
     )
-    assert "truthful limitation" in tools["respond"]["description"]
-    assert "never ask for API credentials" in tools["respond"]["description"]
     assert "without a successful matching tool observation" in (
         gateway.verification_requests[0].messages[0].content
     )
@@ -4621,7 +4584,7 @@ def test_chat_model_can_request_structured_input_before_using_a_tool():
     assert "request_user_input" in {
         tool["function"]["name"] for tool in gateway.fast_requests[0].tools
     }
-    assert gateway.fast_requests[0].tool_choice == "required"
+    assert gateway.fast_requests[0].tool_choice == "auto"
     assert "not evidence of the user's physical location" in (
         gateway.fast_requests[0].messages[0].content
     )
@@ -5030,15 +4993,10 @@ def test_chat_allows_two_distinct_searches_and_fetches_then_caps_tools():
                     tool_input={"url": "https://example.com/weather/details"},
                 )
                 return
-            assert "web__fetch" not in available
-            yield AgentDecision(
-                kind="action",
-                tool_name="respond",
-                tool_input={
-                    "response_text": "北京今天晴。\nhttps://example.com/weather",
-                    "verification_required": False,
-                },
-            )
+
+        def stream_response(self, request: ModelGatewayRequest):
+            self.response_requests.append(request)
+            yield "北京今天晴。\nhttps://example.com/weather"
 
     store = InMemoryControlPlaneStore()
     thread = store.create_chat_thread(
@@ -5120,7 +5078,7 @@ def test_chat_allows_two_distinct_searches_and_fetches_then_caps_tools():
     state = runtime.execute_run(run.tenant_id, run.id)
 
     assert state.status == RunStatus.SUCCEEDED
-    assert len(gateway.fast_requests) == 5
+    assert len(gateway.fast_requests) == 4
     assert gateway.decision_requests == []
     assert "web__search" in {
         tool["function"]["name"] for tool in gateway.fast_requests[1].tools
@@ -5128,11 +5086,8 @@ def test_chat_allows_two_distinct_searches_and_fetches_then_caps_tools():
     assert "web__fetch" in {
         tool["function"]["name"] for tool in gateway.fast_requests[3].tools
     }
-    assert [tool["function"]["name"] for tool in gateway.fast_requests[4].tools] == [
-        "respond"
-    ]
-    assert gateway.fast_requests[4].tool_choice == "required"
-    assert "call respond with the final answer in valid Markdown" in (
+    assert len(gateway.response_requests) == 1
+    assert "return the final answer in valid Markdown" in (
         gateway.fast_requests[1].messages[0].content
     )
     assert len(gateway.fast_requests[1].messages[0].content) < 2_000
@@ -5679,6 +5634,21 @@ def test_explicit_skill_is_loaded_before_the_first_model_decision(tmp_path: Path
     store = InMemoryControlPlaneStore()
     registry = InMemorySkillRegistry()
     package = skill_package()
+    script = b"#!/bin/sh\nprintf done\n"
+    package = package.model_copy(
+        update={
+            "files": (
+                *package.files,
+                SkillPackageFile(
+                    path="scripts/run.sh",
+                    kind=SkillPackageFileKind.SCRIPT,
+                    size_bytes=len(script),
+                    content_digest=hashlib.sha256(script).hexdigest(),
+                    content=script,
+                ),
+            )
+        }
+    )
     registry.register_package_for_tenant("tenant_acme", "user_1", package)
     registry.publish_package("tenant_acme", package.skill_id, package.version)
     registry.install_for_workspace(
@@ -5688,6 +5658,24 @@ def test_explicit_skill_is_loaded_before_the_first_model_decision(tmp_path: Path
         "user_1",
         version=package.version,
         package_digest=package.package_digest,
+    )
+    unrelated = package.model_copy(
+        update={
+            "manifest": package.manifest.model_copy(
+                update={"id": "support.unrelated", "name": "Unrelated Skill"}
+            ),
+            "package_digest": "c" * 64,
+        }
+    )
+    registry.register_package_for_tenant("tenant_acme", "user_1", unrelated)
+    registry.publish_package("tenant_acme", unrelated.skill_id, unrelated.version)
+    registry.install_for_workspace(
+        "tenant_acme",
+        "workspace_support",
+        unrelated.skill_id,
+        "user_1",
+        version=unrelated.version,
+        package_digest=unrelated.package_digest,
     )
     thread = store.create_chat_thread(
         "tenant_acme",
@@ -5736,7 +5724,11 @@ def test_explicit_skill_is_loaded_before_the_first_model_decision(tmp_path: Path
         sandbox_adapter=LocalProcessSandboxAdapter(root_dir=tmp_path),
         skill_service=SkillService(registry=registry),
         full_auto_requires_isolation=False,
+        sandbox_destroy_on_success=False,
     )
+    restored = runtime._initial_state(run)
+    restored.runtime_metadata["skill_runtime_image"] = "workflow"
+    runtime._save_state(restored)
 
     state = runtime.execute_run(run.tenant_id, run.id)
 
@@ -5751,16 +5743,27 @@ def test_explicit_skill_is_loaded_before_the_first_model_decision(tmp_path: Path
     )
     assert payload["available_skills"] == []
     assert payload["loaded_skills"][0]["skill_id"] == package.skill_id
+    assert (
+        next(iter(runtime.sandbox_adapter.sessions.values())).image
+        == runtime.sandbox_runtime_image
+    )
+    assert stat.S_IMODE(next(tmp_path.rglob("SKILL.md")).stat().st_mode) == 0o440
+    assert stat.S_IMODE(next(tmp_path.rglob("run.sh")).stat().st_mode) == 0o550
     assert event_types.count("agent.skill.loaded") == 1
     assert event_types.count("agent.skill.materialized") == 1
     skill_progress = [
-        (event.type, event.payload["status"])
+        (
+            event.type,
+            event.payload["status"],
+            event.payload["skill_name"],
+            event.payload["skill_version"],
+        )
         for event in events
         if event.payload.get("tool_name") == "skill.load"
     ]
     assert skill_progress == [
-        ("tool_call.started", "started"),
-        ("tool_call.completed", "completed"),
+        ("tool_call.started", "started", package.manifest.name, package.version),
+        ("tool_call.completed", "completed", package.manifest.name, package.version),
     ]
     assert [
         meter.meter_type for meter in store.list_billing_meters(run.tenant_id)
@@ -5768,27 +5771,47 @@ def test_explicit_skill_is_loaded_before_the_first_model_decision(tmp_path: Path
 
 
 @pytest.mark.parametrize(
-    ("mode", "expected_tools"),
+    ("mode", "declared_tools", "expected_tools"),
     [
-        (RunMode.CHAT, [{"sandbox__command"}, {"sandbox__command"}]),
+        (
+            RunMode.CHAT,
+            ["sandbox.command"],
+            [{"sandbox__command"}, {"sandbox__command"}],
+        ),
         (
             RunMode.AUTONOMOUS,
+            ["sandbox.command"],
             [
                 {"sandbox__command", "agent__create_draft"},
                 {"sandbox__command", "agent__create_draft"},
             ],
         ),
+        (
+            RunMode.CHAT,
+            None,
+            [
+                {"sandbox__command", "ui__render"},
+                {"sandbox__command", "ui__render"},
+            ],
+        ),
     ],
 )
-def test_loaded_skill_exposes_only_its_authorized_tools(
+def test_loaded_skill_respects_an_optional_tool_allowlist(
     tmp_path: Path,
     mode: RunMode,
+    declared_tools: list[str] | None,
     expected_tools: list[set[str]],
 ):
     store = InMemoryControlPlaneStore()
     registry = InMemorySkillRegistry()
     package = skill_package().model_copy(
-        update={"taroai_config": {"spec": {"tools": ["sandbox.command"]}}}
+        update={
+            "taroai_config": (
+                {"spec": {"tools": declared_tools}}
+                if declared_tools is not None
+                else {}
+            )
+        }
     )
     registry.register_package_for_tenant("tenant_acme", "user_1", package)
     registry.publish_package("tenant_acme", package.skill_id, package.version)
@@ -5832,7 +5855,7 @@ def test_loaded_skill_exposes_only_its_authorized_tools(
             AgentDecision(
                 kind="action",
                 tool_name="sandbox.command",
-                tool_input={"command": "python3 -c \"print('done')\""},
+                tool_input={"command": "test -f SKILL.md"},
             ),
             AgentDecision(
                 kind="respond",
@@ -6336,6 +6359,142 @@ def test_langgraph_stops_repeating_the_same_failed_action_after_two_attempts():
     assert gateway.verification_requests == []
 
 
+def test_failed_duplicate_guard_requires_consecutive_exact_inputs():
+    store, run = create_runtime_run("查询账户状态。")
+
+    def lookup(region: str) -> AgentDecision:
+        return AgentDecision(
+            kind="action",
+            tool_name="research.lookup",
+            tool_input={"account_id": "missing", "region": region},
+        )
+
+    gateway = RecordingGraphGateway(
+        decisions=[lookup("east"), lookup("west"), *[lookup("east")] * 3],
+    )
+    tools = ToolGateway()
+
+    def reject_lookup(_request):
+        raise RuntimeError("account does not exist")
+
+    tools.register_tool(
+        ToolPolicy(
+            tool_name="research.lookup",
+            input_schema={
+                "type": "object",
+                "required": ["account_id"],
+                "properties": {
+                    "account_id": {"type": "string"},
+                    "region": {"type": "string"},
+                },
+            },
+        ),
+        reject_lookup,
+    )
+    runtime = AgentRuntime(
+        store=store,
+        model_gateway=gateway,
+        model_policy=ModelPolicy(default_model="recording-test"),
+        tool_gateway=tools,
+        full_auto_requires_isolation=False,
+    )
+
+    state = runtime.execute_run(run.tenant_id, run.id)
+
+    assert state.status == RunStatus.FAILED
+    assert [
+        action.decision.tool_input["region"]
+        for action in store.list_agent_actions(run.tenant_id, run.id)
+    ] == ["east", "west", "east", "east"]
+
+
+def test_chat_repeated_failed_action_falls_back_to_direct_answer():
+    class RepeatingSandboxGateway(RecordingGraphGateway):
+        fast_requests: list[ModelGatewayRequest] = Field(default_factory=list)
+
+        def stream_next_action(self, request: ModelGatewayRequest):
+            self.fast_requests.append(request)
+            yield AgentDecision(
+                kind="action",
+                tool_name="sandbox__command",
+                tool_input={"command": "cat /workspace/artifacts/bubble_sort.py"},
+            )
+
+        def stream_response(self, request: ModelGatewayRequest):
+            self.response_requests.append(request)
+            yield "```python\ndef bubble_sort(values):\n    return values\n```"
+
+    store = InMemoryControlPlaneStore()
+    thread = store.create_chat_thread(
+        "tenant_acme",
+        "user_1",
+        ChatThreadCreate(workspace_id="workspace_sales", title="Code chat"),
+    )
+    trigger = store.append_chat_message(
+        "tenant_acme",
+        thread.id,
+        "user_1",
+        ChatMessageCreate(
+            content="帮我写一个冒泡算法",
+            dispatch_status=ChatMessageDispatchStatus.INFLIGHT,
+        ),
+    )
+    run = store.create_run(
+        "tenant_acme",
+        "user_1",
+        RunCreate(
+            workspace_id="workspace_sales",
+            message=trigger.content,
+            mode=RunMode.CHAT,
+            thread_id=thread.id,
+            trigger_message_id=trigger.id,
+        ),
+    )
+    gateway = RepeatingSandboxGateway()
+    tools = ToolGateway()
+    tools.register_tool(
+        ToolPolicy(
+            tool_name="sandbox.command",
+            input_schema={
+                "type": "object",
+                "required": ["command"],
+                "properties": {"command": {"type": "string"}},
+            },
+        ),
+        lambda request: ToolResult(
+            tool_name=request.tool_name,
+            output={
+                "exit_code": 1,
+                "stdout": "",
+                "stderr": "bubble_sort.py: No such file or directory",
+            },
+        ),
+    )
+    runtime = AgentRuntime(
+        store=store,
+        model_gateway=gateway,
+        model_policy=ModelPolicy(default_model="recording-test"),
+        tool_gateway=tools,
+        full_auto_requires_isolation=False,
+    )
+
+    state = runtime.execute_run(run.tenant_id, run.id)
+
+    assert state.status == RunStatus.SUCCEEDED
+    assert state.final_response_text.startswith("```python")
+    assert len(store.list_agent_actions(run.tenant_id, run.id)) == 1
+    assert len(gateway.response_requests) == 1
+    assert "Writing or explaining code is not code execution" in (
+        gateway.fast_requests[0].messages[0].content
+    )
+    assert "never retry the unchanged action" in (
+        gateway.fast_requests[1].messages[0].content
+    )
+    assert "agent.action.failed_duplicate_suppressed" in [
+        event.type for event in store.list_run_events(run.tenant_id, run.id)
+    ]
+
+
 def test_agent_model_receives_connector_schema_as_native_tool():
     runtime = AgentRuntime(store=InMemoryControlPlaneStore())
 
@@ -6467,6 +6626,169 @@ def test_skill_loaders_share_dynamic_tool_search_catalog():
         )
 
 
+def test_small_skill_catalog_stays_visible_before_generic_sandbox():
+    execution = AgentExecutionServices(AgentRuntime(store=InMemoryControlPlaneStore()))
+    state = AgentRuntimeState(
+        tenant_id="tenant_acme",
+        workspace_id="workspace_sales",
+        user_id="user_1",
+        run_id="run_skills",
+        goal="Analyze the spreadsheet",
+        status=RunStatus.RUNNING,
+    )
+    summaries = [
+        {
+            "skill_id": f"skill.{index}",
+            "name": f"Skill {index}",
+            "description": f"Handle task {index}.",
+            "input_schema": {"type": "object"},
+        }
+        for index in range(4)
+    ]
+    definitions, skill_tools = execution._skill_tool_definitions(summaries)
+    definitions.extend(
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": name,
+                "parameters": {"type": "object"},
+            },
+        }
+        for name in ["sandbox__command", *(f"utility__{index}" for index in range(5))]
+    )
+
+    visible = execution._with_dynamic_tool_search(state, definitions)
+    visible_names = {item["function"]["name"] for item in visible}
+
+    assert set(skill_tools) < visible_names
+    assert "sandbox__command" not in visible_names
+    assert "tool__search" in visible_names
+
+
+def test_automatically_loaded_skill_hides_remaining_skill_loaders(tmp_path: Path):
+    store, run = create_runtime_run("Analyze the attached spreadsheet.")
+    gateway = RecordingGraphGateway(
+        decisions=[
+            AgentDecision(
+                kind="respond",
+                response_text="Done.",
+                verification_required=False,
+            )
+        ]
+    )
+    tools = ToolGateway()
+    sandbox = LocalProcessSandboxAdapter(root_dir=tmp_path)
+    register_sandbox_tool_handlers(tools, sandbox)
+    runtime = AgentRuntime(
+        store=store,
+        model_gateway=gateway,
+        model_policy=ModelPolicy(default_model="recording-test"),
+        tool_gateway=tools,
+        sandbox_adapter=sandbox,
+        full_auto_requires_isolation=False,
+    )
+    execution = AgentExecutionServices(runtime)
+    execution._discover_skill_summaries = lambda _run: {
+        "skill.other": {
+            "skill_id": "skill.other",
+            "name": "Other Skill",
+            "description": "An unrelated reusable skill.",
+            "input_schema": {"type": "object"},
+            "allowed_tools": ["sandbox.command"],
+        }
+    }
+    state = runtime._initial_state(run)
+    state.runtime_metadata["loaded_skill_context"] = {
+        "skill.spreadsheet": {
+            "skill_id": "skill.spreadsheet",
+            "name": "Spreadsheet Skill",
+            "description": "Analyze spreadsheets.",
+            "input": {},
+            "input_schema": {"type": "object"},
+            "allowed_tools": ["sandbox.command"],
+            "root_path": "/workspace/.taroai/skills/skill.spreadsheet/1.0.0/",
+            "skill_md": "# Spreadsheet Skill",
+        }
+    }
+
+    execution._decide(state, run)
+
+    request = gateway.decision_requests[0]
+    payload = json.loads(request.messages[-1].content)
+    assert payload["available_skills"] == []
+    assert {tool["function"]["name"] for tool in request.tools} == {
+        "sandbox__command"
+    }
+
+
+def test_native_tool_call_keeps_multi_skill_context_for_sandbox_cwd(tmp_path: Path):
+    store, run = create_runtime_run("Run the selected Skill script.")
+    gateway = RecordingGraphGateway(
+        decisions=[
+            AgentDecision(
+                kind="action",
+                tool_name="sandbox.command",
+                tool_input={
+                    "command": "test -f SKILL.md",
+                    "_taroai_skill_id": "skill.two",
+                },
+            )
+        ]
+    )
+    tools = ToolGateway()
+    sandbox = LocalProcessSandboxAdapter(root_dir=tmp_path)
+    register_sandbox_tool_handlers(tools, sandbox)
+    runtime = AgentRuntime(
+        store=store,
+        model_gateway=gateway,
+        model_policy=ModelPolicy(default_model="recording-test"),
+        tool_gateway=tools,
+        sandbox_adapter=sandbox,
+        full_auto_requires_isolation=False,
+    )
+    state = runtime._initial_state(run)
+    roots = {
+        "skill.one": "/workspace/.taroai/skills/skill.one/1.0.0/",
+        "skill.two": "/workspace/.taroai/skills/skill.two/1.0.0/",
+    }
+    state.runtime_metadata["loaded_skill_context"] = {
+        skill_id: {
+            "skill_id": skill_id,
+            "root_path": root,
+            "allowed_tools": [],
+            "skill_md": f"# {skill_id}",
+        }
+        for skill_id, root in roots.items()
+    }
+
+    decision = AgentExecutionServices(runtime)._decide(state, run)
+    prepared = runtime._prepare_step_for_execution(
+        state,
+        PlanStep(
+            id="run-skill",
+            title="Run Skill",
+            tool_name=decision.tool_name or "",
+            skill_id=decision.skill_id,
+            tool_input=decision.tool_input,
+        ),
+    )
+    parameters = next(
+        tool["function"]["parameters"]
+        for tool in gateway.decision_requests[0].tools
+        if tool["function"]["name"] == "sandbox__command"
+    )
+
+    assert parameters["properties"]["_taroai_skill_id"]["enum"] == [
+        "skill.one",
+        "skill.two",
+    ]
+    assert "_taroai_skill_id" in parameters["required"]
+    assert decision.skill_id == "skill.two"
+    assert decision.tool_input == {"command": "test -f SKILL.md"}
+    assert prepared.tool_input["cwd"] == roots["skill.two"]
+
+
 def test_tool_search_rejects_a_name_outside_the_filtered_catalog():
     execution = AgentExecutionServices(AgentRuntime(store=InMemoryControlPlaneStore()))
     state = AgentRuntimeState(
@@ -6580,7 +6902,7 @@ def test_agent_model_searches_large_tool_catalog_and_can_search_again():
         {tool["function"]["name"] for tool in request.tools}
         for request in model.decision_requests
     ]
-    chat_tools = {"respond", "request_user_input"}
+    chat_tools = {"request_user_input"}
     assert state.status == RunStatus.SUCCEEDED
     assert request_tool_names[0] == {"tool__search", *chat_tools}
     assert request_tool_names[1] == {
@@ -6669,6 +6991,14 @@ def test_langgraph_verifier_receives_reviewed_memory_as_evidence():
     assert "key=legacy" not in verification_context
     assert "A legacy memory remains readable." not in verification_context
     assert "The user prefers concise Chinese answers." in verification_context
+    candidates = memory_service.list_by_scope(
+        run.tenant_id,
+        MemoryScopeType.AGENT,
+        run.agent_id,
+        status=MemoryStatus.CANDIDATE,
+    )
+    assert len(candidates) == 1
+    assert candidates[0].metadata["source"] == "agent_session_summary"
 
 
 def test_final_response_adds_missing_web_source_links():

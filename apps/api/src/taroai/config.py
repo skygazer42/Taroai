@@ -129,6 +129,8 @@ class Settings(BaseSettings):
             "application/pdf", "image/png", "image/jpeg", "image/webp",
             "audio/mpeg", "audio/mp4", "audio/wav", "audio/webm", "audio/ogg",
             "application/zip",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         ]
     )
     secret_service_backend: Literal["memory", "local", "aws_secrets_manager"] = "memory"
@@ -179,6 +181,9 @@ class Settings(BaseSettings):
     browser_controller_base_url: str = ""
     browser_controller_api_key: str = ""
     browser_controller_timeout_seconds: int = Field(default=30, ge=1)
+    browser_controller_navigation_allowed_hosts: list[str] = Field(
+        default_factory=list
+    )
     tavily_api_key: str = Field(default="", repr=False)
     tavily_timeout_seconds: int = Field(default=15, ge=1)
     model_gateway_base_url: str = "https://api.openai.com/v1"
@@ -294,6 +299,12 @@ class Settings(BaseSettings):
     access_token_ttl_seconds: int = 3600
     remembered_access_token_ttl_seconds: int = 2_592_000
     auth_session_backend: Literal["auto", "memory", "sql"] = "auto"
+    auth_public_registration_enabled: bool = False
+    auth_password_reset_enabled: bool = False
+    auth_smtp_url: str = Field(default="", repr=False)
+    auth_email_from: str = ""
+    auth_email_verification_ttl_seconds: int = Field(default=86_400, ge=300)
+    auth_password_reset_ttl_seconds: int = Field(default=3_600, ge=300)
     audit_retention_days: int = Field(default=365, ge=1)
     trace_exporter_backend: Literal["disabled", "otlp_http"] = "disabled"
     trace_exporter_endpoint_url: str = ""
@@ -384,6 +395,7 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_deployment_profile(self) -> "Settings":
+        self._validate_browser_navigation_allowlist()
         self._validate_runtime_environment()
         if self.deployment_mode in CUSTOMER_OPERATED_DEPLOYMENT_MODES:
             self._validate_customer_operated_deployment()
@@ -409,6 +421,7 @@ class Settings(BaseSettings):
             )
         if environment in {"prod", "production"}:
             self._validate_auth_secret_values(f"{environment} environment")
+            self._validate_auth_email_delivery(f"{environment} environment")
             self._validate_operator_token_values(f"{environment} environment")
             self._validate_durable_backends(f"{environment} environment", "requires")
             self._validate_secret_management(f"{environment} environment", "requires")
@@ -467,6 +480,7 @@ class Settings(BaseSettings):
                 f"{self.deployment_mode} deployments cannot enable dev request headers"
             )
         self._validate_auth_secret_values(f"{self.deployment_mode} deployments")
+        self._validate_auth_email_delivery(f"{self.deployment_mode} deployments")
         self._validate_operator_token_values(f"{self.deployment_mode} deployments")
 
         if self.deployment_storage_region != self.object_storage_region:
@@ -540,6 +554,51 @@ class Settings(BaseSettings):
             "browser_controller_api_key",
             self.browser_controller_api_key,
         )
+
+    def _validate_browser_navigation_allowlist(self) -> None:
+        if self.browser_provider == "disabled":
+            return
+        allowed_hosts = [
+            host.strip().lower()
+            for host in self.browser_controller_navigation_allowed_hosts
+            if host.strip()
+        ]
+        if not allowed_hosts:
+            raise ValueError(
+                "browser automation requires browser_controller_navigation_allowed_hosts"
+            )
+        if any(
+            host in {"*", "*."}
+            or "/" in host
+            or "?" in host
+            or "#" in host
+            for host in allowed_hosts
+        ):
+            raise ValueError(
+                "browser_controller_navigation_allowed_hosts must contain hostnames"
+            )
+        self.browser_controller_navigation_allowed_hosts = list(
+            dict.fromkeys(allowed_hosts)
+        )
+
+    def _validate_auth_email_delivery(self, context: str) -> None:
+        if not (
+            self.auth_public_registration_enabled
+            or self.auth_password_reset_enabled
+        ):
+            return
+        if not self.deployment_external_url.strip():
+            raise ValueError(f"{context} requires deployment_external_url for auth email")
+        parsed_external_url = urlparse(self.deployment_external_url)
+        if parsed_external_url.scheme != "https" or not parsed_external_url.hostname:
+            raise ValueError(
+                f"{context} requires an https deployment_external_url for auth email"
+            )
+        parsed_smtp_url = urlparse(self.auth_smtp_url)
+        if parsed_smtp_url.scheme not in {"smtp", "smtps"} or not parsed_smtp_url.hostname:
+            raise ValueError(f"{context} requires auth_smtp_url")
+        if "@" not in self.auth_email_from:
+            raise ValueError(f"{context} requires auth_email_from")
 
     def _validate_auth_secret_values(self, context: str) -> None:
         if self._is_default_auth_secret(self.access_token_secret):

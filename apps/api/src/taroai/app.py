@@ -41,6 +41,9 @@ from taroai.agent_engines import (
     SqlAgentEngineRegistry,
 )
 from taroai.agents import (
+    AgentApiKey,
+    AgentApiKeyCreate,
+    AgentApiKeyService,
     AgentDefinitionCreate,
     AgentDefinitionPatch,
     AgentExtractRequest,
@@ -50,6 +53,11 @@ from taroai.agents import (
     AgentVersionCreate,
     AgentVersionSpec,
     InMemoryAgentRegistry,
+    InMemoryAgentApiKeyStore,
+    PublicAgentRunCreated,
+    PublicAgentRunRequest,
+    PublicAgentRunResult,
+    SqlAgentApiKeyStore,
     SqlAgentRegistry,
     register_agent_tool_handlers,
 )
@@ -65,13 +73,18 @@ from taroai.api.pagination import (
     paginate_created_at_records,
 )
 from taroai.auth import (
+    AuthEmailVerificationRequest,
+    AuthEmailVerificationSendRequest,
     AuthLoginRequest,
+    AuthPasswordForgotRequest,
+    AuthPasswordResetRequest,
     AuthRegisterRequest,
     AuthRequiredError,
     AuthService,
     AuthSessionStore,
     InMemoryAuthSessionStore,
     SqlAuthSessionStore,
+    send_auth_email,
 )
 from taroai.audit import (
     AuditActor,
@@ -132,7 +145,9 @@ from taroai.coding_workspaces import (
 from taroai.artifacts import ArtifactService, ArtifactShareCreate, RichArtifactCreate
 from taroai.config import ENTERPRISE_SANDBOX_PROVIDERS, Settings, load_settings
 from taroai.connectors import (
+    ConnectorAuthMode,
     ConnectorCreateRequest,
+    ConnectorCredentialExpiredError,
     ConnectorCredentialRef,
     ConnectorDefinition,
     ConnectorDispatchError,
@@ -270,6 +285,7 @@ from taroai.memory import (
     InMemoryShortTermMemoryService,
     MemoryCandidateApiCreate,
     MemoryScopeType,
+    MemoryStatus,
     MemoryWriteRequest,
     RedisShortTermMemoryService,
     ShortTermMemoryApiCreate,
@@ -383,6 +399,7 @@ from taroai.skills import (
     InMemorySkillRegistry,
     SkillInstallationStatus,
     SkillManifest,
+    SkillPackageKind,
     SkillStatus,
     SkillType,
     SqlSkillRegistry,
@@ -427,6 +444,7 @@ from taroai.store_catalog import (
     install_builtin_store_item,
 )
 from taroai.tool_gateway import ToolExecutionError, ToolGateway, ToolGatewayRequest
+from taroai.tool_gateway.schema import JsonSchemaValidator
 from taroai.triggers import (
     AgentHandoffRequest,
     AgentHandoffResponse,
@@ -883,6 +901,31 @@ def list_or_page_created_at_records(
     return [record.model_dump(mode="json") for record in records]
 
 
+def public_thread_html(payload: dict[str, Any]) -> str:
+    thread = payload["thread"]
+    messages = (
+        "".join(
+            f"""<article class="message {escape(message["role"])}">
+<header>{"You" if message["role"] == "user" else "Taroai"}<time>{escape(message["created_at"])}</time></header>
+<div>{escape(message["content"])}</div></article>"""
+            for message in payload["messages"]
+        )
+        or '<p class="empty">This conversation has no shared messages.</p>'
+    )
+    artifacts = "".join(
+        f"<li><span>{escape(artifact['name'])}</span><small>{escape(artifact['artifact_type'])}</small></li>"
+        for artifact in payload["artifacts"]
+    )
+    artifact_section = (
+        f"<section class=artifacts><h2>Artifacts</h2><ul>{artifacts}</ul></section>"
+        if artifacts
+        else ""
+    )
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(thread["title"] or "Shared conversation")}</title><style>
+:root{{color-scheme:light;background:#f8f6f2;color:#25221f;font:15px/1.65 Inter,ui-sans-serif,system-ui,sans-serif}}*{{box-sizing:border-box}}body{{margin:0}}main{{width:min(760px,calc(100% - 32px));margin:0 auto;padding:56px 0 96px}}.brand{{font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#8a8178}}h1{{margin:12px 0 6px;font:600 clamp(28px,5vw,42px)/1.15 Georgia,serif}}.meta{{margin:0 0 48px;color:#8a8178;font-size:12px}}.messages{{display:grid;gap:28px}}.message{{max-width:86%}}.message.user{{justify-self:end;background:#ebe7e1;border-radius:20px 20px 6px 20px;padding:14px 17px}}.message.assistant{{justify-self:start}}.message header{{display:flex;gap:10px;align-items:center;margin-bottom:7px;color:#69625c;font-size:11px;font-weight:700}}time{{color:#aaa199;font-weight:400}}.message div{{white-space:pre-wrap;overflow-wrap:anywhere}}.artifacts{{margin-top:52px;padding-top:22px;border-top:1px solid #ddd7cf}}h2{{font-size:13px}}ul{{display:grid;gap:8px;padding:0;list-style:none}}li{{display:flex;justify-content:space-between;padding:10px 12px;border:1px solid #ddd7cf;border-radius:10px;background:#fff}}li small,.empty{{color:#8a8178}}@media(max-width:600px){{main{{padding-top:32px}}.message{{max-width:94%}}}}
+</style></head><body><main><div class="brand">Taroai · Shared conversation</div><h1>{escape(thread["title"] or "Shared conversation")}</h1><p class="meta">Read-only · Expires {escape(payload["expires_at"])}</p><section class="messages">{messages}</section>{artifact_section}</main></body></html>"""
+
+
 def parse_webhook_json_payload(body: bytes) -> dict[str, Any]:
     if not body:
         return {}
@@ -1106,6 +1149,16 @@ def get_request_context(
     ):
         return RequestContext(tenant_id=tenant_id, user_id=user_id)
     raise AuthRequiredError("authentication required")
+
+
+def get_agent_api_key(
+    app_id: str,
+    request: Request,
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> AgentApiKey:
+    return request.app.state.agent_api_key_service.authenticate(
+        authorization, app_id
+    )
 
 
 def allowed_oauth_opener_origin(request: Request, settings: Settings) -> str | None:
@@ -1344,6 +1397,77 @@ def resolve_event_replay_sequence(
         raise ValueError("Last-Event-ID must be an integer event sequence") from error
 
 
+def stream_run_events(
+    app: FastAPI,
+    tenant_id: str,
+    run_id: str,
+    after_sequence: int | None,
+    last_event_id: str | None,
+) -> StreamingResponse:
+    replay_after_sequence = resolve_event_replay_sequence(
+        after_sequence, last_event_id
+    )
+    events = app.state.store.list_run_events(
+        tenant_id,
+        run_id,
+        after_sequence=replay_after_sequence,
+    )
+
+    def stream() -> Iterator[str]:
+        for event in events:
+            payload = json.dumps(
+                event.model_dump(mode="json"), separators=(",", ":")
+            )
+            yield f"id: {event.sequence}\n"
+            yield f"event: {event.type}\n"
+            yield f"data: {payload}\n\n"
+
+    return StreamingResponse(
+        stream(), media_type=app.state.settings.event_stream_media_type
+    )
+
+
+def get_public_agent_run(app: FastAPI, api_key: AgentApiKey, run_id: str):
+    run = app.state.store.get_run(api_key.tenant_id, run_id)
+    # ponytail: audit scan is enough at current volume; add an indexed API-run
+    # mapping only when this lookup becomes measurable.
+    owned = any(
+        event.run_id == run_id
+        and event.event_type == "agent.api.invoked"
+        and event.metadata.get("api_key_id") == api_key.id
+        for event in app.state.audit_service.list_for_tenant(api_key.tenant_id)
+    )
+    if run.agent_id != api_key.agent_id or not owned:
+        raise NotFoundError("Agent API run not found")
+    return run
+
+
+def send_auth_action_email(
+    settings: Settings,
+    account: Any,
+    purpose: Literal["email_verification", "password_reset"],
+    token: str,
+) -> None:
+    parameter = "verifyEmail" if purpose == "email_verification" else "resetPassword"
+    link = (
+        f"{settings.deployment_external_url.rstrip('/')}"
+        f"/?{urlencode({parameter: token})}"
+    )
+    subject = (
+        "Verify your Taroai email"
+        if purpose == "email_verification"
+        else "Reset your Taroai password"
+    )
+    action = "verify your email" if purpose == "email_verification" else "reset your password"
+    send_auth_email(
+        settings.auth_smtp_url,
+        settings.auth_email_from,
+        account.email,
+        subject,
+        f"Open this link to {action}:\n\n{link}\n\nIf you did not request this, ignore this email.",
+    )
+
+
 def create_app(
     store: InMemoryControlPlaneStore | SqlControlPlaneRepository | None = None,
     settings: Settings | None = None,
@@ -1469,6 +1593,7 @@ def create_app(
     )
     app.state.store_catalog = BuiltinStoreCatalog()
     app.state.agent_registry = agent_registry or build_agent_registry(resolved_settings)
+    app.state.agent_api_key_store = build_agent_api_key_store(resolved_settings)
     app.state.evaluation_repository = (
         evaluation_repository or build_evaluation_repository(resolved_settings)
     )
@@ -1540,6 +1665,12 @@ def create_app(
     app.state.identity_service = identity_service or build_identity_service(
         resolved_settings,
         app.state.audit_service,
+    )
+    app.state.agent_api_key_service = AgentApiKeyService(
+        store=app.state.agent_api_key_store,
+        agent_registry=app.state.agent_registry,
+        identity_service=app.state.identity_service,
+        hash_secret=resolved_settings.access_token_secret,
     )
     app.state.policy_service = policy_service or IdentityPolicyService(
         identity_service=app.state.identity_service
@@ -2017,8 +2148,15 @@ def create_app(
         secret_readiness = build_secret_service_readiness(
             app.state.settings, app.state.secret_service
         )
+        browser_readiness = build_browser_readiness(
+            app.state.settings,
+            app.state.browser_controller,
+        )
         readiness = {
-            "ready": secret_readiness["configured"],
+            "ready": secret_readiness["configured"] and (
+                app.state.settings.browser_provider == "disabled"
+                or browser_readiness.configured
+            ),
             "checks": {
                 "settings": "ok",
                 "control_plane_store_backend": app.state.settings.control_plane_store_backend,
@@ -2036,10 +2174,7 @@ def create_app(
                     app.state.sandbox_adapter,
                 ).model_dump(mode="json", exclude_none=True),
                 "sandbox_provider": app.state.settings.sandbox_provider,
-                "browser": build_browser_readiness(
-                    app.state.settings,
-                    app.state.browser_controller,
-                ).model_dump(
+                "browser": browser_readiness.model_dump(
                     mode="json",
                     exclude_none=True,
                 ),
@@ -2064,15 +2199,62 @@ def create_app(
             response["workspace_id"] = workspace_ids[0]
         return response
 
+    @app.get("/api/auth/capabilities")
+    def auth_capabilities() -> dict[str, bool]:
+        development_registration = (
+            app.state.settings.environment.strip().lower()
+            in {"local", "local-cloud-poc", "development", "test"}
+        )
+        return {
+            "registration_enabled": (
+                development_registration
+                or app.state.settings.auth_public_registration_enabled
+            ),
+            "email_verification_required": (
+                not development_registration
+                and app.state.settings.auth_public_registration_enabled
+            ),
+            "password_reset_enabled": app.state.settings.auth_password_reset_enabled,
+        }
+
     @app.post("/api/auth/register", status_code=status.HTTP_201_CREATED)
     def register(payload: AuthRegisterRequest) -> dict:
-        if app.state.settings.environment.strip().lower() not in {
+        development_registration = app.state.settings.environment.strip().lower() in {
             "local",
             "local-cloud-poc",
             "development",
             "test",
-        }:
+        }
+        if not (
+            development_registration
+            or app.state.settings.auth_public_registration_enabled
+        ):
             raise TenantAccessError("account registration is not enabled")
+        if not development_registration:
+            existing_accounts = app.state.identity_service.find_users_by_email(
+                payload.email
+            )
+            pending_accounts = [
+                account
+                for account in existing_accounts
+                if account.status == "pending"
+            ]
+            if pending_accounts:
+                account = pending_accounts[0]
+                token = app.state.auth_service.issue_action_token(
+                    account,
+                    "email_verification",
+                    app.state.settings.auth_email_verification_ttl_seconds,
+                )
+                send_auth_action_email(
+                    app.state.settings,
+                    account,
+                    "email_verification",
+                    token,
+                )
+                return {"accepted": True, "verification_required": True}
+            if existing_accounts:
+                return {"accepted": True, "verification_required": True}
         result = app.state.tenant_bootstrap_service.bootstrap(
             request=TenantBootstrapRequest(
                 tenant_id=new_id("tenant"),
@@ -2082,7 +2264,94 @@ def create_app(
             ),
             bootstrap_token=app.state.settings.tenant_bootstrap_token,
         )
+        if not development_registration:
+            account = app.state.identity_service.mark_user_pending(
+                result.tenant_id,
+                result.owner_user_id,
+            )
+            token = app.state.auth_service.issue_action_token(
+                account,
+                "email_verification",
+                app.state.settings.auth_email_verification_ttl_seconds,
+            )
+            send_auth_action_email(
+                app.state.settings,
+                account,
+                "email_verification",
+                token,
+            )
+            return {"accepted": True, "verification_required": True}
         return result.model_dump(mode="json")
+
+    @app.post("/api/auth/email-verification/request", status_code=status.HTTP_202_ACCEPTED)
+    def request_email_verification(
+        payload: AuthEmailVerificationSendRequest,
+    ) -> dict[str, bool]:
+        if app.state.settings.auth_public_registration_enabled:
+            pending_accounts = [
+                account
+                for account in app.state.identity_service.find_users_by_email(
+                    payload.email
+                )
+                if account.status == "pending"
+            ]
+            if pending_accounts:
+                account = pending_accounts[0]
+                token = app.state.auth_service.issue_action_token(
+                    account,
+                    "email_verification",
+                    app.state.settings.auth_email_verification_ttl_seconds,
+                )
+                send_auth_action_email(
+                    app.state.settings,
+                    account,
+                    "email_verification",
+                    token,
+                )
+        return {"accepted": True}
+
+    @app.post("/api/auth/email-verification/confirm")
+    def confirm_email_verification(
+        payload: AuthEmailVerificationRequest,
+    ) -> dict[str, bool]:
+        app.state.auth_service.verify_email_action(payload.token)
+        return {"verified": True}
+
+    @app.post("/api/auth/password/forgot", status_code=status.HTTP_202_ACCEPTED)
+    def forgot_password(payload: AuthPasswordForgotRequest) -> dict[str, bool]:
+        if app.state.settings.auth_password_reset_enabled:
+            accounts = [
+                account
+                for account in app.state.identity_service.find_users_by_email(
+                    payload.email
+                )
+                if account.status == "active"
+                and (
+                    payload.tenant_id is None
+                    or account.tenant_id == payload.tenant_id
+                )
+            ]
+            for account in accounts:
+                token = app.state.auth_service.issue_action_token(
+                    account,
+                    "password_reset",
+                    app.state.settings.auth_password_reset_ttl_seconds,
+                )
+                send_auth_action_email(
+                    app.state.settings,
+                    account,
+                    "password_reset",
+                    token,
+                )
+        return {"accepted": True}
+
+    @app.post("/api/auth/password/reset")
+    def reset_password(payload: AuthPasswordResetRequest) -> dict[str, bool]:
+        app.state.auth_service.reset_password_action(
+            payload.token,
+            payload.password,
+        )
+        return {"reset": True}
 
     @app.get("/api/auth/session")
     def get_auth_session(
@@ -3099,20 +3368,31 @@ def create_app(
             context.tenant_id, share_id, context.user_id
         ).model_dump(mode="json", exclude={"token_hash"})
 
-    @app.get("/public/threads/{public_id}")
+    @app.get("/public/threads/{public_id}", response_model=None)
     def read_public_thread(
         public_id: str,
+        request: Request,
         tenant_id: str = Query(min_length=1),
         token: str | None = Query(default=None, min_length=20),
         share_token: str | None = Header(
             default=None, alias="X-Share-Token", min_length=20
         ),
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | HTMLResponse:
         resolved_token = share_token or token
         if resolved_token is None:
             raise AuthRequiredError("share token required")
-        return app.state.thread_share_service.read_public(
+        payload = app.state.thread_share_service.read_public(
             tenant_id, public_id, resolved_token
+        )
+        if "text/html" not in request.headers.get("accept", ""):
+            return payload
+        return HTMLResponse(
+            public_thread_html(payload),
+            headers={
+                "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'",
+                "Referrer-Policy": "no-referrer",
+                "X-Content-Type-Options": "nosniff",
+            },
         )
 
     @app.get("/api/evaluations/suites")
@@ -3852,6 +4132,182 @@ def create_app(
         )
         return invocation.model_dump(mode="json")
 
+    @app.get("/api/api-keys")
+    def list_agent_api_keys(
+        agent_id: str | None = Query(default=None, min_length=1),
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        if agent_id is not None:
+            app.state.agent_registry.get(context.tenant_id, agent_id)
+        return {
+            "items": [
+                item.model_dump(mode="json")
+                for item in app.state.agent_api_key_store.list(
+                    context.tenant_id, agent_id, context.user_id
+                )
+            ]
+        }
+
+    @app.post("/api/api-keys", status_code=status.HTTP_201_CREATED)
+    def create_agent_api_key(
+        payload: AgentApiKeyCreate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        api_key, raw_token = app.state.agent_api_key_service.create(
+            context.tenant_id, context.user_id, payload
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=api_key.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="agent.api_key.created",
+            metadata={"api_key_id": api_key.id, "agent_id": api_key.agent_id},
+            request=request,
+        )
+        return {"key": api_key.model_dump(mode="json"), "rawToken": raw_token}
+
+    @app.delete("/api/api-keys/{key_id}")
+    def revoke_agent_api_key(
+        key_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        api_key = app.state.agent_api_key_service.revoke(
+            context.tenant_id, context.user_id, key_id
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=api_key.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="agent.api_key.revoked",
+            metadata={"api_key_id": api_key.id, "agent_id": api_key.agent_id},
+            request=request,
+        )
+        return api_key.model_dump(mode="json")
+
+    @app.post(
+        "/api/v1/apps/{app_id}/runs",
+        status_code=status.HTTP_202_ACCEPTED,
+        response_model=PublicAgentRunCreated,
+    )
+    def invoke_public_agent(
+        app_id: str,
+        payload: PublicAgentRunRequest,
+        background_tasks: BackgroundTasks,
+        response: Response,
+        request: Request,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        api_key: AgentApiKey = Depends(get_agent_api_key),
+    ) -> dict[str, Any]:
+        path = f"/api/v1/apps/{app_id}/runs"
+        idempotency_request = build_idempotency_request(
+            tenant_id=api_key.tenant_id,
+            key=f"{api_key.id}:{idempotency_key}" if idempotency_key else None,
+            method="POST",
+            path=path,
+            payload=payload,
+        )
+
+        def start_agent_run() -> PublicAgentRunCreated:
+            invocation = app.state.agent_registry_service.run(
+                api_key.tenant_id,
+                api_key.created_by_user_id,
+                app_id,
+                AgentRunRequest(input=payload.inputs),
+            )
+            app.state.agent_api_key_service.record_use(api_key)
+            record_audit_event(
+                app,
+                tenant_id=api_key.tenant_id,
+                workspace_id=api_key.workspace_id,
+                user_id=api_key.created_by_user_id,
+                run_id=invocation.run_id,
+                event_type="agent.api.invoked",
+                metadata={
+                    "api_key_id": api_key.id,
+                    "agent_id": app_id,
+                    "agent_version": invocation.agent_version,
+                },
+                request=request,
+            )
+            dispatch_chat_run(
+                api_key.tenant_id,
+                MessageDispatch(
+                    message_id=invocation.message_id,
+                    run_id=invocation.run_id,
+                    dispatch_status=ChatMessageDispatchStatus.INFLIGHT,
+                    events_url=invocation.events_url,
+                    run_started=True,
+                ),
+                api_key.created_by_user_id,
+                background_tasks,
+            )
+            return PublicAgentRunCreated(
+                run_id=invocation.run_id,
+                agent_id=app_id,
+                agent_version=invocation.agent_version,
+                status="queued",
+                status_url=f"{path}/{invocation.run_id}",
+                events_url=f"{path}/{invocation.run_id}/events",
+            )
+
+        response.status_code, response_body = (
+            app.state.chat_service.execute_idempotently(
+                idempotency_request, start_agent_run
+            )
+        )
+        return response_body
+
+    @app.get(
+        "/api/v1/apps/{app_id}/runs/{run_id}",
+        response_model=PublicAgentRunResult,
+    )
+    def get_public_agent_result(
+        app_id: str,
+        run_id: str,
+        api_key: AgentApiKey = Depends(get_agent_api_key),
+    ) -> dict[str, Any]:
+        run = get_public_agent_run(app, api_key, run_id)
+        output = next(
+            (
+                event.payload.get("content")
+                for event in reversed(
+                    app.state.store.list_run_events(api_key.tenant_id, run.id)
+                )
+                if event.type == "assistant.message.completed"
+                and event.payload.get("content")
+            ),
+            None,
+        )
+        app.state.agent_api_key_service.record_use(api_key)
+        return PublicAgentRunResult(
+            run_id=run.id,
+            agent_id=app_id,
+            status=run.status.value,
+            output=output,
+            created_at=run.created_at,
+            updated_at=run.updated_at,
+        ).model_dump(mode="json")
+
+    @app.get("/api/v1/apps/{app_id}/runs/{run_id}/events")
+    def get_public_agent_events(
+        app_id: str,
+        run_id: str,
+        after_sequence: int | None = None,
+        last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+        api_key: AgentApiKey = Depends(get_agent_api_key),
+    ) -> StreamingResponse:
+        get_public_agent_run(app, api_key, run_id)
+        app.state.agent_api_key_service.record_use(api_key)
+        return stream_run_events(
+            app, api_key.tenant_id, run_id, after_sequence, last_event_id
+        )
+
     @app.get("/api/speech/capabilities")
     def get_speech_capabilities() -> dict[str, Any]:
         capability = app.state.speech_gateway.capabilities().model_copy(
@@ -4131,6 +4587,74 @@ def create_app(
         )
         return connector.model_dump(mode="json")
 
+    @app.post("/api/connectors/{connector_id}/mcp-credential")
+    def capture_mcp_connector_credential(
+        connector_id: str,
+        payload: SecretCaptureResolveRequest,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "connectors.manage")
+        connector = app.state.connector_registry.get_connector(
+            context.tenant_id,
+            connector_id,
+        )
+        if connector.type != ConnectorType.MCP_SERVER:
+            raise ValueError("Connector is not an MCP server")
+        if (
+            connector.auth_mode == ConnectorAuthMode.NONE
+            and connector.status != ConnectorStatus.NEEDS_REAUTH
+        ):
+            raise ValueError("Unauthenticated MCP servers do not accept a credential")
+        value = payload.value.get_secret_value().strip()
+        if not value:
+            raise ValueError("MCP credential must not be blank")
+        actions = (
+            connector.credential_ref.required_actions
+            if connector.credential_ref is not None
+            else ["mcp.call"]
+        )
+        secret = app.state.secret_service.create_secret(
+            tenant_id=context.tenant_id,
+            workspace_id=connector.workspace_id,
+            name=f"{connector.display_name} credential",
+            value=value,
+            scope=SecretScope(
+                tenant_id=context.tenant_id,
+                workspace_id=connector.workspace_id,
+                allowed_tool_names=[f"connector.{connector.id}.*"],
+                actions=actions,
+            ),
+        )
+        connector = app.state.connector_registry.update_connector_credential(
+            context.tenant_id,
+            connector.id,
+            ConnectorCredentialRef(
+                tenant_id=context.tenant_id,
+                workspace_id=connector.workspace_id,
+                secret_ref_id=secret.id,
+                required_actions=actions,
+                secret_backend=secret.backend,
+                secret_external_name=secret.external_name,
+            ),
+        )
+        connector = app.state.connector_registry.update_connector_status(
+            context.tenant_id,
+            connector.id,
+            ConnectorStatus.DRAFT,
+        )
+        app.state.audit_service.record(
+            AuditEventCreate(
+                tenant_id=context.tenant_id,
+                workspace_id=connector.workspace_id,
+                user_id=context.user_id,
+                run_id=None,
+                event_type="connector.credential_updated",
+                metadata=connector_audit_metadata(connector),
+            )
+        )
+        return connector.model_dump(mode="json")
+
     @app.get("/api/connectors")
     def list_connectors(
         request: Request,
@@ -4196,18 +4720,31 @@ def create_app(
             context.tenant_id,
             connector_id,
         )
+        if (
+            connector.auth_mode != ConnectorAuthMode.NONE
+            and connector.credential_ref is None
+        ):
+            raise ValueError("Connector credential is required before enabling")
         if connector.type == ConnectorType.MCP_SERVER:
-            connector = app.state.connector_registry.update_connector(
-                context.tenant_id,
-                connector_id,
-                ConnectorUpdateRequest(
-                    capabilities=(
-                        app.state.connector_dispatcher.discover_mcp_capabilities(
-                            connector
+            try:
+                connector = app.state.connector_registry.update_connector(
+                    context.tenant_id,
+                    connector_id,
+                    ConnectorUpdateRequest(
+                        capabilities=(
+                            app.state.connector_dispatcher.discover_mcp_capabilities(
+                                connector
+                            )
                         )
-                    )
-                ),
-            )
+                    ),
+                )
+            except ConnectorCredentialExpiredError:
+                app.state.connector_registry.update_connector_status(
+                    context.tenant_id,
+                    connector_id,
+                    ConnectorStatus.NEEDS_REAUTH,
+                )
+                raise
         connector = app.state.connector_registry.update_connector_status(
             context.tenant_id,
             connector_id,
@@ -5212,26 +5749,8 @@ def create_app(
         last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
         context: RequestContext = Depends(get_request_context),
     ) -> StreamingResponse:
-        replay_after_sequence = resolve_event_replay_sequence(
-            after_sequence, last_event_id
-        )
-        events = app.state.store.list_run_events(
-            context.tenant_id,
-            run_id,
-            after_sequence=replay_after_sequence,
-        )
-
-        def stream() -> Iterator[str]:
-            for event in events:
-                payload = json.dumps(
-                    event.model_dump(mode="json"), separators=(",", ":")
-                )
-                yield f"id: {event.sequence}\n"
-                yield f"event: {event.type}\n"
-                yield f"data: {payload}\n\n"
-
-        return StreamingResponse(
-            stream(), media_type=app.state.settings.event_stream_media_type
+        return stream_run_events(
+            app, context.tenant_id, run_id, after_sequence, last_event_id
         )
 
     @app.post("/api/runs/{run_id}/execute")
@@ -5666,6 +6185,7 @@ def create_app(
         request_id: str,
         payload: SecretCaptureResolveRequest,
         background_tasks: BackgroundTasks,
+        request: Request,
         context: RequestContext = Depends(get_request_context),
     ) -> dict[str, Any]:
         capture = app.state.store.get_secret_capture_request(
@@ -5673,6 +6193,22 @@ def create_app(
         )
         if capture.status != "pending":
             raise ValueError("secret capture request is no longer pending")
+        run = app.state.store.get_run(context.tenant_id, capture.run_id)
+        if run.workspace_id != capture.workspace_id:
+            raise TenantAccessError("secret capture is not in the run workspace")
+        connector = (
+            app.state.connector_registry.get_connector(
+                context.tenant_id, capture.connector_id
+            )
+            if capture.connector_id
+            else None
+        )
+        if connector is not None:
+            require_permission(request, context, "connectors.manage")
+            if connector.workspace_id != capture.workspace_id:
+                raise TenantAccessError("connector is not in the secret capture workspace")
+        elif run.user_id != context.user_id:
+            raise TenantAccessError("secret capture is not owned by this run user")
         secret = app.state.secret_service.create_secret(
             tenant_id=context.tenant_id,
             workspace_id=capture.workspace_id,
@@ -5681,14 +6217,15 @@ def create_app(
             scope=SecretScope(
                 tenant_id=context.tenant_id,
                 workspace_id=capture.workspace_id,
-                allowed_tool_names=([capture.tool_name] if capture.tool_name else []),
+                allowed_tool_names=(
+                    [f"connector.{connector.id}.*"]
+                    if connector is not None
+                    else ([capture.tool_name] if capture.tool_name else [])
+                ),
                 actions=capture.actions,
             ),
         )
-        if capture.connector_id:
-            connector = app.state.connector_registry.get_connector(
-                context.tenant_id, capture.connector_id
-            )
+        if connector is not None:
             app.state.connector_registry.update_connector_credential(
                 context.tenant_id,
                 connector.id,
@@ -7890,6 +8427,50 @@ def create_app(
             page,
         )
 
+    @app.get("/api/store")
+    def list_public_store_items() -> dict[str, Any]:
+        return {
+            "items": [
+                item.summary() for item in app.state.store_catalog.list_items()
+            ],
+            "nextCursor": None,
+        }
+
+    @app.get("/api/store/featured")
+    def list_featured_store_items() -> list[dict[str, Any]]:
+        return [
+            item.summary()
+            for item in app.state.store_catalog.list_items()
+            if item.featured
+        ]
+
+    @app.get("/api/skills/builtin")
+    def list_public_builtin_skills() -> list[dict[str, Any]]:
+        return [
+            {
+                key: skill[key]
+                for key in ("id", "displayName", "description", "tags")
+            }
+            for skill in app.state.store_catalog.list_skills()
+        ]
+
+    @app.get("/api/discover/skills")
+    def discover_public_skills() -> list[dict[str, Any]]:
+        return [
+            {
+                "id": skill["id"],
+                "repoUrl": None,
+                "name": skill["displayName"],
+                "blurb": skill["description"],
+                "owner": skill["owner"],
+                "xHandle": None,
+                "starsSnapshot": None,
+                "installCount": None,
+                "origin": "builtin",
+            }
+            for skill in app.state.store_catalog.list_skills()
+        ]
+
     @app.get("/api/store/items")
     def list_builtin_store_items(
         request: Request,
@@ -8851,10 +9432,17 @@ def create_app(
             missing_scopes = sorted(
                 set(entry.manifest.required_scopes) - set(granted_scopes)
             )
-            invocation_mode = skill_invocation_mode(entry.manifest)
-            executable = is_agent_run_skill(
-                entry.manifest
-            ) or app.state.runtime.tool_gateway.can_execute_tool(entry.manifest.id)
+            package_backed = installation.package_kind == SkillPackageKind.PACKAGE
+            invocation_mode = (
+                "agent_skill"
+                if package_backed
+                else skill_invocation_mode(entry.manifest)
+            )
+            executable = (
+                package_backed
+                or is_agent_run_skill(entry.manifest)
+                or app.state.runtime.tool_gateway.can_execute_tool(entry.manifest.id)
+            )
             item.update(
                 {
                     "invocation_mode": invocation_mode,
@@ -9002,26 +9590,49 @@ def create_app(
                 f"Permission denied: missing skill scopes: {', '.join(missing_scopes)}"
             )
 
-        if is_agent_run_skill(entry.manifest):
+        package_backed = installation.package_kind == SkillPackageKind.PACKAGE
+        if package_backed or is_agent_run_skill(entry.manifest):
+            validation = JsonSchemaValidator(
+                json_schema=entry.manifest.input_schema
+            ).validate(payload.input)
+            if not validation.valid:
+                raise ValueError(
+                    f"Skill input is invalid: {'; '.join(validation.errors)}"
+                )
+            tool_name = "agent.skill" if package_backed else "agent.workflow"
+            event_type = (
+                "skill.invoked" if package_backed else "skill.workflow_invoked"
+            )
             run = app.state.store.create_run(
                 tenant_id=context.tenant_id,
                 user_id=context.user_id,
                 payload=RunCreate(
                     workspace_id=workspace_id,
-                    agent_id=entry.manifest.id,
+                    agent_id=None if package_backed else entry.manifest.id,
                     message=build_agent_run_skill_message(
                         entry.manifest,
                         payload.input,
                     ),
-                    mode=RunMode.WORKFLOW,
+                    mode=RunMode.CHAT if package_backed else RunMode.WORKFLOW,
+                    resource_refs=(
+                        [
+                            ResourceReference(
+                                type="skill",
+                                id=entry.manifest.id,
+                                version=installation.installed_version,
+                            )
+                        ]
+                        if package_backed
+                        else []
+                    ),
                 ),
             )
             app.state.store.append_run_event(
                 run,
-                "skill.workflow_invoked",
+                event_type,
                 {
                     "skill_id": entry.manifest.id,
-                    "skill_version": entry.manifest.version,
+                    "skill_version": installation.installed_version,
                     "input_keys": sorted(payload.input.keys()),
                 },
             )
@@ -9031,38 +9642,41 @@ def create_app(
                 "status": state.status.value,
                 "events_url": f"/api/runs/{run.id}/events",
             }
+            if state.final_response_text:
+                output["response"] = state.final_response_text
             metadata = {
                 "skill_id": entry.manifest.id,
-                "tool_name": "agent.workflow",
+                "tool_name": tool_name,
                 "workspace_id": workspace_id,
                 "run_id": run.id,
                 "input_keys": sorted(payload.input.keys()),
                 "output_keys": sorted(output.keys()),
             }
-            app.state.store.record_billing_meter(
-                tenant_id=context.tenant_id,
-                run_id=run.id,
-                meter_type="skill_call_count",
-                quantity=1,
-                unit="call",
-                skill_id=entry.manifest.id,
-                workspace_id=workspace_id,
-                user_id=context.user_id,
-                metadata=metadata,
-            )
+            if not package_backed:
+                app.state.store.record_billing_meter(
+                    tenant_id=context.tenant_id,
+                    run_id=run.id,
+                    meter_type="skill_call_count",
+                    quantity=1,
+                    unit="call",
+                    skill_id=entry.manifest.id,
+                    workspace_id=workspace_id,
+                    user_id=context.user_id,
+                    metadata=metadata,
+                )
             record_audit_event(
                 app,
                 tenant_id=context.tenant_id,
                 workspace_id=workspace_id,
                 user_id=context.user_id,
                 run_id=run.id,
-                event_type="skill.workflow_invoked",
+                event_type=event_type,
                 metadata=metadata,
                 request=request,
             )
             return {
                 "skill_id": entry.manifest.id,
-                "tool_name": "agent.workflow",
+                "tool_name": tool_name,
                 "run_id": run.id,
                 "status": state.status.value,
                 "output": output,
@@ -9780,6 +10394,10 @@ def create_app(
         scope_type: MemoryScopeType,
         scope_id: str,
         request: Request,
+        memory_status: MemoryStatus = Query(
+            default=MemoryStatus.ACTIVE,
+            alias="status",
+        ),
         page: PageRequest = Depends(get_page_request),
         context: RequestContext = Depends(get_request_context),
     ) -> list[dict[str, Any]] | dict[str, Any]:
@@ -9789,6 +10407,7 @@ def create_app(
                 context.tenant_id,
                 scope_type,
                 scope_id,
+                memory_status,
             ),
             request,
             page,
@@ -11285,6 +11904,16 @@ def build_agent_registry(settings: Settings):
     return InMemoryAgentRegistry()
 
 
+def build_agent_api_key_store(settings: Settings):
+    if settings.agent_registry_backend == "sql":
+        config = settings.database_config()
+        MigrationRunner(
+            config=config, migrations_path=Path("apps/api/migrations")
+        ).apply()
+        return SqlAgentApiKeyStore(config=config)
+    return InMemoryAgentApiKeyStore()
+
+
 def build_evaluation_repository(settings: Settings) -> EvaluationRepository:
     if settings.evaluation_repository_backend == "sql":
         config = settings.database_config()
@@ -11630,6 +12259,8 @@ def build_browser_readiness(
         missing.append("browser_controller_base_url")
     if controller_required and not controller_auth_configured:
         missing.append("browser_controller_api_key")
+    if controller_required and not settings.browser_controller_navigation_allowed_hosts:
+        missing.append("browser_controller_navigation_allowed_hosts")
     readiness = BrowserReadiness(
         configured=not missing,
         provider=settings.browser_provider,
@@ -11659,8 +12290,13 @@ def build_browser_readiness(
                     }
                 )
             return readiness
+        capability_missing = list(readiness.missing)
+        if not capabilities.navigation_allowlist_enforced:
+            capability_missing.append("browser_navigation_allowlist")
         readiness = readiness.model_copy(
             update={
+                "configured": not capability_missing,
+                "missing": capability_missing,
                 "capabilities_checked": True,
                 "auth_required_declared": capabilities.auth_required,
                 "session_ttl_enforced_declared": capabilities.session_ttl_enforced,

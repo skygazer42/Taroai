@@ -142,12 +142,22 @@ class SqlConnectorRegistry(BaseModel):
             connection.execute(
                 """
                 UPDATE connector_definitions
-                SET credential_ref = ?, status = ?, updated_at = ?
+                SET auth_mode = ?, credential_ref = ?, status = ?, updated_at = ?
                 WHERE tenant_id = ? AND id = ?
                 """,
                 (
+                    (
+                        ConnectorAuthMode.MCP
+                        if connector.type == ConnectorType.MCP_SERVER
+                        and connector.auth_mode == ConnectorAuthMode.NONE
+                        else connector.auth_mode
+                    ).value,
                     self._credential_ref_json(credential_ref),
-                    ConnectorStatus.ENABLED.value,
+                    (
+                        ConnectorStatus.ENABLED
+                        if connector.status == ConnectorStatus.NEEDS_REAUTH
+                        else connector.status
+                    ).value,
                     self._dt(utc_now()),
                     tenant_id,
                     connector_id,

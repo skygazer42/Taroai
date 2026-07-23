@@ -52,6 +52,25 @@ class InMemoryIdentityService(BaseModel):
         account = self.get_user_by_email(tenant_id, email)
         return self.password_hasher.verify_password(password, account.password_hash)
 
+    def update_password(
+        self,
+        tenant_id: str,
+        user_id: str,
+        password: str,
+    ) -> UserAccount:
+        account = self.get_user(tenant_id, user_id)
+        updated = account.model_copy(
+            update={"password_hash": self.password_hasher.hash_password(password)}
+        )
+        self.users[user_id] = updated
+        self._record_audit_event(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            event_type="identity.user.password_changed",
+            metadata={"user_id": user_id},
+        )
+        return updated
+
     def disable_user(self, tenant_id: str, user_id: str) -> UserAccount:
         return self._set_user_status(
             tenant_id=tenant_id,

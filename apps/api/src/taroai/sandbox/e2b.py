@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import mimetypes
+import shlex
 from datetime import timedelta
 from pathlib import PurePosixPath
 
@@ -40,6 +41,7 @@ class E2BSandboxAdapter(SandboxAdapter):
     provider: str = "e2b"
     api_key: str = Field(min_length=1, repr=False)
     template: str = ""
+    default_runtime_image: str = "python:3.12-slim"
     request_timeout_seconds: int = Field(default=30, ge=1)
     max_output_chars: int = Field(default=65536, ge=1024)
     max_session_ttl_seconds: int = Field(default=3600, ge=1)
@@ -91,9 +93,15 @@ class E2BSandboxAdapter(SandboxAdapter):
             "taroai_network_mode": request.network_mode.value,
             "taroai_timeout_seconds": str(request.timeout_seconds),
         }
+        template = (
+            request.image
+            if "image" in request.model_fields_set
+            and request.image != self.default_runtime_image
+            else self.template or None
+        )
         try:
             sandbox = Sandbox.create(
-                template=self.template or None,
+                template=template,
                 timeout=request.timeout_seconds,
                 metadata=metadata,
                 allow_internet_access=request.network_mode == SandboxNetworkMode.OPEN,
@@ -225,11 +233,22 @@ class E2BSandboxAdapter(SandboxAdapter):
         path = self._workspace_path(file_write.path)
         content = file_write.content_bytes()
         try:
-            self._connect(session).files.write(
+            sandbox = self._connect(session)
+            sandbox.files.write(
                 path,
                 content,
                 request_timeout=self.request_timeout_seconds,
             )
+            if file_write.mode is not None:
+                chmod = sandbox.commands.run(
+                    f"chmod {file_write.mode:o} {shlex.quote(path)}",
+                    timeout=min(30, session.timeout_seconds),
+                    request_timeout=self.request_timeout_seconds,
+                )
+                if chmod.exit_code != 0:
+                    raise SandboxExecutionError(
+                        "e2b sandbox failed to set uploaded file mode"
+                    )
         except SandboxException as error:
             raise SandboxExecutionError(f"e2b sandbox file upload failed: {error}") from error
         return SandboxFileRef(
@@ -433,7 +452,7 @@ class E2BSandboxAdapter(SandboxAdapter):
             workspace_id=metadata["taroai_workspace_id"],
             run_id=metadata["taroai_run_id"],
             provider=self.provider,
-            image=self.template or info.template_id or "base",
+            image=info.template_id or self.template or "base",
             network_mode=SandboxNetworkMode(
                 metadata.get("taroai_network_mode", SandboxNetworkMode.DISABLED.value)
             ),

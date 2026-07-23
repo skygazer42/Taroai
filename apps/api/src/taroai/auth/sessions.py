@@ -32,6 +32,14 @@ class AuthSessionStore(BaseModel):
     def revoke_session(self, tenant_id: str, session_id: str, revoked_at: datetime) -> bool:
         raise NotImplementedError
 
+    def revoke_user_sessions(
+        self,
+        tenant_id: str,
+        user_id: str,
+        revoked_at: datetime,
+    ) -> int:
+        raise NotImplementedError
+
 
 class InMemoryAuthSessionStore(AuthSessionStore):
     sessions: dict[str, AuthSession] = Field(default_factory=dict)
@@ -65,6 +73,25 @@ class InMemoryAuthSessionStore(AuthSessionStore):
             return False
         self.sessions[session_id] = session.model_copy(update={"revoked_at": revoked_at})
         return True
+
+    def revoke_user_sessions(
+        self,
+        tenant_id: str,
+        user_id: str,
+        revoked_at: datetime,
+    ) -> int:
+        session_ids = [
+            session_id
+            for session_id, session in self.sessions.items()
+            if session.tenant_id == tenant_id
+            and session.user_id == user_id
+            and session.revoked_at is None
+        ]
+        for session_id in session_ids:
+            self.sessions[session_id] = self.sessions[session_id].model_copy(
+                update={"revoked_at": revoked_at}
+            )
+        return len(session_ids)
 
 
 class SqlAuthSessionStore(AuthSessionStore):
@@ -124,6 +151,23 @@ class SqlAuthSessionStore(AuthSessionStore):
                 (self._dt(revoked_at), tenant_id, session_id),
             )
         return cursor.rowcount > 0
+
+    def revoke_user_sessions(
+        self,
+        tenant_id: str,
+        user_id: str,
+        revoked_at: datetime,
+    ) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE auth_sessions
+                SET revoked_at = ?
+                WHERE tenant_id = ? AND user_id = ? AND revoked_at IS NULL
+                """,
+                (self._dt(revoked_at), tenant_id, user_id),
+            )
+        return cursor.rowcount
 
     def _connect(self):
         return connect_database(self.config)

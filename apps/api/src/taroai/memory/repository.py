@@ -92,6 +92,7 @@ class SqlLongTermMemoryService(BaseModel):
         tenant_id: str,
         scope_type: MemoryScopeType,
         scope_id: str,
+        status: MemoryStatus = MemoryStatus.ACTIVE,
     ) -> list[MemoryRecord]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -100,11 +101,17 @@ class SqlLongTermMemoryService(BaseModel):
                 WHERE tenant_id = ?
                     AND scope_type = ?
                     AND scope_id = ?
-                    AND status = 'active'
+                    AND status = ?
                     AND (expires_at IS NULL OR expires_at > ?)
                 ORDER BY created_at, id
                 """,
-                (tenant_id, scope_type.value, scope_id, self._dt(utc_now())),
+                (
+                    tenant_id,
+                    scope_type.value,
+                    scope_id,
+                    status.value,
+                    self._dt(utc_now()),
+                ),
             ).fetchall()
         return [self._from_row(row) for row in rows]
 

@@ -178,7 +178,8 @@ def test_account_auth_is_separate_from_developer_operations():
     root = parse_index()
     auth_dialog = root.find_by_attr("id", "auth-dialog")
     operations = root.find_by_attr("data-testid", "operations-drawer")
-    account = root.find_by_attr("data-auth-dialog-open", "")
+    account = root.find_by_attr("data-account-menu-toggle", "")
+    account_menu = root.find_by_attr("data-account-menu", "")
     login_email = root.find_by_attr("id", "login-email")
     remember_login = root.find_by_attr("id", "remember-login")
     password_toggle = root.find_by_attr("data-password-toggle", "")
@@ -190,6 +191,9 @@ def test_account_auth_is_separate_from_developer_operations():
 
     assert auth_dialog is not None and auth_dialog.tag == "dialog"
     assert account is not None and account.attrs.get("aria-haspopup") == "dialog"
+    assert account.attrs.get("aria-controls") == "auth-dialog"
+    assert account_menu is not None and account_menu.attrs.get("role") == "menu"
+    assert "hidden" in account_menu.attrs
     assert login_email is not None and is_descendant(login_email, auth_dialog)
     assert login_email.attrs.get("placeholder") == "username@email.com"
     assert remember_login is not None and "checked" in remember_login.attrs
@@ -205,6 +209,21 @@ def test_account_auth_is_separate_from_developer_operations():
     assert ".auth-dialog[open]" in styles
     assert ".auth-dialog::before" in styles
     assert "width: min(384px" in styles
+
+
+def test_account_menu_and_login_surface_offer_persistent_language_switching():
+    root = parse_index()
+    account_menu = root.find_by_attr("data-account-menu", "")
+    auth_dialog = root.find_by_attr("id", "auth-dialog")
+    assert account_menu.find_by_attr("data-locale-choice", "zh-CN") is not None
+    assert account_menu.find_by_attr("data-locale-choice", "en") is not None
+    assert auth_dialog.find_by_attr("data-locale-choice", "zh-CN") is not None
+    assert auth_dialog.find_by_attr("data-locale-choice", "en") is not None
+
+    i18n = asset_source("i18n.js")
+    assert 'localStorage.getItem("taroai.locale")' in i18n
+    assert 'localStorage.setItem("taroai.locale", nextLocale)' in i18n
+    assert "function setLocale(nextLocale)" in i18n
 
 
 def test_protected_workspace_data_waits_for_sign_in():
@@ -295,7 +314,17 @@ def test_model_policy_denial_refreshes_catalog_and_disables_sending_without_a_mo
     assert "await this.loadModelCatalog()" in create_thread
     assert 'error.body?.code === "model_policy_denied"' in send
     assert "await this.loadModelCatalog()" in send
-    assert "!chatState.selectedModel || uploadPending" in sync
+    assert "!chatState.selectedModel || uploadBlocked" in sync
+
+
+def test_failed_upload_cannot_be_silently_dropped_from_a_message():
+    source = chat_controller_source()
+    sync = function_source(source, "  syncComposer()", "  async sendThreadMessage(")
+    send = function_source(source, "  async sendThreadMessage(", "  updateThreadPreview(content)")
+
+    assert 'upload.status !== "Ready"' in sync
+    assert 'upload.status === "Failed"' in send
+    assert 'this.network("Remove failed files before sending", "warning")' in send
 
 
 def test_model_menu_only_renders_models_and_efforts_returned_by_the_api():
@@ -308,14 +337,17 @@ def test_model_menu_only_renders_models_and_efforts_returned_by_the_api():
     assert "Claude Sonnet 5" not in html
     assert 'chatState.modelCatalog = []' in load_catalog
     assert 'queryAll("[data-model-option]")' not in load_catalog
-    assert "const visibleModels = new Map()" in render_menu
-    assert "!visibleModels.has(model.model_id) || modelKey(model) === selectedKey" in render_menu
-    assert "for (const model of visibleModels.values())" in render_menu
+    assert "const groups = new Map()" in render_menu
+    assert "for (const model of chatState.modelCatalog)" in render_menu
+    assert "visibleModels" not in render_menu
+    assert "label.textContent = providerLabel(provider)" in render_menu
     assert 'if (model.reasoning_efforts.length)' in render_menu
     assert 'empty.textContent = signedIn ? "No models available for this workspace." : "Sign in to load models."' in render_menu
     assert 'signIn.dataset.authDialogOpen = ""' in render_menu
     assert '["none"]' not in source
     assert '"glm-4.7": { name: "GLM 4.7"' in source
+    assert 'zhipu: "Zhipu AI"' in source
+    assert 'key.startsWith(`${id}-`)' in source
 
 
 def test_new_chat_restores_the_catalog_default_reasoning_effort():
@@ -354,16 +386,30 @@ def test_creao_query_thread_deep_link_is_supported():
     assert 'url.searchParams.delete("threadId")' in write_route
 
 
+def test_secret_capture_reloads_the_thread_to_resume_streaming():
+    source = chat_controller_source()
+    capture = function_source(source, "  renderSecretCapture()", "  renderAgentAppResult()")
+
+    assert "const threadId = chatState.currentThreadId;" in capture
+    assert "if (threadId) await this.loadThread(threadId, false);" in capture
+
+
 def test_discover_only_opens_the_selected_published_agent():
     source = script_source()
     cards = function_source(source, "function routeCards(", "function handleRouteAction(")
     action = function_source(source, "function handleRouteAction(", "function setSidebarCollapsed(")
+    skills = asset_source("skills-ui.js")
+    skill_load = function_source(skills, "  async load()", "  filtered()")
 
     assert '.filter((agent) => agent.status === "published")' in cards
     assert 'action: `agent:${agent.id || agent.agent_id}`' in cards
     assert 'action.startsWith("agent:")' in action
     assert 'window.location.hash = `agents/${encodeURIComponent' in action
-    assert 'action: "route:skills"' in cards
+    assert "state.storeItems.map((item)" in cards
+    assert 'action: `store:${item.id}`' in cards
+    assert 'action.startsWith("store:")' in action
+    assert 'window.location.hash = `skills/${encodeURIComponent' in action
+    assert "skill.id === requestedId" in skill_load
     assert '`${state.workspaceSkills.length} installed`' in cards
 
 
@@ -463,7 +509,7 @@ def test_chat_collapses_runtime_events_into_one_thinking_state():
 
     assert 'thinking.className = "chat-thinking"' in render
     assert 'label.textContent = "Thinking"' in render
-    assert "else if (!liveAssistantId)" in render
+    assert "if (!thoughtRendered && !liveAssistantId)" in render
     assert "renderExecutionCard" not in source
     assert "this.renderApprovalCard(messageRunId)" in render
     assert "currentApprovalCard = this.renderApprovalCard()" in render
@@ -498,6 +544,28 @@ def test_composer_waits_for_upload_scanning_before_sending():
     assert "Wait for files to finish uploading and scanning" in send
 
 
+def test_composer_has_one_accessible_state_owner_and_clear_running_copy():
+    source = chat_controller_source()
+    keydown = function_source(source, "  onKeydown(event)", "  onChange(event)")
+    composer = function_source(source, "  syncComposer()", "  async sendThreadMessage(")
+    legacy = script_source()
+    styles = asset_source("styles.css")
+
+    assert "event.isComposing || event.keyCode === 229" in keydown
+    assert 'const activeRun = chatState.running && !assistantResponseReady()' in composer
+    assert '"Add a follow-up while Taroai is working..."' in composer
+    assert '"Queue follow-up"' in composer
+    assert 'this.refs.dropzone.dataset.composerState' in composer
+    assert "if (window.__taroaiThreadChat) return" in legacy
+    assert ".composer-surface:focus-within" in styles
+    assert "min-height: 158px" in styles
+    assert "max-height: min(150px, 35dvh)" in styles
+    assert '.workspace-shell[data-chat-state="thread"] .composer-surface' not in styles
+    assert '.workspace-shell[data-chat-state="thread"] #composer-input' not in styles
+    assert ".composer-create-agent" in styles
+    assert "@media (pointer: coarse)" in styles
+
+
 def test_composer_leaves_tool_choice_to_the_agent_model():
     source = chat_controller_source()
     send = function_source(source, "  async sendThreadMessage(", "  updateThreadPreview(content)")
@@ -506,9 +574,24 @@ def test_composer_leaves_tool_choice_to_the_agent_model():
     assert "AGENT_TOOL_INTENTS" not in source
     assert "requiresAgentTools" not in source
     assert 'createIntent ? "autonomous" : "chat"' in send
-    assert 'message.kind === "agent" ? "autonomous" : "chat"' in source
-    assert "this.refs.conversation.scrollTop = this.refs.conversation.scrollHeight" in conversation
+    assert 'message.kind === "agent" ? "agent" : null' in source
+    assert "const shouldFollowOutput" in conversation
     assert "this.refs.chatScroll" not in conversation
+
+
+def test_streaming_only_follows_when_the_reader_is_near_the_bottom():
+    source = chat_controller_source()
+    conversation = function_source(source, "  renderConversation()", "  renderSuggestions(")
+
+    distance = conversation.index("const shouldFollowOutput")
+    replace = conversation.index("this.refs.conversation.replaceChildren()")
+    guard = conversation.index("if (shouldFollowOutput)", replace)
+    scroll = conversation.index(
+        "this.refs.conversation.scrollTop = this.refs.conversation.scrollHeight",
+        guard,
+    )
+
+    assert distance < replace < guard < scroll
 
 
 def test_composer_sends_display_text_and_skill_bindings_separately():
@@ -545,6 +628,28 @@ def test_failed_run_shows_a_safe_retry_notice():
     assert "The selected model is not allowed for this request." in render
     assert "A workflow task failed." in render
     assert "Nothing was changed." not in render
+
+
+def test_failed_run_exposes_real_recovery_actions():
+    source = chat_controller_source()
+    render = function_source(source, "  renderConversation()", "  renderSuggestions(")
+    retry = function_source(source, "  async retryRun(", "  continueFailedRun(")
+    restore = function_source(source, "  restoreMessageToComposer(", "  retryMessage(")
+
+    assert "retry.dataset.runRetry" in render
+    assert "continueButton.dataset.runContinue" in render
+    assert "newChat.dataset.newChat" in render
+    assert "model_budget_exceeded" in render
+    assert "cost_budget_exhausted" in render
+    assert "model_policy_denied" in render
+    assert "`/api/runs/${encodeURIComponent(runId)}/retry`" in retry
+    assert '{ reason_code: "operator_retry" }' in retry
+    assert "if (!runId || chatState.running) return" in retry
+    assert "chatState.resourceRefs = refs.filter" in restore
+    assert 'item.type === "browser_profile"' in restore
+    assert "message.kind === \"workflow\"" in restore
+    assert 'dispatchStatus(item) === "failed"' in source
+    assert 'statusValue === "failed" && message.optimistic' in source
 
 
 def test_temporary_worker_retry_is_visible_in_chat():
@@ -586,13 +691,42 @@ def test_completed_run_exposes_a_collapsed_thought_summary():
     assert "const keyedSteps = new Map()" in render_thought
     assert "steps[keyedSteps.get(step.key)] = step" in render_thought
     assert 'type.startsWith("tool_call.")' in source
-    assert 'key: `tool:${p.action_id || p.step_id || tool}`' in source
+    assert 'key: `tool:${toolActivityKey(event) || eventSequence(event)}`' in source
     assert 'toggle.dataset.thoughtToggle = ""' in render_thought
     assert "runActivityEvents()" in source
     assert 'control.matches("[data-thought-toggle]")' in source
-    assert "chatState.thoughtOpen = !chatState.thoughtOpen" in source
+    assert 'const expanded = control.getAttribute("aria-expanded") !== "true"' in source
+    assert "chatState.disclosureOpen.set(control.dataset.disclosureKey, expanded)" in source
     assert ".chat-thought-toggle" in styles
     assert ".chat-thought-detail" in styles
+
+
+def test_activity_timeline_pairs_safe_lifecycle_events_in_sequence():
+    source = chat_controller_source()
+    describe = function_source(source, "  describeActivityEvent(event)", "  renderSearchCard(")
+    thought = function_source(source, "  renderThoughtCard(runId = chatState.currentRunId)", "  renderConversation()")
+    conversation = function_source(source, "  renderConversation()", "  renderSuggestions(")
+
+    for event_type in ["model.operation.started", "model.operation.completed", "model.operation.failed"]:
+        assert event_type in describe
+    assert 'operation === "verify"' in describe
+    assert '"verification:current"' in describe
+    assert '`model:${p.operation_id || eventSequence(event)}`' in describe
+    assert 'transient: !failed' in describe
+    assert '["agent.conversation.loaded", "agent.loop.started", "agent.cycle.started"]' in describe
+    assert 'type === "run.attachments.materialized"' in describe
+    assert 'Prepared uploaded file · ${filename}' in describe
+    assert "return leftSequence - rightSequence" in source
+    assert "steps[keyedSteps.get(step.key)] = step" in thought
+    assert "latestStep = step" in thought
+    assert "if (step.transient) continue" in thought
+    assert "hasModelLifecycle" in thought
+    assert "this.renderSearchCard(runId, step.actionKey)" in thought
+    assert "this.renderCodeCard(runId, step.actionKey)" in thought
+    assert "this.renderToolCards(runId, step.actionKey)" in thought
+    assert "rationale" not in describe and "feedback" not in describe
+    assert "this.renderSearchCard(messageRunId)" not in conversation
+    assert "this.renderCodeCard(messageRunId)" not in conversation
 
 
 def test_completed_response_stops_presenting_backend_cleanup_as_thinking():
@@ -614,8 +748,8 @@ def test_completed_response_stops_presenting_backend_cleanup_as_thinking():
 
 def test_web_search_results_render_as_a_structured_source_block():
     source = chat_controller_source()
-    search = function_source(source, "  renderSearchCard(runId = chatState.currentRunId)", "  renderThoughtCard(runId = chatState.currentRunId)")
-    conversation = function_source(source, "  renderConversation()", "  renderSuggestions(")
+    search = function_source(source, "  renderSearchCard(runId = chatState.currentRunId, actionKey = null)", "  renderThoughtCard(runId = chatState.currentRunId)")
+    thought = function_source(source, "  renderThoughtCard(runId = chatState.currentRunId)", "  renderConversation()")
 
     assert '"tool_call.started", "tool_call.completed", "tool_call.failed", "tool_call.cancelled", "tool_call.approval_required"' in search
     assert 'eventType(item) === "agent.decision.created"' in search
@@ -629,18 +763,24 @@ def test_web_search_results_render_as_a_structured_source_block():
     assert 'p.summary || fallback' in source
     assert 'link.rel = "noopener noreferrer"' in search
     assert 'note.textContent = "Source details were not retained for this run."' in search
-    assert "this.renderSearchCard()" in conversation
+    assert "this.renderSearchCard(runId, step.actionKey)" in thought
     assert ".chat-search-card" in asset_source("styles.css")
 
 
 def test_sandbox_command_renders_as_a_structured_code_block():
     source = chat_controller_source()
-    code = function_source(source, "  renderCodeCard(runId = chatState.currentRunId)", "  renderThoughtCard(runId = chatState.currentRunId)")
+    code = function_source(source, "  renderCodeCard(runId = chatState.currentRunId, actionKey = null)", "  renderThoughtCard(runId = chatState.currentRunId)")
     output_loader = function_source(source, "  async loadCommandOutput(event)", "  renderApprovalCard(runId = chatState.currentRunId)")
-    conversation = function_source(source, "  renderConversation()", "  renderSuggestions(")
+    thought = function_source(source, "  renderThoughtCard(runId = chatState.currentRunId)", "  renderConversation()")
 
     assert 'value.tool_name === "sandbox.command"' in code
-    assert 'waiting ? "Code needs approval"' in code
+    assert "const commandCopy = commandActivity(commandPayload)" in code
+    assert "commandSubject(command, commandPayload.command_kind)" in code
+    assert '`${activity} · ${subject}`' in code
+    assert 'read_file: { started: "Reading file", completed: "Read file"' in source
+    assert 'list_files: { started: "Listing files", completed: "Listed files"' in source
+    assert 'search_files: { started: "Searching files", completed: "Found files"' in source
+    assert 'run_command: { started: "Running command", completed: "Ran command"' in source
     assert "decision?.tool_input?.command" in code
     assert 'eventType(item) === "agent.observation.recorded"' in code
     assert 'item === decision' in code
@@ -655,8 +795,41 @@ def test_sandbox_command_renders_as_a_structured_code_block():
     assert "stream.textContent = value" in code
     assert "… output truncated …" in source
     assert "fragment.append(details)" in code
-    assert "this.renderCodeCard()" in conversation
+    assert "bindDisclosure(" in code
+    assert "chatState.disclosureOpen" in source
+    assert "this.renderCodeCard(runId, step.actionKey)" in thought
     assert ".chat-code-card" in asset_source("styles.css")
+
+
+def test_other_tools_render_from_safe_lifecycle_events():
+    source = chat_controller_source()
+    tools = function_source(
+        source,
+        "  renderToolCards(runId = chatState.currentRunId, actionKey = null)",
+        "  renderUiElement(",
+    )
+    thought = function_source(source, "  renderThoughtCard(runId = chatState.currentRunId)", "  renderConversation()")
+
+    assert 'type.startsWith("tool_call.")' in tools
+    assert "p.action_id || p.step_id" in tools
+    assert 'eventType(item) === "agent.observation.recorded"' in tools
+    assert "observationPayload.safe_error" in tools
+    assert "payload.result || observationPayload.result" in tools
+    assert '["web.search", "sandbox.command", "tool.search", "ui.render"]' in tools
+    assert 'eventType(item) !== "agent.decision.created"' in tools
+    assert "decision?.tool_input" in tools
+    assert '[["Input", input], ["Result", result], ["Error", error]]' in tools
+    assert "safeToolInput(value, tool)" in source
+    assert "password|passwd|secret|token" in source
+    assert 'tool === "browser.action" && /^(text|value)$/i.test(key)' in source
+    assert "retry.dataset.runRetry" in tools
+    assert "retry.dataset.messageRetry" in tools
+    assert "continueButton.dataset.runContinue" in tools
+    assert "newChat.dataset.newChat" in tools
+    assert '`Loading ${skillName}`' in tools
+    assert '`Used ${skillName}`' in tools
+    assert '`${skillFileCount} file${skillFileCount === 1 ? "" : "s"} ready`' in tools
+    assert "this.renderToolCards(runId, step.actionKey)" in thought
 
 
 def test_historical_run_blocks_stay_with_their_assistant_message():
@@ -676,9 +849,9 @@ def test_historical_run_blocks_stay_with_their_assistant_message():
     assert 'eventType(event) !== "assistant.message.completed"' in conversation
     assert "eventPayload(event).message_id" in conversation
     assert "const messageRunId = assistantRunIds.get(message.id) || fallbackRunId" in conversation
-    assert "this.renderSearchCard(messageRunId)" in conversation
-    assert "this.renderCodeCard(messageRunId)" in conversation
     assert "this.renderThoughtCard(messageRunId)" in conversation
+    assert "this.renderSearchCard(runId, step.actionKey)" in thought
+    assert "this.renderCodeCard(runId, step.actionKey)" in thought
     assert "const lastRunId = runId ||" in activity
     assert "chatState.running && runId === chatState.currentRunId" in thought
 
@@ -865,11 +1038,15 @@ def test_live_run_shows_compact_activity_without_rebuilding_the_conversation():
     render_thought = function_source(source, "  renderThoughtCard(runId = chatState.currentRunId)", "  renderConversation()")
     click = function_source(source, "  onClick(event)", "  onInput(event)")
 
-    assert "live ? steps.at(-1).text" in render_thought
+    assert "live ? latestStep?.text || steps.at(-1).text" in render_thought
     assert 'card.classList.toggle("is-live", live)' in render_thought
-    assert "detail.hidden = !chatState.thoughtOpen" in render_thought
+    assert "chatState.disclosureOpen.has(disclosureKey)" in render_thought
+    assert "toggle.dataset.disclosureKey = disclosureKey" in render_thought
+    assert "toggle.disabled = live" not in render_thought
+    assert "detail.hidden = !expanded" in render_thought
     thought_handler = click[click.index('control.matches("[data-thought-toggle]")'):click.index('control.matches("#send-button")')]
-    assert 'card?.classList.toggle("is-open", chatState.thoughtOpen)' in thought_handler
+    assert 'card?.classList.toggle("is-open", expanded)' in thought_handler
+    assert "chatState.disclosureOpen.set(control.dataset.disclosureKey, expanded)" in thought_handler
     assert "this.renderConversation()" not in thought_handler
 
 
@@ -1111,6 +1288,10 @@ def test_agent_editor_pins_installed_skills_and_explicit_sandbox_access():
     assert 'data.getAll("skill_binding")' in save
     assert "version: skill.version || skill.installed_version" in save
     assert 'sandbox_enabled: data.has("sandbox_enabled")' in save
+    assert "/api/connectors?workspace_id=${workspace}" in editor
+    assert "/api/knowledge-bases?workspace_id=${workspace}" in editor
+    assert 'data.getAll("connector_binding")' in save
+    assert 'data.getAll("knowledge_binding")' in save
 
 
 def test_agent_mutations_refresh_the_shared_homepage_cards():
@@ -1138,6 +1319,68 @@ def test_agent_schedule_tab_connects_the_trigger_lifecycle():
     assert "data-trigger-delete" in source
     assert "agent-schedule-delete" in source
     assert 'this.switchTab("schedule")' in source
+
+
+def test_agent_api_tab_exposes_published_contract_and_scoped_key_lifecycle():
+    source = asset_source("agents-ui.js")
+    api_panel = function_source(source, "  apiMarkup(agent, schema)", "  async copyApiValue")
+    create_key = function_source(source, "  openApiKeyDialog()", "  async revokeApiKey")
+    revoke_key = function_source(source, "  async revokeApiKey", "  scheduleMarkup(")
+
+    assert 'data-agent-tab="api"' in source
+    assert "agent.published_version" in api_panel
+    assert "API Trigger" in api_panel
+    assert "Publish this Agent to enable API access" in api_panel
+    assert "/api/v1/apps/${encodeURIComponent(id)}/runs" in api_panel
+    assert "const request = { inputs: schemaExample(schema) }" in api_panel
+    assert "Input JSON schema" in api_panel
+    assert "/api/api-keys?agent_id=${encodeURIComponent(id)}" in source
+    assert 'this.api.post("/api/api-keys"' in create_key
+    assert "result.rawToken" in create_key
+    assert "/api/api-keys/${encodeURIComponent(button.dataset.agentApiKeyRevoke)}" in revoke_key
+    assert ".agent-api-panel" in asset_source("styles.css")
+
+
+def test_account_settings_aggregates_agent_api_keys_without_broad_key_creation():
+    root = parse_index()
+    menu = root.find_by_attr("data-account-menu", "")
+    settings_button = root.find_by_attr("data-account-settings", "")
+    dialog = root.find_by_attr("id", "settings-dialog")
+    close = root.find_by_attr("data-settings-dialog-close", "")
+    source = script_source()
+    render = function_source(
+        source, "function renderSettingsApiKeys", "async function loadSettingsApiKeys"
+    )
+    load = function_source(
+        source, "async function loadSettingsApiKeys", "async function openSettingsDialog"
+    )
+    revoke = function_source(
+        source, "async function revokeSettingsApiKey", "function openAgentFromSettings"
+    )
+    navigation = function_source(
+        source, "function openAgentFromSettings", "async function openFilesDialog"
+    )
+
+    assert settings_button is not None and is_descendant(settings_button, menu)
+    assert settings_button.attrs.get("role") == "menuitem"
+    assert dialog is not None and dialog.tag == "dialog"
+    assert dialog.attrs.get("aria-labelledby") == "settings-dialog-title"
+    assert close is not None and is_descendant(close, dialog)
+    assert 'elements.accountSettings.hidden = !hasToken' in source
+    assert 'apiFetch("/api/api-keys")' in load
+    assert "/api/agents?workspace_id=${encodeURIComponent(state.workspaceId)}" in load
+    assert "Promise.allSettled" in load and "state.homepageAgents" in load
+    for field in ["token_prefix", "created_at", "last_used_at", "revoked_at"]:
+        assert f"key.{field}" in render
+    assert 'method: "DELETE"' in revoke
+    assert 'method: "POST"' not in load + revoke
+    assert "window.location.hash = `agents/${encodeURIComponent(agentId)}`" in navigation
+    assert ".settings-api-key-row" in asset_source("styles.css")
+    assert '"Settings": "设置"' in asset_source("i18n.js")
+    index = (WEB_ROOT / "index.html").read_text()
+    assert "styles.css?v=20260723-flow131" in index
+    assert "i18n.js?v=20260723-flow132" in index
+    assert "main.js?v=20260723-flow132" in index
 
 
 def test_agent_sessions_escape_persisted_content_before_rendering():
@@ -1230,7 +1473,7 @@ def test_chat_attachment_names_survive_send_reload_and_retry():
     load = function_source(source, "  async loadThread(", "  async hydrateMessageAttachments(")
     hydrate = function_source(source, "  async hydrateMessageAttachments(", "  async restoreFromHash()")
     send = function_source(source, "  async sendThreadMessage(", "  updateThreadPreview(")
-    retry = function_source(source, "  retryMessage(", "  speakMessage(")
+    retry = function_source(source, "  restoreMessageToComposer(", "  speakMessage(")
     stream = function_source(source, "  applyStreamEvent(", "  captureArtifactFromEvent(")
 
     assert "await this.hydrateMessageAttachments(" in load
@@ -1239,6 +1482,8 @@ def test_chat_attachment_names_survive_send_reload_and_retry():
     assert "attachments: displayAttachments" in send
     assert "displayAttachments.find((item) => item.id === id)" in send
     assert "chatState.uploads = arrayFrom(message.attachments" in retry
+    assert "chatState.resourceRefs = refs.filter" in retry
+    assert "chatState.browserProfile = refs.find" in retry
     assert ".then(async (messages)" in stream
     assert "await this.hydrateMessageAttachments(" in stream
 
@@ -1432,3 +1677,23 @@ def test_agent_runs_use_the_current_chat_model_as_an_explicit_override():
     assert "provider_id: model.provider_id" in run
     assert "model_id: model.model_id" in run
     assert "reasoning_effort: model.reasoning_effort || null" in run
+
+
+def test_agent_run_handoff_moves_to_chat_and_is_consumed_once():
+    agents = asset_source("agents-ui.js")
+    run = function_source(agents, "  async run(form)", "  async openDraft(")
+    chat = asset_source("chat-controller.js")
+    restore = function_source(chat, "  async restoreFromHash()", "  async runAgentHandoff(")
+    handoff = function_source(chat, "  async runAgentHandoff(", "  startNewChat(")
+
+    assert "data-agent-run-form novalidate" in agents
+    assert "form.reportValidity()" in run
+    assert "queueAgentRunHandoff({" in run
+    assert 'window.location.hash = "chat"' in run
+    assert "/api/agents/${encodeURIComponent(id)}/runs" not in run
+    assert "sessionStorage.removeItem(AGENT_RUN_HANDOFF_KEY)" in chat
+    assert "if (handoff) return this.runAgentHandoff(handoff)" in restore
+    assert "/api/agents/${encodeURIComponent(agentId)}/runs" in handoff
+    assert "const threadId = result.thread_id" in handoff
+    assert "await this.loadThread(threadId, true)" in handoff
+    assert "result.run_id" not in handoff

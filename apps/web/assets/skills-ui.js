@@ -1,5 +1,5 @@
 import { chatApi } from "./chat-api.js?v=20260722-flow115";
-import { chatState } from "./chat-controller.js?v=20260722-flow115";
+import { chatState } from "./chat-controller.js?v=20260723-flow131";
 
 function items(value, ...keys) {
   if (Array.isArray(value)) return value;
@@ -137,7 +137,12 @@ export class SkillsUI {
         });
       }
       this.skills = Array.from(byId.values());
-      this.selected = this.skills.find((skill) => skill.id === this.selected?.id) || this.skills[0] || null;
+      const routeId = window.location.hash.replace(/^#/, "").split("/")[1];
+      const requestedId = routeId ? decodeURIComponent(routeId) : null;
+      this.selected = this.skills.find((skill) => skill.id === requestedId)
+        || this.skills.find((skill) => skill.id === this.selected?.id)
+        || this.skills[0]
+        || null;
       this.renderList();
       if (this.selected) await this.select(this.selected.id);
       else this.renderDetail();

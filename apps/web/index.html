@@ -9,7 +9,7 @@
     />
     <title>Taroai Workspace</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2316181a'/%3E%3Ctext x='32' y='43' text-anchor='middle' font-size='36' fill='white'%3ET%3C/text%3E%3C/svg%3E" />
-    <link rel="stylesheet" href="./assets/styles.css?v=20260722-flow115" />
+    <link rel="stylesheet" href="./assets/styles.css?v=20260723-flow131" />
   </head>
   <body>
     <div class="workspace-shell" data-app="taroai-workspace" data-chat-state="empty">
@@ -73,8 +73,24 @@
         </section>
 
         <footer class="sidebar-footer">
+          <div id="sidebar-account-menu" class="sidebar-account-menu" role="menu" aria-label="Account" data-account-menu hidden>
+            <header>
+              <strong data-account-menu-name>Sign in</strong>
+              <small data-account-menu-meta>Connect your workspace</small>
+            </header>
+            <button type="button" role="menuitem" data-account-sign-in>Sign in</button>
+            <button type="button" role="menuitem" data-account-settings hidden>Settings</button>
+            <div class="account-language">
+              <span>Language</span>
+              <div class="locale-options" role="group" aria-label="Language">
+                <button type="button" data-locale-choice="zh-CN" aria-pressed="false">简体中文</button>
+                <button type="button" data-locale-choice="en" aria-pressed="false">English</button>
+              </div>
+            </div>
+            <button type="button" role="menuitem" data-account-sign-out hidden>Sign out</button>
+          </div>
           <div class="sidebar-account-row">
-            <button class="sidebar-account" type="button" aria-label="Account" aria-haspopup="dialog" data-auth-dialog-open>
+            <button class="sidebar-account" type="button" aria-label="Account" aria-haspopup="dialog" aria-controls="auth-dialog" aria-expanded="false" data-account-menu-toggle>
               <span class="account-avatar" data-account-avatar aria-hidden="true">→</span>
               <span><strong data-account-name>Sign in</strong><small data-account-meta>Connect your workspace</small></span>
             </button>
@@ -104,7 +120,7 @@
               aria-controls="model-selector-menu"
               aria-expanded="false"
             >
-              <span class="model-spark" aria-hidden="true">✹</span>
+              <span class="model-spark" data-selected-model-glyph aria-hidden="true">✹</span>
               <span data-selected-model>Choose model</span>
               <span aria-hidden="true">⌄</span>
             </button>
@@ -170,7 +186,7 @@
             <div class="composer-resource-row" data-resource-chips aria-live="polite"></div>
             <div class="composer-upload-row" data-upload-list aria-live="polite"></div>
             <div class="composer-row">
-              <textarea id="composer-input" rows="1" placeholder="Ask anything..." aria-label="Message"></textarea>
+              <textarea id="composer-input" rows="1" placeholder="Ask anything… Use @ to add skills, connectors, or agents" aria-label="Message"></textarea>
               <div class="mention-menu" data-mention-menu role="listbox" aria-label="Mention a workspace resource" hidden>
                 <div class="mention-menu-header"><span>Reference</span><small>Skills, connectors, agents, knowledge</small></div>
                 <div data-mention-results></div>
@@ -181,12 +197,13 @@
                 <button id="composer-add-button" class="composer-icon-button" type="button" aria-label="Add files, create media, and more" aria-haspopup="menu" aria-controls="composer-add-menu" aria-expanded="false"><span aria-hidden="true">+</span></button>
                 <input id="composer-file-input" type="file" multiple hidden />
                 <div data-attachment-chips class="attachment-chips" aria-live="polite"></div>
+                <button class="composer-create-agent" type="button" data-thread-create-agent aria-label="Create agent from this conversation"><span aria-hidden="true">✦</span><span>Create agent</span></button>
               </div>
               <div class="composer-action-group">
                 <button class="composer-icon-button" type="button" aria-label="Voice input" data-voice-input title="Start voice input">
                   <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="12" rx="3"></rect><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3"></path></svg>
                 </button>
-                <button class="stop-button" type="button" data-thread-stop hidden aria-label="Stop response"><span aria-hidden="true"></span> Stop</button>
+                <button class="stop-button" type="button" data-thread-stop hidden aria-label="Stop response"><span aria-hidden="true"></span><span class="visually-hidden">Stop response</span></button>
                 <button id="send-button" class="send-button" type="button" aria-label="Send message" disabled>
                   <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M6.5 10.5 12 5l5.5 5.5"></path></svg>
                 </button>
@@ -921,6 +938,7 @@
             <input id="remember-login" type="checkbox" checked />
             <span>Remember me</span>
           </label>
+          <button class="auth-forgot" type="button" data-auth-forgot hidden>Forgot password?</button>
           <span class="auth-status" data-auth-status aria-live="polite"></span>
           <button id="login-button" class="primary auth-submit" type="submit" disabled>Login</button>
           <button id="logout-button" class="auth-submit" type="button" hidden>Sign out</button>
@@ -951,7 +969,29 @@
           </details>
         </form>
         <p class="auth-legal">By continuing, you agree to your workspace access policy.</p>
+        <div class="auth-language locale-options" role="group" aria-label="Language">
+          <button type="button" data-locale-choice="zh-CN" aria-pressed="false">简体中文</button>
+          <button type="button" data-locale-choice="en" aria-pressed="false">English</button>
+        </div>
       </div>
+    </dialog>
+
+    <dialog id="settings-dialog" class="chat-dialog settings-dialog" aria-labelledby="settings-dialog-title" aria-describedby="settings-dialog-description">
+      <form method="dialog" class="chat-dialog-card settings-dialog-card">
+        <header>
+          <div>
+            <small>Settings</small>
+            <h2 id="settings-dialog-title">API keys</h2>
+          </div>
+          <button type="submit" value="cancel" aria-label="Close" data-settings-dialog-close>×</button>
+        </header>
+        <p id="settings-dialog-description">Review and revoke keys that can invoke your published Agents.</p>
+        <div class="settings-api-keys-state" data-settings-api-keys-state role="status" aria-live="polite">Loading API keys…</div>
+        <div class="settings-api-keys-list" data-settings-api-keys-list></div>
+        <footer>
+          <button type="button" class="primary" data-settings-open-agents>Create in Agent</button>
+        </footer>
+      </form>
     </dialog>
 
     <dialog id="files-dialog" class="files-dialog" aria-labelledby="files-dialog-title">
@@ -993,6 +1033,7 @@
       </form>
     </dialog>
 
-    <script src="./assets/main.js?v=20260722-flow115" type="module"></script>
+    <script src="./assets/i18n.js?v=20260723-flow132"></script>
+    <script src="./assets/main.js?v=20260723-flow132" type="module"></script>
   </body>
 </html>

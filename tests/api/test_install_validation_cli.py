@@ -5224,7 +5224,7 @@ def test_install_validation_runner_reports_stale_release_upgrade_matrix(
     assert check.status == "failed"
     assert (
         "upgrade matrix must cover migration range "
-            "001_initial to 045_tenant_invitations"
+            "001_initial to 046_agent_api_keys"
     ) in check.message
     assert check.metadata["upgrade_matrix_error_count"] == 1
 

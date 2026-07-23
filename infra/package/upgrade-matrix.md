@@ -4,7 +4,7 @@ This matrix records supported package compatibility for private delivery. It mus
 
 | App Version | Chart Version | Migration Range | PostgreSQL Version | Redis Version | Object Storage | Rollback Boundary | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0.1.0 | 0.1.0 | 001_initial to 045_tenant_invitations | PostgreSQL 16 | Redis 7 | S3-compatible or MinIO current local PoC profile | Restore backup for schema rollback beyond 001_initial | Private package baseline including Agent Loop V2, Skill Runtime V2, versioned Agents, browser profiles, Agent Engines, coding workspaces, thread sharing, rich artifacts, workflow approvals, notifications, organization invitations, and evaluation release gates. See docs/operations/private-upgrade-rollback.md. |
+| 0.1.0 | 0.1.0 | 001_initial to 046_agent_api_keys | PostgreSQL 16 | Redis 7 | S3-compatible or MinIO current local PoC profile | Restore backup for schema rollback beyond 001_initial | Private package baseline including Agent Loop V2, Skill Runtime V2, versioned Agents, Agent API keys, browser profiles, Agent Engines, coding workspaces, thread sharing, rich artifacts, workflow approvals, notifications, organization invitations, and evaluation release gates. See docs/operations/private-upgrade-rollback.md. |
 
 ## Compatibility Rules
 

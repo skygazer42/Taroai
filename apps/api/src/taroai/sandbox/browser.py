@@ -166,6 +166,10 @@ class HttpBrowserController(BrowserController):
             missing.append("max_sessions_per_tenant")
         if capabilities.max_sessions_per_run <= 0:
             missing.append("max_sessions_per_run")
+        if not capabilities.navigation_allowlist_enforced:
+            missing.append("navigation_allowlist_enforced")
+        if capabilities.navigation_allowed_host_count <= 0:
+            missing.append("navigation_allowed_host_count")
         if missing:
             raise BrowserProviderUnavailableError(
                 "browser controller capabilities are insufficient: "

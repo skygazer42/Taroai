@@ -73,6 +73,7 @@ class InMemoryLongTermMemoryService(BaseModel):
         tenant_id: str,
         scope_type: MemoryScopeType,
         scope_id: str,
+        status: MemoryStatus = MemoryStatus.ACTIVE,
     ) -> list[MemoryRecord]:
         return [
             record
@@ -80,7 +81,7 @@ class InMemoryLongTermMemoryService(BaseModel):
             if record.tenant_id == tenant_id
             and record.scope_type == scope_type
             and record.scope_id == scope_id
-            and record.status == MemoryStatus.ACTIVE
+            and record.status == status
         ]
 
     def forget(self, tenant_id: str, memory_id: str) -> MemoryRecord:
@@ -401,8 +402,9 @@ class GuardedLongTermMemoryService(BaseModel):
         tenant_id: str,
         scope_type: MemoryScopeType,
         scope_id: str,
+        status: MemoryStatus = MemoryStatus.ACTIVE,
     ) -> list[MemoryRecord]:
-        return self.service.list_by_scope(tenant_id, scope_type, scope_id)
+        return self.service.list_by_scope(tenant_id, scope_type, scope_id, status)
 
     def forget(self, tenant_id: str, memory_id: str) -> MemoryRecord:
         return self.service.forget(tenant_id, memory_id)

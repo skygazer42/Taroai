@@ -157,6 +157,8 @@ class LocalProcessSandboxAdapter(SandboxAdapter):
         path.parent.mkdir(parents=True, exist_ok=True)
         content_bytes = file_write.content_bytes()
         path.write_bytes(content_bytes)
+        if file_write.mode is not None:
+            path.chmod(file_write.mode)
         return SandboxFileRef.from_bytes(
             content_bytes,
             tenant_id=file_write.tenant_id,

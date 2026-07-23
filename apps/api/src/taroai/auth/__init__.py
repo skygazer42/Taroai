@@ -1,11 +1,24 @@
 from taroai.auth.models import (
+    AuthActionPurpose,
+    AuthActionTokenClaims,
+    AuthEmailVerificationRequest,
+    AuthEmailVerificationSendRequest,
     AuthLoginRequest,
     AuthLoginResult,
     AuthLogoutResult,
+    AuthPasswordForgotRequest,
+    AuthPasswordResetRequest,
     AuthRegisterRequest,
     AuthTokenClaims,
 )
-from taroai.auth.service import AuthInvalidCredentialsError, AuthRequiredError, AuthService
+from taroai.auth.service import (
+    AuthActionTokenError,
+    AuthEmailDeliveryError,
+    AuthInvalidCredentialsError,
+    AuthRequiredError,
+    AuthService,
+    send_auth_email,
+)
 from taroai.auth.sessions import (
     AuthSession,
     AuthSessionStore,
@@ -14,10 +27,18 @@ from taroai.auth.sessions import (
 )
 
 __all__ = [
+    "AuthActionPurpose",
+    "AuthActionTokenClaims",
+    "AuthActionTokenError",
+    "AuthEmailVerificationRequest",
+    "AuthEmailVerificationSendRequest",
+    "AuthEmailDeliveryError",
     "AuthInvalidCredentialsError",
     "AuthLoginRequest",
     "AuthLoginResult",
     "AuthLogoutResult",
+    "AuthPasswordForgotRequest",
+    "AuthPasswordResetRequest",
     "AuthRegisterRequest",
     "AuthRequiredError",
     "AuthSession",
@@ -26,4 +47,5 @@ __all__ = [
     "AuthTokenClaims",
     "InMemoryAuthSessionStore",
     "SqlAuthSessionStore",
+    "send_auth_email",
 ]

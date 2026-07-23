@@ -121,7 +121,11 @@ class ConnectorDefinitionCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_auth_boundary(self) -> "ConnectorDefinitionCreate":
-        if self.auth_mode != ConnectorAuthMode.NONE and self.credential_ref is None:
+        if (
+            self.auth_mode != ConnectorAuthMode.NONE
+            and self.credential_ref is None
+            and self.status != ConnectorStatus.DRAFT
+        ):
             raise ValueError("credential_ref is required for authenticated connectors")
         if self.auth_mode == ConnectorAuthMode.NONE and self.credential_ref is not None:
             raise ValueError("credential_ref is not allowed for unauthenticated connectors")
@@ -143,7 +147,11 @@ class ConnectorCreateRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_auth_boundary(self) -> "ConnectorCreateRequest":
-        if self.auth_mode != ConnectorAuthMode.NONE and self.credential is None:
+        if (
+            self.auth_mode != ConnectorAuthMode.NONE
+            and self.credential is None
+            and self.status != ConnectorStatus.DRAFT
+        ):
             raise ValueError("credential is required for authenticated connectors")
         if self.auth_mode == ConnectorAuthMode.NONE and self.credential is not None:
             raise ValueError("credential is not allowed for unauthenticated connectors")

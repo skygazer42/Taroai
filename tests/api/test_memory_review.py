@@ -149,6 +149,54 @@ def test_agent_memory_tool_indexes_the_request_for_cross_thread_recall():
     assert [record.content for record in recalled] == ["青竹-724"]
 
 
+def test_agent_memory_is_recalled_only_by_the_same_agent():
+    store = InMemoryControlPlaneStore()
+    service = InMemoryLongTermMemoryService()
+    gateway = ToolGateway()
+    register_memory_tool_handler(gateway, service, store)
+
+    def create_run(agent_id: str | None = None):
+        return store.create_run(
+            "tenant_acme",
+            "user_1",
+            RunCreate(
+                workspace_id="workspace_sales",
+                agent_id=agent_id,
+                message="这个 Agent 的发布格式是什么？",
+                mode="autonomous" if agent_id else "chat",
+            ),
+        )
+
+    source = create_run("agent_a")
+    request = ToolGatewayRequest(
+        tenant_id=source.tenant_id,
+        workspace_id=source.workspace_id,
+        user_id=source.user_id,
+        run_id=source.id,
+        step_id="step_memory",
+        tool_name="memory.save",
+        tool_input={
+            "content": "这个 Agent 的发布格式使用简短中文。",
+            "memory_key": "agent.release_format",
+        },
+        granted_scopes=["memory.write"],
+        approved=True,
+    )
+    with pytest.raises(ValueError, match="does not belong"):
+        gateway.execute_request(request.model_copy(update={"user_id": "user_2"}))
+    result = gateway.execute_request(request)
+    runtime = AgentRuntime(store=store, long_term_memory_service=service)
+
+    assert result.output["scope_type"] == MemoryScopeType.AGENT.value
+    assert result.output["scope_id"] == "agent_a"
+    assert service.list_by_scope("tenant_acme", MemoryScopeType.USER, "user_1") == []
+    assert [
+        record.content for record in runtime._load_memory_context(create_run("agent_a"))
+    ] == ["这个 Agent 的发布格式使用简短中文。"]
+    assert runtime._load_memory_context(create_run("agent_b")) == []
+    assert runtime._load_memory_context(create_run()) == []
+
+
 def test_agent_memory_tool_replaces_only_the_current_users_matching_fact():
     service = InMemoryLongTermMemoryService()
     old = service.write(
@@ -183,9 +231,7 @@ def test_agent_memory_tool_replaces_only_the_current_users_matching_fact():
         )
     )
 
-    active = service.list_by_scope(
-        "tenant_acme", MemoryScopeType.USER, "user_1"
-    )
+    active = service.list_by_scope("tenant_acme", MemoryScopeType.USER, "user_1")
     assert [record.content for record in active] == ["My demo code is NEW."]
     assert result.output["superseded_memory_ids"] == [old.id]
 
@@ -210,9 +256,7 @@ def test_agent_memory_tool_rejects_generic_keys_before_writing():
             )
         )
 
-    assert service.list_by_scope(
-        "tenant_acme", MemoryScopeType.USER, "user_1"
-    ) == []
+    assert service.list_by_scope("tenant_acme", MemoryScopeType.USER, "user_1") == []
 
 
 def test_sql_long_term_memory_persists_candidate_review_state(tmp_path: Path):

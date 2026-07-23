@@ -87,8 +87,9 @@ def register_sandbox_tool_handlers(gateway: ToolGateway, adapter: SandboxAdapter
             tool_name="sandbox.command",
             description=(
                 "Run one POSIX shell command in the isolated thread workspace. "
-                "Do not use it merely to check a standard formula or straightforward arithmetic "
-                "unless the user explicitly requests code or sandbox execution. "
+                "Use it only when the user asks to run, test, or debug code, inspect an "
+                "existing sandbox file, or create a downloadable artifact. Writing or "
+                "explaining code alone must be answered directly without this tool. "
                 "Wrap Python with python3 -c or a shell heredoc; never pass bare Python "
                 "source. Declare only artifact files that the command actually creates. "
                 "Set result_mode=raw_stdout only when stdout itself is the complete answer."

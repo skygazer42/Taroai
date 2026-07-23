@@ -1,0 +1,24 @@
+{
+  "metadata": {
+    "id": "taroai.code-analysis",
+    "version": "1.0.0",
+    "owner": "taroai/development"
+  },
+  "spec": {
+    "type": "data_skill",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "goal": {"type": "string"},
+        "code": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "outputSchema": {"type": "string"},
+    "requiredScopes": ["sandbox.execute"],
+    "riskLevel": "medium",
+    "visibility": "tenant",
+    "runtime": {"sandbox": "skill-package", "timeoutSeconds": 300},
+    "tools": ["sandbox.command"]
+  }
+}

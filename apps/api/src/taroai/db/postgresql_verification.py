@@ -63,6 +63,7 @@ TENANT_SCOPED_RLS_TABLES: tuple[str, ...] = (
     "model_provider_versions",
     "model_provider_change_requests",
     "model_provider_rate_limit_samples",
+    "agent_api_keys",
     "connector_definitions",
     "tenant_offboarding_plans",
 )

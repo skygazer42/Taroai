@@ -1,0 +1,24 @@
+{
+  "metadata": {
+    "id": "taroai.document-evidence-brief",
+    "version": "1.0.0",
+    "owner": "taroai/documents"
+  },
+  "spec": {
+    "type": "document_skill",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "goal": {"type": "string"},
+        "content": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "outputSchema": {"type": "string"},
+    "requiredScopes": ["sandbox.execute"],
+    "riskLevel": "medium",
+    "visibility": "tenant",
+    "runtime": {"sandbox": "skill-package", "timeoutSeconds": 180},
+    "tools": ["sandbox.command"]
+  }
+}

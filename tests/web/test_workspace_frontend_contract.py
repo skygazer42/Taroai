@@ -1334,6 +1334,7 @@ def test_static_workspace_is_packaged_with_local_cloud_poc():
     assert "${TAROAI_WEB_PORT:-3000}:80" in compose
     assert "location /api/" in nginx
     assert "proxy_pass http://api:8000" in nginx
+    assert 'add_header Cache-Control "no-store, no-cache, must-revalidate"' in nginx
     assert 'localStorage.getItem("taroai.apiBase") || window.location.origin' in main
     assert '"taroai.apiBase", window.location.origin' in chat_api
 

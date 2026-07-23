@@ -78,6 +78,7 @@ def test_migration_runner_applies_pending_schema_and_records_versions(tmp_path: 
             "043_owner_connector_invoke_permission.sql",
             "044_notifications.sql",
             "045_tenant_invitations.sql",
+            "046_agent_api_keys.sql",
     ]
     runner = MigrationRunner(
         config=DatabaseConfig(url=f"sqlite:///{database_path}"),
@@ -125,6 +126,7 @@ def test_migration_runner_applies_pending_schema_and_records_versions(tmp_path: 
     assert "billing_pricing_rules" in tables
     assert "billing_invoices" in tables
     assert "share_grants" in tables
+    assert "agent_api_keys" in tables
     assert {
         "chat_threads",
         "chat_messages",
@@ -220,6 +222,7 @@ def test_chat_loop_migration_adds_state_payload_to_existing_runtime_states(
             "043_owner_connector_invoke_permission.sql",
             "044_notifications.sql",
             "045_tenant_invitations.sql",
+            "046_agent_api_keys.sql",
     ]
     assert "state_payload" in columns
     assert state_payload == "{}"

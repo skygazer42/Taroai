@@ -31,6 +31,7 @@ class BuiltinStoreItem:
     manifest: SolutionPackManifest
     category: str
     publisher: str
+    featured: bool
     skills: tuple[BuiltinStoreSkill, ...]
 
     @property
@@ -54,6 +55,7 @@ class BuiltinStoreItem:
             "description": self.manifest.description,
             "category": self.category,
             "publisher": self.publisher,
+            "featured": self.featured,
             "kind": "solution_pack",
             "origin": "builtin",
             "digest": self.digest,
@@ -95,6 +97,23 @@ class BuiltinStoreCatalog:
     def list_items(self) -> list[BuiltinStoreItem]:
         return sorted(self._items.values(), key=lambda item: item.manifest.id)
 
+    def list_skills(self) -> list[dict[str, Any]]:
+        skills: dict[str, dict[str, Any]] = {}
+        for item in self.list_items():
+            for asset in item.skills:
+                manifest = asset.package.manifest
+                skills.setdefault(
+                    manifest.id,
+                    {
+                        "id": manifest.id,
+                        "displayName": manifest.name,
+                        "description": manifest.description,
+                        "tags": [item.category],
+                        "owner": manifest.owner,
+                    },
+                )
+        return sorted(skills.values(), key=lambda skill: skill["id"])
+
     def get(self, item_id: str) -> BuiltinStoreItem:
         item = self._items.get(item_id)
         if item is None:
@@ -132,6 +151,7 @@ class BuiltinStoreCatalog:
                 manifest=manifest,
                 category=str(raw.get("category", "general")),
                 publisher=str(raw.get("publisher", "Taroai")),
+                featured=bool(raw.get("featured", False)),
                 skills=skill_assets,
             )
         return items

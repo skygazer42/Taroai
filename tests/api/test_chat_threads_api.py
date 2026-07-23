@@ -319,6 +319,9 @@ def test_thread_share_url_opens_and_header_access_remains_supported():
     assert created.status_code == 201
     assert query["tenant_id"] == ["tenant_acme"]
     assert client.get(body["url"]).status_code == 200
+    public_page = client.get(body["url"], headers={"Accept": "text/html"})
+    assert public_page.headers["content-type"].startswith("text/html")
+    assert "Taroai · Shared conversation" in public_page.text
     assert (
         client.get(
             f"{public_url.path}?tenant_id=tenant_acme",

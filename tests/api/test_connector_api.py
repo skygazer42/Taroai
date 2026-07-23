@@ -1,10 +1,18 @@
 from datetime import datetime, timezone
 
+import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
+import taroai.connectors.mcp as mcp_module
 from taroai.app import create_app
 from taroai.config import Settings
-from taroai.connectors import ConnectorDispatchService
+from taroai.connectors import ConnectorDispatchService, ConnectorStatus
+from taroai.connectors.mcp import (
+    McpConnectorConfig,
+    McpConnectorError,
+    StreamableHttpMcpClient,
+)
 from taroai.identity import (
     InMemoryIdentityService,
     PasswordHasher,
@@ -44,12 +52,13 @@ def create_connector_operator_identity(can_manage: bool = True, can_read: bool =
 
 
 class FakeMcpClient:
-    def __init__(self):
+    def __init__(self, expected_headers=None):
         self.calls = []
+        self.expected_headers = expected_headers or {}
 
     def list_tools(self, config, headers):
         assert config.url == "https://mcp.example.test/mcp"
-        assert headers == {}
+        assert headers == self.expected_headers
         return [
             {
                 "name": "get_weather",
@@ -106,8 +115,8 @@ def test_mcp_connector_discovers_tools_on_enable_and_dispatches_calls():
 
     assert enabled.status_code == 200
     capabilities = {item["name"]: item for item in enabled.json()["capabilities"]}
-    assert capabilities["get_weather"]["risk_level"] == "low"
-    assert capabilities["get_weather"]["approval_required"] is False
+    assert capabilities["get_weather"]["risk_level"] == "medium"
+    assert capabilities["get_weather"]["approval_required"] is True
     assert capabilities["get_weather"]["description"] == "Get current weather"
     assert capabilities["delete_station"]["risk_level"] == "high"
     assert capabilities["delete_station"]["approval_required"] is True
@@ -131,6 +140,111 @@ def test_mcp_connector_discovers_tools_on_enable_and_dispatches_calls():
             {},
         )
     ]
+
+
+def test_authenticated_mcp_draft_captures_credential_before_discovery():
+    identity, account = create_connector_operator_identity()
+    fake_mcp = FakeMcpClient(
+        expected_headers={"authorization": "Bearer github-token"}
+    )
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            connector_dispatcher=ConnectorDispatchService(mcp_client=fake_mcp),
+        )
+    )
+    headers = {"X-Tenant-ID": "tenant_acme", "X-User-ID": account.id}
+    created = client.post(
+        "/api/connectors",
+        headers=headers,
+        json={
+            "workspace_id": "workspace_sales",
+            "type": "mcp_server",
+            "display_name": "GitHub",
+            "auth_mode": "mcp",
+            "metadata": {"mcp": {"url": "https://mcp.example.test/mcp"}},
+        },
+    )
+
+    assert created.status_code == 201
+    assert created.json()["status"] == "draft"
+    assert client.post(
+        f"/api/connectors/{created.json()['id']}/enable", headers=headers
+    ).status_code == 409
+
+    captured = client.post(
+        f"/api/connectors/{created.json()['id']}/mcp-credential",
+        headers=headers,
+        json={"value": "github-token"},
+    )
+    enabled = client.post(
+        f"/api/connectors/{created.json()['id']}/enable", headers=headers
+    )
+
+    assert captured.status_code == 200
+    assert captured.json()["status"] == "draft"
+    assert "github-token" not in captured.text
+    assert enabled.status_code == 200
+    assert enabled.json()["status"] == "enabled"
+    assert {item["name"] for item in enabled.json()["capabilities"]} == {
+        "get_weather",
+        "delete_station",
+    }
+
+
+def test_needs_reauth_anonymous_mcp_can_be_upgraded_with_a_credential():
+    identity, account = create_connector_operator_identity()
+    client = TestClient(create_app(identity_service=identity))
+    headers = {"X-Tenant-ID": "tenant_acme", "X-User-ID": account.id}
+    created = client.post(
+        "/api/connectors",
+        headers=headers,
+        json={
+            "workspace_id": "workspace_sales",
+            "type": "mcp_server",
+            "display_name": "Private MCP",
+            "auth_mode": "none",
+            "metadata": {"mcp": {"url": "https://mcp.example.test/mcp"}},
+        },
+    ).json()
+
+    healthy_capture = client.post(
+        f"/api/connectors/{created['id']}/mcp-credential",
+        headers=headers,
+        json={"value": "private-token"},
+    )
+    client.app.state.connector_registry.update_connector_status(
+        "tenant_acme", created["id"], ConnectorStatus.NEEDS_REAUTH
+    )
+    recovered = client.post(
+        f"/api/connectors/{created['id']}/mcp-credential",
+        headers=headers,
+        json={"value": "private-token"},
+    )
+
+    assert healthy_capture.status_code == 409
+    assert recovered.status_code == 200
+    assert recovered.json()["auth_mode"] == "mcp"
+    assert recovered.json()["status"] == "draft"
+    assert "private-token" not in recovered.text
+
+
+def test_real_mcp_client_rejects_insecure_or_private_network_targets(monkeypatch):
+    with pytest.raises(ValidationError, match="HTTPS"):
+        McpConnectorConfig(url="http://mcp.example.test/mcp")
+    with pytest.raises(ValidationError, match="public host"):
+        McpConnectorConfig(url="https://127.0.0.1/mcp")
+
+    monkeypatch.setattr(
+        mcp_module,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [(2, 1, 6, "", ("10.0.0.8", 443))],
+    )
+    with pytest.raises(McpConnectorError, match="public addresses"):
+        StreamableHttpMcpClient().list_tools(
+            McpConnectorConfig(url="https://mcp.example.test/mcp"),
+            {},
+        )
 
 
 def test_connector_api_creates_lists_and_reads_tenant_scoped_connector():

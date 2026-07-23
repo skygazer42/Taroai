@@ -1843,10 +1843,23 @@ class AgentRuntime(BaseModel):
         if self.knowledge_service is None:
             return []
         query = self._retrieval_query(run)
+        knowledge_base_ids = {
+            reference.id
+            for reference in run.resource_refs
+            if reference.type == "knowledge"
+        }
+        agent_bound = any(reference.type == "agent" for reference in run.resource_refs)
         results = []
-        if self.knowledge_service.list_documents(
+        documents = self.knowledge_service.list_documents(
             run.tenant_id, workspace_id=run.workspace_id
-        ):
+        )
+        if knowledge_base_ids:
+            documents = [
+                document
+                for document in documents
+                if document.knowledge_base_id in knowledge_base_ids
+            ]
+        if documents and (knowledge_base_ids or not agent_bound):
             query_embedding = self._load_query_embedding(run, query)
             results = self.knowledge_service.retrieve(
                 RetrievalRequest(
@@ -1854,6 +1867,7 @@ class AgentRuntime(BaseModel):
                     query=query,
                     query_embedding=query_embedding,
                     allowed_workspace_ids=[run.workspace_id],
+                    allowed_knowledge_base_ids=sorted(knowledge_base_ids),
                     acl_subjects=[
                         f"user:{run.user_id}",
                         f"workspace:{run.workspace_id}",
@@ -1877,6 +1891,7 @@ class AgentRuntime(BaseModel):
                 "source_document_ids": [
                     result.source_document_id for result in results
                 ],
+                "knowledge_base_ids": sorted(knowledge_base_ids),
             },
         )
         return results
@@ -2081,7 +2096,10 @@ class AgentRuntime(BaseModel):
         semantic_candidates = [
             record
             for record in records
-            if record.scope_type == MemoryScopeType.USER
+            if (
+                record.scope_type == MemoryScopeType.USER
+                or record.metadata.get("source") == "agent_session_summary"
+            )
             and record.sensitivity_level == 0
             and record.metadata.get("pinned") is not True
             and record.metadata.get("memory_key")
@@ -2116,7 +2134,10 @@ class AgentRuntime(BaseModel):
         records = [
             record
             for record in records
-            if record.scope_type != MemoryScopeType.USER
+            if (
+                record.scope_type != MemoryScopeType.USER
+                and record.metadata.get("source") != "agent_session_summary"
+            )
             or record.metadata.get("pinned") is True
             or record.metadata.get("memory_key") in _ALWAYS_APPLY_USER_MEMORY_KEYS
             or lexical_scores[record.id] >= minimum_relevance
@@ -2270,10 +2291,19 @@ class AgentRuntime(BaseModel):
             session_id = self._ensure_browser_session(state).session_id
         else:
             return step
-        if step.tool_input.get("session_id") == session_id:
+        cwd = None
+        if step.tool_name == "sandbox.command":
+            skill = state.runtime_metadata.get("loaded_skill_context", {}).get(
+                step.skill_id or ""
+            )
+            if skill and "cwd" not in step.tool_input:
+                cwd = skill.get("root_path")
+        if step.tool_input.get("session_id") == session_id and cwd is None:
             return step
         updated_input = dict(step.tool_input)
         updated_input["session_id"] = session_id
+        if cwd is not None:
+            updated_input["cwd"] = cwd
         updated_step = step.model_copy(update={"tool_input": updated_input})
         state.plan = [
             updated_step if existing.id == step.id else existing
@@ -3438,35 +3468,6 @@ class AgentRuntime(BaseModel):
     ) -> AgentRuntimeState:
         run = self.store.get_run(state.tenant_id, state.run_id)
         artifacts = self.store.list_artifacts(state.tenant_id, state.run_id)
-        if artifacts:
-            artifact = {
-                "name": artifacts[-1].name,
-                "artifact_type": artifacts[-1].artifact_type,
-                "uri": artifacts[-1].uri,
-            }
-        else:
-            artifact = {
-                "name": "agent-result.md",
-                "artifact_type": "document",
-                "uri": f"s3://{state.tenant_id}/runs/{state.run_id}/agent-result.md",
-            }
-            try:
-                artifact = self._apply_artifact_guardrails(
-                    run,
-                    artifact,
-                    state.approved_guardrail_keys,
-                )
-            except _RuntimeGuardrailApprovalRequired as error:
-                return self._pause_for_guardrail_approval(state, run, error)
-            except _RuntimeGuardrailViolation as error:
-                return self._fail_for_guardrail(state, run, error)
-            self.store.create_artifact(
-                tenant_id=state.tenant_id,
-                run_id=state.run_id,
-                name=artifact["name"],
-                artifact_type=artifact["artifact_type"],
-                uri=artifact["uri"],
-            )
         if before_runtime_cleanup is not None:
             before_runtime_cleanup()
         self._capture_reusable_runtime_snapshot(state, run)
@@ -3485,9 +3486,8 @@ class AgentRuntime(BaseModel):
             emit_status_event=False,
         )
         if emit_event:
-            self.store.append_run_event(
-                run, "run.succeeded", {"artifact_name": artifact["name"]}
-            )
+            payload = {"artifact_name": artifacts[-1].name} if artifacts else {}
+            self.store.append_run_event(run, "run.succeeded", payload)
         state.status = RunStatus.SUCCEEDED
         state.current_step_id = None
         self._save_state(state)

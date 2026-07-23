@@ -18,6 +18,7 @@ export const chatState = {
   events: [],
   artifacts: [],
   commandOutputs: new Map(),
+  disclosureOpen: new Map(),
   codingWorkspace: null,
   activeCodingChange: null,
   modelCatalog: [],
@@ -55,6 +56,24 @@ export const chatState = {
   inputRequestEntering: false,
   suggestionsEntering: false,
 };
+
+const AGENT_RUN_HANDOFF_KEY = "taroai.agentRunHandoff";
+
+export function queueAgentRunHandoff(payload) {
+  sessionStorage.setItem(AGENT_RUN_HANDOFF_KEY, JSON.stringify(payload));
+}
+
+function takeAgentRunHandoff() {
+  const raw = sessionStorage.getItem(AGENT_RUN_HANDOFF_KEY);
+  if (!raw) return null;
+  sessionStorage.removeItem(AGENT_RUN_HANDOFF_KEY);
+  try {
+    const payload = JSON.parse(raw);
+    return payload && typeof payload === "object" ? payload : null;
+  } catch {
+    return null;
+  }
+}
 
 const ACTIVE_RUN_STATES = new Set([
   "created",
@@ -137,6 +156,35 @@ function safeCommandStream(value, limit = 8000) {
   return `${value.slice(0, half)}\n… output truncated …\n${value.slice(-half)}`;
 }
 
+function safeToolInput(value, tool = "") {
+  if (value === null || value === undefined) return "";
+  if (typeof value !== "object") return "[Input provided]";
+  try {
+    return JSON.stringify(value, (key, item) => (
+      /password|passwd|secret|token|api[-_]?key|private[-_]?key|access[-_]?key|authorization|bearer|cookie|credential/i.test(key)
+      || (tool === "browser.action" && /^(text|value)$/i.test(key))
+        ? "••••••••"
+        : item
+    ), 2);
+  } catch {
+    return "[Input details unavailable]";
+  }
+}
+
+function toolLabel(tool) {
+  if (tool === "web.search") return "Web search";
+  if (tool === "web.fetch") return "Web page";
+  if (tool === "sandbox.command") return "Code execution";
+  if (tool === "browser.action") return "Browser action";
+  if (tool === "tool.search") return "Tool search";
+  if (tool === "ui.render") return "Structured result";
+  if (tool === "memory.save") return "Memory";
+  if (tool === "skill.load" || tool.startsWith("skill.")) return "Skill";
+  if (tool.startsWith("mcp.")) return "MCP tool";
+  if (tool.startsWith("connector.")) return "Connected tool";
+  return tool;
+}
+
 function setText(element, value) {
   if (element) element.textContent = value;
 }
@@ -178,6 +226,7 @@ const PROVIDER_LABELS = {
   gemini: "Google",
   meta: "Meta",
   deepseek: "DeepSeek",
+  zhipu: "Zhipu AI",
   zai: "Z.AI",
   "z-ai": "Z.AI",
   minimax: "MiniMax",
@@ -194,6 +243,7 @@ const PROVIDER_GLYPHS = {
   gemini: "✦",
   meta: "∞",
   deepseek: "◗",
+  zhipu: "◇",
   zai: "◇",
   minimax: "✶",
   moonshot: "☾",
@@ -221,11 +271,14 @@ const MODEL_PRESENTATION = {
 
 function providerLabel(providerId) {
   const key = String(providerId || "").toLowerCase();
-  return PROVIDER_LABELS[key] || `${key.slice(0, 1).toUpperCase()}${key.slice(1)}` || "Models";
+  const known = Object.keys(PROVIDER_LABELS).find((id) => key === id || key.startsWith(`${id}-`));
+  return PROVIDER_LABELS[known] || `${key.slice(0, 1).toUpperCase()}${key.slice(1)}` || "Models";
 }
 
 function providerGlyph(providerId) {
-  return PROVIDER_GLYPHS[String(providerId || "").toLowerCase()] || "✹";
+  const key = String(providerId || "").toLowerCase();
+  const known = Object.keys(PROVIDER_GLYPHS).find((id) => key === id || key.startsWith(`${id}-`));
+  return PROVIDER_GLYPHS[known] || "✹";
 }
 
 function normalizedModel(model, providerFallback = "") {
@@ -265,6 +318,45 @@ function eventSequence(event) {
   return Number(event.thread_sequence || event.sequence || event.id || 0);
 }
 
+const COMMAND_ACTIVITY_COPY = {
+  read_file: { started: "Reading file", completed: "Read file", noun: "File read" },
+  list_files: { started: "Listing files", completed: "Listed files", noun: "File listing" },
+  search_files: { started: "Searching files", completed: "Found files", noun: "File search" },
+  run_command: { started: "Running command", completed: "Ran command", noun: "Command" },
+};
+
+function commandActivity(payload = {}) {
+  return COMMAND_ACTIVITY_COPY[payload.command_kind] || COMMAND_ACTIVITY_COPY.run_command;
+}
+
+function commandSubject(command, kind = "run_command") {
+  const tokens = String(command || "").match(/"[^"]*"|'[^']*'|\S+/g)?.map((item) => item.replace(/^(['"])(.*)\1$/, "$2")) || [];
+  if (!tokens.length) return "";
+  const executable = tokens[0].split(/[\\/]/).at(-1);
+  let target = executable;
+  if (/^(python\d*|node|bash|sh|zsh)$/.test(executable)) {
+    target = tokens.slice(1).find((item) => /\.(py|m?js|cjs|sh)$/i.test(item)) || executable;
+  } else if (kind !== "run_command") {
+    target = [...tokens.slice(1)].reverse().find((item) => !item.startsWith("-")) || executable;
+  }
+  return target.split(/[\\/]/).filter(Boolean).at(-1)?.slice(0, 80) || executable;
+}
+
+function toolActivityKey(event) {
+  const payload = eventPayload(event);
+  return payload.action_id || payload.step_id || payload.call_id || null;
+}
+
+function bindDisclosure(details, key, defaultOpen = false) {
+  details.dataset.disclosureKey = key;
+  details.open = chatState.disclosureOpen.has(key)
+    ? chatState.disclosureOpen.get(key)
+    : defaultOpen;
+  details.addEventListener("toggle", () => {
+    chatState.disclosureOpen.set(key, details.open);
+  });
+}
+
 function dispatchStatus(message) {
   return String(message.dispatch_status || message.status || "completed").toLowerCase();
 }
@@ -280,7 +372,7 @@ function visibleMessageContent(message) {
   return intent ? content.slice(intent.prefix.length) : content;
 }
 
-function appendInlineText(parent, value) {
+function appendInlineMarkup(parent, value) {
   const source = String(value);
   const pattern = /(\*\*([^*\n]+)\*\*|`([^`\n]+)`|\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)|(https?:\/\/[^\s<>()\[\]]*[^\s<>()\[\].,!?;:'"。，！？；：]))/g;
   let cursor = 0;
@@ -305,6 +397,119 @@ function appendInlineText(parent, value) {
     cursor = match.index + match[0].length;
   }
   if (cursor < source.length) parent.append(source.slice(cursor));
+}
+
+const MATH_NS = "http://www.w3.org/1998/Math/MathML";
+const MATH_SYMBOLS = {
+  cdot: "·", times: "×", div: "÷", pm: "±", le: "≤", leq: "≤",
+  ge: "≥", geq: "≥", neq: "≠", approx: "≈", infty: "∞", sum: "∑",
+  prod: "∏", int: "∫", alpha: "α", beta: "β", gamma: "γ", delta: "δ",
+  theta: "θ", lambda: "λ", mu: "μ", pi: "π", sigma: "σ", phi: "φ", omega: "ω",
+};
+
+function mathElement(name, textValue = null) {
+  const node = document.createElementNS(MATH_NS, name);
+  if (textValue !== null) node.textContent = textValue;
+  return node;
+}
+
+function appendMath(parent, value, display = false) {
+  const source = String(value).trim().slice(0, 2000);
+  let cursor = 0;
+  let depth = 0;
+  const sequence = (grouped = false) => {
+    const row = mathElement("mrow");
+    while (cursor < source.length && !(grouped && source[cursor] === "}")) {
+      if (/\s/.test(source[cursor])) {
+        cursor += 1;
+        continue;
+      }
+      let base = atom();
+      let sub = null;
+      let sup = null;
+      while (source[cursor] === "_" || source[cursor] === "^") {
+        const marker = source[cursor++];
+        if (marker === "_") sub = group();
+        else sup = group();
+      }
+      if (sub || sup) {
+        const script = mathElement(sub && sup ? "msubsup" : sub ? "msub" : "msup");
+        script.append(base);
+        if (sub) script.append(sub);
+        if (sup) script.append(sup);
+        base = script;
+      }
+      row.append(base);
+    }
+    return row;
+  };
+  const group = () => {
+    if (depth >= 20) {
+      cursor += 1;
+      return mathElement("mtext", "");
+    }
+    if (source[cursor] !== "{") return atom();
+    cursor += 1;
+    depth += 1;
+    const row = sequence(true);
+    depth -= 1;
+    if (source[cursor] === "}") cursor += 1;
+    return row;
+  };
+  const atom = () => {
+    const start = cursor;
+    const char = source[cursor++];
+    if (char === "{") {
+      cursor = start;
+      return group();
+    }
+    if (char === "\\") {
+      const command = source.slice(cursor).match(/^[A-Za-z]+/)?.[0] || source[cursor++] || "";
+      cursor += /^[A-Za-z]+/.test(command) ? command.length : 0;
+      if (command === "frac") {
+        const fraction = mathElement("mfrac");
+        fraction.append(group(), group());
+        return fraction;
+      }
+      if (command === "sqrt") {
+        const root = mathElement("msqrt");
+        root.append(group());
+        return root;
+      }
+      if (command === "text" || command === "mathrm") {
+        const content = group();
+        return mathElement("mtext", content.textContent);
+      }
+      if (command === "left" || command === "right") return atom();
+      const symbol = MATH_SYMBOLS[command];
+      return mathElement(/[A-Za-zͰ-Ͽ]/.test(symbol || "") ? "mi" : "mo", symbol || command);
+    }
+    if (/\d/.test(char)) {
+      const tail = source.slice(cursor).match(/^[\d.]*/)?.[0] || "";
+      cursor += tail.length;
+      return mathElement("mn", char + tail);
+    }
+    if (/[A-Za-z]/.test(char)) return mathElement("mi", char);
+    return mathElement(/[+\-=(),\[\]|<>]/.test(char) ? "mo" : "mtext", char || "");
+  };
+  const math = mathElement("math");
+  math.classList.add("chat-math");
+  if (display) math.setAttribute("display", "block");
+  math.setAttribute("aria-label", source);
+  math.append(sequence());
+  parent.append(math);
+}
+
+function appendInlineText(parent, value) {
+  const source = String(value);
+  const pattern = /(\\\((.+?)\\\)|\$(?!\s)([^$\n]*?\S)\$)/g;
+  let cursor = 0;
+  for (const match of source.matchAll(pattern)) {
+    if (match.index > cursor) appendInlineMarkup(parent, source.slice(cursor, match.index));
+    appendMath(parent, match[2] || match[3]);
+    cursor = match.index + match[0].length;
+  }
+  if (cursor < source.length) appendInlineMarkup(parent, source.slice(cursor));
 }
 
 function appendCodeBlock(parent, source, language = "") {
@@ -347,6 +552,27 @@ function appendMarkdown(parent, value) {
     const line = lines[index];
     if (!line.trim()) {
       index += 1;
+      continue;
+    }
+    const singleLineMath = line.match(/^\s*(?:\$\$(.+)\$\$|\\\[(.+)\\\])\s*$/);
+    if (singleLineMath) {
+      const block = document.createElement("div");
+      block.className = "chat-math-block";
+      appendMath(block, singleLineMath[1] || singleLineMath[2], true);
+      parent.append(block);
+      index += 1;
+      continue;
+    }
+    if (["$$", "\\["].includes(line.trim())) {
+      const close = line.trim() === "$$" ? "$$" : "\\]";
+      const formula = [];
+      index += 1;
+      while (index < lines.length && lines[index].trim() !== close) formula.push(lines[index++]);
+      if (index < lines.length) index += 1;
+      const block = document.createElement("div");
+      block.className = "chat-math-block";
+      appendMath(block, formula.join(" "), true);
+      parent.append(block);
       continue;
     }
     const fence = line.match(/^```([\w.+-]*)\s*$/);
@@ -497,6 +723,7 @@ export class ChatController {
       modelButton: query("#model-selector-button"),
       modelMenu: query("#model-selector-menu"),
       selectedModel: query("[data-selected-model]"),
+      selectedModelGlyph: query("[data-selected-model-glyph]"),
       fileInput: query("#composer-file-input"),
       dropzone: query("[data-chat-dropzone]"),
       uploadList: query("[data-upload-list]"),
@@ -577,6 +804,7 @@ export class ChatController {
         "[data-thread-create-agent], [data-thread-artifact], [data-artifact-copy], [data-artifact-download], " +
         "[data-coding-tab], [data-coding-change], [data-coding-action], [data-thought-toggle], " +
         "[data-message-copy], [data-message-retry], [data-message-speak], [data-message-summarize], " +
+        "[data-run-retry], [data-run-continue], [data-ui-submit], [data-ui-action], " +
         "[data-message-feedback], [data-message-more], [data-input-option], [data-input-submit], [data-suggestion]",
     );
   }
@@ -593,12 +821,16 @@ export class ChatController {
 
     if (control.matches("[data-new-chat]")) return this.startNewChat();
     if (control.matches("[data-thought-toggle]")) {
-      chatState.thoughtOpen = !chatState.thoughtOpen;
+      const expanded = control.getAttribute("aria-expanded") !== "true";
+      chatState.thoughtOpen = expanded;
+      if (control.dataset.disclosureKey) {
+        chatState.disclosureOpen.set(control.dataset.disclosureKey, expanded);
+      }
       const card = control.closest(".chat-thought");
-      card?.classList.toggle("is-open", chatState.thoughtOpen);
-      control.setAttribute("aria-expanded", String(chatState.thoughtOpen));
+      card?.classList.toggle("is-open", expanded);
+      control.setAttribute("aria-expanded", String(expanded));
       const detail = query(".chat-thought-detail", card);
-      if (detail) detail.hidden = !chatState.thoughtOpen;
+      if (detail) detail.hidden = !expanded;
       return;
     }
     if (control.matches("#send-button")) return this.sendThreadMessage();
@@ -642,6 +874,10 @@ export class ChatController {
     if (control.matches("[data-coding-action]")) return this.requestCodingAction(control.dataset.codingAction);
     if (control.matches("[data-message-copy]")) return this.copyMessage(control.dataset.messageCopy);
     if (control.matches("[data-message-retry]")) return this.retryMessage(control.dataset.messageRetry);
+    if (control.matches("[data-run-retry]")) return this.retryRun(control.dataset.runRetry);
+    if (control.matches("[data-run-continue]")) return this.continueFailedRun(control.dataset.runContinue);
+    if (control.matches("[data-ui-submit]")) return this.submitUiCard(control);
+    if (control.matches("[data-ui-action]")) return this.sendThreadMessage(control.dataset.uiMessage || "");
     if (control.matches("[data-message-speak]")) return this.speakMessage(control.dataset.messageSpeak, control);
     if (control.matches("[data-message-summarize]")) return this.summarizeMessage(control.dataset.messageSummarize);
     if (control.matches("[data-message-feedback]")) return this.submitMessageFeedback(control);
@@ -672,6 +908,7 @@ export class ChatController {
   }
 
   onKeydown(event) {
+    if (event.isComposing || event.keyCode === 229) return;
     if (event.key === "Escape") {
       const addMenu = query("#composer-add-menu");
       const returnFocus = !this.refs.actionsMenu?.hidden
@@ -875,6 +1112,7 @@ export class ChatController {
     chatState.messages = [];
     chatState.events = [];
     chatState.commandOutputs = new Map();
+    chatState.disclosureOpen = new Map();
     chatState.queue = [];
     chatState.suggestions = [];
     chatState.inputRequest = null;
@@ -1061,9 +1299,51 @@ export class ChatController {
 
   async restoreFromHash() {
     if (!this.api.settings().accessToken) return;
+    const route = window.location.hash.replace(/^#/, "").split("/")[0].toLowerCase();
+    const handoff = !route || route === "chat" ? takeAgentRunHandoff() : null;
+    if (handoff) return this.runAgentHandoff(handoff);
     const threadId = threadIdFromHash();
     if (threadId && threadId !== chatState.currentThreadId) return this.loadThread(threadId, false);
     if (!threadId && chatState.currentThreadId) this.startNewChat(false);
+  }
+
+  async runAgentHandoff(handoff) {
+    const agentId = String(handoff.agent_id || "").trim();
+    this.startNewChat(false);
+    chatState.currentRunMode = "autonomous";
+    chatState.loading = true;
+    this.refs.shell.dataset.chatState = "thread";
+    if (this.refs.emptyState) this.refs.emptyState.hidden = true;
+    this.refs.conversation.replaceChildren();
+    this.renderInlineNotice("Starting agent…", "Opening a new Agent conversation.");
+    this.network("Starting agent…", "loading");
+    try {
+      if (!agentId) throw new Error("Agent run is missing its Agent ID.");
+      const version = Number(handoff.version);
+      const result = await this.api.post(
+        `/api/agents/${encodeURIComponent(agentId)}/runs`,
+        {
+          input: handoff.input && typeof handoff.input === "object" && !Array.isArray(handoff.input) ? handoff.input : {},
+          ...(Number.isInteger(version) && version > 0 ? { version } : {}),
+          ...(handoff.provider_id && handoff.model_id ? {
+            provider_id: handoff.provider_id,
+            model_id: handoff.model_id,
+            reasoning_effort: handoff.reasoning_effort || null,
+          } : {}),
+        },
+        { scope: "agent-run" },
+      );
+      const threadId = result.thread_id;
+      if (!threadId) throw new Error("The Agent run did not return a thread.");
+      window.dispatchEvent(new CustomEvent("taroai:agents-changed"));
+      await this.loadThread(threadId, true);
+    } catch (error) {
+      chatState.loading = false;
+      this.refs.conversation.replaceChildren();
+      this.renderInlineNotice("Agent could not start", error.message, "failure");
+      this.network("Agent could not start", "error");
+      this.refs.input?.focus();
+    }
   }
 
   startNewChat(updateHash = true) {
@@ -1083,6 +1363,7 @@ export class ChatController {
     chatState.events = [];
     chatState.artifacts = [];
     chatState.commandOutputs = new Map();
+    chatState.disclosureOpen = new Map();
     chatState.codingWorkspace = null;
     chatState.activeCodingChange = null;
     chatState.resourceRefs = [];
@@ -1236,15 +1517,8 @@ export class ChatController {
       }
       return;
     }
-    const selectedKey = modelKey(chatState.selectedModel || {});
-    const visibleModels = new Map();
-    for (const model of chatState.modelCatalog) {
-      if (!visibleModels.has(model.model_id) || modelKey(model) === selectedKey) {
-        visibleModels.set(model.model_id, model);
-      }
-    }
     const groups = new Map();
-    for (const model of visibleModels.values()) {
+    for (const model of chatState.modelCatalog) {
       if (!groups.has(model.provider_id)) groups.set(model.provider_id, []);
       groups.get(model.provider_id).push(model);
     }
@@ -1329,11 +1603,13 @@ export class ChatController {
 
   renderModelButton() {
     if (!chatState.selectedModel) {
+      setText(this.refs.selectedModelGlyph, "✹");
       setText(this.refs.selectedModel, "Choose model");
       setText(this.refs.detailModel, "");
       return;
     }
     const effort = chatState.selectedModel.reasoning_effort;
+    setText(this.refs.selectedModelGlyph, providerGlyph(chatState.selectedModel.provider_id));
     setText(this.refs.selectedModel, chatState.selectedModel.display_name);
     setText(this.refs.detailModel, [chatState.selectedModel.provider_id, chatState.selectedModel.model_id, effort].filter(Boolean).join(" / "));
   }
@@ -1764,14 +2040,26 @@ export class ChatController {
   syncComposer() {
     if (!this.refs.input || !this.refs.send) return;
     this.refs.input.style.height = "auto";
-    this.refs.input.style.height = `${Math.min(this.refs.input.scrollHeight, 180)}px`;
-    const uploadPending = chatState.uploads.some((upload) => !["Ready", "Failed"].includes(upload.status));
-    this.refs.send.disabled = !chatState.selectedModel || uploadPending || (!this.refs.input.value.trim() && !chatState.uploads.some((upload) => upload.status === "Ready"));
-    if (this.refs.stop) this.refs.stop.hidden = !chatState.running || assistantResponseReady();
-    this.refs.send.hidden = chatState.running && !this.refs.input.value.trim();
+    this.refs.input.style.height = `${Math.min(this.refs.input.scrollHeight, 150)}px`;
+    const activeRun = chatState.running && !assistantResponseReady();
+    const uploadBlocked = chatState.uploads.some((upload) => upload.status !== "Ready");
+    const hasContent = Boolean(this.refs.input.value.trim() || chatState.uploads.some((upload) => upload.status === "Ready"));
+    const placeholder = activeRun ? "Add a follow-up while Taroai is working..." : "Ask anything… Use @ to add skills, connectors, or agents";
+    const sendLabel = activeRun ? "Queue follow-up" : "Send message";
+    this.refs.input.placeholder = window.TaroaiI18n?.t(placeholder) || placeholder;
+    this.refs.send.setAttribute("aria-label", window.TaroaiI18n?.t(sendLabel) || sendLabel);
+    this.refs.send.title = window.TaroaiI18n?.t(sendLabel) || sendLabel;
+    this.refs.dropzone.dataset.composerState = activeRun ? "running" : "idle";
+    this.refs.send.disabled = !chatState.selectedModel || uploadBlocked || !hasContent;
+    if (this.refs.stop) this.refs.stop.hidden = !activeRun;
+    this.refs.send.hidden = activeRun && !hasContent;
   }
 
   async sendThreadMessage(contentOverride = null, deliveryOverride = null, modeOverride = null) {
+    if (chatState.uploads.some((upload) => upload.status === "Failed")) {
+      this.network("Remove failed files before sending", "warning");
+      return null;
+    }
     if (chatState.uploads.some((upload) => !["Ready", "Failed"].includes(upload.status))) {
       this.network("Wait for files to finish uploading and scanning", "warning");
       return null;
@@ -2205,6 +2493,7 @@ export class ChatController {
       chatState.messages = chatState.messages.filter((message) => message.id !== streamId);
     }
     if (type === "assistant.message.completed") {
+      chatState.thoughtOpen = false;
       const finalId = payloadDetail.message_id || `assistant:${chatState.currentRunId || Date.now()}`;
       const streamId = `stream:${chatState.currentRunId || chatState.currentThreadId}`;
       const streamed = chatState.messages.find((item) => item.id === streamId);
@@ -2293,6 +2582,7 @@ export class ChatController {
     }[type] || null;
     if (terminalStatus) {
       chatState.running = false;
+      chatState.thoughtOpen = false;
       chatState.inputRequest = null;
       chatState.inputAnswers = {};
       chatState.inputExtra = "";
@@ -2345,7 +2635,9 @@ export class ChatController {
         stdout: safeCommandStream(output.stdout),
         stderr: safeCommandStream(output.stderr),
       });
-    } catch { /* The safe execution summary remains available without raw output. */ }
+    } catch {
+      if (cache === chatState.commandOutputs) cache.delete(key);
+    }
   }
 
   renderApprovalCard(runId = chatState.currentRunId) {
@@ -2735,6 +3027,7 @@ export class ChatController {
     form.querySelector("p").textContent = `${payload.name || "This tool"} is needed to continue. The value will not appear in the conversation.`;
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
+      const threadId = chatState.currentThreadId;
       const input = form.elements.value;
       const button = form.querySelector("button");
       button.disabled = true;
@@ -2746,6 +3039,7 @@ export class ChatController {
         );
         input.value = "";
         this.network("Credential saved; the task is resuming", "success");
+        if (threadId) await this.loadThread(threadId, false);
       } catch (error) {
         button.disabled = false;
         this.network(`Could not save credential: ${error.message}`, "error");
@@ -2893,7 +3187,7 @@ export class ChatController {
       menu.append(summarize, speak);
       meta.append(menu);
     }
-    if (statusValue === "failed") {
+    if (statusValue === "failed" && message.optimistic) {
       const retry = document.createElement("button");
       retry.type = "button";
       retry.dataset.messageRetry = message.id;
@@ -2911,7 +3205,14 @@ export class ChatController {
     if (!events.length) return [];
     const lastRunId = runId || events.at(-1)?.run_id || null;
     const scoped = lastRunId ? events.filter((event) => (event.run_id || eventPayload(event).run_id) === lastRunId) : [];
-    return scoped.length ? scoped : events;
+    return [...(scoped.length ? scoped : events)].sort((left, right) => {
+      const leftSequence = eventSequence(left);
+      const rightSequence = eventSequence(right);
+      if (leftSequence && rightSequence) return leftSequence - rightSequence;
+      const leftTime = new Date(left.created_at || 0).valueOf();
+      const rightTime = new Date(right.created_at || 0).valueOf();
+      return leftTime - rightTime;
+    });
   }
 
   describeActivityEvent(event) {
@@ -2921,65 +3222,122 @@ export class ChatController {
       const text = String(value ?? "").trim();
       return text.length > max ? `${text.slice(0, max)}…` : text;
     };
+    if (type === "context.loaded") {
+      const references = Number(p.knowledge_result_count) || 0;
+      const memories = Number(p.memory_record_count) || 0;
+      const reviewed = [
+        references && `${references} workspace reference${references === 1 ? "" : "s"}`,
+        memories && `${memories} saved memor${memories === 1 ? "y" : "ies"}`,
+      ].filter(Boolean);
+      return reviewed.length ? { text: `Reviewed ${reviewed.join(" and ")}.` } : null;
+    }
+    if (["agent.conversation.loaded", "agent.loop.started", "agent.cycle.started"].includes(type)) return null;
+    if (type === "run.attachments.materialized") {
+      const count = Number(p.count) || (Array.isArray(p.files) ? p.files.length : 0);
+      const filename = clip(p.files?.[0]?.filename, 80);
+      if (!count) return null;
+      return { text: count === 1 && filename ? `Prepared uploaded file · ${filename}` : `Prepared ${count} uploaded files.` };
+    }
+    if (["model.operation.started", "model.operation.completed", "model.operation.failed", "model.operation.recorded"].includes(type)) {
+      const status = type.slice("model.operation.".length);
+      const operation = String(p.operation || "model").toLowerCase();
+      const labels = {
+        decide: ["Choosing the next action", "Chose the next action."],
+        respond_or_act: ["Choosing the next action", "Chose the next action."],
+        respond: ["Writing the response", "Response ready."],
+        verify: ["Checking the result", "Checked the result."],
+        compact: ["Summarizing the conversation", "Summarized the conversation."],
+      }[operation] || ["Working with the model", "Model step completed."];
+      const failed = status === "failed";
+      const textValue = failed ? "Model step failed." : status === "started" ? labels[0] : labels[1];
+      return {
+        key: operation === "verify"
+          ? "verification:current"
+          : `model:${p.operation_id || eventSequence(event)}`,
+        text: p.attempt > 1 ? `${textValue} · retry ${p.attempt}` : textValue,
+        tone: failed ? "warn" : null,
+        transient: !failed,
+      };
+    }
     if (type === "model.operation.retrying") return { text: "Model connection interrupted · retrying", tone: "warn" };
+    if (type === "agent.verification.started") {
+      return { key: `verification:${p.cycle_id || "current"}`, text: "Checking the result" };
+    }
+    if (type === "agent.verification.completed") {
+      const complete = p.outcome === "complete";
+      const checks = Array.isArray(p.evidence) ? p.evidence.length : 0;
+      return {
+        key: `verification:${p.cycle_id || "current"}`,
+        text: complete && checks
+          ? `Verified the result against ${checks} check${checks === 1 ? "" : "s"}.`
+          : complete
+            ? "Checked the result."
+            : "Checked the result · refining the answer.",
+        tone: p.outcome === "fail" ? "warn" : null,
+      };
+    }
+    if (type === "agent.verification.skipped") return null;
     if (type === "agent.decision.created") {
       const decision = p.decision || {};
-      if (decision.kind === "respond") return { text: "Prepared the answer." };
       if (decision.kind === "request_input") return { text: "Prepared a focused follow-up." };
       return null;
     }
     if (type.startsWith("tool_call.")) {
       const status = String(p.status || type.slice("tool_call.".length));
       const tool = String(p.tool_name || "tool");
-      const label = tool === "web.search"
-        ? "Web search"
-        : tool === "web.fetch"
-          ? "Web page"
-          : tool === "sandbox.command"
-            ? "Code execution"
-            : tool === "browser.action"
-              ? "Browser action"
-              : tool === "skill.load" || tool.startsWith("skill.")
-                ? "Skill"
-                : tool.startsWith("connector.")
-                  ? "Connected tool"
-                  : tool;
-      const fallback = status === "started"
-        ? `${label} started`
-        : status === "completed"
-          ? `${label} completed`
+      if (["tool.search", "ui.render"].includes(tool)) return null;
+      const label = toolLabel(tool);
+      const command = commandActivity(p);
+      const fallback = tool === "sandbox.command"
+        ? status === "started"
+          ? command.started
+          : status === "completed"
+            ? command.completed
+            : status === "awaiting_approval"
+              ? `${command.noun} is waiting for approval`
+              : status === "cancelled"
+                ? `${command.noun} cancelled`
+                : `${command.noun} failed`
+        : status === "started"
+          ? `${label} started`
+          : status === "completed"
+            ? `${label} completed`
           : status === "awaiting_approval"
             ? `${label} is waiting for approval`
             : status === "cancelled"
               ? `${label} cancelled`
               : `${label} failed`;
       return {
-        key: `tool:${p.action_id || p.step_id || tool}`,
-        text: clip(p.summary || fallback),
+        key: `tool:${toolActivityKey(event) || eventSequence(event)}`,
+        text: clip(tool === "sandbox.command" ? fallback : p.summary || fallback),
         tone: status === "failed" ? "warn" : null,
+        tool,
+        actionKey: toolActivityKey(event),
       };
     }
-    if (type === "tool.failed") {
-      return { text: `Tool failed — ${clip(p.error || p.reason || "see logs", 120)}`, tone: "warn" };
-    }
-    if (type === "agent.verification.completed" && p.outcome !== "complete") return { text: "Checked the evidence and refined the result." };
+    if (type === "tool.failed") return null;
     return null;
   }
 
-  renderSearchCard(runId = chatState.currentRunId) {
-    const events = [...this.runActivityEvents(runId)].reverse();
-    const decision = events.find((item) =>
-      eventType(item) === "agent.decision.created"
-      && eventPayload(item).decision?.tool_name === "web.search",
-    );
-    const event = events.find((item) => (
+  renderSearchCard(runId = chatState.currentRunId, actionKey = null) {
+    const orderedEvents = this.runActivityEvents(runId);
+    const events = [...orderedEvents].reverse();
+    const lifecycleEvent = events.find((item) => (
       ["tool_call.started", "tool_call.completed", "tool_call.failed", "tool_call.cancelled", "tool_call.approval_required"].includes(eventType(item))
       && eventPayload(item).tool_name === "web.search"
+      && (!actionKey || toolActivityKey(item) === actionKey)
     ) || (
       eventType(item) === "agent.observation.recorded"
       && eventPayload(item).success === false
       && eventPayload(item).result?.tool_name === "web.search"
-    ) || item === decision);
+      && (!actionKey || eventPayload(item).action_id === actionKey)
+    ));
+    const lifecycleIndex = lifecycleEvent ? orderedEvents.indexOf(lifecycleEvent) : orderedEvents.length - 1;
+    const decision = [...orderedEvents.slice(0, lifecycleIndex + 1)].reverse().find((item) =>
+      eventType(item) === "agent.decision.created"
+      && eventPayload(item).decision?.tool_name === "web.search",
+    );
+    const event = lifecycleEvent || (!actionKey ? decision : null);
     if (!event) return null;
     const running = event === decision || eventType(event) === "tool_call.started";
     const failed = ["agent.observation.recorded", "tool_call.failed"].includes(eventType(event));
@@ -2989,7 +3347,11 @@ export class ChatController {
     const results = Array.isArray(output?.results) ? output.results : [];
     const details = document.createElement("details");
     details.className = `chat-search-card${running ? " is-running" : failed ? " is-error" : ""}`;
-    details.open = running;
+    bindDisclosure(
+      details,
+      `tool:${runId}:web.search:${actionKey || toolActivityKey(lifecycleEvent || {}) || eventSequence(decision || event)}`,
+      running,
+    );
     if (running) details.setAttribute("aria-busy", "true");
     const summary = document.createElement("summary");
     const mark = document.createElement("span");
@@ -3044,7 +3406,7 @@ export class ChatController {
     return details;
   }
 
-  renderCodeCard(runId = chatState.currentRunId) {
+  renderCodeCard(runId = chatState.currentRunId, actionKey = null) {
     const events = this.runActivityEvents(runId);
     const decisions = events.filter((item) => {
       const value = eventPayload(item).decision || {};
@@ -3056,13 +3418,16 @@ export class ChatController {
       const start = events.indexOf(decision);
       const next = decisions[index + 1];
       const executionEvents = events.slice(start, next ? events.indexOf(next) : events.length);
+      if (actionKey && !executionEvents.some((item) => toolActivityKey(item) === actionKey)) continue;
       const outcome = [...executionEvents].reverse().find((item) => (
         ["tool_call.started", "tool_call.completed", "tool_call.failed", "tool_call.cancelled", "tool_call.approval_required"].includes(eventType(item))
         && eventPayload(item).tool_name === "sandbox.command"
+        && (!actionKey || toolActivityKey(item) === actionKey)
       ) || (
         eventType(item) === "agent.observation.recorded"
         && eventPayload(item).result?.tool_name === "sandbox.command"
         && eventPayload(item).success === false
+        && (!actionKey || eventPayload(item).action_id === actionKey)
       ) || item === decision);
       const running = outcome === decision || eventType(outcome || {}) === "tool_call.started";
       const completed = eventType(outcome || {}) === "tool_call.completed" ? outcome : null;
@@ -3070,6 +3435,9 @@ export class ChatController {
       const cancelled = eventType(outcome || {}) === "tool_call.cancelled";
       const waiting = eventType(outcome || {}) === "tool_call.approval_required";
       const command = String(eventPayload(decision).decision?.tool_input?.command || "").trim();
+      const commandPayload = eventPayload(outcome || {});
+      const commandCopy = commandActivity(commandPayload);
+      const subject = commandSubject(command, commandPayload.command_kind);
       const output = eventPayload(completed || {}).result?.output || {};
       const execution = [...executionEvents].reverse().find((item) => eventType(item) === "sandbox.command.executed");
       const executionPayload = eventPayload(execution || {});
@@ -3086,14 +3454,27 @@ export class ChatController {
         : "Running";
       const details = document.createElement("details");
       details.className = `chat-search-card chat-code-card${running ? " is-running" : failed ? " is-error" : ""}`;
-      details.open = running;
+      bindDisclosure(
+        details,
+        `tool:${runId}:sandbox.command:${actionKey || toolActivityKey(outcome || {}) || eventPayload(decision).decision?.action_key || eventSequence(decision)}`,
+        running,
+      );
       if (running) details.setAttribute("aria-busy", "true");
       const summary = document.createElement("summary");
       const mark = document.createElement("span");
       mark.setAttribute("aria-hidden", "true");
       mark.textContent = ">_";
       const title = document.createElement("strong");
-      title.textContent = running ? "Running code" : waiting ? "Code needs approval" : cancelled ? "Code cancelled" : failed ? "Code failed" : "Ran code";
+      const activity = running
+        ? commandCopy.started
+        : waiting
+          ? `${commandCopy.noun} needs approval`
+          : cancelled
+            ? `${commandCopy.noun} cancelled`
+            : failed
+              ? `${commandCopy.noun} failed`
+              : commandCopy.completed;
+      title.textContent = subject ? `${activity} · ${subject}` : activity;
       const state = document.createElement("span");
       state.textContent = status;
       summary.append(mark, title, state);
@@ -3112,6 +3493,160 @@ export class ChatController {
         stream.className = `chat-code-output is-${name}`;
         stream.textContent = value;
         details.append(label, stream);
+      }
+      fragment.append(details);
+    }
+    return fragment;
+  }
+
+  renderToolCards(runId = chatState.currentRunId, actionKey = null) {
+    const events = this.runActivityEvents(runId);
+    const calls = new Map();
+    for (const event of events) {
+      const type = eventType(event);
+      if (!type.startsWith("tool_call.")) continue;
+      const p = eventPayload(event);
+      const tool = String(p.tool_name || "tool");
+      if (["web.search", "sandbox.command", "tool.search", "ui.render"].includes(tool)) continue;
+      const key = p.action_id || p.step_id || `${tool}:${eventSequence(event)}`;
+      if (actionKey && key !== actionKey) continue;
+      calls.set(key, { key, tool, payload: p, event });
+    }
+    if (!calls.size) return null;
+
+    const assistantEvent = [...events].reverse().find((item) => (
+      eventType(item) === "assistant.message.completed"
+    ));
+    const assistantIndex = chatState.messages.findIndex((item) => (
+      item.id === eventPayload(assistantEvent || {}).message_id
+    ));
+    const messagesBeforeAnswer = assistantIndex < 0
+      ? chatState.messages
+      : chatState.messages.slice(0, assistantIndex);
+    const triggerMessage = [...messagesBeforeAnswer]
+      .reverse()
+      .find((item) => !isAssistant(item));
+    const fragment = document.createDocumentFragment();
+    for (const { key, tool, payload, event } of calls.values()) {
+      const type = eventType(event);
+      const eventIndex = events.indexOf(event);
+      const decisionEvent = [...events.slice(0, eventIndex + 1)].reverse().find((item) => {
+        if (eventType(item) !== "agent.decision.created") return false;
+        const decision = eventPayload(item).decision || {};
+        return decision.tool_name === tool
+          || (tool === "skill.load" && decision.skill_id === payload.skill_id);
+      });
+      const input = payload.input || eventPayload(decisionEvent || {}).decision?.tool_input;
+      const observation = payload.action_id
+        ? [...events].reverse().find((item) => (
+          eventType(item) === "agent.observation.recorded"
+          && eventPayload(item).action_id === payload.action_id
+        ))
+        : null;
+      const observationPayload = eventPayload(observation || {});
+      const failed = type === "tool_call.failed";
+      const waiting = type === "tool_call.approval_required";
+      const running = type === "tool_call.started";
+      const status = waiting
+        ? "Approval needed"
+        : failed
+          ? "Failed"
+          : type === "tool_call.cancelled"
+            ? "Cancelled"
+            : running
+              ? "Running"
+              : "Completed";
+      const skillOutput = tool === "skill.load" && payload.result?.output && typeof payload.result.output === "object"
+        ? payload.result.output
+        : {};
+      const skillId = String(payload.skill_id || skillOutput.skill_id || "");
+      const skillName = String(payload.skill_name || skillOutput.skill_name || skillId.split(".").at(-1) || "Skill")
+        .split(/[-_]/)
+        .map((part) => part.length <= 3 ? part.toUpperCase() : `${part[0]?.toUpperCase() || ""}${part.slice(1)}`)
+        .join(" ");
+      const details = document.createElement("details");
+      details.className = `chat-search-card chat-code-card chat-tool-card${running ? " is-running" : failed ? " is-error" : ""}`;
+      bindDisclosure(details, `tool:${runId}:${tool}:${key}`, running || failed || waiting);
+      if (running) details.setAttribute("aria-busy", "true");
+      const summary = document.createElement("summary");
+      const mark = document.createElement("span");
+      mark.setAttribute("aria-hidden", "true");
+      mark.textContent = "↗";
+      const title = document.createElement("strong");
+      title.textContent = tool === "skill.load"
+        ? running
+          ? `Loading ${skillName}`
+          : failed
+            ? `Could not load ${skillName}`
+            : type === "tool_call.cancelled"
+              ? `Cancelled loading ${skillName}`
+              : `Used ${skillName}`
+        : toolLabel(tool);
+      const state = document.createElement("span");
+      state.textContent = tool === "skill.load" && !failed && !waiting
+        ? running ? "Loading…" : type === "tool_call.cancelled" ? "Cancelled" : "Ready"
+        : status;
+      summary.append(mark, title, state);
+      details.append(summary);
+
+      const name = document.createElement("p");
+      const skillVersion = payload.skill_version || skillOutput.version;
+      const skillFileCount = Number(skillOutput.file_count);
+      name.textContent = tool === "skill.load"
+        ? [skillVersion && `Version ${skillVersion}`, skillFileCount > 0 && `${skillFileCount} file${skillFileCount === 1 ? "" : "s"} ready`].filter(Boolean).join(" · ")
+        : [tool, payload.skill_id].filter(Boolean).join(" · ");
+      details.append(name);
+      const result = payload.result || observationPayload.result;
+      const failureClass = observationPayload.failure_class || payload.failure_class;
+      const error = payload.safe_error || observationPayload.safe_error || (failed
+        ? {
+          connector_reconnect_required: "Connector authorization expired. Reconnect it before retrying.",
+          policy_blocked: "This tool call was blocked by workspace policy.",
+        }[failureClass] || "The tool could not complete. Unsafe error details were hidden."
+        : null);
+      const fields = tool === "skill.load" ? [["Error", error]] : [["Input", input], ["Result", result], ["Error", error]];
+      for (const [label, value] of fields) {
+        if (value === null || value === undefined || value === "") continue;
+        const caption = document.createElement("small");
+        caption.className = "chat-code-output-label";
+        caption.textContent = label;
+        const output = document.createElement("pre");
+        output.className = "chat-code-output";
+        output.textContent = safeCommandStream(label === "Input" ? safeToolInput(value, tool) : text(value));
+        details.append(caption, output);
+      }
+      if (failed) {
+        const actions = document.createElement("footer");
+        actions.className = "chat-workflow-actions";
+        const terminalFailure = [...events].reverse().find((item) => (
+          ["run.failed", "run.cancelled", "run.timed_out"].includes(eventType(item))
+        ));
+        if (terminalFailure && runId) {
+          const retry = document.createElement("button");
+          retry.type = "button";
+          retry.dataset.runRetry = runId;
+          retry.textContent = "Retry";
+          actions.append(retry);
+        } else if (triggerMessage) {
+          const retry = document.createElement("button");
+          retry.type = "button";
+          retry.dataset.messageRetry = triggerMessage.id;
+          retry.textContent = "Retry";
+          actions.append(retry);
+        }
+        if (triggerMessage) {
+          const continueButton = document.createElement("button");
+          continueButton.type = "button";
+          continueButton.dataset.runContinue = triggerMessage.id;
+          continueButton.textContent = "Continue";
+          actions.append(continueButton);
+        }
+        const newChat = document.createElement("button");
+        newChat.type = "button";
+        newChat.dataset.newChat = "";
+        newChat.textContent = "New chat";
+        actions.append(newChat);
+        details.append(actions);
       }
       fragment.append(details);
     }
@@ -3172,6 +3707,64 @@ export class ChatController {
     } else if (element.type === "Separator") {
       node = document.createElement("hr");
       node.className = "chat-ui-separator";
+    } else if (element.type === "Form") {
+      node = document.createElement("form");
+      node.className = "chat-ui-form";
+      node.addEventListener("submit", (event) => {
+        event.preventDefault();
+        this.submitUiCard(event.submitter || query("[data-ui-submit]", node));
+      });
+    } else if (element.type === "Input") {
+      node = document.createElement("label");
+      node.className = "chat-ui-field";
+      const label = document.createElement("span");
+      label.textContent = String(props.label || props.name || "");
+      const input = props.type === "select" ? document.createElement("select") : document.createElement("input");
+      input.name = String(props.name || elementId);
+      input.required = Boolean(props.required);
+      if (input instanceof HTMLInputElement) {
+        input.type = ["text", "email", "number", "date"].includes(props.type) ? props.type : "text";
+        input.placeholder = String(props.placeholder || "");
+      } else {
+        for (const value of Array.isArray(props.options) ? props.options.slice(0, 12) : []) {
+          const option = document.createElement("option");
+          option.value = String(value);
+          option.textContent = String(value);
+          input.append(option);
+        }
+      }
+      node.append(label, input);
+    } else if (element.type === "Button") {
+      node = document.createElement("button");
+      node.type = props.submit ? "submit" : "button";
+      node.className = "chat-ui-button";
+      node.textContent = String(props.label || "继续");
+      if (props.submit) node.dataset.uiSubmit = "";
+      else {
+        node.dataset.uiAction = "";
+        node.dataset.uiMessage = String(props.message || props.label || "");
+      }
+    } else if (element.type === "BarChart") {
+      node = document.createElement("figure");
+      node.className = "chat-ui-chart";
+      const labels = Array.isArray(props.labels) ? props.labels.slice(0, 12) : [];
+      const values = (Array.isArray(props.values) ? props.values : []).slice(0, labels.length).map(Number);
+      const maximum = Math.max(1, ...values.filter(Number.isFinite));
+      for (let index = 0; index < values.length; index += 1) {
+        if (!Number.isFinite(values[index])) continue;
+        const row = document.createElement("div");
+        const label = document.createElement("span");
+        label.textContent = String(labels[index] || "");
+        const meter = document.createElement("meter");
+        meter.min = 0;
+        meter.max = maximum;
+        meter.value = Math.max(0, values[index]);
+        meter.setAttribute("aria-label", `${label.textContent}: ${values[index]}`);
+        const value = document.createElement("strong");
+        value.textContent = String(values[index]);
+        row.append(label, meter, value);
+        node.append(row);
+      }
     } else {
       return null;
     }
@@ -3180,6 +3773,13 @@ export class ChatController {
       if (child) node.append(child);
     }
     return node;
+  }
+
+  submitUiCard(control) {
+    const form = control?.closest?.("form");
+    if (!form || !form.reportValidity()) return false;
+    const answers = [...new FormData(form)].map(([name, value]) => `${name}: ${value}`);
+    return answers.length ? this.sendThreadMessage(answers.join("\n")) : false;
   }
 
   renderUiCards(runId = chatState.currentRunId) {
@@ -3220,23 +3820,40 @@ export class ChatController {
     if (!events.length) return null;
     const steps = [];
     const keyedSteps = new Map();
+    const hasModelLifecycle = events.some((event) => (
+      ["model.operation.started", "model.operation.completed", "model.operation.failed"].includes(eventType(event))
+    ));
     let retrying = false;
+    let currentCycleId = null;
+    let latestStep = null;
     for (const event of events) {
+      if (eventType(event) === "agent.cycle.started") {
+        currentCycleId = eventPayload(event).cycle_id || eventSequence(event);
+      }
+      if (
+        eventType(event) === "model.operation.recorded"
+        && hasModelLifecycle
+      ) continue;
       const status = eventType(event) === "run.status_changed"
         ? String(eventPayload(event).status || "").toLowerCase()
         : "";
       if (status === "retrying") {
         retrying = true;
-        steps.push({ text: "Temporary execution error · retrying", tone: "warn" });
+        latestStep = { text: "Temporary execution error · retrying", tone: "warn" };
+        steps.push(latestStep);
         continue;
       }
       if (retrying && status === "running") {
         retrying = false;
-        steps.push({ text: "Retry resumed" });
+        latestStep = { text: "Retry resumed" };
+        steps.push(latestStep);
         continue;
       }
       const step = this.describeActivityEvent(event);
       if (!step) continue;
+      if (step.key === "verification:current") step.key = `verification:${currentCycleId || eventSequence(event)}`;
+      latestStep = step;
+      if (step.transient) continue;
       if (step.key && keyedSteps.has(step.key)) {
         steps[keyedSteps.get(step.key)] = step;
       } else {
@@ -3244,17 +3861,17 @@ export class ChatController {
         steps.push(step);
       }
     }
-    if (
-      !steps.length
-      && events.some((event) => eventType(event) === "model.operation.recorded")
-      && events.some((event) => eventType(event) === "assistant.message.completed")
-    ) steps.push({ text: "Prepared the answer." });
-    if (!steps.length) return null;
-    const started = new Date(events[0].created_at || "");
     const lastMessage = chatState.messages.at(-1);
     const responseReady = runId !== chatState.currentRunId
       || !chatState.running
       || (isAssistant(lastMessage || {}) && dispatchStatus(lastMessage) === "completed");
+    if (!steps.length && !responseReady && latestStep) steps.push(latestStep);
+    if (
+      !steps.length
+      && events.some((event) => eventType(event) === "assistant.message.completed")
+    ) steps.push({ text: "Prepared the answer." });
+    if (!steps.length) return null;
+    const started = new Date(events[0].created_at || "");
     const responseEvent = responseReady
       ? [...events].reverse().find((event) => eventType(event) === "assistant.message.completed")
       : null;
@@ -3282,26 +3899,45 @@ export class ChatController {
       ? Math.max(1, Math.round(((ended - started) - pausedMilliseconds) / 1000))
       : null;
     const live = chatState.running && runId === chatState.currentRunId && !responseReady;
-    const title = live ? steps.at(-1).text : seconds ? `Thought for ${seconds}s` : "Run activity";
+    const title = live ? latestStep?.text || steps.at(-1).text : seconds ? `Thought for ${seconds}s` : "Run activity";
+    const disclosureKey = `thought:${runId || chatState.currentRunId || "current"}`;
+    const expanded = chatState.disclosureOpen.has(disclosureKey)
+      ? chatState.disclosureOpen.get(disclosureKey)
+      : live;
     const card = document.createElement("div");
     card.className = "chat-thought";
     card.classList.toggle("is-live", live);
-    card.classList.toggle("is-open", Boolean(chatState.thoughtOpen));
+    card.classList.toggle("is-open", expanded);
     if (live) card.setAttribute("aria-live", "polite");
     const toggle = document.createElement("button");
     toggle.type = "button";
     toggle.className = "chat-thought-toggle";
     toggle.dataset.thoughtToggle = "";
-    toggle.setAttribute("aria-expanded", String(Boolean(chatState.thoughtOpen)));
+    toggle.dataset.disclosureKey = disclosureKey;
+    toggle.setAttribute("aria-expanded", String(expanded));
     toggle.innerHTML = `<svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"></circle><path d="M12 8v4l2.5 2.5"></path></svg><span>${escapeHtml(title)}</span><span class="chat-thought-chevron" aria-hidden="true">›</span>`;
     card.append(toggle);
     const detail = document.createElement("div");
     detail.className = "chat-thought-detail";
-    detail.hidden = !chatState.thoughtOpen;
+    detail.hidden = !expanded;
     for (const step of steps) {
       const row = document.createElement("div");
       row.className = "chat-thought-step";
+      if (step.key) row.dataset.activityKey = step.key;
       if (step.tone === "warn") row.classList.add("is-warn");
+      const activityCard = step.tool === "web.search"
+        ? this.renderSearchCard(runId, step.actionKey)
+        : step.tool === "sandbox.command"
+          ? this.renderCodeCard(runId, step.actionKey)
+          : step.tool && !["tool.search", "ui.render"].includes(step.tool)
+            ? this.renderToolCards(runId, step.actionKey)
+            : null;
+      if (activityCard && activityCard.childNodes.length) {
+        row.classList.add("is-tool");
+        row.append(activityCard);
+        detail.append(row);
+        continue;
+      }
       const line = document.createElement("p");
       line.className = "chat-thought-line";
       line.textContent = step.text;
@@ -3430,6 +4066,9 @@ export class ChatController {
 
   renderConversation() {
     if (!this.refs.conversation) return;
+    const shouldFollowOutput = this.refs.conversation.scrollHeight
+      - this.refs.conversation.scrollTop
+      - this.refs.conversation.clientHeight <= 80;
     this.refs.conversation.replaceChildren();
     const hasContent = chatState.messages.length || chatState.events.length;
     this.refs.shell.dataset.chatState = hasContent || chatState.currentThreadId ? "thread" : "empty";
@@ -3475,8 +4114,6 @@ export class ChatController {
     const displayableArtifacts = chatState.artifacts.filter(isDisplayableArtifact);
     let currentApprovalCard = null;
     let thoughtRendered = false;
-    let searchRendered = false;
-    let codeRendered = false;
     for (const message of chatState.messages) {
       const createdAt = new Date(message.created_at || message.updated_at || "");
       const day = Number.isNaN(createdAt.valueOf()) ? "" : createdAt.toDateString();
@@ -3506,16 +4143,6 @@ export class ChatController {
       if (activityMessageForRun) {
         renderedRunIds.add(messageRunId);
         const currentRun = messageRunId === chatState.currentRunId;
-        const search = this.renderSearchCard(messageRunId);
-        if (search) {
-          this.refs.conversation.append(search);
-          if (currentRun) searchRendered = true;
-        }
-        const code = this.renderCodeCard(messageRunId);
-        if (code) {
-          this.refs.conversation.append(code);
-          if (currentRun) codeRendered = true;
-        }
         const thought = this.renderThoughtCard(messageRunId);
         if (thought) {
           this.refs.conversation.append(thought);
@@ -3536,15 +4163,12 @@ export class ChatController {
         if (outputs) this.refs.conversation.append(outputs);
       }
     }
-    if (!searchRendered) {
-      const search = this.renderSearchCard();
-      if (search) this.refs.conversation.append(search);
-    }
-    if (!codeRendered) {
-      const code = this.renderCodeCard();
-      if (code) this.refs.conversation.append(code);
-    }
     if (!renderedRunIds.has(chatState.currentRunId)) {
+      const thought = this.renderThoughtCard();
+      if (thought) {
+        this.refs.conversation.append(thought);
+        thoughtRendered = true;
+      }
       for (const card of this.renderUiCards()) this.refs.conversation.append(card);
     }
     const unattachedArtifacts = displayableArtifacts.filter(
@@ -3603,16 +4227,33 @@ export class ChatController {
       }[reason] || (eventType(failedRun) === "run.timed_out"
         ? ["The run timed out", "Any completed output is preserved. Retry with a smaller request or a longer run limit."]
         : ["The run ended with an error", "Any completed output is preserved. Retry the message or choose another model."]);
-      this.renderInlineNotice(
+      const notice = this.renderInlineNotice(
         failure[0],
         failure[1],
         "failure",
       );
+      const actions = document.createElement("footer");
+      actions.className = "chat-workflow-actions";
+      if (!["model_budget_exceeded", "cost_budget_exhausted", "model_policy_denied"].includes(reason)) {
+        const retry = document.createElement("button");
+        retry.type = "button";
+        retry.dataset.runRetry = failedRun.run_id || eventPayload(failedRun).run_id || chatState.currentRunId;
+        retry.textContent = "Retry";
+        const continueButton = document.createElement("button");
+        continueButton.type = "button";
+        continueButton.dataset.runContinue = "";
+        continueButton.textContent = "Continue";
+        actions.append(retry, continueButton);
+      }
+      const newChat = document.createElement("button");
+      newChat.type = "button";
+      newChat.dataset.newChat = "";
+      newChat.textContent = "New chat";
+      actions.append(newChat);
+      notice.append(actions);
     }
     if (chatState.running && !responseReady && !currentApprovalCard) {
-      const thought = thoughtRendered ? null : this.renderThoughtCard();
-      if (thought) this.refs.conversation.append(thought);
-      else if (!liveAssistantId) {
+      if (!thoughtRendered && !liveAssistantId) {
         const thinking = document.createElement("div");
         thinking.className = "chat-thinking";
         thinking.setAttribute("role", "status");
@@ -3629,9 +4270,11 @@ export class ChatController {
     const inputRequest = !chatState.running ? this.renderInputRequest() : null;
     if (inputRequest) this.refs.conversation.append(inputRequest);
     else if (!chatState.running && chatState.messages.length && chatState.suggestions.length) this.renderSuggestions(chatState.suggestions);
-    requestAnimationFrame(() => {
-      this.refs.conversation.scrollTop = this.refs.conversation.scrollHeight;
-    });
+    if (shouldFollowOutput) {
+      requestAnimationFrame(() => {
+        this.refs.conversation.scrollTop = this.refs.conversation.scrollHeight;
+      });
+    }
   }
 
   renderSuggestions(suggestions) {
@@ -3668,6 +4311,7 @@ export class ChatController {
     body.textContent = detail;
     card.append(strong, body);
     this.refs.conversation.append(card);
+    return card;
   }
 
   renderReconnectCard(detail) {
@@ -4317,18 +4961,61 @@ export class ChatController {
     }, 1200);
   }
 
-  retryMessage(messageId) {
-    const message = chatState.messages.find((item) => item.id === messageId);
-    if (!message) return;
-    chatState.messages = chatState.messages.filter((item) => item.id !== messageId);
+  restoreMessageToComposer(message) {
+    const refs = arrayFrom(message.resource_refs || [], "items");
+    chatState.browserProfile = refs.find((item) => item.type === "browser_profile") || null;
+    chatState.resourceRefs = refs.filter((item) => item.type !== "browser_profile");
     chatState.uploads = arrayFrom(message.attachments || [], "items").map((attachment) => ({
       ...(typeof attachment === "string" ? {} : attachment),
       id: typeof attachment === "string" ? attachment : attachment.id || attachment.storage_object_id,
       status: "Ready",
       progress: 1,
     }));
-    const mode = message.kind === "workflow" ? "workflow" : message.kind === "agent" ? "autonomous" : "chat";
-    this.sendThreadMessage(messageContent(message), chatState.running ? "queue" : "auto", mode);
+    chatState.createIntent = message.kind === "workflow" ? "workflow" : message.kind === "agent" ? "agent" : null;
+    if (this.refs.input) this.refs.input.value = messageContent(message);
+    this.saveDraft();
+    this.renderAll();
+    this.refs.input?.focus();
+  }
+
+  retryMessage(messageId) {
+    const message = chatState.messages.find((item) => item.id === messageId);
+    if (!message) return;
+    chatState.messages = chatState.messages.filter((item) => item.id !== messageId);
+    this.restoreMessageToComposer(message);
+    this.sendThreadMessage(null, chatState.running ? "queue" : "auto");
+  }
+
+  async retryRun(runId) {
+    if (!runId || chatState.running) return;
+    this.abortStream();
+    chatState.running = true;
+    this.network("Retrying run…", "loading");
+    this.renderAll();
+    try {
+      await this.api.post(
+        `/api/runs/${encodeURIComponent(runId)}/retry`,
+        { reason_code: "operator_retry" },
+        { scope: "run-retry" },
+      );
+      chatState.currentRunId = runId;
+      publishChatContext();
+      this.startEventStream();
+    } catch (error) {
+      chatState.running = false;
+      this.network(`Retry failed: ${error.message}`, "error");
+      this.renderAll();
+    }
+  }
+
+  continueFailedRun(messageId = null) {
+    const userMessages = [...chatState.messages].reverse().filter((item) => !isAssistant(item));
+    const message = userMessages.find((item) => item.id === messageId)
+      || userMessages.find((item) => dispatchStatus(item) === "failed")
+      || userMessages[0];
+    if (!message) return;
+    this.restoreMessageToComposer(message);
+    this.network("Request restored to the composer", "success");
   }
 
   speakMessage(messageId, control) {

@@ -3,16 +3,59 @@
   "items": [
     {
       "id": "taroai.data-signal-starter",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "name": "Data Signal Starter",
-      "description": "Turn an attached CSV into a concise, evidence-backed data quality and signal brief.",
+      "description": "Turn an attached CSV or Excel XLSX file into a concise, evidence-backed data quality and signal brief.",
       "category": "data",
       "publisher": "Taroai",
+      "featured": true,
       "industry": "general",
-      "use_cases": ["csv_analysis", "data_quality", "exploratory_summary"],
+      "use_cases": ["csv_analysis", "xlsx_analysis", "data_quality", "exploratory_summary"],
       "skills": ["items/csv-signal-brief"],
       "success_metrics": ["grounded_findings", "reported_data_quality_issues"],
-      "rollout_checklist": ["attach_a_csv", "review_sensitive_columns"]
+      "rollout_checklist": ["attach_a_csv_or_xlsx", "review_sensitive_columns"]
+    },
+    {
+      "id": "taroai.source-research-starter",
+      "version": "1.0.0",
+      "name": "Source Research Brief",
+      "description": "Research a question on the live web and produce a concise brief grounded in traceable sources.",
+      "category": "research",
+      "publisher": "Taroai",
+      "featured": true,
+      "industry": "general",
+      "use_cases": ["web_research", "source_comparison", "evidence_brief"],
+      "skills": ["items/source-research-brief"],
+      "success_metrics": ["traceable_sources", "separated_facts_and_inferences"],
+      "rollout_checklist": ["state_the_research_question", "review_source_quality"]
+    },
+    {
+      "id": "taroai.document-evidence-starter",
+      "version": "1.0.0",
+      "name": "Document Evidence Brief",
+      "description": "Turn supplied text or an attached document into a grounded summary, evidence list, and action items.",
+      "category": "documents",
+      "publisher": "Taroai",
+      "featured": true,
+      "industry": "general",
+      "use_cases": ["document_summary", "evidence_extraction", "action_items"],
+      "skills": ["items/document-evidence-brief"],
+      "success_metrics": ["grounded_summary", "traceable_action_items"],
+      "rollout_checklist": ["supply_text_or_attach_a_document", "review_sensitive_content"]
+    },
+    {
+      "id": "taroai.code-analysis-starter",
+      "version": "1.0.0",
+      "name": "Code Analysis",
+      "description": "Inspect supplied code or an attached source archive and report evidence-backed defects and minimal fixes.",
+      "category": "development",
+      "publisher": "Taroai",
+      "featured": true,
+      "industry": "general",
+      "use_cases": ["code_review", "bug_analysis", "source_archive_review"],
+      "skills": ["items/code-analysis"],
+      "success_metrics": ["file_line_findings", "minimal_actionable_fixes"],
+      "rollout_checklist": ["supply_code_or_attach_an_archive", "exclude_secrets"]
     }
   ]
 }

@@ -1,5 +1,6 @@
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -649,6 +650,124 @@ def test_agent_files_expose_the_runtime_skill_and_config():
     config = json.loads(files["/workspace/agent/config.json"]["content"])
     assert config["agent_id"] == agent["id"]
     assert config["write_autonomy"] == "approval_required"
+
+
+def test_published_agent_can_be_invoked_with_its_own_api_key():
+    identity = InMemoryIdentityService(
+        password_hasher=PasswordHasher(salt="test_salt")
+    )
+    owner = identity.create_user(
+        UserAccountCreate(
+            tenant_id="tenant_acme",
+            email="agent-api-owner@example.com",
+            display_name="Agent API owner",
+            password="correct horse battery staple",
+        )
+    )
+    member = identity.create_user(
+        UserAccountCreate(
+            tenant_id="tenant_acme",
+            email="agent-api-member@example.com",
+            display_name="Agent API member",
+            password="correct horse battery staple",
+        )
+    )
+    client = TestClient(
+        create_app(
+            settings=Settings(
+                run_execution_dispatch_mode="queue",
+                dev_request_headers_enabled=True,
+                _env_file=None,
+            ),
+            identity_service=identity,
+            job_queue=InMemoryJobQueue(),
+        )
+    )
+    headers = {"X-Tenant-ID": "tenant_acme", "X-User-ID": owner.id}
+    agent = client.post(
+        "/api/agents",
+        headers=headers,
+        json={
+            "workspace_id": "workspace_sales",
+            "name": "Public research agent",
+            "version": {
+                "instructions": "Answer the structured request.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"request": {"type": "string"}},
+                    "required": ["request"],
+                },
+            },
+        },
+    ).json()["agent"]
+    published = client.post(
+        f"/api/agents/{agent['id']}/versions/1/publish", headers=headers
+    )
+    created_key = client.post(
+        "/api/api-keys",
+        headers=headers,
+        json={"agent_id": agent["id"], "name": "Production"},
+    )
+
+    assert published.status_code == 200
+    assert created_key.status_code == 201
+    assert client.post(
+        "/api/api-keys",
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": member.id},
+        json={"agent_id": agent["id"], "name": "Not mine"},
+    ).status_code == 403
+    raw_token = created_key.json()["rawToken"]
+    assert raw_token.startswith("taak_")
+    assert "token_hash" not in created_key.text
+    listed = client.get(
+        "/api/api-keys", headers=headers, params={"agent_id": agent["id"]}
+    )
+    assert listed.json()["items"][0]["token_prefix"].startswith("taak_")
+    assert raw_token not in listed.text
+    assert client.get("/api/api-keys", headers=headers).json() == listed.json()
+
+    api_headers = {
+        "Authorization": f"Bearer {raw_token}",
+        "Idempotency-Key": "public-run-1",
+    }
+    path = f"/api/v1/apps/{agent['id']}/runs"
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first, replay = list(
+            executor.map(
+                lambda _index: client.post(
+                    path,
+                    headers=api_headers,
+                    json={"inputs": {"request": "Hello"}},
+                ),
+                range(2),
+            )
+        )
+
+    assert first.status_code == replay.status_code == 202
+    assert replay.json() == first.json()
+    run_id = first.json()["run_id"]
+    run = client.app.state.store.get_run("tenant_acme", run_id)
+    client.app.state.store.append_chat_message(
+        "tenant_acme",
+        run.thread_id,
+        owner.id,
+        ChatMessageCreate(role="assistant", content="A later thread reply"),
+    )
+    result = client.get(f"{path}/{run_id}", headers=api_headers)
+    assert result.status_code == 200
+    assert result.json()["output"] is None
+    assert client.get(
+        f"{path}/{run_id}/events", headers=api_headers
+    ).status_code == 200
+    assert client.post(
+        path,
+        headers={"Authorization": f"Bearer {raw_token}"},
+        json={"inputs": {"request": "Hello"}, "version": 1},
+    ).status_code == 422
+
+    key_id = created_key.json()["key"]["id"]
+    assert client.delete(f"/api/api-keys/{key_id}", headers=headers).status_code == 200
+    assert client.get(f"{path}/{run_id}", headers=api_headers).status_code == 401
 
 
 def test_post_run_reuses_response_for_same_idempotency_key():
@@ -3842,7 +3961,7 @@ def test_execute_run_endpoint_completes_run():
         f"/api/runs/{created['run_id']}/artifacts",
         headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": "user_1"},
     )
-    assert [artifact["name"] for artifact in artifacts.json()] == ["agent-result.md"]
+    assert artifacts.json() == []
 
 
 def test_execute_run_endpoint_can_enqueue_run_for_worker():

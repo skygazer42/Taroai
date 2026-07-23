@@ -247,6 +247,16 @@ def test_knowledge_retrieval_filters_by_tenant_workspace_acl_and_sensitivity():
             clearance_level=1,
         )
     )
+    wrong_base_results = service.retrieve(
+        RetrievalRequest(
+            tenant_id="tenant_acme",
+            query="renewal pricing compliance",
+            allowed_workspace_ids=["workspace_sales"],
+            allowed_knowledge_base_ids=[finance_base.id],
+            acl_subjects=["team:sales"],
+            clearance_level=1,
+        )
+    )
     other_tenant_results = service.retrieve(
         RetrievalRequest(
             tenant_id="tenant_other",
@@ -261,6 +271,7 @@ def test_knowledge_retrieval_filters_by_tenant_workspace_acl_and_sensitivity():
     assert allowed_results[0].citation == {"section": "discovery"}
     assert allowed_results[0].sensitivity_level == 1
     assert [result.source_document_id for result in blocked_results] == ["sales_doc"]
+    assert wrong_base_results == []
     assert other_tenant_results == []
 
 

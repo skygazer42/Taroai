@@ -1,6 +1,8 @@
 import json
 from contextlib import asynccontextmanager
 from datetime import timedelta
+from ipaddress import ip_address
+from socket import SOCK_STREAM, getaddrinfo
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -19,6 +21,8 @@ from taroai.secrets import (
     SecretAccessDeniedError,
     SecretLeaseExpiredError,
     SecretNotFoundError,
+    SecretRef,
+    SecretScope,
     SecretService,
 )
 
@@ -29,6 +33,13 @@ class McpConnectorError(RuntimeError):
 
 class McpCredentialExpiredError(McpConnectorError):
     pass
+
+
+_BLOCKED_MCP_HOSTS = {
+    "instance-data",
+    "instance-data.ec2.internal",
+    "metadata.google.internal",
+}
 
 
 class McpConnectorConfig(BaseModel):
@@ -49,10 +60,24 @@ class McpConnectorConfig(BaseModel):
     @classmethod
     def validate_url(cls, value: str) -> str:
         parsed = urlsplit(value)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("MCP URL must use HTTP or HTTPS")
+        if parsed.scheme != "https" or not parsed.netloc:
+            raise ValueError("MCP URL must use HTTPS")
         if parsed.username or parsed.password or parsed.fragment:
             raise ValueError("MCP URL must not contain credentials or a fragment")
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if not host or host in _BLOCKED_MCP_HOSTS or host == "localhost":
+            raise ValueError("MCP URL must use a public host")
+        try:
+            parsed.port
+        except ValueError as error:
+            raise ValueError("MCP URL uses an invalid port") from error
+        try:
+            address = ip_address(host.split("%", 1)[0])
+        except ValueError:
+            address = None
+        if address is not None:
+            if not address.is_global:
+                raise ValueError("MCP URL must use a public host")
         return value
 
     @field_validator("auth_header")
@@ -71,10 +96,15 @@ class StreamableHttpMcpClient:
         headers: dict[str, str],
     ) -> list[dict[str, Any]]:
         try:
+            _assert_public_mcp_endpoint(config.url)
             return anyio.run(self._list_tools, config, headers)
         except McpConnectorError:
             raise
         except Exception as error:
+            if _credential_rejected(error):
+                raise McpCredentialExpiredError(
+                    "MCP server rejected the connector credential"
+                ) from error
             raise McpConnectorError("MCP tool discovery failed") from error
 
     def call_tool(
@@ -85,10 +115,15 @@ class StreamableHttpMcpClient:
         headers: dict[str, str],
     ) -> dict[str, Any]:
         try:
+            _assert_public_mcp_endpoint(config.url)
             return anyio.run(self._call_tool, config, name, arguments, headers)
         except McpConnectorError:
             raise
         except Exception as error:
+            if _credential_rejected(error):
+                raise McpCredentialExpiredError(
+                    "MCP server rejected the connector credential"
+                ) from error
             raise McpConnectorError("MCP tool call failed") from error
 
     @asynccontextmanager
@@ -173,10 +208,11 @@ def discover_mcp_capabilities(
         annotations = tool.get("annotations") or {}
         if not isinstance(annotations, dict):
             raise McpConnectorError("MCP server returned invalid tool annotations")
-        read_only = annotations.get("readOnlyHint") is True
         destructive = annotations.get("destructiveHint") is True
-        risk_level = "high" if destructive else "low" if read_only else "medium"
-        approval_required = not read_only
+        # MCP annotations are supplied by the remote server and are advisory only.
+        # A newly discovered third-party tool must not self-declare its way out of approval.
+        risk_level = "high" if destructive else "medium"
+        approval_required = True
         previous = existing.get(name)
         if previous is not None:
             risk_level = max(
@@ -239,6 +275,27 @@ def _config(connector: ConnectorDefinition) -> McpConnectorConfig:
         raise McpConnectorError(str(error)) from error
 
 
+def _assert_public_mcp_endpoint(url: str) -> None:
+    parsed = urlsplit(url)
+    host = parsed.hostname
+    if host is None:
+        raise McpConnectorError("MCP URL must use a public host")
+    try:
+        resolved = getaddrinfo(host, parsed.port or 443, type=SOCK_STREAM)
+    except OSError as error:
+        raise McpConnectorError("MCP server host could not be resolved") from error
+    if not resolved:
+        raise McpConnectorError("MCP server host could not be resolved")
+    try:
+        addresses = {
+            ip_address(str(item[4][0]).split("%", 1)[0]) for item in resolved
+        }
+    except ValueError as error:
+        raise McpConnectorError("MCP server resolved to an invalid address") from error
+    if any(not address.is_global for address in addresses):
+        raise McpConnectorError("MCP server must resolve only to public addresses")
+
+
 def _auth_headers(
     connector: ConnectorDefinition,
     secret_service: SecretService | None,
@@ -255,13 +312,31 @@ def _auth_headers(
         raise McpConnectorError("connector auth mode is not supported for MCP")
     if connector.credential_ref is None or secret_service is None:
         raise McpCredentialExpiredError("MCP connector credential is not configured")
+    credential_ref = connector.credential_ref
+    if credential_ref.secret_backend and credential_ref.secret_external_name:
+        secret_service.register_secret_ref(
+            SecretRef(
+                id=credential_ref.secret_ref_id,
+                tenant_id=connector.tenant_id,
+                workspace_id=connector.workspace_id,
+                name=f"{connector.display_name} credential",
+                scope=SecretScope(
+                    tenant_id=connector.tenant_id,
+                    workspace_id=connector.workspace_id,
+                    allowed_tool_names=[f"connector.{connector.id}.*"],
+                    actions=credential_ref.required_actions,
+                ),
+                backend=credential_ref.secret_backend,
+                external_name=credential_ref.secret_external_name,
+            )
+        )
     try:
         lease = secret_service.create_lease(
             tenant_id=connector.tenant_id,
             workspace_id=connector.workspace_id,
-            secret_id=connector.credential_ref.secret_ref_id,
+            secret_id=credential_ref.secret_ref_id,
             tool_name=f"connector.{connector.id}.{operation}",
-            actions=connector.credential_ref.required_actions,
+            actions=credential_ref.required_actions,
             ttl_seconds=config.lease_ttl_seconds,
         )
         value = secret_service.resolve_lease_value(
@@ -285,3 +360,26 @@ def _check_size(value: Any, limit: int) -> int:
     if size > limit:
         raise McpConnectorError("MCP response exceeds max_response_bytes")
     return size
+
+
+def _credential_rejected(error: BaseException) -> bool:
+    """识别 anyio ExceptionGroup 中被包装的上游 401/403。"""
+
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if getattr(getattr(current, "response", None), "status_code", None) in {
+            401,
+            403,
+        }:
+            return True
+        pending.extend(getattr(current, "exceptions", ()))
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return False

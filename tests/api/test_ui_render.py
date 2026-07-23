@@ -76,3 +76,38 @@ def test_ui_render_tool_emits_a_safe_structured_block():
     request.tool_input["content"] = "   "
     with pytest.raises(ToolExecutionError, match="must not be empty"):
         gateway.execute_request(request)
+
+
+def test_ui_render_tool_emits_bounded_interactive_elements():
+    store = EventStore()
+    gateway = ToolGateway()
+    register_ui_render_tool_handler(gateway, store)
+    result = gateway.execute_request(
+        ToolGatewayRequest(
+            tenant_id="tenant_1",
+            workspace_id="workspace_1",
+            user_id="user_1",
+            run_id="run_1",
+            step_id="step:interactive",
+            tool_name="ui.render",
+            tool_input={
+                "title": "下一步",
+                "content": "补充信息或直接继续。",
+                "form": {
+                    "fields": [{"name": "city", "label": "城市", "type": "text", "required": True}],
+                    "submit_label": "提交",
+                },
+                "actions": [{"label": "继续", "message": "继续处理"}],
+                "chart": {"labels": ["已完成", "待处理"], "values": [3, 1]},
+            },
+        )
+    )
+    elements = result.output["spec"]["elements"]
+    assert [elements[item]["type"] for item in elements["card"]["children"]] == [
+        "Text",
+        "BarChart",
+        "Form",
+        "Stack",
+    ]
+    assert elements["field-0"]["props"]["required"] is True
+    assert elements["action-0"]["props"]["message"] == "继续处理"

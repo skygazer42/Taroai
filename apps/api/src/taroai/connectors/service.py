@@ -3,11 +3,13 @@ from pydantic import BaseModel, Field
 from taroai.domain import utc_now
 
 from taroai.connectors.models import (
+    ConnectorAuthMode,
     ConnectorCredentialRef,
     ConnectorDefinition,
     ConnectorDefinitionCreate,
     ConnectorSyncStateUpdate,
     ConnectorStatus,
+    ConnectorType,
     ConnectorUpdateRequest,
 )
 
@@ -96,8 +98,18 @@ class InMemoryConnectorRegistry(BaseModel):
             raise ConnectorAccessDeniedError("connector credential is not in workspace")
         updated = connector.model_copy(
             update={
+                "auth_mode": (
+                    ConnectorAuthMode.MCP
+                    if connector.type == ConnectorType.MCP_SERVER
+                    and connector.auth_mode == ConnectorAuthMode.NONE
+                    else connector.auth_mode
+                ),
                 "credential_ref": credential_ref,
-                "status": ConnectorStatus.ENABLED,
+                "status": (
+                    ConnectorStatus.ENABLED
+                    if connector.status == ConnectorStatus.NEEDS_REAUTH
+                    else connector.status
+                ),
                 "updated_at": utc_now(),
             }
         )

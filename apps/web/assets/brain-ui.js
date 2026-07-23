@@ -60,7 +60,7 @@ export class AgentBrainUI {
       <section class="capability-page agent-brain-page">
         <header class="capability-page-header">
           <div><p>Workspace capabilities</p><h1>Agent Brain</h1><span>Control the skills and connected services available to every agent turn.</span></div>
-          <div class="capability-header-actions"><button type="button" class="primary" data-mcp-create>Add MCP server</button><button type="button" data-brain-refresh>Refresh</button></div>
+          <div class="capability-header-actions"><button type="button" data-learn-mcp-create>Microsoft Learn</button><button type="button" data-github-mcp-create>GitHub</button><button type="button" class="primary" data-mcp-create>Add MCP server</button><button type="button" data-brain-refresh>Refresh</button></div>
         </header>
         <nav class="skill-detail-tabs" aria-label="Agent Brain sections">
           <button class="is-active" data-brain-tab="connectors">Connectors</button>
@@ -151,10 +151,11 @@ export class AgentBrainUI {
     const capabilities = asArray(connector.capabilities);
     const oauth = connector.auth_mode === "oauth2";
     const enabled = connector.status === "enabled";
+    const needsCredential = connector.type === "mcp_server" && (connector.status === "needs_reauth" || (connector.status === "draft" && !connector.credential_ref));
     detail.innerHTML = `
       <header class="capability-detail-header">
         <div><span class="capability-glyph large">C</span><div><small>${connector.type.replaceAll("_", " ")}</small><h2></h2><p>${connector.id}</p></div></div>
-        <div>${oauth && !enabled ? `<button class="primary" data-connector-connect>${connector.status === "needs_reauth" ? "Reconnect" : "Connect"}</button>` : ""}<button data-connector-toggle>${enabled ? "Disable" : oauth ? "Enable after authorization" : "Enable"}</button></div>
+        <div>${needsCredential ? `<button class="primary" data-connector-credential>Add credential</button>` : ""}${oauth && !enabled ? `<button class="primary" data-connector-connect>${connector.status === "needs_reauth" ? "Reconnect" : "Connect"}</button>` : ""}<button data-connector-toggle>${enabled ? "Disable" : oauth ? "Enable after authorization" : "Enable"}</button></div>
       </header>
       <div class="skill-evidence-strip"><div><small>Status</small><strong>${connector.status}</strong></div><div><small>Authorization</small><strong>${connector.auth_mode}</strong></div><div><small>Capabilities</small><strong>${capabilities.length}</strong></div><div><small>Sensitivity</small><strong>${connector.sensitivity_level}</strong></div></div>
       <section class="connector-capability-grid"><header><h3>Available actions</h3><p>Only enabled capabilities are exposed to the Agent Loop.</p></header><div data-connector-capabilities></div></section>`;
@@ -186,55 +187,58 @@ export class AgentBrainUI {
     if (repositories) this.renderRepositories(repositories);
   }
 
-  openMcpConnectorEditor() {
+  openMcpConnectorEditor(preset = null, existingConnector = null) {
     const dialog = document.createElement("dialog");
     dialog.className = "chat-dialog";
-    dialog.innerHTML = `<form class="chat-dialog-card">
-      <header><div><small>Model Context Protocol</small><h2>Add MCP server</h2></div><button type="button" data-close aria-label="Close">×</button></header>
+    dialog.innerHTML = `<form class="chat-dialog-card" autocomplete="off">
+      <header><div><small>Model Context Protocol</small><h2>${existingConnector ? "Add MCP credential" : "Add MCP server"}</h2></div><button type="button" data-close aria-label="Close">×</button></header>
       <p>Taroai connects over Streamable HTTP and discovers the server's tools before enabling it.</p>
       <label><span>Name</span><input name="display_name" maxlength="160" autocomplete="off" placeholder="Company tools" required /></label>
       <label><span>Server URL</span><input name="url" type="url" inputmode="url" autocomplete="url" placeholder="https://mcp.example.com/mcp" required /></label>
-      <label><span>Secret reference ID <small>Optional · sent as a Bearer token</small></span><input name="secret_ref_id" autocomplete="off" placeholder="Secret Vault reference" /></label>
+      <label><span>Access token <small>Optional · stored in the Secret Vault and sent as Bearer</small></span><input name="token" type="password" autocomplete="new-password" placeholder="Paste token" ${preset?.tokenRequired || existingConnector ? "required" : ""} /></label>
       <footer><button type="button" data-close>Cancel</button><button class="primary" type="submit">Connect</button></footer>
     </form>`;
     document.body.append(dialog);
+    dialog.querySelector("[name='display_name']").value = existingConnector?.display_name || preset?.name || "";
+    dialog.querySelector("[name='url']").value = existingConnector?.metadata?.mcp?.url || preset?.url || "";
+    if (existingConnector) dialog.querySelectorAll("[name='display_name'], [name='url']").forEach((input) => { input.readOnly = true; });
     dialog.addEventListener("click", (event) => {
       if (event.target.closest("[data-close]")) dialog.close();
     });
     dialog.addEventListener("close", () => dialog.remove());
+    let created = existingConnector;
     dialog.querySelector("form").addEventListener("submit", async (event) => {
       event.preventDefault();
       const data = new FormData(event.currentTarget);
-      const secretRefId = String(data.get("secret_ref_id") || "").trim();
+      const token = String(data.get("token") || "").trim();
       const submit = event.currentTarget.querySelector("[type='submit']");
       submit.disabled = true;
       submit.textContent = "Discovering tools…";
-      let created = null;
       try {
-        created = await this.api.post("/api/connectors", {
-          workspace_id: this.api.settings().workspaceId,
-          type: "mcp_server",
-          display_name: String(data.get("display_name") || "").trim(),
-          auth_mode: secretRefId ? "api_key" : "none",
-          ...(secretRefId ? { credential: { secret_ref_id: secretRefId, required_actions: ["mcp.call"] } } : {}),
-          metadata: { mcp: { url: String(data.get("url") || "").trim() } },
-        }, { scope: "mcp-create" });
+        if (!created) {
+          created = await this.api.post("/api/connectors", {
+            workspace_id: this.api.settings().workspaceId,
+            type: "mcp_server",
+            display_name: String(data.get("display_name") || "").trim(),
+            auth_mode: token ? "mcp" : "none",
+            metadata: { mcp: { url: String(data.get("url") || "").trim() } },
+          }, { scope: "mcp-create" });
+        }
         this.selectedConnectorId = created.id;
+        if (token) {
+          await this.api.post(`/api/connectors/${encodeURIComponent(created.id)}/mcp-credential`, { value: token }, { scope: "mcp-credential" });
+        }
         await this.api.post(`/api/connectors/${encodeURIComponent(created.id)}/enable`, {}, { scope: "mcp-enable" });
+        event.currentTarget.elements.token.value = "";
         dialog.close();
         await this.load();
         await window.taroaiChat?.loadCapabilities?.();
         this.toast("MCP server connected", "success");
       } catch (error) {
-        if (created) {
-          dialog.close();
-          await this.load();
-          this.toast(`MCP server saved as a draft: ${error.message}`, "warning");
-          return;
-        }
         submit.disabled = false;
         submit.textContent = "Connect";
-        this.toast(error.message || "MCP server could not be added", "error");
+        if (created) await this.load();
+        this.toast(error.message || "MCP server could not be connected", "error");
       }
     });
     dialog.showModal();
@@ -306,6 +310,9 @@ export class AgentBrainUI {
     }
     if (button.matches("[data-brain-refresh]")) return this.load();
     if (button.matches("[data-mcp-create]")) return this.openMcpConnectorEditor();
+    if (button.matches("[data-learn-mcp-create]")) return this.openMcpConnectorEditor({ name: "Microsoft Learn", url: "https://learn.microsoft.com/api/mcp" });
+    if (button.matches("[data-github-mcp-create]")) return this.openMcpConnectorEditor({ name: "GitHub", url: "https://api.githubcopilot.com/mcp/readonly", tokenRequired: true });
+    if (button.matches("[data-connector-credential]")) return this.openMcpConnectorEditor(null, this.connectors.find((item) => item.id === this.selectedConnectorId));
     if (button.matches("[data-connector-connect]")) return this.connect();
     if (button.matches("[data-connector-toggle]")) return this.toggle();
     if (button.matches("[data-open-skills]")) window.location.hash = "skills";

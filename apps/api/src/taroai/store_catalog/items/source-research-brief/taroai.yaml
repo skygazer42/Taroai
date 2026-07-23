@@ -1,0 +1,28 @@
+{
+  "metadata": {
+    "id": "taroai.source-research-brief",
+    "version": "1.0.0",
+    "owner": "taroai/research"
+  },
+  "spec": {
+    "type": "workflow_skill",
+    "inputSchema": {
+      "type": "object",
+      "required": ["question"],
+      "properties": {
+        "question": {"type": "string", "minLength": 1},
+        "preferred_domains": {
+          "type": "array",
+          "items": {"type": "string"},
+          "maxItems": 10
+        }
+      },
+      "additionalProperties": false
+    },
+    "outputSchema": {"type": "string"},
+    "riskLevel": "low",
+    "visibility": "tenant",
+    "runtime": {"sandbox": "skill-package", "timeoutSeconds": 180},
+    "tools": ["web.search", "web.fetch"]
+  }
+}

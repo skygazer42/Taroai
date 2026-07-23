@@ -14,6 +14,13 @@ from taroai.connectors import (
     InMemoryConnectorRegistry,
 )
 from taroai.domain import RunCreate
+from taroai.identity import (
+    InMemoryIdentityService,
+    PasswordHasher,
+    Permission,
+    Role,
+    UserAccountCreate,
+)
 from taroai.secrets import (
     AwsSecretsManagerConfig,
     AwsSecretsManagerSecretService,
@@ -51,6 +58,33 @@ class RecordingHttpClient:
             headers={"content-type": "application/json"},
             body=b'{"ok":true}',
         )
+
+
+def create_connector_manager_identity():
+    identity = InMemoryIdentityService(password_hasher=PasswordHasher(salt="test_salt"))
+    account = identity.create_user(
+        UserAccountCreate(
+            tenant_id="tenant_acme",
+            email="secret-manager@example.com",
+            display_name="Secret Manager",
+            password="correct horse battery staple",
+        )
+    )
+    identity.create_role(
+        Role(
+            tenant_id="tenant_acme",
+            id="role_connector_manager",
+            name="Connector Manager",
+            permissions=[
+                Permission(
+                    action="connectors.manage",
+                    resource="tenant:tenant_acme",
+                )
+            ],
+        )
+    )
+    identity.assign_role("tenant_acme", account.id, "role_connector_manager")
+    return identity, account
 
 
 def test_local_secret_survives_a_fresh_process_without_plaintext_on_disk(tmp_path):
@@ -157,6 +191,11 @@ def test_secret_capture_is_tenant_scoped_and_rejects_empty_values():
         headers={"X-Tenant-ID": "tenant_other", "X-User-ID": "user_2"},
         json={"value": "not-used"},
     )
+    wrong_user = client.post(
+        f"/api/secret-captures/{capture.id}",
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": "user_2"},
+        json={"value": "not-used"},
+    )
     empty = client.post(
         f"/api/secret-captures/{capture.id}",
         headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": "user_1"},
@@ -164,6 +203,7 @@ def test_secret_capture_is_tenant_scoped_and_rejects_empty_values():
     )
 
     assert cross_tenant.status_code == 404
+    assert wrong_user.status_code == 403
     assert empty.status_code == 422
     assert store.get_secret_capture_request("tenant_acme", capture.id).status == "pending"
 
@@ -198,6 +238,7 @@ def test_secret_capture_reports_unavailable_backend_and_remains_pending():
 
 
 def test_captured_aws_secret_can_be_used_by_a_fresh_worker_process():
+    identity, connector_manager = create_connector_manager_identity()
     store = InMemoryControlPlaneStore()
     run = store.create_run(
         "tenant_acme",
@@ -244,6 +285,7 @@ def test_captured_aws_secret_can_be_used_by_a_fresh_worker_process():
         create_app(
             store=store,
             connector_registry=registry,
+            identity_service=identity,
             secret_service=AwsSecretsManagerSecretService(
                 config=config, client=secrets_client
             ),
@@ -251,7 +293,10 @@ def test_captured_aws_secret_can_be_used_by_a_fresh_worker_process():
         )
     ).post(
         f"/api/secret-captures/{capture.id}",
-        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": "user_1"},
+        headers={
+            "X-Tenant-ID": "tenant_acme",
+            "X-User-ID": connector_manager.id,
+        },
         json={"value": "captured-worker-secret"},
     )
 

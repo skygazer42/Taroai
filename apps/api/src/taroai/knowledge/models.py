@@ -108,6 +108,7 @@ class RetrievalRequest(BaseModel):
     tenant_id: str = Field(min_length=1)
     query: str = Field(min_length=1)
     allowed_workspace_ids: list[str] = Field(default_factory=list)
+    allowed_knowledge_base_ids: list[str] = Field(default_factory=list)
     acl_subjects: list[str] = Field(default_factory=list)
     clearance_level: int = Field(default=0, ge=0)
     limit: int = Field(default=5, ge=1, le=50)

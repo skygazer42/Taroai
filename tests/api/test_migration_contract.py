@@ -1380,6 +1380,7 @@ def test_unique_run_event_sequence_migration_repairs_existing_duplicates(tmp_pat
         "043_owner_connector_invoke_permission.sql",
         "044_notifications.sql",
         "045_tenant_invitations.sql",
+        "046_agent_api_keys.sql",
     ]
     with sqlite3.connect(sqlite_path) as connection:
         sequences = connection.execute(
@@ -1440,6 +1441,7 @@ def test_owner_connector_invoke_permission_migration_upgrades_existing_role(
         "043_owner_connector_invoke_permission.sql",
         "044_notifications.sql",
         "045_tenant_invitations.sql",
+        "046_agent_api_keys.sql",
     ]
     assert permission == ("tenant:tenant_acme",)
 
