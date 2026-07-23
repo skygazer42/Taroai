@@ -179,6 +179,8 @@ class MigrationRunner(BaseModel):
                 "no such table" in error_text
                 or "no such column" in error_text
             )
-            and normalized.startswith(("alter table", "update ", "create index"))
+            and normalized.startswith(
+                ("alter table", "update ", "create index", "create unique index")
+            )
         )
         return duplicate_column or missing_sqlite_upgrade_table

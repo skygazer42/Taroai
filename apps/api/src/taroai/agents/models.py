@@ -4,6 +4,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from taroai.domain import utc_now
+from taroai.model_gateway import ReasoningEffort
 
 
 class AgentVersionSpec(BaseModel):
@@ -29,6 +30,8 @@ class AgentDefinitionCreate(BaseModel):
     workspace_id: str = Field(min_length=1)
     name: str = Field(min_length=1, max_length=160)
     description: str = Field(default="", max_length=2000)
+    app_kind: Literal["agent", "workflow"] = "agent"
+    write_autonomy: Literal["approval_required", "full_auto"] = "approval_required"
     version: AgentVersionSpec
 
     model_config = ConfigDict(extra="forbid")
@@ -37,6 +40,8 @@ class AgentDefinitionCreate(BaseModel):
 class AgentDefinitionPatch(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=160)
     description: str | None = Field(default=None, max_length=2000)
+    app_kind: Literal["agent", "workflow"] | None = None
+    write_autonomy: Literal["approval_required", "full_auto"] | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -47,6 +52,8 @@ class AgentDefinition(BaseModel):
     workspace_id: str
     name: str
     description: str = ""
+    app_kind: Literal["agent", "workflow"] = "agent"
+    write_autonomy: Literal["approval_required", "full_auto"] = "approval_required"
     status: Literal["draft", "published", "archived"] = "draft"
     latest_version: int = 0
     published_version: int | None = None
@@ -90,6 +97,9 @@ class AgentRunRequest(BaseModel):
     input: dict[str, Any] = Field(default_factory=dict)
     version: int | None = Field(default=None, ge=1)
     mode: Literal["workflow", "autonomous"] | None = None
+    provider_id: str | None = Field(default=None, min_length=1)
+    model_id: str | None = Field(default=None, min_length=1)
+    reasoning_effort: ReasoningEffort | None = None
 
 
 class AgentImportRequest(BaseModel):
@@ -108,4 +118,3 @@ class AgentInvocation(BaseModel):
     message_id: str
     run_id: str
     events_url: str
-

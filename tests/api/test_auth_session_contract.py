@@ -1,5 +1,5 @@
 import pytest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from fastapi.testclient import TestClient
 
 from taroai.auth import (
@@ -17,6 +17,7 @@ from taroai.identity import (
 )
 from taroai.app import create_app
 from taroai.sso import InMemorySsoProviderRegistry, SsoProviderCreate
+from taroai.store import InMemoryControlPlaneStore
 
 
 def oidc_sso_provider_payload(password_fallback_enabled: bool = False) -> dict:
@@ -100,11 +101,206 @@ def test_auth_service_issues_and_validates_signed_access_tokens():
     assert claims.tenant_id == "tenant_acme"
     assert claims.user_id == login.user_id
     assert claims.email == "luke@example.com"
+    assert login.display_name == claims.display_name == "Luke"
     assert claims.role_ids == ["role_admin"]
 
     tampered_token = f"{login.access_token[:-1]}x"
     with pytest.raises(AuthRequiredError):
         auth_service.validate_token(tampered_token)
+
+
+def test_auth_endpoint_extends_only_remembered_sessions():
+    client = TestClient(
+        create_app(
+            identity_service=build_identity_service(),
+            settings=Settings(
+                access_token_secret="unit_test_secret",
+                access_token_ttl_seconds=900,
+                remembered_access_token_ttl_seconds=2_592_000,
+                _env_file=None,
+            ),
+        )
+    )
+    credentials = {
+        "tenant_id": "tenant_acme",
+        "email": "luke@example.com",
+        "password": "correct horse battery staple",
+    }
+
+    regular = client.post("/api/auth/login", json=credentials)
+    remembered = client.post(
+        "/api/auth/login",
+        json={**credentials, "remember_me": True},
+    )
+
+    assert regular.status_code == remembered.status_code == 200
+    regular_expiry = datetime.fromisoformat(
+        regular.json()["expires_at"].replace("Z", "+00:00")
+    )
+    remembered_expiry = datetime.fromisoformat(
+        remembered.json()["expires_at"].replace("Z", "+00:00")
+    )
+    assert remembered_expiry - regular_expiry > timedelta(days=29)
+
+
+def test_auth_session_endpoint_syncs_valid_session_and_hides_invalid_state():
+    client = TestClient(
+        create_app(
+            identity_service=build_identity_service(),
+            store=InMemoryControlPlaneStore(
+                workspace_tenants={
+                    "workspace_sales": "tenant_acme",
+                    "workspace_research": "tenant_acme",
+                }
+            ),
+            settings=Settings(access_token_secret="unit_test_secret", _env_file=None),
+        )
+    )
+    assert client.get("/api/auth/session").json() == {"authenticated": False}
+
+    login = client.post(
+        "/api/auth/login",
+        json={
+            "email": "luke@example.com",
+            "password": "correct horse battery staple",
+        },
+    ).json()
+    headers = {"Authorization": f"Bearer {login['access_token']}"}
+    session = client.get("/api/auth/session", headers=headers).json()
+
+    assert session["authenticated"] is True
+    assert session["tenant_id"] == "tenant_acme"
+    assert session["user_id"] == login["user_id"]
+    assert session["email"] == "luke@example.com"
+    assert session["display_name"] == "Luke"
+    assert session["workspace_id"] == "workspace_sales"
+
+    selected_session = client.get(
+        "/api/auth/session",
+        headers={**headers, "X-Workspace-ID": "workspace_research"},
+    ).json()
+    assert selected_session["workspace_id"] == "workspace_research"
+
+    client.post("/api/auth/logout", headers=headers)
+    assert client.get("/api/auth/session", headers=headers).json() == {
+        "authenticated": False
+    }
+
+
+def test_development_registration_creates_a_workspace_and_supports_login():
+    client = TestClient(
+        create_app(
+            identity_service=InMemoryIdentityService(
+                password_hasher=PasswordHasher(salt="test_salt")
+            ),
+            store=InMemoryControlPlaneStore(),
+            settings=Settings(
+                access_token_secret="unit_test_secret",
+                tenant_bootstrap_token="bootstrap_secret",
+                dev_request_headers_enabled=True,
+                _env_file=None,
+            ),
+        )
+    )
+    credentials = {
+        "display_name": "New User",
+        "email": "new.user@example.com",
+        "password": "correct horse battery staple",
+    }
+
+    registration = client.post("/api/auth/register", json=credentials)
+
+    assert registration.status_code == 201
+    tenant_id = registration.json()["tenant_id"]
+    workspace_id = registration.json()["starter_workspace_id"]
+    login = client.post(
+        "/api/auth/login",
+        json={
+            "tenant_id": tenant_id,
+            "email": credentials["email"],
+            "password": credentials["password"],
+        },
+    )
+    assert login.status_code == 200
+    assert login.json()["tenant_id"] == tenant_id
+    assert login.json()["workspace_id"] == workspace_id
+    assert login.json()["display_name"] == credentials["display_name"]
+
+
+def test_registration_is_disabled_outside_local_environments():
+    client = TestClient(
+        create_app(
+            settings=Settings(
+                access_token_secret="unit_test_secret",
+                tenant_bootstrap_token="bootstrap_secret",
+                environment="staging",
+                dev_request_headers_enabled=False,
+                _env_file=None,
+            )
+        )
+    )
+
+    response = client.post(
+        "/api/auth/register",
+        json={
+            "display_name": "New User",
+            "email": "new.user@example.com",
+            "password": "correct horse battery staple",
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "tenant_access_denied"
+
+
+@pytest.mark.parametrize("tenant_id", [None, "tenant_stale"])
+def test_auth_endpoint_resolves_unique_account_without_a_valid_tenant_hint(tenant_id):
+    client = TestClient(
+        create_app(
+            identity_service=build_identity_service(),
+            store=InMemoryControlPlaneStore(
+                workspace_tenants={"workspace_sales": "tenant_acme"}
+            ),
+            settings=Settings(access_token_secret="unit_test_secret", _env_file=None),
+        )
+    )
+    payload = {
+        "email": "luke@example.com",
+        "password": "correct horse battery staple",
+    }
+    if tenant_id is not None:
+        payload["tenant_id"] = tenant_id
+
+    response = client.post("/api/auth/login", json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["tenant_id"] == "tenant_acme"
+    assert response.json()["workspace_id"] == "workspace_sales"
+
+
+def test_auth_service_rejects_ambiguous_account_without_tenant_hint():
+    identity_service = build_identity_service()
+    identity_service.create_user(
+        UserAccountCreate(
+            tenant_id="tenant_other",
+            email="luke@example.com",
+            display_name="Other Luke",
+            password="correct horse battery staple",
+        )
+    )
+    auth_service = AuthService(
+        identity_service=identity_service,
+        access_token_secret="unit_test_secret",
+        access_token_ttl_seconds=900,
+    )
+
+    with pytest.raises(AuthInvalidCredentialsError, match="invalid credentials"):
+        auth_service.login(None, "luke@example.com", "correct horse battery staple")
+
+    login = auth_service.login(
+        "tenant_acme", "luke@example.com", "correct horse battery staple"
+    )
+    assert login.tenant_id == "tenant_acme"
 
 
 def test_auth_service_rejects_bad_password_and_disabled_user():
@@ -202,9 +398,13 @@ def test_auth_endpoint_applies_sso_password_fallback_policy():
 
 def test_auth_endpoint_token_can_replace_dev_headers_for_run_creation():
     identity_service = build_identity_service()
+    store = InMemoryControlPlaneStore(
+        workspace_tenants={"workspace_sales": "tenant_acme"}
+    )
     client = TestClient(
         create_app(
             identity_service=identity_service,
+            store=store,
             settings=Settings(
                 dev_request_headers_enabled=False,
                 access_token_secret="unit_test_secret",
@@ -241,6 +441,7 @@ def test_auth_endpoint_token_can_replace_dev_headers_for_run_creation():
     )
 
     assert login.status_code == 200
+    assert login.json()["workspace_id"] == "workspace_sales"
     assert unauthenticated.status_code == 401
     assert unauthenticated.json()["code"] == "auth_required"
     assert created.status_code == 201

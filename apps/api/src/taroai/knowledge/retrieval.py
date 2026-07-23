@@ -5,7 +5,7 @@ from taroai.knowledge.models import DocumentChunk, RetrievalRequest, RetrievalRe
 
 
 def retrieve_chunks(chunks: list[DocumentChunk], request: RetrievalRequest) -> list[RetrievalResult]:
-    query_terms = _terms(request.query)
+    query_terms = retrieval_terms(request.query)
     results: list[RetrievalResult] = []
     for chunk in chunks:
         if not _can_read(chunk, request):
@@ -46,19 +46,19 @@ def _score_chunk(
     chunk: DocumentChunk,
 ) -> float:
     if request.query_embedding and chunk.embedding:
-        return _cosine_similarity(request.query_embedding, chunk.embedding)
-    return _term_score(query_terms, chunk.content)
+        return cosine_similarity(request.query_embedding, chunk.embedding)
+    return term_relevance(query_terms, chunk.content)
 
 
-def _term_score(query_terms: set[str], content: str) -> float:
+def term_relevance(query_terms: set[str], content: str) -> float:
     if not query_terms:
         return 0
-    content_terms = _terms(content)
+    content_terms = retrieval_terms(content)
     matches = query_terms & content_terms
     return len(matches) / len(query_terms)
 
 
-def _cosine_similarity(query_embedding: list[float], chunk_embedding: list[float]) -> float:
+def cosine_similarity(query_embedding: list[float], chunk_embedding: list[float]) -> float:
     if len(query_embedding) != len(chunk_embedding):
         return 0
     query_norm = sqrt(sum(value * value for value in query_embedding))
@@ -72,5 +72,10 @@ def _cosine_similarity(query_embedding: list[float], chunk_embedding: list[float
     return max(0, score)
 
 
-def _terms(value: str) -> set[str]:
-    return {term for term in re.findall(r"[a-zA-Z0-9_]+", value.lower()) if term}
+def retrieval_terms(value: str) -> set[str]:
+    value = value.lower()
+    terms = set(re.findall(r"[a-z0-9_]+", value))
+    # ponytail: CJK bigrams are the no-service fallback; enable embeddings for semantic recall.
+    for text in re.findall(r"[\u3400-\u9fff]+", value):
+        terms.update(text[index : index + 2] for index in range(max(1, len(text) - 1)))
+    return terms

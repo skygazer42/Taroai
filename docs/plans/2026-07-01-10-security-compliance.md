@@ -1,6 +1,5 @@
 # Security and Compliance Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Add the security foundation required for an enterprise Agent Workspace: tenant isolation, RBAC/ABAC policy checks, secrets management, data classification, audit coverage, and safe sandbox/tool execution.
 

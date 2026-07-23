@@ -1,6 +1,5 @@
 # Testing, Release, and Quality Gates Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Define and implement the quality gates required to ship the enterprise Agent Workspace safely: unit, integration, contract, e2e, migration, security, performance, and release verification.
 

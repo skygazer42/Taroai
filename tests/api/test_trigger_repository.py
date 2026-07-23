@@ -168,6 +168,34 @@ def test_sql_trigger_store_updates_status_and_next_run_at(tmp_path: Path):
     assert updated.next_run_at == datetime(2026, 7, 3, 9, 0, tzinfo=timezone.utc)
     assert service.list_schedule_triggers()[0].id == trigger.id
 
+    deleted = service.delete_trigger("tenant_acme", trigger.id)
+
+    assert deleted.id == trigger.id
+    assert service.list_schedule_triggers() == []
+
+
+def test_sql_trigger_store_lists_schedules_across_tenants(tmp_path: Path):
+    config = prepare_database(tmp_path / "multi-tenant-triggers.sqlite3")
+    service = TriggerService(store=SqlTriggerStore(config=config))
+    first = service.create_trigger(scheduled_trigger_payload())
+    second = service.create_trigger(
+        scheduled_trigger_payload(
+            tenant_id="tenant_beta",
+            workspace_id="workspace_beta",
+            service_account_id="svc_beta",
+        )
+    )
+
+    assert [item.id for item in service.list_schedule_triggers()] == [first.id, second.id]
+
+
+def test_sql_trigger_store_accepts_predecoded_postgres_json(tmp_path: Path):
+    store = SqlTriggerStore(config=prepare_database(tmp_path / "postgres-json.sqlite3"))
+
+    assert store._loads({"message": "already decoded"}) == {
+        "message": "already decoded"
+    }
+
 
 def create_trigger_admin_identity():
     identity = InMemoryIdentityService(password_hasher=PasswordHasher(salt="test_salt"))

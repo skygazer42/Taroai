@@ -1,7 +1,7 @@
 import json
 from typing import Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
 from taroai.db import DatabaseConfig
 from taroai.db.connection import connect_database

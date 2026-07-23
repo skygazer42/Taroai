@@ -10,7 +10,13 @@ from taroai.app import create_app
 from taroai.audit import AuditService
 from taroai.config import Settings
 from taroai.db import DatabaseConfig, MigrationRunner
-from taroai.domain import RunStatus, utc_now
+from taroai.domain import (
+    ChatMessageCreate,
+    ChatThreadCreate,
+    RunCreate,
+    RunStatus,
+    utc_now,
+)
 from taroai.guardrails import (
     GuardrailAction,
     GuardrailCondition,
@@ -509,6 +515,140 @@ def test_post_run_returns_run_id_and_events_url():
     assert body["run_id"].startswith("run_")
     assert body["status"] == "created"
     assert body["events_url"] == f"/api/runs/{body['run_id']}/events"
+
+
+def test_agent_list_includes_real_run_count():
+    client = TestClient(create_app())
+    headers = {"X-Tenant-ID": "tenant_acme", "X-User-ID": "user_1"}
+    agent = client.post(
+        "/api/agents",
+        headers=headers,
+        json={
+            "workspace_id": "workspace_sales",
+            "name": "Sales agent",
+            "version": {
+                "instructions": "Prepare the sales brief.",
+                "skill_bindings": [
+                    {"id": "sales-brief", "version": "1.0.0"}
+                ],
+            },
+        },
+    ).json()["agent"]
+    parent_run = client.post(
+        "/api/runs",
+        headers=headers,
+        json={
+            "workspace_id": "workspace_sales",
+            "agent_id": agent["id"],
+            "message": "Prepare today's brief.",
+        },
+    ).json()
+    store = client.app.state.store
+    worker_thread = store.create_chat_thread(
+        "tenant_acme",
+        "user_1",
+        ChatThreadCreate(workspace_id="workspace_sales"),
+    )
+    worker_message = store.append_chat_message(
+        "tenant_acme",
+        worker_thread.id,
+        "user_1",
+        ChatMessageCreate(content="Workflow child", kind="workflow_task"),
+    )
+    store.create_run(
+        "tenant_acme",
+        "user_1",
+        RunCreate(
+            workspace_id="workspace_sales",
+            agent_id=agent["id"],
+            message="Workflow child",
+            thread_id=worker_thread.id,
+            trigger_message_id=worker_message.id,
+        ),
+    )
+
+    listed = client.get(
+        "/api/agents",
+        headers=headers,
+        params={"workspace_id": "workspace_sales"},
+    )
+
+    assert listed.status_code == 200
+    assert listed.json()[0]["run_count"] == 1
+    assert listed.json()[0]["skill_bindings"] == [
+        {"id": "sales-brief", "version": "1.0.0"}
+    ]
+    sessions = client.get(f"/api/agents/{agent['id']}/sessions", headers=headers)
+    assert [item["run_id"] for item in sessions.json()["sessions"]] == [
+        parent_run["run_id"]
+    ]
+    activity = client.get(f"/api/agents/{agent['id']}/activity", headers=headers)
+    assert [
+        item["run_id"]
+        for item in activity.json()["activity"]
+        if item["type"] == "agent.run"
+    ] == [parent_run["run_id"]]
+
+
+def test_agent_activity_records_create_and_metadata_updates():
+    client = TestClient(create_app())
+    headers = {"X-Tenant-ID": "tenant_acme", "X-User-ID": "user_1"}
+    agent = client.post(
+        "/api/agents",
+        headers=headers,
+        json={
+            "workspace_id": "workspace_sales",
+            "name": "Research agent",
+            "version": {"instructions": "Prepare a sourced brief."},
+        },
+    ).json()["agent"]
+
+    updated = client.patch(
+        f"/api/agents/{agent['id']}",
+        headers=headers,
+        json={"write_autonomy": "full_auto"},
+    )
+    activity = client.get(
+        f"/api/agents/{agent['id']}/activity", headers=headers
+    )
+
+    assert updated.status_code == 200
+    assert updated.json()["write_autonomy"] == "full_auto"
+    assert {item["type"] for item in activity.json()["activity"]} >= {
+        "agent.created",
+        "agent.updated",
+        "agent.version.created",
+    }
+
+
+def test_agent_files_expose_the_runtime_skill_and_config():
+    client = TestClient(create_app())
+    headers = {"X-Tenant-ID": "tenant_acme", "X-User-ID": "user_1"}
+    agent = client.post(
+        "/api/agents",
+        headers=headers,
+        json={
+            "workspace_id": "workspace_sales",
+            "name": "Research agent",
+            "app_kind": "agent",
+            "write_autonomy": "approval_required",
+            "version": {
+                "instructions": "Prepare a sourced brief.",
+                "input_schema": {"type": "object", "properties": {}},
+            },
+        },
+    ).json()["agent"]
+
+    response = client.get(f"/api/agents/{agent['id']}/files", headers=headers)
+
+    assert response.status_code == 200
+    files = {item["path"]: item for item in response.json()["files"]}
+    assert files["/workspace/agent/SKILL.md"]["content"] == (
+        "Prepare a sourced brief."
+    )
+    config = json.loads(files["/workspace/agent/config.json"]["content"])
+    assert config["agent_id"] == agent["id"]
+    assert config["write_autonomy"] == "approval_required"
 
 
 def test_post_run_reuses_response_for_same_idempotency_key():
@@ -1433,6 +1573,7 @@ def test_run_trace_returns_runtime_stage_spans_for_executed_run():
                     title="Research prospect",
                     tool_name="research.lookup",
                     tool_input={"query": "prospect"},
+                    approval_required=True,
                 )
             ]
         ),
@@ -1448,7 +1589,7 @@ def test_run_trace_returns_runtime_stage_spans_for_executed_run():
             "workspace_id": "workspace_sales",
             "agent_id": "agent_sales",
             "message": "Create a prospect brief.",
-            "mode": "workflow",
+            "mode": "autonomous",
         },
     ).json()
 
@@ -1456,12 +1597,19 @@ def test_run_trace_returns_runtime_stage_spans_for_executed_run():
         f"/api/runs/{created['run_id']}/execute",
         headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": auditor.id},
     )
+    approved = client.post(
+        f"/api/runs/{created['run_id']}/approvals",
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": auditor.id},
+        json={"approval_id": executed.json()["approval_id"]},
+    )
     trace = client.get(
         f"/api/runs/{created['run_id']}/trace",
         headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": auditor.id},
     )
 
     assert executed.status_code == 200
+    assert executed.json()["status"] == "awaiting_approval"
+    assert approved.status_code == 200
     assert trace.status_code == 200
     body = trace.json()
     root_span_id = f"run:{created['run_id']}"
@@ -2988,6 +3136,15 @@ def test_memory_api_reviews_candidates_before_active_reads_and_records_audit():
         f"/api/memory/{rejected_candidate.json()['id']}/reject",
         headers=headers,
     )
+    forgotten = client.delete(
+        f"/api/memory/{candidate.json()['id']}",
+        headers=headers,
+    )
+    active_after_forget = client.get(
+        "/api/memory",
+        headers=headers,
+        params={"scope_type": "team", "scope_id": "team_sales"},
+    )
     audit_events = client.get("/api/audit-events", headers=headers)
 
     assert candidate.status_code == 201
@@ -2998,11 +3155,14 @@ def test_memory_api_reviews_candidates_before_active_reads_and_records_audit():
         candidate.json()["id"]
     ]
     assert rejected.json()["status"] == "rejected"
+    assert forgotten.json()["status"] == "expired"
+    assert active_after_forget.json() == []
     assert [event["event_type"] for event in audit_events.json()] == [
         "memory.candidate_created",
         "memory.approved",
         "memory.candidate_created",
         "memory.rejected",
+        "memory.forgotten",
     ]
     assert "content" not in audit_events.json()[0]["metadata"]
 
@@ -3762,8 +3922,9 @@ def test_default_execute_run_requires_configured_model_gateway():
     assert failure_audits[0].run_id == created["run_id"]
     assert failure_audits[0].metadata["error_type"] == "ModelGatewayConfigurationError"
     assert "Create a prospect brief" not in str(failure_audits[0].metadata)
-    assert run_events[-1].type == "run.failed"
-    assert run_events[-1].payload["reason"] == "model_gateway_error"
+    failed = next(event for event in run_events if event.type == "run.failed")
+    assert failed.payload["reason"] == "model_gateway_error"
+    assert run_events[-1].type == "agent.loop.completed"
 
 
 def test_execute_run_denies_models_outside_enterprise_policy_without_provider_call():
@@ -3805,8 +3966,9 @@ def test_execute_run_denies_models_outside_enterprise_policy_without_provider_ca
     assert policy_audits[0].metadata["requested_model"] == "unapproved-model"
     assert policy_audits[0].metadata["allowed_models"] == ["approved-model"]
     assert "confidential prospect" not in str(policy_audits[0].metadata)
-    assert run_events[-1].type == "run.failed"
-    assert run_events[-1].payload["reason"] == "model_policy_denied"
+    failed = next(event for event in run_events if event.type == "run.failed")
+    assert failed.payload["reason"] == "model_policy_denied"
+    assert run_events[-1].type == "agent.loop.completed"
 
 
 def test_model_policy_api_updates_runtime_policy_before_provider_call():
@@ -4500,10 +4662,12 @@ def test_run_state_endpoint_returns_persisted_runtime_state():
     assert state.json()["current_step_id"] == "step_send"
     assert state.json()["plan"][0]["id"] == "step_send"
     assert state.json()["tool_results"] == []
+    assert state.json()["promoted_sandbox_artifact_paths"] == []
+    assert "state_payload" not in state.json()
     assert "updated_at" in state.json()
 
 
-def test_run_state_endpoint_returns_not_found_before_runtime_snapshot_exists():
+def test_run_state_endpoint_returns_initial_state_before_runtime_snapshot_exists():
     client = create_client_with_plan([])
     created = client.post(
         "/api/runs",
@@ -4520,8 +4684,11 @@ def test_run_state_endpoint_returns_not_found_before_runtime_snapshot_exists():
         headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": "user_1"},
     )
 
-    assert response.status_code == 404
-    assert response.json()["code"] == "not_found"
+    assert response.status_code == 200
+    assert response.json()["run_id"] == created["run_id"]
+    assert response.json()["status"] == "created"
+    assert response.json()["plan"] == []
+    assert "updated_at" in response.json()
 
 
 def test_approval_endpoint_resumes_paused_run():
@@ -4665,7 +4832,7 @@ def test_approval_endpoint_rejects_idempotency_key_reused_with_changed_body():
     assert second.json()["code"] == "idempotency_key_conflict"
 
 
-def test_approval_rejection_endpoint_fails_paused_run():
+def test_approval_rejection_endpoint_cancels_paused_run():
     client = create_client_with_plan(
         [
             PlannedToolCall(
@@ -4704,7 +4871,7 @@ def test_approval_rejection_endpoint_fails_paused_run():
     ]
 
     assert rejected.status_code == 200
-    assert rejected.json()["status"] == "failed"
+    assert rejected.json()["status"] == "cancelled"
     assert audits[0].metadata == {
         "approval_id": approval_id,
         "resolved_by_user_id": "manager_1",

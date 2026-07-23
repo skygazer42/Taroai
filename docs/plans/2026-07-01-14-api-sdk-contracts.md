@@ -1,6 +1,5 @@
 # API Contract and SDK Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Turn the backend API into a stable integration surface for the client portal, enterprise admins, solution engineers, custom skills, and future SDK users.
 

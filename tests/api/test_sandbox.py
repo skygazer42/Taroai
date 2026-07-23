@@ -23,6 +23,8 @@ from taroai.sandbox import (
     BrowserAction,
     BrowserActionType,
     SandboxCommand,
+    SandboxCommandResult,
+    SandboxCommandStatus,
     SandboxCreateRequest,
     SandboxFileWrite,
     SandboxNetworkMode,
@@ -39,9 +41,23 @@ from taroai.tool_gateway import (
     ToolExecutionError,
     ToolGateway,
     ToolGatewayRequest,
+    ToolSchemaValidationError,
     ToolSecretRequirement,
 )
 from tests.api.sandbox_adapters import InMemoryBrowserController, InMemorySandboxAdapter
+
+
+def test_sandbox_command_result_marks_nonzero_exit_as_failed():
+    result = SandboxCommandResult(
+        tenant_id="tenant_1",
+        workspace_id="workspace_1",
+        run_id="run_1",
+        session_id="sandbox_1",
+        command="exit 7",
+        exit_code=7,
+    )
+
+    assert result.status == SandboxCommandStatus.FAILED
 
 
 class RecordingBody:
@@ -404,6 +420,18 @@ def test_sandbox_tool_gateway_handler_executes_command_with_scope():
     gateway = ToolGateway()
     register_sandbox_tool_handlers(gateway, adapter)
 
+    policy = gateway.policies["sandbox.command"]
+    assert "python3 -c" in policy.description
+    assert "straightforward arithmetic" in policy.description
+    assert "explicitly requests code" in policy.description
+    assert policy.input_schema["properties"]["result_mode"]["enum"] == [
+        "raw_stdout",
+        "summarize",
+    ]
+    assert "omit for stdout-only work" in (
+        policy.input_schema["properties"]["artifact_paths"]["description"]
+    )
+
     result = gateway.execute_request(
         ToolGatewayRequest(
             tenant_id="tenant_acme",
@@ -475,6 +503,7 @@ def test_sandbox_tool_gateway_handler_injects_secret_lease_handles_without_secre
     command_env = adapter.commands[0].env
     lease_payload = json.loads(command_env["TAROAI_SECRET_LEASES"])
     assert result.output["exit_code"] == 0
+    assert adapter.commands[0].id == "step_code"
     assert command_env["TAROAI_SECRET_LEASE_COUNT"] == "1"
     assert lease_payload[0]["secret_ref_id"] == secret.id
     assert lease_payload[0]["tool_name"] == "sandbox.command"
@@ -579,6 +608,37 @@ def test_browser_tool_gateway_handler_applies_action_with_scope():
     assert result.tool_name == "browser.action"
     assert result.output["action_type"] == "navigate"
     assert result.output["current_url"] == "https://example.com"
+
+
+def test_browser_tool_contract_rejects_non_browser_actions_before_execution():
+    browser = InMemoryBrowserController()
+    session = browser.open_session(
+        tenant_id="tenant_acme",
+        workspace_id="workspace_sales",
+        run_id="run_1",
+        session_id="browser_1",
+    )
+    gateway = ToolGateway()
+    register_browser_tool_handlers(gateway, browser)
+
+    with pytest.raises(ToolSchemaValidationError, match="action_type.*must be one of"):
+        gateway.execute_request(
+            ToolGatewayRequest(
+                tenant_id="tenant_acme",
+                workspace_id="workspace_sales",
+                user_id="user_1",
+                run_id="run_1",
+                step_id="step_browser",
+                tool_name="browser.action",
+                tool_input={
+                    "session_id": session.session_id,
+                    "action_type": "generate_image",
+                },
+                granted_scopes=["browser.act"],
+            )
+        )
+
+    assert browser.get_session("tenant_acme", session.session_id).actions == []
 
 
 def test_browser_screenshot_content_is_not_serialized_in_observation_response():
@@ -1464,6 +1524,7 @@ def test_sandbox_api_requires_permissions_and_records_audit_billing():
 
 
 def test_sandbox_api_manages_files_snapshots_and_destroy_with_audit_billing():
+    file_content = b"\x89PNG\r\n\x1a\n\x00\xff"
     identity, operator, creator = create_sandbox_identity()
     store = InMemoryControlPlaneStore()
     storage_client = RecordingS3Client()
@@ -1517,15 +1578,15 @@ def test_sandbox_api_manages_files_snapshots_and_destroy_with_audit_billing():
         f"/api/sandbox/sessions/{session['id']}/files",
         headers=operator_headers,
         json={
-            "path": "/workspace/report.txt",
-            "content": "customer-secret",
-            "content_type": "text/plain",
+            "path": "/workspace/report.png",
+            "content_base64": base64.b64encode(file_content).decode("ascii"),
+            "content_type": "image/png",
         },
     )
     downloaded = client.get(
         f"/api/sandbox/sessions/{session['id']}/files",
         headers=operator_headers,
-        params={"path": "/workspace/report.txt"},
+        params={"path": "/workspace/report.png"},
     )
     snapshot = client.post(
         f"/api/sandbox/sessions/{session['id']}/snapshot",
@@ -1549,24 +1610,24 @@ def test_sandbox_api_manages_files_snapshots_and_destroy_with_audit_billing():
 
     assert forbidden_upload.status_code == 403
     assert uploaded.status_code == 201
-    assert uploaded.json()["size_bytes"] == len("customer-secret")
+    assert uploaded.json()["size_bytes"] == len(file_content)
     assert downloaded.status_code == 200
-    assert downloaded.json()["content"] == "customer-secret"
+    assert base64.b64decode(downloaded.json()["content_base64"]) == file_content
     sandbox_file_objects = [
         storage_object
         for storage_object in storage_objects.json()
         if storage_object["purpose"] == "sandbox-files"
     ]
     assert len(sandbox_file_objects) == 1
-    assert sandbox_file_objects[0]["content_type"] == "text/plain"
-    assert sandbox_file_objects[0]["filename"] == "report.txt"
-    assert sandbox_file_objects[0]["size_bytes"] == len("customer-secret")
+    assert sandbox_file_objects[0]["content_type"] == "image/png"
+    assert sandbox_file_objects[0]["filename"] == "report.png"
+    assert sandbox_file_objects[0]["size_bytes"] == len(file_content)
     sandbox_file_content = client.get(
         f"/api/storage/objects/{sandbox_file_objects[0]['id']}/content",
         headers=operator_headers,
     )
     assert sandbox_file_content.status_code == 200
-    assert sandbox_file_content.content == b"customer-secret"
+    assert sandbox_file_content.content == file_content
     assert snapshot.status_code == 200
     assert snapshot.json()["uri"].endswith("/snapshot.json")
     snapshot_objects = [
@@ -1594,8 +1655,8 @@ def test_sandbox_api_manages_files_snapshots_and_destroy_with_audit_billing():
         call for call in storage_client.put_calls if call["Key"] == snapshot_objects[0]["key"]
     )
     assert sandbox_file_put["Bucket"] == "taroai-artifacts"
-    assert sandbox_file_put["ContentType"] == "text/plain"
-    assert sandbox_file_put["Body"] == b"customer-secret"
+    assert sandbox_file_put["ContentType"] == "image/png"
+    assert sandbox_file_put["Body"] == file_content
     assert snapshot_put["Bucket"] == "taroai-artifacts"
     assert snapshot_put["ContentType"] == "application/json"
     assert snapshot_objects[0]["size_bytes"] == len(snapshot_put["Body"])
@@ -1605,7 +1666,7 @@ def test_sandbox_api_manages_files_snapshots_and_destroy_with_audit_billing():
     artifact_meters = [
         meter for meter in meters.json() if meter["meter_type"] == "artifact_bytes"
     ]
-    assert artifact_meters[0]["quantity"] == len("customer-secret")
+    assert artifact_meters[0]["quantity"] == len(file_content)
     audit_events = [
         event
         for event in audits.json()
@@ -1623,11 +1684,11 @@ def test_sandbox_api_manages_files_snapshots_and_destroy_with_audit_billing():
         "sandbox.snapshot.created",
         "sandbox.session.destroyed",
     ]
-    assert audit_events[0]["metadata"]["path"] == "/workspace/report.txt"
-    assert audit_events[0]["metadata"]["size_bytes"] == len("customer-secret")
+    assert audit_events[0]["metadata"]["path"] == "/workspace/report.png"
+    assert audit_events[0]["metadata"]["size_bytes"] == len(file_content)
     assert audit_events[0]["metadata"]["storage_object_id"] == sandbox_file_objects[0]["id"]
     assert audit_events[2]["metadata"]["storage_object_id"] == snapshot_objects[0]["id"]
-    assert "customer-secret" not in str(audit_events)
+    assert base64.b64encode(file_content).decode("ascii") not in str(audit_events)
 
 
 def test_default_browser_api_requires_configured_browser_provider():

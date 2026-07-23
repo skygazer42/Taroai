@@ -1,6 +1,5 @@
 # Private Deployment and Packaging Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Prepare the platform for BYOC, VPC, and private deployment by defining packaging, configuration, license checks, install validation, upgrades, air-gapped constraints, and customer-operated runbooks.
 

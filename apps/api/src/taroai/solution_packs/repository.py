@@ -1,5 +1,6 @@
 import json
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -300,7 +301,7 @@ class SqlSolutionPackRegistry(BaseModel):
     def _entry_from_row(self, row) -> SolutionPackEntry:
         return SolutionPackEntry(
             tenant_id=row["tenant_id"],
-            manifest=SolutionPackManifest.model_validate(json.loads(row["manifest"])),
+            manifest=SolutionPackManifest.model_validate(self._loads(row["manifest"])),
             status=SolutionPackStatus(row["status"]),
             created_by_user_id=row["created_by_user_id"],
             created_at=self._parse_dt(row["created_at"]),
@@ -312,8 +313,8 @@ class SqlSolutionPackRegistry(BaseModel):
             tenant_id=row["tenant_id"],
             pack_id=row["pack_id"],
             version=row["version"],
-            workspace_ids=json.loads(row["workspace_ids"])["items"],
-            installed_skill_ids=json.loads(row["installed_skill_ids"])["items"],
+            workspace_ids=self._loads(row["workspace_ids"])["items"],
+            installed_skill_ids=self._loads(row["installed_skill_ids"])["items"],
             status=SolutionPackInstallationStatus(row["status"]),
             installed_by_user_id=row["installed_by_user_id"],
             created_at=self._parse_dt(row["created_at"]),
@@ -323,8 +324,11 @@ class SqlSolutionPackRegistry(BaseModel):
     def _json(self, value: dict) -> str:
         return json.dumps(value, separators=(",", ":"))
 
+    def _loads(self, value: Any) -> Any:
+        return json.loads(value) if isinstance(value, str) else value
+
     def _dt(self, value: datetime) -> str:
         return value.isoformat()
 
-    def _parse_dt(self, value: str) -> datetime:
-        return datetime.fromisoformat(value)
+    def _parse_dt(self, value: datetime | str) -> datetime:
+        return datetime.fromisoformat(value) if isinstance(value, str) else value

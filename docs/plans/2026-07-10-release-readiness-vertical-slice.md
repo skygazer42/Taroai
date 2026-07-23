@@ -1,6 +1,5 @@
 # Taroai Release-Readiness Vertical Slice Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Deliver a verifiable internal-alpha release path that proves a real DeepSeek-backed Docker Compose run, persistent CREAO-style conversations with Manus-class execution UX, a deterministic 50-case agent-quality gate, and signed builder artifacts instead of a repository ZIP.
 
@@ -14,9 +13,9 @@
 
 - Approved design: **docs/plans/2026-07-10-release-readiness-vertical-slice-design.md**
 - Execute in the dependency order below. Do not skip a RED result, do not combine unrelated tasks, and do not promote after a failed gate.
-- Before implementation, invoke **superpowers:using-git-worktrees** because the primary workspace contains uncommitted CREAO frontend work. Preserve those changes and reconcile them deliberately when Tasks 15-18 touch the same files.
-- For every behavior change, invoke **superpowers:test-driven-development** and perform the named RED/GREEN sequence.
-- Before any completion, release, or promotion claim, invoke **superpowers:verification-before-completion**.
+- Preserve the primary workspace's uncommitted CREAO frontend work and reconcile it deliberately when Tasks 15-18 touch the same files.
+- For every behavior change, perform the named RED/GREEN sequence.
+- Before any completion, release, or promotion claim, run the named verification commands.
 - Use the existing DeepSeek-compatible values from the local untracked .env only for synthetic live verification. Never print, copy into evidence, or commit secret values.
 - Keep release profiles explicit:
   - internal-alpha requires hermetic, Compose, evaluation, frontend, and formal-builder gates.
@@ -49,7 +48,7 @@ Expected: the known frontend changes remain visible; no secret file content is d
 
 **Step 2: Create the isolated worktree**
 
-Invoke **superpowers:using-git-worktrees** and create a branch using the required **codex/** prefix from commit **6690f53** or its verified descendant.
+Create an isolated worktree and a branch using the required **codex/** prefix from commit **6690f53** or its verified descendant.
 
 **Step 3: Preserve, do not blindly apply, the dirty frontend work**
 
@@ -1696,8 +1695,8 @@ Publish promotion status from verified evidence only
 
 ## Final handoff checklist
 
-- Invoke **superpowers:requesting-code-review** after Tasks 1-21 and address only verified actionable findings.
-- Invoke **superpowers:verification-before-completion** again after fixes.
+- Review Tasks 1-21 after implementation and address only verified actionable findings.
+- Run the verification commands again after fixes.
 - Confirm no pending implementation tasks, zero known non-live errors, and every claimed gate has current evidence.
 - Do not stage local .env, generated credentials, raw prompts, screenshots containing secrets, or temporary worktree patches.
 - Do not push, publish packages, create a GitHub release, or label production without the user's explicit external-publication authority.

@@ -145,7 +145,7 @@ class SqlCustomerFeedbackService(InMemoryCustomerFeedbackService):
         for feedback in self.list_feedback(tenant_id):
             if not self._is_low_rated_run_feedback(feedback):
                 continue
-            if self._has_evaluation_candidate_for_feedback(feedback.id):
+            if self._has_evaluation_candidate_for_feedback(tenant_id, feedback.id):
                 continue
             candidate = FeedbackEvaluationCandidate(
                 id=new_id("eval_candidate"),
@@ -316,10 +316,19 @@ class SqlCustomerFeedbackService(InMemoryCustomerFeedbackService):
             (tenant_id, tenant_id, self._dt(utc_now())),
         )
 
-    def _has_evaluation_candidate_for_feedback(self, feedback_id: str) -> bool:
+    def _has_evaluation_candidate_for_feedback(
+        self,
+        tenant_id: str,
+        feedback_id: str,
+    ) -> bool:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT source_feedback_ids FROM customer_feedback_evaluation_candidates"
+                """
+                SELECT source_feedback_ids
+                FROM customer_feedback_evaluation_candidates
+                WHERE tenant_id = ?
+                """,
+                (tenant_id,),
             ).fetchall()
         return any(feedback_id in self._loads(row["source_feedback_ids"]) for row in rows)
 

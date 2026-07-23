@@ -24,6 +24,10 @@ def register_skill_tool_handlers(
     gateway.register_tool(
         ToolPolicy(
             tool_name=CREATE_SKILL_DRAFT_TOOL,
+            description=(
+                "Create a governed draft Skill package when the user explicitly asks "
+                "for a reusable Skill or workflow."
+            ),
             required_scopes=["skills.publish"],
             risk_level=ToolRiskLevel.MEDIUM,
             input_schema={

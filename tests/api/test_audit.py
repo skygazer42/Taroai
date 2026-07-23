@@ -386,7 +386,7 @@ def test_agent_runtime_records_model_and_tool_audit_through_audit_service():
             workspace_id="workspace_sales",
             agent_id="agent_sales",
             message="Create a prospect brief.",
-            mode="workflow",
+            mode="autonomous",
         ),
     )
     audit_service = RecordingAuditService()

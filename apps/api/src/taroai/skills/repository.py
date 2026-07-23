@@ -710,23 +710,6 @@ class SqlSkillRegistry(BaseModel):
         published_at = (
             now if status == SkillStatus.PUBLISHED else record.published_at
         )
-
-    def uninstall_for_workspace(
-        self,
-        tenant_id: str,
-        workspace_id: str,
-        skill_id: str,
-    ) -> SkillInstallation:
-        installation = self.get_installation(tenant_id, workspace_id, skill_id)
-        with self._connect() as connection:
-            connection.execute(
-                """
-                DELETE FROM skill_installations
-                WHERE tenant_id = ? AND workspace_id = ? AND skill_id = ?
-                """,
-                (tenant_id, workspace_id, skill_id),
-            )
-        return installation
         with self._connect() as connection:
             connection.execute(
                 """
@@ -760,6 +743,23 @@ class SqlSkillRegistry(BaseModel):
                 (status.value, self._dt(now), tenant_id, skill_id, version),
             )
         return self.get_package_record(tenant_id, skill_id, version)
+
+    def uninstall_for_workspace(
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        skill_id: str,
+    ) -> SkillInstallation:
+        installation = self.get_installation(tenant_id, workspace_id, skill_id)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                DELETE FROM skill_installations
+                WHERE tenant_id = ? AND workspace_id = ? AND skill_id = ?
+                """,
+                (tenant_id, workspace_id, skill_id),
+            )
+        return installation
 
     def _persist_package_installation(
         self,

@@ -9,7 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from taroai.billing import BillingPricingRule
 from taroai.db import DatabaseConfig
 from taroai.licensing import LicenseSignatureVerifier
-from taroai.model_gateway import ModelPolicyScope, ModelProviderConfig
+from taroai.model_gateway import ModelPolicyScope, ModelProviderConfig, ReasoningEffort
 from taroai.model_gateway.providers import validate_chat_request_options
 
 
@@ -131,7 +131,8 @@ class Settings(BaseSettings):
             "application/zip",
         ]
     )
-    secret_service_backend: Literal["memory", "aws_secrets_manager"] = "memory"
+    secret_service_backend: Literal["memory", "local", "aws_secrets_manager"] = "memory"
+    secret_service_local_path: Path = Path("/data/taroai/secrets.db")
     secret_service_region: str = "us-east-1"
     secret_service_endpoint_url: str = ""
     secret_service_name_prefix: str = "taroai"
@@ -158,6 +159,10 @@ class Settings(BaseSettings):
     sandbox_controller_base_url: str = ""
     sandbox_controller_api_key: str = Field(default="", repr=False)
     sandbox_controller_timeout_seconds: int = Field(default=30, ge=1)
+    e2b_api_key: str = Field(default="", repr=False)
+    e2b_template: str = ""
+    e2b_request_timeout_seconds: int = Field(default=30, ge=1)
+    e2b_max_session_ttl_seconds: int = Field(default=3600, ge=1)
     sandbox_docker_memory_limit: str = "1g"
     sandbox_docker_cpus: float = Field(default=1.0, gt=0)
     sandbox_docker_pids_limit: int = Field(default=256, ge=1)
@@ -174,6 +179,8 @@ class Settings(BaseSettings):
     browser_controller_base_url: str = ""
     browser_controller_api_key: str = ""
     browser_controller_timeout_seconds: int = Field(default=30, ge=1)
+    tavily_api_key: str = Field(default="", repr=False)
+    tavily_timeout_seconds: int = Field(default=15, ge=1)
     model_gateway_base_url: str = "https://api.openai.com/v1"
     model_gateway_api_key: str = Field(default="", repr=False)
     model_gateway_api_key_secret_ref_id: str = ""
@@ -181,6 +188,10 @@ class Settings(BaseSettings):
     model_gateway_model: str | None = None
     model_gateway_timeout_seconds: int = 30
     model_gateway_chat_request_options: dict[str, object] = Field(default_factory=dict)
+    model_gateway_reasoning_efforts: list[ReasoningEffort] = Field(
+        default_factory=list
+    )
+    model_gateway_default_reasoning_effort: ReasoningEffort | None = None
     model_gateway_providers: list[ModelProviderConfig] = Field(default_factory=list)
     embedding_gateway_enabled: bool = False
     embedding_gateway_base_url: str = "https://api.openai.com/v1"
@@ -281,6 +292,7 @@ class Settings(BaseSettings):
     password_hash_salt: str = "change_me_in_production"
     access_token_secret: str = "change_me_in_production"
     access_token_ttl_seconds: int = 3600
+    remembered_access_token_ttl_seconds: int = 2_592_000
     auth_session_backend: Literal["auto", "memory", "sql"] = "auto"
     audit_retention_days: int = Field(default=365, ge=1)
     trace_exporter_backend: Literal["disabled", "otlp_http"] = "disabled"
@@ -293,7 +305,6 @@ class Settings(BaseSettings):
     tenant_quota_profile: Literal["trial", "poc", "business", "enterprise"] = "poc"
     job_queue_backend: Literal["disabled", "redis"] = "disabled"
     run_execution_dispatch_mode: Literal["inline", "queue"] = "inline"
-    agent_runtime_mode: Literal["legacy", "loop_v2"] = "legacy"
     agent_loop_max_iterations: int = Field(default=12, ge=1)
     agent_loop_max_repairs: int = Field(default=4, ge=0)
     agent_loop_timeout_seconds: int = Field(default=1800, ge=1)
@@ -337,6 +348,11 @@ class Settings(BaseSettings):
             return None
         return value
 
+    @field_validator("model_gateway_default_reasoning_effort", mode="before")
+    @classmethod
+    def validate_optional_reasoning_effort(cls, value):
+        return None if value == "" else value
+
     @model_validator(mode="after")
     def validate_data_residency_primary_region(self) -> "Settings":
         if (
@@ -356,6 +372,14 @@ class Settings(BaseSettings):
                 "knowledge chunk overlap characters must be less than max characters"
             )
         validate_chat_request_options(dict(self.model_gateway_chat_request_options))
+        if (
+            self.model_gateway_default_reasoning_effort is not None
+            and self.model_gateway_default_reasoning_effort
+            not in self.model_gateway_reasoning_efforts
+        ):
+            raise ValueError(
+                "model gateway default reasoning effort must be listed in supported efforts"
+            )
         return self
 
     @model_validator(mode="after")
@@ -470,12 +494,16 @@ class Settings(BaseSettings):
             raise ValueError(f"{context} {verb} a non-local secret manager type")
         if self.secret_service_backend == "memory":
             raise ValueError(f"{context} {verb} a non-memory secret service backend")
+        if self.secret_service_backend == "local":
+            raise ValueError(f"{context} {verb} a non-local secret service backend")
 
     def _validate_enterprise_sandbox_provider(self, context: str, verb: str) -> None:
         if self.sandbox_provider not in ENTERPRISE_SANDBOX_PROVIDERS:
             raise ValueError(f"{context} {verb} an enterprise sandbox provider")
 
     def _validate_sandbox_controller_endpoint(self, context: str, verb: str) -> None:
+        if self.sandbox_provider == "e2b" and self.e2b_api_key.strip():
+            return
         if (
             self.sandbox_provider in ENTERPRISE_SANDBOX_PROVIDERS
             and not self.sandbox_controller_base_url.strip()
@@ -483,6 +511,8 @@ class Settings(BaseSettings):
             raise ValueError(f"{context} {verb} a sandbox controller endpoint")
 
     def _validate_sandbox_controller_auth(self, context: str, verb: str) -> None:
+        if self.sandbox_provider == "e2b" and self.e2b_api_key.strip():
+            return
         if self.sandbox_provider not in ENTERPRISE_SANDBOX_PROVIDERS:
             return
         if not self.sandbox_controller_api_key.strip():

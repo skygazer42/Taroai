@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -9,6 +10,7 @@ from taroai.customer_success import SqlCustomerFeedbackService
 from taroai.sandbox.adapter import SandboxAdapter
 from taroai.sandbox.browser import BrowserController, BrowserControllerCapabilities
 from taroai.sandbox.models import SandboxControllerCapabilities
+from taroai.secrets import AwsSecretsManagerSecretService
 
 
 class CapabilityReportingSandboxAdapter(SandboxAdapter):
@@ -91,6 +93,7 @@ def test_settings_have_safe_local_defaults():
     assert settings.object_storage_signed_url_ttl_seconds == 3600
     assert settings.object_storage_content_scan_blocked_terms == []
     assert settings.secret_service_backend == "memory"
+    assert settings.secret_service_local_path == Path("/data/taroai/secrets.db")
     assert settings.secret_service_region == "us-east-1"
     assert settings.secret_service_endpoint_url == ""
     assert settings.secret_service_name_prefix == "taroai"
@@ -130,6 +133,8 @@ def test_settings_have_safe_local_defaults():
     assert settings.model_gateway_model is None
     assert settings.model_gateway_timeout_seconds == 30
     assert settings.model_gateway_chat_request_options == {}
+    assert settings.model_gateway_reasoning_efforts == []
+    assert settings.model_gateway_default_reasoning_effort is None
     assert settings.model_gateway_providers == []
     assert settings.embedding_gateway_enabled is False
     assert settings.embedding_gateway_base_url == "https://api.openai.com/v1"
@@ -783,6 +788,57 @@ def test_app_exposes_container_health_and_readiness_endpoints():
     }
 
 
+def test_readyz_reports_missing_aws_secret_manager_credentials():
+    secret_service = AwsSecretsManagerSecretService(
+        client=SimpleNamespace(
+            _request_signer=SimpleNamespace(_credentials=None)
+        )
+    )
+    client = TestClient(
+        create_app(
+            settings=Settings(
+                secret_service_backend="aws_secrets_manager",
+                _env_file=None,
+            ),
+            secret_service=secret_service,
+        )
+    )
+
+    response = client.get("/readyz")
+    readiness = response.json()
+
+    assert response.status_code == 503
+    assert readiness["ready"] is False
+    assert readiness["checks"]["secret_service"] == {
+        "configured": False,
+        "backend": "aws_secrets_manager",
+        "credentials_configured": False,
+        "endpoint_configured": False,
+        "missing": ["aws_credentials"],
+    }
+
+
+def test_readyz_accepts_local_encrypted_secret_backend(tmp_path: Path):
+    response = TestClient(
+        create_app(
+            settings=Settings(
+                secret_service_backend="local",
+                secret_service_local_path=tmp_path / "secrets.db",
+                _env_file=None,
+            )
+        )
+    ).get("/readyz")
+
+    assert response.status_code == 200
+    assert response.json()["checks"]["secret_service"] == {
+        "configured": True,
+        "backend": "local",
+        "credentials_configured": None,
+        "endpoint_configured": False,
+        "missing": [],
+    }
+
+
 def test_readyz_reports_model_gateway_configured_for_execution():
     app = create_app(
         settings=Settings(
@@ -1113,7 +1169,6 @@ def test_local_cloud_poc_deployment_contract_files_are_env_driven():
     entrypoint = Path("apps/api/entrypoint.sh")
     operations_doc = Path("docs/operations/mvp-local-cloud-poc.md")
     env_example = Path(".env.example")
-    env_file = Path(".env")
     gitignore = Path(".gitignore")
     requirements = Path("apps/api/requirements.txt")
     browser_requirements = Path("apps/api/requirements-browser.txt")
@@ -1137,7 +1192,6 @@ def test_local_cloud_poc_deployment_contract_files_are_env_driven():
     assert entrypoint.exists()
     assert operations_doc.exists()
     assert env_example.exists()
-    assert not env_file.exists()
     assert browser_requirements.exists()
     assert local_cloud_poc_verifier.exists()
     assert model_gateway_verifier.exists()
@@ -1193,7 +1247,7 @@ def test_local_cloud_poc_deployment_contract_files_are_env_driven():
 
     assert "uvicorn" in dockerfile_text
     assert "taroai.app:app" in dockerfile_text
-    assert "USER taroai" not in dockerfile_text
+    assert "USER taroai" in dockerfile_text
     assert "uvicorn" in browser_dockerfile_text
     assert "taroai.sandbox.playwright_service:app" in browser_dockerfile_text
     assert "uvicorn" in sandbox_dockerfile_text
@@ -1246,7 +1300,7 @@ def test_local_cloud_poc_deployment_contract_files_are_env_driven():
         "TAROAI_TRIGGER_WEBHOOK_SIGNING_SECRETS: '${TAROAI_TRIGGER_WEBHOOK_SIGNING_SECRETS:-[\"replace-with-webhook-signing-secret\"]}'",
     ]:
         assert api_secret_env in compose_text
-    assert "TAROAI_BROWSER_PROVIDER: ${TAROAI_BROWSER_PROVIDER:-playwright}" in compose_text
+    assert "TAROAI_BROWSER_PROVIDER: ${TAROAI_BROWSER_PROVIDER:-disabled}" in compose_text
     assert (
         "TAROAI_SANDBOX_CONTROLLER_BASE_URL: "
         "${TAROAI_SANDBOX_CONTROLLER_BASE_URL:-http://sandbox-controller:8002}"
@@ -1309,17 +1363,27 @@ def test_local_cloud_poc_deployment_contract_files_are_env_driven():
     ]:
         assert api_only_env not in sandbox_controller_service_text
         assert api_only_env not in browser_controller_service_text
-    for model_gateway_env in [
-        "TAROAI_MODEL_GATEWAY_BASE_URL: ${TAROAI_MODEL_GATEWAY_BASE_URL:-https://api.openai.com/v1}",
-        "TAROAI_MODEL_GATEWAY_API_KEY: ${TAROAI_MODEL_GATEWAY_API_KEY:-}",
-        "TAROAI_MODEL_GATEWAY_API_KEY_SECRET_REF_ID: ${TAROAI_MODEL_GATEWAY_API_KEY_SECRET_REF_ID:-}",
-        "TAROAI_MODEL_GATEWAY_SECRET_LEASE_TTL_SECONDS: ${TAROAI_MODEL_GATEWAY_SECRET_LEASE_TTL_SECONDS:-60}",
-        "TAROAI_MODEL_GATEWAY_MODEL: ${TAROAI_MODEL_GATEWAY_MODEL:-}",
-        "TAROAI_MODEL_GATEWAY_TIMEOUT_SECONDS: ${TAROAI_MODEL_GATEWAY_TIMEOUT_SECONDS:-30}",
-        "TAROAI_MODEL_GATEWAY_CHAT_REQUEST_OPTIONS: '${TAROAI_MODEL_GATEWAY_CHAT_REQUEST_OPTIONS:-{}}'",
-        "TAROAI_MODEL_GATEWAY_PROVIDERS: '${TAROAI_MODEL_GATEWAY_PROVIDERS:-[]}'",
+    for model_gateway_key in [
+        "TAROAI_MODEL_GATEWAY_BASE_URL",
+        "TAROAI_MODEL_GATEWAY_API_KEY",
+        "TAROAI_MODEL_GATEWAY_API_KEY_SECRET_REF_ID",
+        "TAROAI_MODEL_GATEWAY_SECRET_LEASE_TTL_SECONDS",
+        "TAROAI_MODEL_GATEWAY_MODEL",
+        "TAROAI_MODEL_GATEWAY_TIMEOUT_SECONDS",
+        "TAROAI_MODEL_GATEWAY_CHAT_REQUEST_OPTIONS",
+        "TAROAI_MODEL_GATEWAY_REASONING_EFFORTS",
+        "TAROAI_MODEL_GATEWAY_DEFAULT_REASONING_EFFORT",
+        "TAROAI_MODEL_GATEWAY_PROVIDERS",
+        "TAROAI_EMBEDDING_GATEWAY_ENABLED",
+        "TAROAI_EMBEDDING_GATEWAY_BASE_URL",
+        "TAROAI_EMBEDDING_GATEWAY_API_KEY",
+        "TAROAI_EMBEDDING_GATEWAY_API_KEY_SECRET_REF_ID",
+        "TAROAI_EMBEDDING_GATEWAY_MODEL",
+        "TAROAI_EMBEDDING_GATEWAY_DIMENSIONS",
+        "TAROAI_EMBEDDING_GATEWAY_TIMEOUT_SECONDS",
     ]:
-        assert model_gateway_env in compose_text
+        assert f"      {model_gateway_key}:" not in api_service_text
+        assert f"{model_gateway_key}=" in env_text
     assert "POSTGRES_USER: ${POSTGRES_USER:-taroai_admin}" in compose_text
     assert "POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-taroai_admin}" in compose_text
     assert (
@@ -1332,12 +1396,13 @@ def test_local_cloud_poc_deployment_contract_files_are_env_driven():
     assert "TAROAI_RUN_MIGRATIONS" in entrypoint_text
     assert "MigrationRunner" in entrypoint_text
     assert "exec python - \"$@\" <<'PY'" in entrypoint_text
-    assert "Path(\"/data/taroai\")" in entrypoint_text
-    assert "os.setgid" in entrypoint_text
-    assert "os.setuid" in entrypoint_text
+    assert "install -d -o taroai -g taroai /data/taroai" in dockerfile_text
+    assert "chown_tree" not in entrypoint_text
+    assert "os.setgid" not in entrypoint_text
+    assert "os.setuid" not in entrypoint_text
     assert "os.execvp" in entrypoint_text
     assert "langgraph==" in requirements_text
-    assert "playwright" in requirements_text
+    assert "playwright" not in requirements_text
     assert "playwright" in browser_requirements_text
     assert "fastapi" in browser_requirements_text
     assert "cryptography" not in browser_requirements_text
@@ -1397,7 +1462,7 @@ def test_local_cloud_poc_deployment_contract_files_are_env_driven():
         "TAROAI_SANDBOX_CONTROLLER_API_KEY=local_sandbox_controller_key_2026_dev_only",
         'TAROAI_SANDBOX_CONTROLLER_KUBERNETES_ALLOWED_IMAGES=["ghcr.io/customer/sandbox-runtime@sha256:*"]',
         "TAROAI_SANDBOX_CONTROLLER_KUBERNETES_ORPHAN_CLEANUP_ENABLED=false",
-        "TAROAI_BROWSER_PROVIDER=playwright",
+        "TAROAI_BROWSER_PROVIDER=disabled",
         "TAROAI_BROWSER_CONTROLLER_BASE_URL=http://browser-controller:8001",
         "TAROAI_BROWSER_CONTROLLER_API_KEY=local_browser_controller_key_2026_dev_only",
         "TAROAI_BROWSER_CONTROLLER_PORT=8001",
@@ -1418,7 +1483,10 @@ def test_local_cloud_poc_deployment_contract_files_are_env_driven():
     assert ".env" in gitignore_text
     assert "!.env.example" in gitignore_text
     assert "a.out" in gitignore_text
-    assert "docker compose -f infra/docker-compose.yml up --build" in operations_text
+    assert (
+        "docker compose --env-file .env -f infra/docker-compose.yml up --build"
+        in operations_text
+    )
     assert "/readyz" in operations_text
     assert "http://localhost:8001/healthz" in operations_text
     assert "TAROAI_TENANT_BOOTSTRAP_TOKEN" in operations_text

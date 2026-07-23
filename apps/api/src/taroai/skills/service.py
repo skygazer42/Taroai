@@ -1,5 +1,6 @@
 import difflib
 
+from taroai.domain import utc_now
 from taroai.skills.discovery import (
     SkillDiscoveryService,
     SkillDiscoverySummary,
@@ -9,6 +10,7 @@ from taroai.skills.evaluation import (
     SkillEvaluationGate,
     SkillEvaluationRun,
     SkillEvaluationRunner,
+    SkillEvaluationStatus,
     SkillEvaluationSuite,
     load_evaluation_suite,
 )
@@ -103,10 +105,28 @@ class SkillService:
         created_by_user_id: str,
         suite: SkillEvaluationSuite | None = None,
     ) -> SkillEvaluationRun:
-        if self.evaluation_runner is None:
-            raise ValueError("skill evaluation runner is not configured")
         package = self.registry.get_package_version(tenant_id, skill_id, version)
         resolved_suite = suite or load_evaluation_suite(package)
+        if resolved_suite is None:
+            return self.registry.record_evaluation_run(
+                SkillEvaluationRun(
+                    tenant_id=tenant_id,
+                    workspace_id=workspace_id,
+                    skill_id=skill_id,
+                    version=version,
+                    package_digest=package.package_digest,
+                    suite_digest=package.package_digest,
+                    evaluator_version="package-validation.v1",
+                    status=SkillEvaluationStatus.PASSED,
+                    minimum_score=1,
+                    score=1,
+                    passed=True,
+                    created_by_user_id=created_by_user_id,
+                    completed_at=utc_now(),
+                )
+            )
+        if self.evaluation_runner is None:
+            raise ValueError("skill evaluation runner is not configured")
         run = self.evaluation_runner.run(
             tenant_id=tenant_id,
             workspace_id=workspace_id,

@@ -1,3 +1,5 @@
+import pytest
+
 from fastapi.testclient import TestClient
 
 from taroai.app import create_app
@@ -7,9 +9,12 @@ from taroai.connectors import (
     ConnectorCapability,
     ConnectorCredentialRef,
     ConnectorDefinitionCreate,
+    ConnectorOAuthService,
     ConnectorStatus,
     ConnectorType,
     InMemoryConnectorRegistry,
+    OAuthConnectorConfig,
+    RedisOAuthAuthorizationStateStore,
 )
 from taroai.identity import (
     InMemoryIdentityService,
@@ -42,6 +47,33 @@ class LocalOAuthTokenClient:
             "expires_in": 3600,
             "token_type": "Bearer",
         }
+
+
+class FakeRedis:
+    def __init__(self):
+        self.values = {}
+
+    def set(self, key, value, ex):
+        assert ex > 0
+        self.values[key] = value
+
+    def get(self, key):
+        return self.values.get(key)
+
+    def getdel(self, key):
+        return self.values.pop(key, None)
+
+
+def test_oauth_connector_rejects_non_http_urls():
+    with pytest.raises(ValueError, match="HTTP or HTTPS"):
+        OAuthConnectorConfig(
+            authorize_url="https://crm.example.com/oauth/authorize",
+            token_url="file:///etc/passwd",
+            callback_url="https://agent.example.com/api/connectors/oauth/callback",
+            client_id_secret_ref_id="secret_client_id",
+            client_secret_secret_ref_id="secret_client_secret",
+            access_token_secret_ref_id="secret_access_token",
+        )
 
 
 def create_connector_oauth_identity():
@@ -265,6 +297,59 @@ def test_connector_oauth_callback_rotates_token_secret_values_without_audit_leak
     assert "new-access-token-value" not in str(events[0].metadata)
     assert "new-refresh-token-value" not in str(events[0].metadata)
     assert "client-secret-value" not in str(events[0].metadata)
+
+
+def test_connector_oauth_shared_callback_resolves_connector_from_state():
+    identity, account = create_connector_oauth_identity()
+    registry = InMemoryConnectorRegistry()
+    secret_service, client_id, client_secret, access_token, refresh_token = create_oauth_secrets()
+    connector = register_oauth_connector(
+        registry,
+        client_id,
+        client_secret,
+        access_token,
+        refresh_token,
+    )
+    token_client = LocalOAuthTokenClient()
+    state_store = RedisOAuthAuthorizationStateStore(
+        url="redis://unused",
+        client=FakeRedis(),
+    )
+
+    def client():
+        return TestClient(
+            create_app(
+                identity_service=identity,
+                connector_registry=registry,
+                secret_service=secret_service,
+                connector_oauth_service=ConnectorOAuthService(
+                    secret_service=secret_service,
+                    token_client=token_client,
+                    state_store=state_store,
+                ),
+                settings=Settings(_env_file=None),
+            )
+        )
+
+    authorize = client().post(
+        f"/api/connectors/{connector.id}/oauth/authorize",
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": account.id},
+    ).json()
+
+    response = client().get(
+        "/api/connectors/oauth/callback",
+        params={"code": "provider-code-value", "state": authorize["state"]},
+    )
+
+    assert response.status_code == 200
+    assert "Connector connected successfully." in response.text
+    assert "new-access-token-value" not in response.text
+    assert token_client.calls[0][0] == "exchange_code"
+    assert resolve_secret(
+        secret_service,
+        connector.credential_ref.secret_ref_id,
+        "connector.oauth2.access",
+    ) == "new-access-token-value"
 
 
 def test_connector_oauth_refresh_rotates_tokens_without_returning_values():

@@ -30,7 +30,6 @@ from taroai.domain import (
     RunCreate,
     RunMode,
     RunStatus,
-    utc_now,
 )
 from taroai.store import InMemoryControlPlaneStore, NotFoundError, TenantAccessError
 
@@ -756,6 +755,33 @@ def test_sql_concurrent_message_appends_allocate_strict_thread_sequences(tmp_pat
         message.sequence
         for message in reopen_store().list_chat_messages("tenant_acme", thread.id)
     ] == [1, 2, 3, 4, 5, 6]
+
+
+def test_sql_concurrent_run_events_allocate_strict_sequences(tmp_path: Path):
+    store, reopen_store = build_sql_store(tmp_path)
+    run = store.create_run(
+        "tenant_acme",
+        "user_owner",
+        RunCreate(workspace_id="workspace_sales", message="Concurrent events"),
+    )
+    first_sequence = store.list_run_events("tenant_acme", run.id)[-1].sequence + 1
+    repositories = [reopen_store() for _ in range(6)]
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        events = list(
+            executor.map(
+                lambda indexed: indexed[1].append_run_event(
+                    run,
+                    "test.concurrent",
+                    {"index": indexed[0]},
+                ),
+                enumerate(repositories),
+            )
+        )
+
+    assert sorted(event.sequence for event in events) == list(
+        range(first_sequence, first_sequence + len(repositories))
+    )
 
 
 def test_sql_concurrent_observation_commits_allocate_strict_checkpoint_sequences(

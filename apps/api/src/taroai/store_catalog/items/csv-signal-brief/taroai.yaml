@@ -1,0 +1,38 @@
+{
+  "metadata": {
+    "id": "taroai.csv-signal-brief",
+    "version": "1.0.0",
+    "owner": "taroai/data"
+  },
+  "spec": {
+    "type": "data_skill",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "goal": {"type": "string"},
+        "focus_columns": {
+          "type": "array",
+          "items": {"type": "string"}
+        }
+      },
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "overview": {"type": "string"},
+        "findings": {"type": "array", "items": {"type": "string"}},
+        "caveats": {"type": "array", "items": {"type": "string"}}
+      },
+      "required": ["overview", "findings", "caveats"]
+    },
+    "requiredScopes": ["sandbox.execute"],
+    "riskLevel": "medium",
+    "visibility": "tenant",
+    "runtime": {
+      "sandbox": "skill-package",
+      "timeoutSeconds": 180
+    },
+    "tools": ["sandbox.command"]
+  }
+}

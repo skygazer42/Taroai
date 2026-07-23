@@ -43,6 +43,7 @@ from taroai.connectors.oauth import (
     OAuthConnectorConfig,
     OAuthRefreshRequest,
     OAuthTokenResponse,
+    RedisOAuthAuthorizationStateStore,
     UrlLibOAuthTokenClient,
 )
 from taroai.connectors.service import (
@@ -111,6 +112,7 @@ __all__ = [
     "OAuthConnectorConfig",
     "OAuthRefreshRequest",
     "OAuthTokenResponse",
+    "RedisOAuthAuthorizationStateStore",
     "SourceAclPrincipal",
     "SourceAclPrincipalType",
     "SqlConnectorRegistry",

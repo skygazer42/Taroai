@@ -1,5 +1,8 @@
 from fastapi.testclient import TestClient
 
+from taroai.agent import AgentRuntime, PlanStep
+from taroai.agent.loop import AgentExecutionServices
+from taroai.agent.models import AgentDecision
 from taroai.app import create_app
 from taroai.config import Settings
 from taroai.connectors import (
@@ -15,7 +18,14 @@ from taroai.connectors import (
     ConnectorType,
     InMemoryConnectorRegistry,
 )
-from taroai.domain import ApprovalStatus, RunCreate
+from taroai.domain import (
+    ApprovalStatus,
+    ChatMessageCreate,
+    ChatThreadCreate,
+    RunCreate,
+    RunMode,
+    RunStatus,
+)
 from taroai.identity import (
     InMemoryIdentityService,
     PasswordHasher,
@@ -24,6 +34,8 @@ from taroai.identity import (
     UserAccountCreate,
 )
 from taroai.store import InMemoryControlPlaneStore
+from taroai.model_gateway import PlannedToolCall
+from tests.api.adapters import DeterministicModelGateway
 
 
 def create_connector_operator_identity(
@@ -107,6 +119,7 @@ def registered_internal_api_connector(
     registry: InMemoryConnectorRegistry,
     *,
     approval_required: bool = False,
+    allowed_paths: list[str] | None = None,
 ):
     return registry.register_connector(
         ConnectorDefinitionCreate(
@@ -121,7 +134,7 @@ def registered_internal_api_connector(
                 "internal_api": {
                     "base_url": "https://internal.example.com",
                     "allowed_methods": ["GET"],
-                    "allowed_paths": ["/accounts/*"],
+                    "allowed_paths": allowed_paths or ["/accounts/*"],
                     "timeout_seconds": 4,
                 }
             },
@@ -134,12 +147,29 @@ def registered_internal_api_connector(
                     input_schema={
                         "type": "object",
                         "required": ["path"],
-                        "properties": {"path": {"type": "string"}},
+                        "properties": {
+                            "path": {"type": "string"},
+                            "method": {"type": "string"},
+                        },
                     },
                 )
             ],
         )
     )
+
+
+def test_agent_connector_schema_exposes_exact_internal_api_allowlist():
+    registry = InMemoryConnectorRegistry()
+    registered_internal_api_connector(registry, allowed_paths=["/healthz"])
+    store = InMemoryControlPlaneStore()
+    run = create_run(store, "user_1")
+    runtime = AgentRuntime(store=store, connector_registry=registry)
+
+    tool = AgentExecutionServices(runtime)._discover_connector_tools(run)[0]
+
+    properties = tool["input_schema"]["properties"]
+    assert properties["method"]["enum"] == ["GET"]
+    assert properties["path"]["enum"] == ["/healthz"]
 
 
 class LocalConnectorHttpClient:
@@ -244,6 +274,46 @@ def test_connector_invocation_service_requires_approval_for_guarded_capability()
     assert pending.billing_meter_type is None
     assert approved.status == ConnectorInvocationStatus.READY
     assert approved.billing_meter_type == "connector_invocation_count"
+
+
+def test_full_auto_agent_executes_guarded_connector_without_manual_approval():
+    store = InMemoryControlPlaneStore()
+    run = create_run(store, "user_1")
+    registry = InMemoryConnectorRegistry()
+    connector = registered_internal_api_connector(registry, approval_required=True)
+    http_client = LocalConnectorHttpClient(
+        ConnectorHttpResponse(status_code=200, body=b'{"ok":true}')
+    )
+    runtime = AgentRuntime(
+        store=store,
+        connector_registry=registry,
+        connector_dispatcher=ConnectorDispatchService(http_client=http_client),
+        connector_invocation_service=ConnectorInvocationService(),
+    )
+    state = runtime._initial_state(run)
+    state.runtime_metadata["agent_context"] = {"write_autonomy": "full_auto"}
+    step = PlanStep(
+        id="step_crm",
+        title="Look up account",
+        tool_name=f"connector.{connector.id}.search_accounts",
+        tool_input={"method": "GET", "path": "/accounts/42"},
+    )
+    decision = AgentDecision(
+        kind="action",
+        tool_name=step.tool_name,
+        tool_input=step.tool_input,
+    )
+    execution = AgentExecutionServices(runtime)
+
+    assert execution._requires_approval(state, run, decision, step) is False
+    assert execution._requires_approval(
+        state,
+        run,
+        decision.model_copy(update={"approval_required": True}),
+        step,
+    ) is True
+    execution._execute_connector_action(state, run, step)
+    assert len(http_client.requests) == 1
 
 
 def test_connector_invoke_api_records_safe_audit_and_meter_for_authorized_call():
@@ -368,11 +438,12 @@ def test_connector_invoke_api_returns_approval_required_without_billing():
     assert len(approvals) == 1
     assert approvals[0].id == response.json()["approval_id"]
     assert approvals[0].step_id == "step_crm"
+    assert approvals[0].kind == "connector_action"
     assert approvals[0].status == ApprovalStatus.PENDING
     assert approvals[0].reason == (
         f"connector approval required: {connector.id}:search_accounts"
     )
-    assert "Acme" not in str(approvals[0].model_dump(mode="json"))
+    assert approvals[0].preview_payload["input"] == {"account_name": "Acme"}
     assert [
         meter
         for meter in store.list_billing_meters("tenant_acme")
@@ -501,6 +572,10 @@ def test_connector_invoke_api_requires_resolved_approval_before_approved_dispatc
     assert approved.json()["approval_id"] == pending.json()["approval_id"]
     assert approved.json()["output"]["body"] == {"id": "acct_42"}
     assert len(http_client.requests) == 1
+    assert (
+        store.list_approval_requests("tenant_acme", run.id)[0].execution_status
+        == "applied"
+    )
 
     invoked_events = [
         event
@@ -621,3 +696,366 @@ def test_connector_invoke_api_denies_missing_scope_without_raw_input_in_audit():
     assert events[0].metadata["missing_scopes"] == ["crm.accounts.read"]
     assert events[0].metadata["input_keys"] == ["account_name"]
     assert "Acme" not in str(events[0].metadata)
+
+
+def test_thread_and_agent_action_manifest_approve_apply_is_idempotent():
+    identity, account = create_connector_operator_identity()
+    store = InMemoryControlPlaneStore()
+    registry = InMemoryConnectorRegistry()
+    connector = registered_internal_api_connector(registry, approval_required=True)
+    http_client = LocalConnectorHttpClient(
+        ConnectorHttpResponse(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            body=b'{"id":"acct_42"}',
+        )
+    )
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            store=store,
+            connector_registry=registry,
+            connector_dispatcher=ConnectorDispatchService(http_client=http_client),
+            settings=Settings(_env_file=None),
+        )
+    )
+    headers = {"X-Tenant-ID": "tenant_acme", "X-User-ID": account.id}
+    thread = store.create_chat_thread(
+        "tenant_acme",
+        account.id,
+        ChatThreadCreate(
+            workspace_id="workspace_sales",
+            title="Review CRM action",
+        ),
+    )
+    agent = client.post(
+        "/api/agents",
+        headers=headers,
+        json={
+            "workspace_id": "workspace_sales",
+            "name": "CRM agent",
+            "version": {"instructions": "Review and run the requested CRM action."},
+        },
+    ).json()["agent"]
+    run = store.create_run(
+        tenant_id="tenant_acme",
+        user_id=account.id,
+        payload=RunCreate(
+            workspace_id="workspace_sales",
+            agent_id=agent["id"],
+            thread_id=thread.id,
+            message="Look up account context",
+        ),
+    )
+    invoke = client.post(
+        f"/api/connectors/{connector.id}/invoke",
+        headers=headers,
+        json={
+            "run_id": run.id,
+            "step_id": "step_crm",
+            "capability_name": "search_accounts",
+            "tool_input": {"method": "GET", "path": "/accounts/42"},
+            "granted_scopes": ["crm.accounts.read"],
+        },
+    )
+
+    assert invoke.status_code == 202
+    manifest_id = invoke.json()["approval_id"]
+    thread_items = client.get(
+        f"/api/threads/{thread.id}/action-manifests",
+        headers=headers,
+    ).json()
+    agent_items = client.get(
+        f"/api/agentapps/{agent['id']}/action-manifests",
+        headers=headers,
+    ).json()
+    assert len(thread_items) == 1
+    assert agent_items == {"items": thread_items, "nextCursor": None}
+    assert {"createdAt", "resolvedAt", "error"} <= set(thread_items[0])
+    assert thread_items[0]["manifestId"] == manifest_id
+    assert thread_items[0]["provider"] == "Sales CRM API"
+    assert thread_items[0]["status"] == "approval_required"
+    assert thread_items[0]["approvalStatus"] == "approval_required"
+    assert thread_items[0]["preview"]["input"] == {
+        "method": "GET",
+        "path": "/accounts/42",
+    }
+    assert http_client.requests == []
+
+    approved = client.post(
+        f"/api/threads/{thread.id}/action-manifests/{manifest_id}/approve",
+        headers=headers,
+    )
+    applied = client.post(
+        f"/api/threads/{thread.id}/action-manifests/{manifest_id}/apply",
+        headers=headers,
+    )
+    replay = client.post(
+        f"/api/threads/{thread.id}/action-manifests/{manifest_id}/apply",
+        headers=headers,
+    )
+
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "approved"
+    assert applied.status_code == 200
+    assert applied.json()["status"] == "applied"
+    assert applied.json()["result"]["body"] == {"id": "acct_42"}
+    assert replay.status_code == 200
+    assert replay.json()["status"] == "applied"
+    assert "result" not in replay.json()
+    assert len(http_client.requests) == 1
+    assert [
+        event.payload["status"]
+        for event in store.list_run_events("tenant_acme", run.id)
+        if event.type == "action_approval"
+    ] == ["approval_required", "approved", "applying", "applied"]
+
+
+def test_runtime_connector_manifest_apply_resumes_agent_once():
+    identity, account = create_connector_operator_identity()
+    store = InMemoryControlPlaneStore()
+    registry = InMemoryConnectorRegistry()
+    connector = registered_internal_api_connector(registry, approval_required=True)
+    http_client = LocalConnectorHttpClient(
+        ConnectorHttpResponse(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            body=b'{"id":"acct_42"}',
+        )
+    )
+    dispatcher = ConnectorDispatchService(http_client=http_client)
+    thread = store.create_chat_thread(
+        "tenant_acme",
+        account.id,
+        ChatThreadCreate(workspace_id="workspace_sales", title="Run CRM action"),
+    )
+    trigger = store.append_chat_message(
+        "tenant_acme",
+        thread.id,
+        account.id,
+        ChatMessageCreate(content="Look up account 42"),
+    )
+    run = store.create_run(
+        tenant_id="tenant_acme",
+        user_id=account.id,
+        payload=RunCreate(
+            workspace_id="workspace_sales",
+            thread_id=thread.id,
+            trigger_message_id=trigger.id,
+            message=trigger.content,
+            mode=RunMode.AUTONOMOUS,
+        ),
+    )
+    runtime = AgentRuntime(
+        store=store,
+        model_gateway=DeterministicModelGateway(
+            plan=[
+                PlannedToolCall(
+                    id="step_crm",
+                    title="Look up account",
+                    tool_name=f"connector.{connector.id}.search_accounts",
+                    tool_input={"method": "GET", "path": "/accounts/42"},
+                ),
+                PlannedToolCall(
+                    id="step_crm_2",
+                    title="Look up another account",
+                    tool_name=f"connector.{connector.id}.search_accounts",
+                    tool_input={"method": "GET", "path": "/accounts/43"},
+                ),
+            ]
+        ),
+        connector_registry=registry,
+        connector_dispatcher=dispatcher,
+        connector_invocation_service=ConnectorInvocationService(),
+        full_auto_requires_isolation=False,
+    )
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            store=store,
+            runtime=runtime,
+            connector_registry=registry,
+            connector_dispatcher=dispatcher,
+            settings=Settings(
+                _env_file=None,
+                agent_loop_full_auto_requires_isolation=False,
+            ),
+        )
+    )
+    headers = {"X-Tenant-ID": "tenant_acme", "X-User-ID": account.id}
+
+    paused = runtime.execute_run("tenant_acme", run.id)
+    manifest = client.get(
+        f"/api/threads/{thread.id}/action-manifests",
+        headers=headers,
+    ).json()[0]
+
+    assert paused.status == RunStatus.AWAITING_APPROVAL
+    assert manifest["provider"] == "Sales CRM API"
+    assert manifest["preview"] == {
+        "connectorId": connector.id,
+        "capability": "search_accounts",
+        "riskLevel": "medium",
+        "inputKeys": ["method", "path"],
+        "input": {"method": "GET", "path": "/accounts/42"},
+    }
+
+    base = f"/api/threads/{thread.id}/action-manifests/{manifest['manifestId']}"
+    approved = client.post(f"{base}/approve", headers=headers)
+    applied = client.post(f"{base}/apply", headers=headers)
+    replay = client.post(f"{base}/apply", headers=headers)
+
+    assert approved.status_code == 200
+    assert applied.status_code == 200
+    assert applied.json()["status"] == "applied"
+    assert replay.status_code == 200
+    assert len(http_client.requests) == 1
+
+    second = client.get(
+        f"/api/threads/{thread.id}/action-manifests",
+        headers=headers,
+    ).json()[0]
+    assert second["manifestId"] != manifest["manifestId"]
+    assert second["status"] == "approval_required"
+    assert second["preview"]["input"]["path"] == "/accounts/43"
+
+    second_base = (
+        f"/api/threads/{thread.id}/action-manifests/{second['manifestId']}"
+    )
+    assert client.post(f"{second_base}/approve", headers=headers).status_code == 200
+    assert client.post(f"{second_base}/apply", headers=headers).status_code == 200
+    assert store.get_run("tenant_acme", run.id).status == RunStatus.SUCCEEDED
+    assert len(http_client.requests) == 2
+
+
+def test_runtime_connector_manifest_reject_terminates_agent():
+    identity, account = create_connector_operator_identity()
+    store = InMemoryControlPlaneStore()
+    registry = InMemoryConnectorRegistry()
+    connector = registered_internal_api_connector(registry, approval_required=True)
+    http_client = LocalConnectorHttpClient(
+        ConnectorHttpResponse(status_code=200, body=b'{"ok":true}')
+    )
+    dispatcher = ConnectorDispatchService(http_client=http_client)
+    thread = store.create_chat_thread(
+        "tenant_acme",
+        account.id,
+        ChatThreadCreate(workspace_id="workspace_sales", title="Reject CRM action"),
+    )
+    trigger = store.append_chat_message(
+        "tenant_acme",
+        thread.id,
+        account.id,
+        ChatMessageCreate(content="Do not run this account lookup"),
+    )
+    run = store.create_run(
+        tenant_id="tenant_acme",
+        user_id=account.id,
+        payload=RunCreate(
+            workspace_id="workspace_sales",
+            thread_id=thread.id,
+            trigger_message_id=trigger.id,
+            message=trigger.content,
+            mode=RunMode.AUTONOMOUS,
+        ),
+    )
+    runtime = AgentRuntime(
+        store=store,
+        model_gateway=DeterministicModelGateway(
+            plan=[
+                PlannedToolCall(
+                    id="step_crm",
+                    title="Look up account",
+                    tool_name=f"connector.{connector.id}.search_accounts",
+                    tool_input={"method": "GET", "path": "/accounts/42"},
+                )
+            ]
+        ),
+        connector_registry=registry,
+        connector_dispatcher=dispatcher,
+        connector_invocation_service=ConnectorInvocationService(),
+    )
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            store=store,
+            runtime=runtime,
+            connector_registry=registry,
+            connector_dispatcher=dispatcher,
+            settings=Settings(
+                _env_file=None,
+                agent_loop_full_auto_requires_isolation=False,
+            ),
+        )
+    )
+    headers = {"X-Tenant-ID": "tenant_acme", "X-User-ID": account.id}
+
+    assert runtime.execute_run("tenant_acme", run.id).status == RunStatus.AWAITING_APPROVAL
+    manifest = client.get(
+        f"/api/threads/{thread.id}/action-manifests",
+        headers=headers,
+    ).json()[0]
+    rejected = client.post(
+        f"/api/threads/{thread.id}/action-manifests/{manifest['manifestId']}/reject",
+        headers=headers,
+    )
+
+    assert rejected.status_code == 200
+    assert rejected.json()["status"] == "rejected"
+    assert store.get_run("tenant_acme", run.id).status == RunStatus.CANCELLED
+    assert http_client.requests == []
+    assert [
+        event.type for event in store.list_run_events("tenant_acme", run.id)
+    ][-2:] == ["agent.loop.completed", "action_approval"]
+
+
+def test_connector_preflight_fails_before_action_manifest_creation():
+    identity, account = create_connector_operator_identity()
+    store = InMemoryControlPlaneStore()
+    registry = InMemoryConnectorRegistry()
+    connector = registry.register_connector(
+        ConnectorDefinitionCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_sales",
+            type=ConnectorType.INTERNAL_API,
+            display_name="Disconnected CRM",
+            owner_user_id=account.id,
+            auth_mode=ConnectorAuthMode.NONE,
+            status=ConnectorStatus.ENABLED,
+            capabilities=[
+                ConnectorCapability(
+                    name="create_note",
+                    approval_required=True,
+                    input_schema={"type": "object"},
+                )
+            ],
+        )
+    )
+    run = create_run(store, account.id)
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            store=store,
+            connector_registry=registry,
+            settings=Settings(_env_file=None),
+        )
+    )
+    response = client.post(
+        f"/api/connectors/{connector.id}/invoke",
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": account.id},
+        json={
+            "run_id": run.id,
+            "step_id": "step_note",
+            "capability_name": "create_note",
+            "tool_input": {"path": "/notes", "json": {"text": "hello"}},
+            "granted_scopes": [],
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "connector_dispatch_failed"
+    assert store.list_approval_requests("tenant_acme", run.id) == []
+    assert all(
+        event.type != "action_approval"
+        for event in store.list_run_events("tenant_acme", run.id)
+    )

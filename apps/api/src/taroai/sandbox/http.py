@@ -148,6 +148,7 @@ class HttpSandboxAdapter(SandboxAdapter):
             command.model_dump(mode="json"),
             expected_statuses={200, 201},
             not_found_message=f"Sandbox session not found: {command.session_id}",
+            timeout_seconds=max(self.timeout_seconds, command.timeout_seconds + 5),
         )
         result = SandboxCommandResult.model_validate(response_body)
         self._validate_command_context(result, command)
@@ -325,6 +326,7 @@ class HttpSandboxAdapter(SandboxAdapter):
         body: dict[str, Any] | None,
         expected_statuses: set[int],
         not_found_message: str | None = None,
+        timeout_seconds: int | None = None,
     ) -> dict[str, Any]:
         if not self.base_url.strip():
             raise SandboxProviderUnavailableError(
@@ -345,7 +347,9 @@ class HttpSandboxAdapter(SandboxAdapter):
         )
         try:
             opener = build_opener(ProxyHandler({}))
-            with opener.open(request, timeout=self.timeout_seconds) as response:
+            with opener.open(
+                request, timeout=timeout_seconds or self.timeout_seconds
+            ) as response:
                 status_code = response.status
                 response_body = self._load_json(response.read())
         except HTTPError as error:
@@ -402,6 +406,8 @@ class HttpSandboxAdapter(SandboxAdapter):
     def _validate_provider_context(self, actual_provider: str) -> None:
         expected = self._normalized_provider(self.provider)
         actual = self._normalized_provider(actual_provider)
+        if expected == "http":
+            return
         if actual != expected:
             raise SandboxProviderUnavailableError(
                 "sandbox provider response context mismatch: "

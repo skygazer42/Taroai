@@ -30,7 +30,7 @@ class EmbeddingGatewayRequest(BaseModel):
     workspace_id: str | None = Field(default=None, min_length=1)
     user_id: str = Field(min_length=1)
     input: list[str] = Field(min_length=1)
-    purpose: Literal["knowledge_index", "knowledge_query"]
+    purpose: Literal["knowledge_index", "knowledge_query", "memory_query"]
     run_id: str | None = None
     model: str | None = None
     dimensions: int | None = Field(default=None, ge=1)

@@ -285,12 +285,8 @@ def test_mvp_acceptance_scenario_onboards_executes_approves_and_enforces_tenant_
         json={"approval_id": approval_id},
     )
     artifacts = client.get(f"/api/runs/{run_id}/artifacts", headers=headers)
-    storage_objects = client.get(
-        f"/api/runs/{run_id}/storage-objects",
-        headers=headers,
-    )
     downloaded = client.get(
-        f"/api/storage/objects/{storage_objects.json()[0]['id']}/content",
+        f"/api/storage/objects/{artifacts.json()[0]['storage_object_id']}/content",
         headers=headers,
     )
     events = client.get(f"/api/runs/{run_id}/events", headers=headers)
@@ -338,13 +334,13 @@ def test_mvp_acceptance_scenario_onboards_executes_approves_and_enforces_tenant_
             "context.loaded",
             "plan.created",
             "policy.checked",
-            "sandbox.session.created",
             "step.started",
             "tool_call.started",
-            "tool_call.completed",
-            "sandbox.command.executed",
+            "sandbox.session.created",
             "artifact.created",
             "sandbox.artifact.promoted",
+            "sandbox.command.executed",
+            "tool_call.completed",
             "approval.requested",
             "approval.resolved",
             "step.started",

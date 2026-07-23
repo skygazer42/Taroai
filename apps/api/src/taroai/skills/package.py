@@ -2,6 +2,7 @@ import hashlib
 import json
 import re
 import stat
+from textwrap import dedent
 import unicodedata
 import zipfile
 from enum import Enum
@@ -174,6 +175,15 @@ class ParsedSkillArchive(BaseModel):
 
 
 _FRONTMATTER_KEYS = {"name", "description", "license", "compatibility", "metadata"}
+_IGNORED_FRONTMATTER_KEYS = {
+    "allowed-tools",
+    "args",
+    "argument-hint",
+    "disable-model-invocation",
+    "homepage",
+    "tools",
+    "user-invokable",
+}
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+_-]{0,99}$")
 _DRIVE_RE = re.compile(r"^[A-Za-z]:")
@@ -266,7 +276,13 @@ def parse_skill_frontmatter(
     if end_index is None:
         raise SkillPackageError("SKILL.md frontmatter is missing a closing delimiter")
     values: dict[str, Any] = {}
-    for line_number, line in enumerate(lines[1:end_index], start=2):
+    seen: set[str] = set()
+    frontmatter_lines = lines[1:end_index]
+    index = 0
+    while index < len(frontmatter_lines):
+        line = frontmatter_lines[index]
+        line_number = index + 2
+        index += 1
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
@@ -276,11 +292,33 @@ def parse_skill_frontmatter(
             )
         key, raw_value = line.split(":", 1)
         key = key.strip()
-        if key not in _FRONTMATTER_KEYS:
+        if key not in _FRONTMATTER_KEYS | _IGNORED_FRONTMATTER_KEYS:
             raise SkillPackageError(f"unsupported SKILL.md frontmatter key: {key}")
-        if key in values:
+        if key in seen:
             raise SkillPackageError(f"duplicate SKILL.md frontmatter key: {key}")
-        values[key] = _parse_restricted_frontmatter_value(raw_value.strip(), key)
+        seen.add(key)
+        raw_value = raw_value.strip()
+        if re.fullmatch(r"[>|][+-]?", raw_value):
+            block: list[str] = []
+            while index < len(frontmatter_lines):
+                block_line = frontmatter_lines[index]
+                if block_line and not block_line.startswith((" ", "\t")):
+                    break
+                if block_line.lstrip(" ").startswith("\t"):
+                    raise SkillPackageError(
+                        f"tabs are forbidden in SKILL.md frontmatter block: {key}"
+                    )
+                block.append(block_line)
+                index += 1
+            value = dedent("\n".join(block)).strip()
+            if raw_value.startswith(">"):
+                value = re.sub(r"(?<!\n)\n(?!\n)", " ", value)
+            if not value:
+                raise SkillPackageError(f"SKILL.md frontmatter value is empty: {key}")
+        else:
+            value = _parse_restricted_frontmatter_value(raw_value, key)
+        if key in _FRONTMATTER_KEYS:
+            values[key] = value
     try:
         frontmatter = SkillFrontmatter.model_validate(values)
     except Exception as error:
@@ -727,4 +765,3 @@ def _validate_version(value: str) -> None:
 def _validate_sha256(value: str, label: str) -> None:
     if not _SHA256_RE.fullmatch(value):
         raise ValueError(f"{label} must be a lowercase SHA-256 hex digest")
-

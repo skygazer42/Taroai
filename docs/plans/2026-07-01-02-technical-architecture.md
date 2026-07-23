@@ -1,6 +1,5 @@
 # Taroai Technical Architecture Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Define the cloud-first technical architecture for an enterprise Agent Cloud Workspace with multi-tenant governance, agent runtime, sandbox execution, shared knowledge, reusable skills, memory, billing, and audit.
 

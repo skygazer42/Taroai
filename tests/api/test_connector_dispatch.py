@@ -8,6 +8,7 @@ from taroai.config import Settings
 from taroai.connectors import (
     ConnectorAuthMode,
     ConnectorCapability,
+    ConnectorCredentialExpiredError,
     ConnectorCredentialRef,
     ConnectorDefinitionCreate,
     ConnectorDispatchError,
@@ -37,6 +38,30 @@ class LocalConnectorHttpClient:
     def send(self, request):
         self.requests.append(request)
         return self.response
+
+
+def test_mcp_discovery_reports_missing_credentials_as_recoverable():
+    connector = InMemoryConnectorRegistry().register_connector(
+        ConnectorDefinitionCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_sales",
+            type=ConnectorType.MCP_SERVER,
+            display_name="Private MCP",
+            owner_user_id="user_admin",
+            auth_mode=ConnectorAuthMode.API_KEY,
+            credential_ref=ConnectorCredentialRef(
+                tenant_id="tenant_acme",
+                workspace_id="workspace_sales",
+                secret_ref_id="missing_secret",
+                required_actions=["mcp.call"],
+            ),
+            status=ConnectorStatus.ENABLED,
+            metadata={"mcp": {"url": "https://mcp.example.test/mcp"}},
+        )
+    )
+
+    with pytest.raises(ConnectorCredentialExpiredError):
+        ConnectorDispatchService().discover_mcp_capabilities(connector)
 
 
 def create_connector_operator_identity():
@@ -343,6 +368,27 @@ def test_internal_api_dispatch_sends_allowed_request_and_decodes_json_response()
         "body": {"id": "acct_42", "name": "Acme"},
     }
     assert result.response_size_bytes == len(response_body)
+
+
+def test_internal_api_dispatch_rejects_http_error_response():
+    registry = InMemoryConnectorRegistry()
+    connector = register_internal_api_connector(registry)
+    http_client = LocalConnectorHttpClient(
+        ConnectorHttpResponse(
+            status_code=403,
+            headers={"content-type": "application/json"},
+            body=b'{"error":"private downstream detail"}',
+        )
+    )
+
+    with pytest.raises(ConnectorDispatchError, match="connector returned HTTP 403") as raised:
+        ConnectorDispatchService(http_client=http_client).dispatch(
+            connector=connector,
+            tool_input={"method": "GET", "path": "/accounts/42"},
+        )
+
+    assert len(http_client.requests) == 1
+    assert "private downstream detail" not in str(raised.value)
 
 
 def test_internal_api_dispatch_injects_api_key_from_secret_reference_only():

@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from taroai.domain import utc_now
 
@@ -16,6 +16,12 @@ class AgentObservation(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class AgentResponseQuestion(BaseModel):
+    question: str = Field(min_length=1, max_length=300)
+    options: list[str] = Field(default_factory=list, max_length=6)
+    required: bool = True
+
+
 class AgentDecision(BaseModel):
     kind: Literal["action", "respond", "request_input", "replan"]
     rationale_summary: str = ""
@@ -26,6 +32,26 @@ class AgentDecision(BaseModel):
     approval_required: bool = False
     expected_outcome: str | None = None
     response_text: str | None = None
+    verification_required: bool = True
+    response_suggestions: list[str] = Field(default_factory=list, max_length=3)
+    response_options: list[str] = Field(default_factory=list, max_length=6)
+    response_questions: list[AgentResponseQuestion] = Field(
+        default_factory=list,
+        max_length=3,
+    )
+
+    @model_validator(mode="after")
+    def require_decision_payload(self):
+        if self.kind == "action" and not (self.tool_name or self.skill_id):
+            raise ValueError("action decisions require tool_name or skill_id")
+        if (
+            self.kind == "request_input"
+            and not (self.response_text or "").strip()
+            and not self.response_questions
+            and not self.response_options
+        ):
+            raise ValueError("request_input decisions require a prompt or choices")
+        return self
 
 
 class AgentVerificationResult(BaseModel):

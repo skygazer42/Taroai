@@ -1,6 +1,5 @@
 # Triggers, Scheduling, and Automation Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Add governed automation so agents can run from schedules, webhooks, API triggers, connector events, and approved agent-to-agent handoffs without turning the platform into uncontrolled background execution.
 

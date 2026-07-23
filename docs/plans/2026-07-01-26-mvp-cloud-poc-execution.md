@@ -1,6 +1,5 @@
 # MVP Cloud PoC Execution Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Turn the current in-memory backend foundation and 01-25 plan set into a concrete backend-first MVP cloud PoC execution sequence for the first enterprise Agent Workspace release.
 
@@ -182,7 +181,7 @@ Do not include in this milestone:
 - Knowledge bases, documents, and chunks have in-memory and SQLite-compatible SQL implementations behind the same service shape.
 - `TAROAI_KNOWLEDGE_SERVICE_BACKEND=sql` selects SQL knowledge persistence in the FastAPI app.
 - Knowledge document upload stores the source object and automatically creates retrievable chunks from uploaded content when explicit chunks are omitted, controlled by `TAROAI_KNOWLEDGE_CHUNK_MAX_CHARACTERS` and `TAROAI_KNOWLEDGE_CHUNK_OVERLAP_CHARACTERS`.
-- `TAROAI_EMBEDDING_GATEWAY_ENABLED=true` enables an OpenAI-compatible Embedding Gateway for API document chunk indexing and query/runtime query vectors; chunk embedding metadata is persisted in the knowledge service, embedding usage emits safe `embedding.gateway.called` audit records without raw text or vectors, and standalone knowledge API plus Agent Runtime retrieval calls emit `embedding_call_count` plus `embedding_tokens` meters when provider usage is returned. The selected durable vector backend remains a review decision.
+- `TAROAI_EMBEDDING_GATEWAY_ENABLED=true` enables an OpenAI-compatible Embedding Gateway for API document chunk indexing, knowledge query vectors, and conservative cross-language long-term-memory recall; chunk embedding metadata is persisted in the knowledge service, embedding usage emits safe `embedding.gateway.called` audit records without raw text or vectors, and standalone knowledge API plus Agent Runtime retrieval calls emit `embedding_call_count` plus `embedding_tokens` meters when provider usage is returned. The selected durable vector backend remains a review decision.
 - Long-term scoped memory has in-memory and SQLite-compatible SQL implementations behind the same `write` and `list_by_scope` service shape.
 - `TAROAI_LONG_TERM_MEMORY_BACKEND=sql` selects SQL long-term memory in the FastAPI app.
 - Short-term memory has in-memory and Redis-backed implementations behind the same `put` and `get` service shape.

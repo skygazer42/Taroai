@@ -1,6 +1,6 @@
 import json
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
 from taroai.evaluation.models import EvaluationSuite
 from taroai.evaluation.scorers import validate_json_schema

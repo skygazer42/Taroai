@@ -1,7 +1,7 @@
 import json
 from datetime import datetime, timedelta
 from typing import Any, Literal
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -65,6 +65,24 @@ def validate_chat_request_options(options: dict[str, Any]) -> dict[str, Any]:
     return options
 
 
+def validate_model_provider_base_url(value: str) -> str:
+    if any(ord(character) <= 0x20 or ord(character) == 0x7F for character in value):
+        raise ValueError("base_url must not contain whitespace or control characters")
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        parsed.port
+    except ValueError as error:
+        raise ValueError("base_url must be a valid HTTP or HTTPS URL") from error
+    if parsed.scheme not in {"http", "https"} or not hostname:
+        raise ValueError("base_url must be a valid HTTP or HTTPS URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("base_url must not contain credentials")
+    if "?" in value or "#" in value:
+        raise ValueError("base_url must not contain query or fragment")
+    return value
+
+
 class ModelProviderConfig(BaseModel):
     id: str = Field(min_length=1)
     display_name: str | None = None
@@ -92,6 +110,7 @@ class ModelProviderConfig(BaseModel):
 
     @model_validator(mode="after")
     def require_tenant_for_workspace(self):
+        validate_model_provider_base_url(self.base_url)
         if self.workspace_id is not None and self.tenant_id is None:
             raise ValueError("tenant_id is required when workspace_id is set")
         validate_chat_request_options(self.chat_request_options)

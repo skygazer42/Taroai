@@ -2,11 +2,11 @@ import json
 from datetime import datetime, timedelta
 from typing import Any
 from urllib.error import URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request as UrlRequest
 from urllib.request import urlopen
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from taroai.connectors.models import ConnectorAuthMode, ConnectorDefinition
 from taroai.domain import new_id, utc_now
@@ -36,6 +36,14 @@ class OAuthConnectorConfig(BaseModel):
     state_ttl_seconds: int = Field(default=600, ge=1)
     lease_ttl_seconds: int = Field(default=60, ge=1)
 
+    @field_validator("authorize_url", "token_url", "callback_url")
+    @classmethod
+    def validate_http_url(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("OAuth URLs must use HTTP or HTTPS")
+        return value
+
 
 class OAuthAuthorizationSession(BaseModel):
     tenant_id: str
@@ -47,6 +55,49 @@ class OAuthAuthorizationSession(BaseModel):
     reconnect_run_id: str | None = None
     reconnect_action_id: str | None = None
     opener_origin: str | None = None
+
+
+class RedisOAuthAuthorizationStateStore(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    url: str
+    key_prefix: str = "taroai:connector-oauth:state"
+    client: Any | None = Field(default=None, exclude=True)
+
+    def save(self, state: str, session: OAuthAuthorizationSession) -> None:
+        ttl = max(1, int((session.expires_at - utc_now()).total_seconds()))
+        self._client().set(self._key(state), session.model_dump_json(), ex=ttl)
+
+    def get(self, state: str) -> OAuthAuthorizationSession | None:
+        return self._decode(self._client().get(self._key(state)))
+
+    def pop(self, state: str) -> OAuthAuthorizationSession | None:
+        return self._decode(self._client().getdel(self._key(state)))
+
+    def _client(self):
+        if self.client is None:
+            import redis
+
+            object.__setattr__(
+                self,
+                "client",
+                redis.Redis.from_url(self.url, decode_responses=True),
+            )
+        return self.client
+
+    def _key(self, state: str) -> str:
+        return f"{self.key_prefix}:{state}"
+
+    @staticmethod
+    def _decode(value: str | bytes | None) -> OAuthAuthorizationSession | None:
+        if value is None:
+            return None
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+        try:
+            return OAuthAuthorizationSession.model_validate_json(value)
+        except ValueError:
+            return None
 
 
 class ConnectorOAuthAuthorizeResult(BaseModel):
@@ -144,14 +195,22 @@ class ConnectorOAuthService(BaseModel):
 
     secret_service: SecretService | None = None
     token_client: Any = Field(default_factory=UrlLibOAuthTokenClient)
+    state_store: Any | None = Field(default=None, exclude=True)
     pending_states: dict[str, OAuthAuthorizationSession] = Field(default_factory=dict)
 
     def pending_authorization(self, state: str) -> OAuthAuthorizationSession:
-        session = self.pending_states.get(state)
+        session = (
+            self.state_store.get(state)
+            if self.state_store is not None
+            else self.pending_states.get(state)
+        )
         if session is None:
             raise ConnectorOAuthError("OAuth state is invalid or already consumed")
         if session.expires_at <= utc_now():
-            self.pending_states.pop(state, None)
+            if self.state_store is not None:
+                self.state_store.pop(state)
+            else:
+                self.pending_states.pop(state, None)
             raise ConnectorOAuthError("OAuth state has expired")
         return session.model_copy(deep=True)
 
@@ -168,7 +227,7 @@ class ConnectorOAuthService(BaseModel):
         config = self._config(connector)
         resolved_now = now or utc_now()
         state = new_id("oauth_state")
-        self.pending_states[state] = OAuthAuthorizationSession(
+        session = OAuthAuthorizationSession(
             tenant_id=connector.tenant_id,
             workspace_id=connector.workspace_id,
             connector_id=connector.id,
@@ -179,6 +238,10 @@ class ConnectorOAuthService(BaseModel):
             reconnect_action_id=reconnect_action_id,
             opener_origin=opener_origin,
         )
+        if self.state_store is not None:
+            self.state_store.save(state, session)
+        else:
+            self.pending_states[state] = session
         client_id = self._secret_value(
             connector=connector,
             secret_id=config.client_id_secret_ref_id,
@@ -198,7 +261,7 @@ class ConnectorOAuthService(BaseModel):
             connector_id=connector.id,
             authorization_url=f"{config.authorize_url}?{query}",
             state=state,
-            expires_at=self.pending_states[state].expires_at,
+            expires_at=session.expires_at,
             reconnect_thread_id=reconnect_thread_id,
             reconnect_run_id=reconnect_run_id,
             reconnect_action_id=reconnect_action_id,
@@ -337,7 +400,11 @@ class ConnectorOAuthService(BaseModel):
         state: str,
         now: datetime,
     ) -> OAuthAuthorizationSession:
-        session = self.pending_states.pop(state, None)
+        session = (
+            self.state_store.pop(state)
+            if self.state_store is not None
+            else self.pending_states.pop(state, None)
+        )
         if session is None:
             raise ConnectorOAuthError("OAuth state is invalid")
         if (

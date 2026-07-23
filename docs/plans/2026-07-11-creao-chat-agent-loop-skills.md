@@ -1,6 +1,5 @@
 # CREAO Chat Agent Loop and Skills Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Turn Taroai's CREAO-style static Chat shell into a durable multi-turn agent product with a repair-capable Agent Loop, portable Skills, complete Chat interactions, interactive outputs, and reusable Agents.
 
@@ -15,12 +14,12 @@
 - Approved design: `docs/plans/2026-07-11-creao-chat-agent-loop-skills-design.md`.
 - Existing visual baseline: `docs/plans/2026-07-10-creao-chat-parity-design.md` and the current dirty `apps/web` changes. Preserve them.
 - Execute in a dedicated `codex/creao-chat-agent-loop-skills` worktree.
-- Use **@superpowers:test-driven-development** for every behavior change.
-- Use **@visual-verdict** after every visual iteration.
-- Before any completion claim use **@superpowers:verification-before-completion**.
+- Run a failing check before every behavior change.
+- Compare the rendered page after every visual iteration.
+- Run the named verification commands before any completion claim.
 - No new runtime or npm dependency is authorized. Use standard-library ZIP, URL, hashing, base64, and HTTP primitives. `SKILL.md` frontmatter supports the required strict scalar fields; optional `taroai.yaml` is accepted as JSON-compatible YAML in this slice. Arbitrary YAML requires separate explicit dependency approval.
 - Do not put a `while` around `_execute_planned_steps()`. It marks command failures terminal and destroys state; V2 must separate Action execution from Run finalization first.
-- Never stage `.env`, `.omx/`, credentials, generated recordings, screenshots, or test output.
+- Never stage `.env`, credentials, generated recordings, screenshots, or test output.
 - Every commit follows the repository Lore protocol and includes `Tested:` plus honest `Not-tested:` trailers.
 
 ## Slice A — Durable Thread and Agent Loop V2
@@ -40,7 +39,7 @@
 
 ```powershell
 $source = 'C:\Users\luke\Desktop\Taroai'
-$target = 'C:\Users\luke\.config\superpowers\worktrees\Taroai\creao-chat-agent-loop-skills'
+$target = 'C:\Users\luke\worktrees\Taroai\creao-chat-agent-loop-skills'
 $patch = Join-Path $env:TEMP 'taroai-creao-chat-visual.patch'
 $diffLines = git -C $source diff --binary -- apps/web/index.html apps/web/assets/main.js apps/web/assets/styles.css tests/web/test_workspace_frontend_contract.py
 [System.IO.File]::WriteAllLines($patch, $diffLines, [System.Text.UTF8Encoding]::new($false))
@@ -58,7 +57,7 @@ Copy-Item "$source\docs\plans\2026-07-10-creao-chat-parity-design.md" "$target\d
 Copy-Item "$source\docs\plans\2026-07-10-creao-chat-parity.md" "$target\docs\plans\2026-07-10-creao-chat-parity.md"
 ```
 
-Expected: no `.env` or `.omx` file is copied.
+Expected: no `.env`, credential, or generated test-state file is copied.
 
 **Step 3: Verify the preserved baseline before changing behavior**
 

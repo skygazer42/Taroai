@@ -1,6 +1,5 @@
 # Taroai Product Logic Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Define the product logic for an enterprise-deliverable Agent Cloud Workspace that gives employees governed cloud agent environments, shared knowledge, reusable skills, and lower cold-start cost.
 

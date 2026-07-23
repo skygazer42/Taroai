@@ -4,6 +4,7 @@ from fastapi.testclient import TestClient
 
 from taroai.app import create_app
 from taroai.config import Settings
+from taroai.connectors import ConnectorDispatchService
 from taroai.identity import (
     InMemoryIdentityService,
     PasswordHasher,
@@ -40,6 +41,96 @@ def create_connector_operator_identity(can_manage: bool = True, can_read: bool =
     )
     identity.assign_role("tenant_acme", account.id, "role_connector_admin")
     return identity, account
+
+
+class FakeMcpClient:
+    def __init__(self):
+        self.calls = []
+
+    def list_tools(self, config, headers):
+        assert config.url == "https://mcp.example.test/mcp"
+        assert headers == {}
+        return [
+            {
+                "name": "get_weather",
+                "description": "Get current weather",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["city"],
+                    "properties": {"city": {"type": "string"}},
+                },
+                "annotations": {"readOnlyHint": True},
+            },
+            {
+                "name": "delete_station",
+                "inputSchema": {"type": "object"},
+                "annotations": {"destructiveHint": True},
+            },
+        ]
+
+    def call_tool(self, config, name, arguments, headers):
+        self.calls.append((config.url, name, arguments, headers))
+        return {
+            "content": [{"type": "text", "text": "Sunny"}],
+            "structuredContent": {"temperature_c": 26},
+            "isError": False,
+        }
+
+
+def test_mcp_connector_discovers_tools_on_enable_and_dispatches_calls():
+    identity, account = create_connector_operator_identity()
+    fake_mcp = FakeMcpClient()
+    client = TestClient(
+        create_app(
+            identity_service=identity,
+            connector_dispatcher=ConnectorDispatchService(mcp_client=fake_mcp),
+        )
+    )
+    headers = {"X-Tenant-ID": "tenant_acme", "X-User-ID": account.id}
+    created = client.post(
+        "/api/connectors",
+        headers=headers,
+        json={
+            "workspace_id": "workspace_sales",
+            "type": "mcp_server",
+            "display_name": "Weather MCP",
+            "auth_mode": "none",
+            "metadata": {"mcp": {"url": "https://mcp.example.test/mcp"}},
+        },
+    )
+
+    enabled = client.post(
+        f"/api/connectors/{created.json()['id']}/enable",
+        headers=headers,
+    )
+
+    assert enabled.status_code == 200
+    capabilities = {item["name"]: item for item in enabled.json()["capabilities"]}
+    assert capabilities["get_weather"]["risk_level"] == "low"
+    assert capabilities["get_weather"]["approval_required"] is False
+    assert capabilities["get_weather"]["description"] == "Get current weather"
+    assert capabilities["delete_station"]["risk_level"] == "high"
+    assert capabilities["delete_station"]["approval_required"] is True
+
+    connector = client.app.state.connector_registry.get_connector(
+        "tenant_acme",
+        created.json()["id"],
+    )
+    result = client.app.state.connector_dispatcher.dispatch(
+        connector,
+        {"city": "Beijing"},
+        f"connector.{connector.id}.get_weather",
+    )
+
+    assert result.output["structured_content"] == {"temperature_c": 26}
+    assert fake_mcp.calls == [
+        (
+            "https://mcp.example.test/mcp",
+            "get_weather",
+            {"city": "Beijing"},
+            {},
+        )
+    ]
 
 
 def test_connector_api_creates_lists_and_reads_tenant_scoped_connector():

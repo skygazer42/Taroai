@@ -619,17 +619,6 @@ class InMemorySkillRegistry(BaseModel):
                 "updated_at": now,
             }
         )
-
-    def uninstall_for_workspace(
-        self,
-        tenant_id: str,
-        workspace_id: str,
-        skill_id: str,
-    ) -> SkillInstallation:
-        key = self._tenant_workspace_skill_key(tenant_id, workspace_id, skill_id)
-        installation = self.get_installation(tenant_id, workspace_id, skill_id)
-        del self.installations[key]
-        return installation
         self.packages[key] = updated_record
         version_key = self._tenant_skill_key(tenant_id, skill_id)
         self.version_entries[version_key] = [
@@ -644,6 +633,17 @@ class InMemorySkillRegistry(BaseModel):
                 update={"status": status, "updated_at": now}
             )
         return updated_record
+
+    def uninstall_for_workspace(
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        skill_id: str,
+    ) -> SkillInstallation:
+        key = self._tenant_workspace_skill_key(tenant_id, workspace_id, skill_id)
+        installation = self.get_installation(tenant_id, workspace_id, skill_id)
+        del self.installations[key]
+        return installation
 
     def _install_package_version(
         self,

@@ -1,6 +1,5 @@
 # Solution Packs and Customer Success Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Productize enterprise delivery by packaging industry templates, custom skills, onboarding assets, demo data, rollout checklists, adoption metrics, and success playbooks into reusable solution packs.
 

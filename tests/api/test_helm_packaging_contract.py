@@ -2,6 +2,8 @@ from pathlib import Path
 
 import yaml
 
+from taroai.config import DURABLE_DEPLOYMENT_BACKENDS
+
 
 CHART_DIR = Path("infra/helm/taroai")
 
@@ -11,7 +13,7 @@ def read_yaml(path: Path) -> dict:
         return yaml.safe_load(file)
 
 
-def test_helm_chart_metadata_and_values_define_private_packaging_path():
+def test_helm_chart_metadata_and_values_define_production_packaging_path():
     chart = read_yaml(CHART_DIR / "Chart.yaml")
     values = read_yaml(CHART_DIR / "values.yaml")
 
@@ -43,6 +45,12 @@ def test_helm_chart_metadata_and_values_define_private_packaging_path():
         assert section in values
 
     assert values["image"]["repository"] == "ghcr.io/creao-ai/taroai-api"
+    assert values["config"]["TAROAI_ENVIRONMENT"] == "production"
+    assert values["config"]["TAROAI_DEPLOYMENT_MODE"] == "cloud"
+    assert values["config"]["TAROAI_SANDBOX_PROVIDER"] == "e2b"
+    assert values["config"]["TAROAI_BROWSER_PROVIDER"] == "disabled"
+    for setting_name, backend in DURABLE_DEPLOYMENT_BACKENDS.items():
+        assert values["config"][f"TAROAI_{setting_name.upper()}"] == backend
     assert values["secrets"]["create"] is False
     assert values["secrets"]["existingSecret"] == "taroai-runtime-secrets"
     assert (
@@ -53,6 +61,8 @@ def test_helm_chart_metadata_and_values_define_private_packaging_path():
         values["secrets"]["secretKeys"]["browserControllerApiKey"]
         == "TAROAI_BROWSER_CONTROLLER_API_KEY"
     )
+    assert values["secrets"]["secretKeys"]["e2bApiKey"] == "TAROAI_E2B_API_KEY"
+    assert values["secrets"]["secretKeys"]["tavilyApiKey"] == "TAROAI_TAVILY_API_KEY"
     assert values["serviceAccount"]["create"] is True
     assert values["networkPolicy"]["enabled"] is True
     assert values["sandboxRuntimePolicy"]["enabled"] is True

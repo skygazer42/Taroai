@@ -1,6 +1,5 @@
 # Agent Runtime and Sandbox Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Turn the current in-memory Agent Runtime into a production-shaped runtime with explicit state persistence, bounded multi-agent delegation, policy checks, sandbox execution, and resumable approvals.
 

@@ -4,7 +4,16 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from taroai.audit import AuditActor, AuditEventCreate, AuditService
-from taroai.domain import RunCreate, RunMode, RunStatus, utc_now
+from taroai.domain import (
+    ChatMessageCreate,
+    ChatMessageDispatchStatus,
+    ChatThreadCreate,
+    ResourceReference,
+    RunCreate,
+    RunMode,
+    RunStatus,
+    utc_now,
+)
 from taroai.triggers.service import TriggerService
 from taroai.workers.models import (
     JobEnvelope,
@@ -78,6 +87,30 @@ class TriggerDueWorker(BaseModel):
             tenant_id=payload.tenant_id,
             trigger_id=payload.trigger_id,
         )
+        thread = None
+        message = None
+        resource_refs = []
+        if run_request.agent_id:
+            resource_refs = [ResourceReference(type="agent", id=run_request.agent_id)]
+            thread = self.store.create_chat_thread(
+                payload.tenant_id,
+                run_request.requested_by_user_id,
+                ChatThreadCreate(
+                    workspace_id=run_request.workspace_id,
+                    title=run_request.message[:160],
+                ),
+            )
+            message = self.store.append_chat_message(
+                payload.tenant_id,
+                thread.id,
+                run_request.requested_by_user_id,
+                ChatMessageCreate(
+                    content=run_request.message,
+                    kind="agent",
+                    dispatch_status=ChatMessageDispatchStatus.INFLIGHT,
+                    resource_refs=resource_refs,
+                ),
+            )
         run = self.store.create_run(
             tenant_id=payload.tenant_id,
             user_id=run_request.requested_by_user_id,
@@ -86,6 +119,9 @@ class TriggerDueWorker(BaseModel):
                 agent_id=run_request.agent_id,
                 message=run_request.message,
                 mode=RunMode.AUTONOMOUS,
+                thread_id=thread.id if thread else None,
+                trigger_message_id=message.id if message else None,
+                resource_refs=resource_refs,
             ),
         )
         audit_service = self.audit_service or AuditService(store=self.store)

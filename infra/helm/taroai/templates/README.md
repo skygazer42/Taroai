@@ -43,10 +43,11 @@ image. The web deployment serves only static assets, does not receive runtime
 secrets, and is validated by the package/install checks as the customer-facing
 workspace surface for local PoC and private package demos.
 
-For `TAROAI_SANDBOX_PROVIDER=k8s` or `e2b`, point
-`TAROAI_SANDBOX_CONTROLLER_BASE_URL` at the approved sandbox controller service
-and provide a generated `TAROAI_SANDBOX_CONTROLLER_API_KEY` through the runtime
-Secret for the HTTP sandbox controller adapter. The controller must expose
+The default `TAROAI_SANDBOX_PROVIDER=e2b` path uses `TAROAI_E2B_API_KEY` from
+the runtime Secret and does not require the packaged Sandbox Controller. For
+`TAROAI_SANDBOX_PROVIDER=k8s`, enable `sandboxController`, point
+`TAROAI_SANDBOX_CONTROLLER_BASE_URL` at that service, and provide a generated
+`TAROAI_SANDBOX_CONTROLLER_API_KEY`. The controller must expose
 `GET /capabilities` and declare network isolation, filesystem isolation,
 resource limits, destroy support, session TTL enforcement, maximum session TTL,
 tenant session capacity, and run session capacity before private install

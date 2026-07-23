@@ -1,6 +1,5 @@
 # Model Gateway and Provider Governance Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Build a governed model access layer so agents, skills, evaluations, and embeddings use approved providers through tenant-aware routing, budgets, audit, fallback, and observability.
 

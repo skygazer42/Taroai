@@ -27,27 +27,40 @@ class AuthService(BaseModel):
     session_store: AuthSessionStore = Field(default_factory=InMemoryAuthSessionStore)
     access_token_secret: str = Field(min_length=1)
     access_token_ttl_seconds: int = Field(gt=0)
+    remembered_access_token_ttl_seconds: int = Field(default=2_592_000, gt=0)
     sso_provider_registry: Any | None = None
 
     def login(
         self,
-        tenant_id: str,
+        tenant_id: str | None,
         email: str,
         password: str,
         now: datetime | None = None,
+        remember_me: bool = False,
     ) -> AuthLoginResult:
-        try:
-            account = self.identity_service.get_user_by_email(tenant_id, email)
-        except NotFoundError as error:
-            raise AuthInvalidCredentialsError("invalid credentials") from error
-        if account.status != "active":
+        accounts = self.identity_service.find_users_by_email(email)
+        matches = [
+            account
+            for account in accounts
+            if account.status == "active"
+            and self._password_login_allowed(account.tenant_id, account.email)
+            and self.identity_service.verify_password(
+                account.tenant_id, account.email, password
+            )
+        ]
+        preferred = [account for account in matches if account.tenant_id == tenant_id]
+        if len(preferred) == 1:
+            matches = preferred
+        if len(matches) != 1:
             raise AuthInvalidCredentialsError("invalid credentials")
-        if not self._password_login_allowed(tenant_id, account.email):
-            raise AuthInvalidCredentialsError("invalid credentials")
-        if not self.identity_service.verify_password(tenant_id, email, password):
-            raise AuthInvalidCredentialsError("invalid credentials")
+        account = matches[0]
         issued_at = now or utc_now()
-        expires_at = issued_at + timedelta(seconds=self.access_token_ttl_seconds)
+        ttl_seconds = (
+            self.remembered_access_token_ttl_seconds
+            if remember_me
+            else self.access_token_ttl_seconds
+        )
+        expires_at = issued_at + timedelta(seconds=ttl_seconds)
         session = self.session_store.create_session(
             tenant_id=account.tenant_id,
             user_id=account.id,
@@ -66,6 +79,7 @@ class AuthService(BaseModel):
             expires_at=claims.expires_at,
             tenant_id=claims.tenant_id,
             user_id=claims.user_id,
+            display_name=claims.display_name,
         )
 
     def authenticate_authorization_header(
@@ -136,6 +150,7 @@ class AuthService(BaseModel):
             tenant_id=account.tenant_id,
             user_id=account.id,
             email=account.email,
+            display_name=account.display_name,
             role_ids=self.identity_service.list_role_ids_for_user(account.tenant_id, account.id),
             issued_at=issued_at,
             expires_at=expires_at,

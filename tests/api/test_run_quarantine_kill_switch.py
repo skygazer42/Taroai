@@ -1,5 +1,12 @@
 from taroai.agent import AgentRuntime
-from taroai.domain import RunCreate, RunStatus
+from taroai.domain import (
+    ChatMessageCreate,
+    ChatMessageDeliveryStatus,
+    ChatMessageDispatchStatus,
+    ChatThreadCreate,
+    RunCreate,
+    RunStatus,
+)
 from taroai.incidents.quarantine import (
     InMemoryOperationalControlService,
     KillSwitchScope,
@@ -14,14 +21,30 @@ from tests.api.adapters import DeterministicModelGateway, DeterministicToolGatew
 
 def create_run(agent_id: str | None = "agent_sales"):
     store = InMemoryControlPlaneStore()
+    thread = store.create_chat_thread(
+        "tenant_acme",
+        "user_1",
+        ChatThreadCreate(workspace_id="workspace_sales"),
+    )
+    trigger = store.append_chat_message(
+        "tenant_acme",
+        thread.id,
+        "user_1",
+        ChatMessageCreate(
+            content="Investigate the customer incident.",
+            dispatch_status=ChatMessageDispatchStatus.INFLIGHT,
+        ),
+    )
     run = store.create_run(
         tenant_id="tenant_acme",
         user_id="user_1",
         payload=RunCreate(
             workspace_id="workspace_sales",
             agent_id=agent_id,
-            message="Investigate the customer incident.",
+            message=trigger.content,
             mode="autonomous",
+            thread_id=thread.id,
+            trigger_message_id=trigger.id,
         ),
     )
     return store, run
@@ -65,7 +88,7 @@ def test_operational_control_service_audits_quarantine_and_kill_switch_changes()
     }
 
 
-def test_agent_runtime_pauses_before_planning_when_run_is_quarantined():
+def test_agent_runtime_refuses_quarantined_run_before_planning():
     store, run = create_run()
     model_gateway = DeterministicModelGateway(
         plan=[
@@ -93,12 +116,19 @@ def test_agent_runtime_pauses_before_planning_when_run_is_quarantined():
 
     state = runtime.execute_run("tenant_acme", run.id)
 
-    assert state.status == RunStatus.AWAITING_POLICY
-    assert store.get_run("tenant_acme", run.id).status == RunStatus.AWAITING_POLICY
+    assert state.status == RunStatus.FAILED
+    assert store.get_run("tenant_acme", run.id).status == RunStatus.FAILED
     assert model_gateway.call_count == 0
+    trigger = store.get_chat_message("tenant_acme", run.trigger_message_id)
+    assert trigger.dispatch_status == ChatMessageDispatchStatus.FAILED
+    assert trigger.delivery_status == ChatMessageDeliveryStatus.FAILED
     events = store.list_run_events("tenant_acme", run.id)
-    assert events[-1].type == "policy.blocked"
-    assert events[-1].payload == {
+    assert [event.type for event in events[-3:]] == [
+        "policy.blocked",
+        "run.failed",
+        "agent.loop.completed",
+    ]
+    assert events[-3].payload == {
         "decision": "denied",
         "reason": "run is quarantined: incident_review",
         "target_type": "run",
@@ -135,12 +165,12 @@ def test_agent_runtime_denies_quarantined_skill_before_tool_execution():
 
     state = runtime.execute_run("tenant_acme", run.id)
 
-    assert state.status == RunStatus.AWAITING_POLICY
+    assert state.status == RunStatus.FAILED
     assert tool_gateway.call_counts == {}
     events = store.list_run_events("tenant_acme", run.id)
-    assert events[-1].type == "policy.blocked"
-    assert events[-1].payload["target_type"] == "skill"
-    assert events[-1].payload["target_id"] == "support.ticket_triage"
+    blocked = next(event for event in events if event.type == "policy.blocked")
+    assert blocked.payload["target_type"] == "skill"
+    assert blocked.payload["target_id"] == "support.ticket_triage"
 
 
 def test_agent_runtime_denies_sandbox_creation_when_tenant_kill_switch_is_enabled():
@@ -171,11 +201,11 @@ def test_agent_runtime_denies_sandbox_creation_when_tenant_kill_switch_is_enable
 
     state = runtime.execute_run("tenant_acme", run.id)
 
-    assert state.status == RunStatus.AWAITING_POLICY
+    assert state.status == RunStatus.FAILED
     assert tool_gateway.call_counts == {}
     events = store.list_run_events("tenant_acme", run.id)
-    assert events[-1].type == "policy.blocked"
-    assert events[-1].payload == {
+    blocked = next(event for event in events if event.type == "policy.blocked")
+    assert blocked.payload == {
         "decision": "denied",
         "reason": "sandbox_creation kill switch is enabled: sandbox_isolation_incident",
         "target_type": "kill_switch",
@@ -214,11 +244,11 @@ def test_agent_runtime_denies_high_risk_tool_when_kill_switch_is_enabled():
 
     state = runtime.execute_run("tenant_acme", run.id)
 
-    assert state.status == RunStatus.AWAITING_POLICY
+    assert state.status == RunStatus.FAILED
     assert tool_gateway.call_counts == {}
     events = store.list_run_events("tenant_acme", run.id)
-    assert events[-1].type == "policy.blocked"
-    assert events[-1].payload == {
+    blocked = next(event for event in events if event.type == "policy.blocked")
+    assert blocked.payload == {
         "decision": "denied",
         "reason": "high_risk_tools kill switch is enabled: tenant_incident",
         "target_type": "kill_switch",

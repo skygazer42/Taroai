@@ -1,4 +1,4 @@
-import { chatApi } from "./chat-api.js";
+import { chatApi } from "./chat-api.js?v=20260722-flow115";
 
 function items(payload) {
   if (Array.isArray(payload)) return payload;

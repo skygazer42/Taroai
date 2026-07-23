@@ -58,6 +58,7 @@ class ToolGateway(BaseModel):
         state,
         step,
         granted_scopes: list[str] | None = None,
+        thread_id: str | None = None,
     ) -> ToolResult:
         return self.execute_request(
             ToolGatewayRequest(
@@ -65,6 +66,7 @@ class ToolGateway(BaseModel):
                 workspace_id=state.workspace_id,
                 user_id=state.user_id,
                 run_id=state.run_id,
+                thread_id=thread_id,
                 step_id=step.id,
                 tool_name=step.tool_name,
                 skill_id=step.skill_id,

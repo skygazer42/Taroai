@@ -6,7 +6,14 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from taroai.agent import AgentRuntime, apply_agent_runtime_settings
-from taroai.agents import InMemoryAgentRegistry, SqlAgentRegistry
+from taroai.agents import (
+    CREATE_AGENT_DRAFT_TOOL,
+    UPDATE_AGENT_DRAFT_TOOL,
+    AgentRegistryService,
+    InMemoryAgentRegistry,
+    SqlAgentRegistry,
+    register_agent_tool_handlers,
+)
 from taroai.audit import AuditService
 from taroai.chat import ChatService
 from taroai.billing import (
@@ -36,6 +43,12 @@ from taroai.lifecycle import (
     SqlRestoreDrillScheduleStore,
 )
 from taroai.licensing import LicenseService
+from taroai.memory import (
+    GuardedLongTermMemoryService,
+    InMemoryLongTermMemoryService,
+    SqlLongTermMemoryService,
+)
+from taroai.memory.tools import register_memory_tool_handler
 from taroai.model_gateway import (
     InMemoryModelProviderStore,
     InMemoryModelPolicyStore,
@@ -62,7 +75,10 @@ from taroai.sandbox import (
     SandboxNetworkMode,
     build_sandbox_adapter,
 )
-from taroai.sandbox.tools import register_browser_tool_handlers, register_sandbox_tool_handlers
+from taroai.sandbox.tools import (
+    register_browser_tool_handlers,
+    register_sandbox_tool_handlers,
+)
 from taroai.policy import IdentityPolicyService
 from taroai.secrets import build_secret_service_from_settings
 from taroai.skills import (
@@ -80,7 +96,11 @@ from taroai.agent_engines import (
     InMemoryAgentEngineRegistry,
     SqlAgentEngineRegistry,
 )
-from taroai.coding_workspaces import CodingWorkspaceRegistry, CodingWorkspaceService, SqlCodingWorkspaceRegistry
+from taroai.coding_workspaces import (
+    CodingWorkspaceRegistry,
+    CodingWorkspaceService,
+    SqlCodingWorkspaceRegistry,
+)
 from taroai.skills.import_service import HttpsGithubArchiveFetcher
 from taroai.skills.service import SkillService
 from taroai.store import InMemoryControlPlaneStore
@@ -93,12 +113,13 @@ from taroai.storage import (
     StorageLifecycleService,
 )
 from taroai.tool_gateway import ToolGateway
+from taroai.web_search import register_web_search_tool_handler
+from taroai.ui_render import UI_RENDER_TOOL, register_ui_render_tool_handler
 from taroai.triggers.repository import SqlTriggerStore
 from taroai.triggers.service import InMemoryTriggerStore, TriggerService
 from taroai.workers.agent_worker import AgentWorker
 from taroai.workers.cleanup_worker import CleanupWorker
 from taroai.workers.connector_sync_worker import ConnectorSyncWorker
-from taroai.workers.models import JobEnvelope
 from taroai.workers.queue import JobQueue, RedisJobQueue, RedisQueueConfigurationError
 from taroai.workers.restore_drill_scheduler_worker import RestoreDrillSchedulerWorker
 from taroai.workers.restore_drill_evidence_worker import RestoreDrillEvidenceWorker
@@ -109,6 +130,7 @@ from taroai.workers.restore_drill_execution_worker import (
 from taroai.workers.restore_drill_worker import RestoreDrillDueWorker
 from taroai.workers.scheduler_worker import TriggerSchedulerWorker
 from taroai.workers.trigger_worker import TriggerDueWorker
+from taroai.workflow import WorkflowCoordinator
 
 
 class WorkerLoopResult(BaseModel):
@@ -431,6 +453,9 @@ def build_agent_worker_runner(
     audit_service = build_worker_audit_service(settings, resolved_store)
     guardrail_service = InMemoryGuardrailService()
     secret_service = build_secret_service_from_settings(settings)
+    model_provider_store = build_model_provider_store(settings)
+    model_policy_store = build_model_policy_store(settings)
+    model_provider_rate_limiter = build_model_provider_rate_limiter(settings)
     sandbox_adapter = build_sandbox_adapter(settings)
     browser_controller = build_worker_browser_controller(settings)
     browser_profile_registry = build_worker_browser_profile_registry(settings)
@@ -454,48 +479,69 @@ def build_agent_worker_runner(
     connector_invocation_service = ConnectorInvocationService()
     worker_skill_service = build_worker_skill_service(settings)
     agent_registry = build_worker_agent_registry(settings)
-    resolved_runtime = apply_agent_runtime_settings(runtime or AgentRuntime(
+    agent_registry_service = AgentRegistryService(
+        registry=agent_registry,
         store=resolved_store,
-        model_gateway=build_worker_model_gateway(settings, secret_service),
-        model_policy=build_model_policy(settings, build_model_policy_store(settings)),
-        model_budget_guard=build_model_budget_guard(settings),
-        tool_gateway=build_worker_tool_gateway(
-            settings,
-            audit_service,
-            guardrail_service,
-            secret_service,
-            sandbox_adapter,
-            browser_controller,
-            worker_skill_service,
-            browser_profile_service,
+    )
+    long_term_memory_service = build_worker_long_term_memory_service(
+        settings,
+        guardrail_service,
+        audit_service,
+    )
+    resolved_runtime = apply_agent_runtime_settings(
+        runtime
+        or AgentRuntime(
+            store=resolved_store,
+            model_gateway=build_worker_model_gateway(
+                settings,
+                secret_service,
+                model_provider_store,
+                model_provider_rate_limiter,
+            ),
+            model_policy=build_model_policy(settings, model_policy_store),
+            model_budget_guard=build_model_budget_guard(settings),
+            tool_gateway=build_worker_tool_gateway(
+                settings,
+                audit_service,
+                guardrail_service,
+                secret_service,
+                sandbox_adapter,
+                browser_controller,
+                worker_skill_service,
+                browser_profile_service,
+                long_term_memory_service,
+                resolved_store,
+            ),
+            policy_service=policy_service,
+            audit_service=audit_service,
+            license_service=getattr(audit_service, "license_service", None),
+            knowledge_service=build_worker_knowledge_service(settings),
+            sandbox_adapter=sandbox_adapter,
+            browser_controller=browser_controller,
+            storage_catalog=build_worker_storage_catalog(settings),
+            object_storage=S3CompatibleObjectStorage.from_settings(settings),
+            storage_content_scanner=build_worker_storage_content_scanner(settings),
+            sandbox_runtime_image=settings.sandbox_runtime_image,
+            sandbox_network_mode=SandboxNetworkMode(settings.sandbox_network_mode),
+            sandbox_timeout_seconds=settings.sandbox_timeout_seconds,
+            embedding_gateway=build_worker_embedding_gateway(settings, secret_service),
+            billing_pricing_service=build_billing_pricing_service(
+                settings,
+                build_billing_pricing_rule_store(settings),
+            ),
+            long_term_memory_service=long_term_memory_service,
+            guardrail_service=guardrail_service,
+            skill_service=worker_skill_service,
+            connector_registry=connector_registry,
+            connector_dispatcher=connector_dispatcher,
+            connector_invocation_service=connector_invocation_service,
+            agent_registry=agent_registry,
+            browser_profile_service=browser_profile_service,
+            agent_engine_service=agent_engine_service,
+            coding_workspace_service=coding_workspace_service,
         ),
-        policy_service=policy_service,
-        audit_service=audit_service,
-        license_service=getattr(audit_service, "license_service", None),
-        knowledge_service=build_worker_knowledge_service(settings),
-        sandbox_adapter=sandbox_adapter,
-        browser_controller=browser_controller,
-        storage_catalog=build_worker_storage_catalog(settings),
-        object_storage=S3CompatibleObjectStorage.from_settings(settings),
-        storage_content_scanner=build_worker_storage_content_scanner(settings),
-        sandbox_runtime_image=settings.sandbox_runtime_image,
-        sandbox_network_mode=SandboxNetworkMode(settings.sandbox_network_mode),
-        sandbox_timeout_seconds=settings.sandbox_timeout_seconds,
-        embedding_gateway=build_worker_embedding_gateway(settings, secret_service),
-        billing_pricing_service=build_billing_pricing_service(
-            settings,
-            build_billing_pricing_rule_store(settings),
-        ),
-        guardrail_service=guardrail_service,
-        skill_service=worker_skill_service,
-        connector_registry=connector_registry,
-        connector_dispatcher=connector_dispatcher,
-        connector_invocation_service=connector_invocation_service,
-        agent_registry=agent_registry,
-        browser_profile_service=browser_profile_service,
-        agent_engine_service=agent_engine_service,
-        coding_workspace_service=coding_workspace_service,
-    ), settings)
+        settings,
+    )
     if resolved_runtime.skill_service is None:
         resolved_runtime.skill_service = worker_skill_service
     if resolved_runtime.connector_registry is None:
@@ -512,14 +558,32 @@ def build_agent_worker_runner(
         resolved_runtime.agent_engine_service = agent_engine_service
     if resolved_runtime.coding_workspace_service is None:
         resolved_runtime.coding_workspace_service = coding_workspace_service
+    if not resolved_runtime.tool_gateway.can_execute_tool(UI_RENDER_TOOL):
+        register_ui_render_tool_handler(resolved_runtime.tool_gateway, resolved_store)
+    if not all(
+        resolved_runtime.tool_gateway.can_execute_tool(name)
+        for name in (CREATE_AGENT_DRAFT_TOOL, UPDATE_AGENT_DRAFT_TOOL)
+    ):
+        register_agent_tool_handlers(
+            resolved_runtime.tool_gateway, agent_registry_service
+        )
+
+    def refresh_model_runtime() -> None:
+        resolved_runtime.model_gateway = build_worker_model_gateway(
+            settings,
+            secret_service,
+            model_provider_store,
+            model_provider_rate_limiter,
+        )
+        resolved_runtime.model_policy = build_model_policy(settings, model_policy_store)
+
     chat_service = ChatService(
         store=resolved_store,
         model_policy_resolver=lambda: resolved_runtime.model_policy,
-        steering_available_resolver=lambda: resolved_runtime.runtime_mode == "loop_v2",
         provider_registry_resolver=lambda: ModelProviderRegistry(
             providers=effective_model_gateway_providers(
                 settings,
-                build_model_provider_store(settings),
+                model_provider_store,
             )
         ),
     )
@@ -529,9 +593,13 @@ def build_agent_worker_runner(
             queue=resolved_queue,
             audit_service=audit_service,
             chat_service=chat_service,
+            workflow_coordinator=WorkflowCoordinator(
+                store=resolved_store, runtime=resolved_runtime
+            ),
             lease_seconds=settings.worker_job_lease_seconds,
             retry_delay_seconds=settings.worker_job_retry_delay_seconds,
             continuation_max_attempts=settings.worker_job_max_attempts,
+            refresh_model_runtime=refresh_model_runtime if runtime is None else None,
         ),
     )
 
@@ -641,8 +709,8 @@ def build_restore_drill_due_worker_runner(
     schedule_store: RestoreDrillScheduleStore | None = None,
 ) -> RestoreDrillDueWorkerRunner:
     resolved_queue = queue or build_worker_queue(settings)
-    resolved_schedule_store = schedule_store or build_worker_restore_drill_schedule_store(
-        settings
+    resolved_schedule_store = (
+        schedule_store or build_worker_restore_drill_schedule_store(settings)
     )
     store = build_worker_control_plane_store(settings)
     audit_service = build_worker_audit_service(settings, store)
@@ -666,8 +734,8 @@ def build_restore_drill_evidence_worker_runner(
     object_storage: ObjectStorageAdapter | None = None,
 ) -> RestoreDrillEvidenceWorkerRunner:
     resolved_queue = queue or build_worker_queue(settings)
-    resolved_schedule_store = schedule_store or build_worker_restore_drill_schedule_store(
-        settings
+    resolved_schedule_store = (
+        schedule_store or build_worker_restore_drill_schedule_store(settings)
     )
     resolved_storage_catalog = storage_catalog or build_worker_storage_catalog(settings)
     resolved_object_storage = object_storage or S3CompatibleObjectStorage.from_settings(
@@ -696,8 +764,8 @@ def build_restore_drill_execution_worker_runner(
     verifier: RestoreDrillVerifier | None = None,
 ) -> RestoreDrillExecutionWorkerRunner:
     resolved_queue = queue or build_worker_queue(settings)
-    resolved_schedule_store = schedule_store or build_worker_restore_drill_schedule_store(
-        settings
+    resolved_schedule_store = (
+        schedule_store or build_worker_restore_drill_schedule_store(settings)
     )
     store = build_worker_control_plane_store(settings)
     audit_service = build_worker_audit_service(settings, store)
@@ -722,8 +790,8 @@ def build_restore_drill_scheduler_worker_runner(
     schedule_store: RestoreDrillScheduleStore | None = None,
 ) -> RestoreDrillSchedulerWorkerRunner:
     resolved_queue = queue or build_worker_queue(settings)
-    resolved_schedule_store = schedule_store or build_worker_restore_drill_schedule_store(
-        settings
+    resolved_schedule_store = (
+        schedule_store or build_worker_restore_drill_schedule_store(settings)
     )
     store = build_worker_control_plane_store(settings)
     audit_service = build_worker_audit_service(settings, store)
@@ -924,6 +992,23 @@ def build_worker_knowledge_service(
     return InMemoryKnowledgeService()
 
 
+def build_worker_long_term_memory_service(
+    settings: Settings,
+    guardrail_service: InMemoryGuardrailService,
+    audit_service: AuditService,
+) -> GuardedLongTermMemoryService:
+    service = (
+        SqlLongTermMemoryService(config=settings.database_config())
+        if settings.long_term_memory_backend == "sql"
+        else InMemoryLongTermMemoryService()
+    )
+    return GuardedLongTermMemoryService(
+        service=service,
+        guardrail_service=guardrail_service,
+        audit_service=audit_service,
+    )
+
+
 def build_worker_embedding_gateway(
     settings: Settings,
     secret_service,
@@ -1001,21 +1086,32 @@ def build_worker_tool_gateway(
     browser_controller: BrowserController | None = None,
     skill_service: SkillService | None = None,
     browser_profile_service: BrowserProfileService | None = None,
+    long_term_memory_service: GuardedLongTermMemoryService | None = None,
+    store: InMemoryControlPlaneStore | SqlControlPlaneRepository | None = None,
 ) -> ToolGateway:
     gateway = ToolGateway(
         audit_service=audit_service,
         secret_service=secret_service or build_secret_service_from_settings(settings),
         guardrail_service=guardrail_service or InMemoryGuardrailService(),
     )
-    register_sandbox_tool_handlers(
-        gateway,
-        sandbox_adapter or build_sandbox_adapter(settings),
-    )
-    register_browser_tool_handlers(
-        gateway,
-        browser_controller or build_worker_browser_controller(settings),
-        profile_service=browser_profile_service,
-    )
+    resolved_sandbox = sandbox_adapter or build_sandbox_adapter(settings)
+    if resolved_sandbox.provider != "disabled":
+        register_sandbox_tool_handlers(gateway, resolved_sandbox)
+    resolved_browser = browser_controller or build_worker_browser_controller(settings)
+    if resolved_browser.provider != "disabled":
+        register_browser_tool_handlers(
+            gateway,
+            resolved_browser,
+            profile_service=browser_profile_service,
+        )
+    if settings.tavily_api_key:
+        register_web_search_tool_handler(
+            gateway,
+            settings.tavily_api_key,
+            settings.tavily_timeout_seconds,
+        )
+    if long_term_memory_service is not None:
+        register_memory_tool_handler(gateway, long_term_memory_service, store)
     register_skill_tool_handlers(
         gateway,
         skill_service or build_worker_skill_service(settings),
@@ -1059,7 +1155,9 @@ def build_worker_agent_engine_registry(settings: Settings):
 def build_worker_coding_workspace_registry(settings: Settings):
     if settings.coding_workspace_store_backend == "sql":
         config = settings.database_config()
-        MigrationRunner(config=config, migrations_path=Path("apps/api/migrations")).apply()
+        MigrationRunner(
+            config=config, migrations_path=Path("apps/api/migrations")
+        ).apply()
         return SqlCodingWorkspaceRegistry(config=config)
     return CodingWorkspaceRegistry()
 
@@ -1091,18 +1189,18 @@ def build_model_budget_guard(settings: Settings) -> ModelBudgetGuard:
 def build_worker_model_gateway(
     settings: Settings,
     secret_service,
+    model_provider_store: ModelProviderStore | None = None,
+    rate_limiter: ModelProviderRateLimiter | None = None,
 ) -> ModelGateway:
     providers = effective_worker_model_gateway_providers(
         settings,
-        build_model_provider_store(settings),
+        model_provider_store or build_model_provider_store(settings),
     )
     if providers:
         return ModelGatewayRouter(
-            provider_registry=ModelProviderRegistry(
-                providers=providers
-            ),
+            provider_registry=ModelProviderRegistry(providers=providers),
             secret_service=secret_service,
-            rate_limiter=build_model_provider_rate_limiter(settings),
+            rate_limiter=rate_limiter or build_model_provider_rate_limiter(settings),
         )
     return OpenAICompatibleModelGateway(
         base_url=settings.model_gateway_base_url,
@@ -1120,14 +1218,10 @@ def effective_worker_model_gateway_providers(
     settings: Settings,
     model_provider_store: ModelProviderStore | None = None,
 ) -> list[ModelProviderConfig]:
-    providers = list(settings.model_gateway_providers)
-    if model_provider_store is not None:
-        providers.extend(
-            record.to_provider_config()
-            for record in model_provider_store.list_all_providers()
-            if record.status == "active"
-        )
-    return providers
+    return effective_model_gateway_providers(
+        settings,
+        model_provider_store or InMemoryModelProviderStore(),
+    )
 
 
 def build_model_provider_rate_limiter(settings: Settings) -> ModelProviderRateLimiter:
@@ -1167,6 +1261,40 @@ def build_model_provider_store(settings: Settings) -> ModelProviderStore:
         ).apply()
         return SqlModelProviderStore(config=config)
     return InMemoryModelProviderStore()
+
+
+def effective_model_gateway_providers(
+    settings: Settings,
+    store: ModelProviderStore,
+) -> list[ModelProviderConfig]:
+    providers = [
+        *settings.model_gateway_providers,
+        *(
+            record.to_provider_config()
+            for record in store.list_all_providers()
+            if record.status == "active"
+        ),
+    ]
+    if providers and settings.model_gateway_model:
+        providers.append(_direct_model_gateway_provider(settings))
+    return providers
+
+
+def _direct_model_gateway_provider(settings: Settings) -> ModelProviderConfig:
+    return ModelProviderConfig(
+        id="default",
+        display_name="Default",
+        base_url=settings.model_gateway_base_url,
+        api_key=settings.model_gateway_api_key,
+        api_key_secret_ref_id=settings.model_gateway_api_key_secret_ref_id or None,
+        secret_lease_ttl_seconds=settings.model_gateway_secret_lease_ttl_seconds,
+        default_model=settings.model_gateway_model,
+        model_ids=[settings.model_gateway_model] if settings.model_gateway_model else [],
+        reasoning_efforts=settings.model_gateway_reasoning_efforts,
+        default_reasoning_effort=settings.model_gateway_default_reasoning_effort,
+        timeout_seconds=settings.model_gateway_timeout_seconds,
+        chat_request_options=settings.model_gateway_chat_request_options,
+    )
 
 
 def build_billing_pricing_rule_store(settings: Settings) -> BillingPricingRuleStore:

@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 from taroai.agents.models import AgentDefinition, AgentVersion, AgentVersionSpec
 from taroai.db import DatabaseConfig
 from taroai.db.connection import connect_database
-from taroai.domain import new_id, utc_now
+from taroai.domain import utc_now
 from taroai.store import NotFoundError
 
 
@@ -108,15 +108,16 @@ class SqlAgentRegistry(AgentRegistry):
                 INSERT INTO agent_definitions (
                     id, tenant_id, workspace_id, name, description, status,
                     latest_version, published_version, created_by_user_id,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, updated_at, app_kind, write_autonomy
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     definition.id, definition.tenant_id, definition.workspace_id,
                     definition.name, definition.description, definition.status,
                     definition.latest_version, definition.published_version,
                     definition.created_by_user_id, self._dt(definition.created_at),
-                    self._dt(definition.updated_at),
+                    self._dt(definition.updated_at), definition.app_kind,
+                    definition.write_autonomy,
                 ),
             )
             self._insert_version(connection, version)
@@ -136,18 +137,29 @@ class SqlAgentRegistry(AgentRegistry):
         definition = self.get(tenant_id, agent_id)
         name = changes.get("name", definition.name)
         description = changes.get("description", definition.description)
+        app_kind = changes.get("app_kind", definition.app_kind)
+        write_autonomy = changes.get("write_autonomy", definition.write_autonomy)
         updated_at = utc_now()
         with self._connect() as connection:
             connection.execute(
                 """
                 UPDATE agent_definitions
-                SET name = ?, description = ?, updated_at = ?
+                SET name = ?, description = ?, app_kind = ?, write_autonomy = ?, updated_at = ?
                 WHERE tenant_id = ? AND id = ?
                 """,
-                (name, description, self._dt(updated_at), tenant_id, agent_id),
+                (
+                    name, description, app_kind, write_autonomy,
+                    self._dt(updated_at), tenant_id, agent_id,
+                ),
             )
         return definition.model_copy(
-            update={"name": name, "description": description, "updated_at": updated_at}
+            update={
+                "name": name,
+                "description": description,
+                "app_kind": app_kind,
+                "write_autonomy": write_autonomy,
+                "updated_at": updated_at,
+            }
         )
 
     def list(self, tenant_id: str, workspace_id: str | None = None):
@@ -260,6 +272,12 @@ class SqlAgentRegistry(AgentRegistry):
         return AgentDefinition(
             id=row["id"], tenant_id=row["tenant_id"], workspace_id=row["workspace_id"],
             name=row["name"], description=row["description"], status=row["status"],
+            app_kind=(row["app_kind"] if "app_kind" in row.keys() else "agent"),
+            write_autonomy=(
+                row["write_autonomy"]
+                if "write_autonomy" in row.keys()
+                else "approval_required"
+            ),
             latest_version=int(row["latest_version"]),
             published_version=(int(row["published_version"]) if row["published_version"] is not None else None),
             created_by_user_id=row["created_by_user_id"],
@@ -303,4 +321,3 @@ class SqlAgentRegistry(AgentRegistry):
     def _parse_dt(self, value):
         from datetime import datetime
         return datetime.fromisoformat(value) if isinstance(value, str) else value
-

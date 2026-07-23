@@ -21,13 +21,81 @@ SANDBOX_SECRET_LEASES_ENV = "TAROAI_SECRET_LEASES"
 SANDBOX_SECRET_LEASE_COUNT_ENV = "TAROAI_SECRET_LEASE_COUNT"
 SANDBOX_SECRET_LEASE_ENV_PREFIX = "TAROAI_SECRET_LEASE"
 
+SANDBOX_COMMAND_INPUT_SCHEMA = {
+    "type": "object",
+    "required": ["command"],
+    "properties": {
+        "command": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "POSIX shell command to run inside /workspace. For Python, use "
+                "python3 -c or a shell heredoc; never pass bare Python source."
+            ),
+        },
+        "cwd": {"type": "string", "default": "/workspace"},
+        "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600},
+        "result_mode": {
+            "type": "string",
+            "enum": ["raw_stdout", "summarize"],
+            "description": (
+                "Use raw_stdout only when short stdout is the complete user-facing "
+                "answer and needs no explanation; otherwise use summarize or omit it."
+            ),
+        },
+        "env": {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+        },
+        "artifact_path": {
+            "type": "string",
+            "description": "Exact /workspace/artifacts file created by the command; omit for stdout-only work.",
+        },
+        "artifact_paths": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Exact /workspace/artifacts files created by the command; omit for stdout-only work.",
+        },
+        # 由运行时注入，模型无需生成。
+        "session_id": {"type": "string", "minLength": 1},
+    },
+    "additionalProperties": False,
+}
+
+BROWSER_ACTION_INPUT_SCHEMA = {
+    "type": "object",
+    "required": ["action_type"],
+    "properties": {
+        "action_type": {
+            "type": "string",
+            "enum": ["navigate", "click", "type", "screenshot", "extract"],
+        },
+        # session_id 由运行时注入，模型不需要生成。
+        "session_id": {"type": "string", "minLength": 1},
+        "url": {"type": ["string", "null"]},
+        "selector": {"type": ["string", "null"]},
+        "text": {"type": ["string", "null"]},
+        "metadata": {"type": "object"},
+    },
+    "additionalProperties": False,
+}
+
 
 def register_sandbox_tool_handlers(gateway: ToolGateway, adapter: SandboxAdapter) -> None:
     gateway.register_tool(
         policy=ToolPolicy(
             tool_name="sandbox.command",
+            description=(
+                "Run one POSIX shell command in the isolated thread workspace. "
+                "Do not use it merely to check a standard formula or straightforward arithmetic "
+                "unless the user explicitly requests code or sandbox execution. "
+                "Wrap Python with python3 -c or a shell heredoc; never pass bare Python "
+                "source. Declare only artifact files that the command actually creates. "
+                "Set result_mode=raw_stdout only when stdout itself is the complete answer."
+            ),
             required_scopes=["sandbox.execute"],
             risk_level=ToolRiskLevel.HIGH,
+            input_schema=SANDBOX_COMMAND_INPUT_SCHEMA,
         ),
         handler=lambda request: _execute_command(adapter, request),
     )
@@ -41,8 +109,13 @@ def register_browser_tool_handlers(
     gateway.register_tool(
         policy=ToolPolicy(
             tool_name="browser.action",
+            description=(
+                "Interact with a browser page by navigating, clicking, typing, "
+                "capturing a screenshot, or extracting visible content."
+            ),
             required_scopes=["browser.act"],
             risk_level=ToolRiskLevel.HIGH,
+            input_schema=BROWSER_ACTION_INPUT_SCHEMA,
         ),
         handler=lambda request: _apply_browser_action(
             controller, request, profile_service=profile_service
@@ -60,9 +133,11 @@ def _execute_command(adapter: SandboxAdapter, request: ToolGatewayRequest) -> To
     )
     result = adapter.execute(
         SandboxCommand(
+            id=request.step_id,
             tenant_id=request.tenant_id,
             workspace_id=request.workspace_id,
             run_id=request.run_id,
+            thread_id=request.thread_id,
             session_id=str(request.tool_input["session_id"]),
             command=str(request.tool_input["command"]),
             cwd=str(request.tool_input.get("cwd", "/workspace")),
@@ -82,16 +157,16 @@ def _apply_browser_action(
     profile_service: Any | None = None,
 ) -> ToolResult:
     action = BrowserAction(
-            tenant_id=request.tenant_id,
-            workspace_id=request.workspace_id,
-            run_id=request.run_id,
-            session_id=str(request.tool_input["session_id"]),
-            action_type=BrowserActionType(str(request.tool_input["action_type"])),
-            url=_optional_str(request.tool_input.get("url")),
-            selector=_optional_str(request.tool_input.get("selector")),
-            text=_optional_str(request.tool_input.get("text")),
-            metadata=dict(request.tool_input.get("metadata", {})),
-        )
+        tenant_id=request.tenant_id,
+        workspace_id=request.workspace_id,
+        run_id=request.run_id,
+        session_id=str(request.tool_input["session_id"]),
+        action_type=BrowserActionType(str(request.tool_input["action_type"])),
+        url=_optional_str(request.tool_input.get("url")),
+        selector=_optional_str(request.tool_input.get("selector")),
+        text=_optional_str(request.tool_input.get("text")),
+        metadata=dict(request.tool_input.get("metadata", {})),
+    )
     if profile_service is not None:
         try:
             observation = profile_service.apply_action(

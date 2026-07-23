@@ -5,16 +5,28 @@ import hmac
 import json
 import secrets
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
+from urllib.parse import urlencode
 
-from fastapi import BackgroundTasks, Body, Depends, FastAPI, Header, Query, Request, Response, status
+from fastapi import (
+    BackgroundTasks,
+    Body,
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from taroai.agent import AgentRuntime, apply_agent_runtime_settings
 from taroai.agent_engines import (
@@ -39,6 +51,7 @@ from taroai.agents import (
     AgentVersionSpec,
     InMemoryAgentRegistry,
     SqlAgentRegistry,
+    register_agent_tool_handlers,
 )
 from taroai.api import ApiExceptionManager
 from taroai.api.idempotency import (
@@ -53,6 +66,7 @@ from taroai.api.pagination import (
 )
 from taroai.auth import (
     AuthLoginRequest,
+    AuthRegisterRequest,
     AuthRequiredError,
     AuthService,
     AuthSessionStore,
@@ -119,6 +133,7 @@ from taroai.artifacts import ArtifactService, ArtifactShareCreate, RichArtifactC
 from taroai.config import ENTERPRISE_SANDBOX_PROVIDERS, Settings, load_settings
 from taroai.connectors import (
     ConnectorCreateRequest,
+    ConnectorCredentialRef,
     ConnectorDefinition,
     ConnectorDispatchError,
     ConnectorDispatchResult,
@@ -134,8 +149,10 @@ from taroai.connectors import (
     ConnectorSyncJobCreate,
     ConnectorSyncStateUpdate,
     ConnectorSyncStatus,
+    ConnectorType,
     ConnectorUpdateRequest,
     InMemoryConnectorRegistry,
+    RedisOAuthAuthorizationStateStore,
     SqlConnectorRegistry,
 )
 from taroai.customer_success import (
@@ -150,6 +167,7 @@ from taroai.domain import (
     ApprovalRequest,
     ApprovalStatus,
     ChatMessageDispatchStatus,
+    ResourceReference,
     RunCreate,
     RunMode,
     RunStatus,
@@ -261,6 +279,7 @@ from taroai.memory import (
     SqlLongTermMemoryService,
     SqlShortTermMemoryReviewStore,
 )
+from taroai.memory.tools import register_memory_tool_handler
 from taroai.model_gateway import (
     InMemoryModelProviderStore,
     InMemoryModelPolicyStore,
@@ -285,6 +304,7 @@ from taroai.model_gateway import (
     ModelProviderStore,
     ModelProviderVersionRecord,
     OpenAICompatibleModelGateway,
+    ModelPolicyDeniedError,
     RedisModelProviderRateLimitStore,
     SqlModelProviderRateLimitStore,
     SqlModelProviderStore,
@@ -316,7 +336,12 @@ from taroai.sandbox import (
     SandboxSessionStatus,
     build_sandbox_adapter,
 )
-from taroai.sandbox.tools import register_browser_tool_handlers, register_sandbox_tool_handlers
+from taroai.sandbox.tools import (
+    register_browser_tool_handlers,
+    register_sandbox_tool_handlers,
+)
+from taroai.web_search import register_web_search_tool_handler
+from taroai.ui_render import UI_RENDER_TOOL, register_ui_render_tool_handler
 from taroai.scim import (
     InMemoryScimProvisioningStore,
     ScimGroupRoleMapping,
@@ -326,7 +351,10 @@ from taroai.scim import (
     SqlScimProvisioningStore,
 )
 from taroai.secrets import (
+    AwsSecretsManagerSecretService,
+    LocalEncryptedSecretService,
     SecretLeaseResolveRequest,
+    SecretScope,
     SecretService,
     build_secret_service_from_settings,
 )
@@ -393,6 +421,11 @@ from taroai.storage import (
     StorageSignedUrlCreate,
     storage_object_audit_metadata,
 )
+from taroai.store_catalog import (
+    BuiltinStoreCatalog,
+    StoreInstallConflictError,
+    install_builtin_store_item,
+)
 from taroai.tool_gateway import ToolExecutionError, ToolGateway, ToolGatewayRequest
 from taroai.triggers import (
     AgentHandoffRequest,
@@ -416,6 +449,14 @@ from taroai.triggers import (
     match_connector_event_triggers,
 )
 from taroai.store import InMemoryControlPlaneStore, NotFoundError, TenantAccessError
+from taroai.tenancy import (
+    TenantInvitationAccept,
+    TenantInvitationCreate,
+    TenantOrganizationService,
+    TenantPatch,
+    WorkspaceCreate,
+    WorkspacePatch,
+)
 from taroai.workers import (
     JobQueue,
     JobType,
@@ -424,6 +465,7 @@ from taroai.workers import (
     RestoreDrillExecutionJob,
     RunExecutionJob,
 )
+from taroai.workflow import WorkflowCoordinator
 
 
 SANDBOX_SECRET_RESOLVER_TOKEN_HEADER = "X-Sandbox-Resolver-Token"
@@ -637,9 +679,18 @@ class SkillExactInstallRequest(BaseModel):
     package_digest: str = Field(min_length=64, max_length=64)
 
 
+class StoreItemInstallRequest(BaseModel):
+    workspace_id: str = Field(min_length=1)
+    expected_digest: str | None = Field(default=None, min_length=64, max_length=64)
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class SkillVersionMoveRequest(BaseModel):
     target_version: str = Field(min_length=1)
-    expected_package_digest: str | None = Field(default=None, min_length=64, max_length=64)
+    expected_package_digest: str | None = Field(
+        default=None, min_length=64, max_length=64
+    )
 
 
 class SkillEvaluateRequest(BaseModel):
@@ -658,6 +709,12 @@ class ApprovalResolveRequest(BaseModel):
 
 class ApprovalRejectRequest(BaseModel):
     approval_id: str = Field(min_length=1)
+
+
+class SecretCaptureResolveRequest(BaseModel):
+    value: SecretStr = Field(min_length=1, max_length=100_000)
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class CustomerSuccessCandidateCreate(BaseModel):
@@ -1284,9 +1341,7 @@ def resolve_event_replay_sequence(
     try:
         return int(last_event_id)
     except ValueError as error:
-        raise ValueError(
-            "Last-Event-ID must be an integer event sequence"
-        ) from error
+        raise ValueError("Last-Event-ID must be an integer event sequence") from error
 
 
 def create_app(
@@ -1412,6 +1467,7 @@ def create_app(
         github_fetcher=HttpsGithubArchiveFetcher(),
         evaluation_runner=skill_evaluation_runner,
     )
+    app.state.store_catalog = BuiltinStoreCatalog()
     app.state.agent_registry = agent_registry or build_agent_registry(resolved_settings)
     app.state.evaluation_repository = (
         evaluation_repository or build_evaluation_repository(resolved_settings)
@@ -1422,8 +1478,8 @@ def create_app(
         storage_catalog=app.state.storage_catalog,
     )
     app.state.speech_gateway = speech_gateway or SpeechGateway()
-    app.state.thread_share_store = (
-        thread_share_store or build_thread_share_store(resolved_settings)
+    app.state.thread_share_store = thread_share_store or build_thread_share_store(
+        resolved_settings
     )
     app.state.thread_share_service = ThreadShareService(
         store=app.state.store,
@@ -1493,7 +1549,16 @@ def create_app(
         session_store=build_auth_session_store(resolved_settings),
         access_token_secret=resolved_settings.access_token_secret,
         access_token_ttl_seconds=resolved_settings.access_token_ttl_seconds,
+        remembered_access_token_ttl_seconds=(
+            resolved_settings.remembered_access_token_ttl_seconds
+        ),
         sso_provider_registry=app.state.sso_provider_registry,
+    )
+    app.state.tenant_organization_service = TenantOrganizationService(
+        store=app.state.store,
+        identity_service=app.state.identity_service,
+        audit_service=app.state.audit_service,
+        token_secret=resolved_settings.access_token_secret,
     )
     app.state.scim_provisioning_service = (
         scim_provisioning_service
@@ -1544,22 +1609,30 @@ def create_app(
     app.state.model_policy_store = model_policy_store or build_model_policy_store(
         resolved_settings
     )
-    app.state.model_provider_store = (
-        model_provider_store or build_model_provider_store(resolved_settings)
+    app.state.model_provider_store = model_provider_store or build_model_provider_store(
+        resolved_settings
     )
     app.state.secret_service = secret_service or build_secret_service_from_settings(
         resolved_settings
     )
-    app.state.agent_engine_registry = agent_engine_registry or build_agent_engine_registry(resolved_settings)
+    app.state.agent_engine_registry = (
+        agent_engine_registry or build_agent_engine_registry(resolved_settings)
+    )
     app.state.agent_engine_service = AgentEngineService(
         app.state.agent_engine_registry, app.state.secret_service, store=app.state.store
     )
-    app.state.coding_workspace_registry = coding_workspace_registry or build_coding_workspace_registry(resolved_settings)
+    app.state.coding_workspace_registry = (
+        coding_workspace_registry or build_coding_workspace_registry(resolved_settings)
+    )
     app.state.coding_workspace_service = CodingWorkspaceService(
         app.state.coding_workspace_registry, app.state.store
     )
-    app.state.agent_registry_service.coding_workspace_registry = app.state.coding_workspace_registry
-    app.state.agent_registry_service.agent_engine_registry = app.state.agent_engine_registry
+    app.state.agent_registry_service.coding_workspace_registry = (
+        app.state.coding_workspace_registry
+    )
+    app.state.agent_registry_service.agent_engine_registry = (
+        app.state.agent_engine_registry
+    )
     app.state.browser_profile_registry = (
         browser_profile_registry or build_browser_profile_registry(resolved_settings)
     )
@@ -1585,13 +1658,26 @@ def create_app(
         resolved_settings
     )
     app.state.connector_invocation_service = ConnectorInvocationService()
+    oauth_state_store = (
+        RedisOAuthAuthorizationStateStore(url=resolved_settings.redis_url)
+        if isinstance(app.state.job_queue, RedisJobQueue)
+        else None
+    )
     if connector_oauth_service is None:
         app.state.connector_oauth_service = ConnectorOAuthService(
             secret_service=app.state.secret_service,
+            state_store=oauth_state_store,
         )
-    elif connector_oauth_service.secret_service is None:
+    elif connector_oauth_service.secret_service is None or (
+        connector_oauth_service.state_store is None and oauth_state_store is not None
+    ):
         app.state.connector_oauth_service = connector_oauth_service.model_copy(
-            update={"secret_service": app.state.secret_service}
+            update={
+                "secret_service": connector_oauth_service.secret_service
+                or app.state.secret_service,
+                "state_store": connector_oauth_service.state_store
+                or oauth_state_store,
+            }
         )
     else:
         app.state.connector_oauth_service = connector_oauth_service
@@ -1625,7 +1711,6 @@ def create_app(
             readiness_service=app.state.tenant_readiness_service,
             audit_service=app.state.audit_service,
             knowledge_service=app.state.knowledge_service,
-            skill_registry=app.state.skill_registry,
             solution_pack_service=app.state.solution_pack_service,
         )
     )
@@ -1635,15 +1720,31 @@ def create_app(
         secret_service=app.state.secret_service,
         guardrail_service=app.state.guardrail_service,
     )
-    register_sandbox_tool_handlers(tool_gateway, app.state.sandbox_adapter)
-    register_browser_tool_handlers(
+    if app.state.sandbox_adapter.provider != "disabled":
+        register_sandbox_tool_handlers(tool_gateway, app.state.sandbox_adapter)
+    if app.state.browser_controller.provider != "disabled":
+        register_browser_tool_handlers(
+            tool_gateway,
+            app.state.browser_controller,
+            profile_service=app.state.browser_profile_service,
+        )
+    if app.state.settings.tavily_api_key:
+        register_web_search_tool_handler(
+            tool_gateway,
+            app.state.settings.tavily_api_key,
+            app.state.settings.tavily_timeout_seconds,
+        )
+    register_memory_tool_handler(
         tool_gateway,
-        app.state.browser_controller,
-        profile_service=app.state.browser_profile_service,
+        app.state.long_term_memory_service,
+        app.state.store,
     )
     register_skill_tool_handlers(tool_gateway, app.state.skill_service)
+    register_agent_tool_handlers(tool_gateway, app.state.agent_registry_service)
+    register_ui_render_tool_handler(tool_gateway, app.state.store)
     app.state.runtime = apply_agent_runtime_settings(
-        runtime or AgentRuntime(
+        runtime
+        or AgentRuntime(
             store=app.state.store,
             model_gateway=build_model_gateway(
                 resolved_settings,
@@ -1702,6 +1803,11 @@ def create_app(
         app.state.runtime.agent_engine_service = app.state.agent_engine_service
     if app.state.runtime.coding_workspace_service is None:
         app.state.runtime.coding_workspace_service = app.state.coding_workspace_service
+    if not app.state.runtime.tool_gateway.can_execute_tool(UI_RENDER_TOOL):
+        register_ui_render_tool_handler(app.state.runtime.tool_gateway, app.state.store)
+    app.state.workflow_coordinator = WorkflowCoordinator(
+        store=app.state.store, runtime=app.state.runtime
+    )
     app.state.evaluation_service = EvaluationService(
         repository=app.state.evaluation_repository,
         executor=AgentEvaluationExecutor(
@@ -1711,13 +1817,14 @@ def create_app(
         ),
     )
     app.state.agent_registry_service.evaluation_service = app.state.evaluation_service
-    app.state.agent_registry_service.evaluation_repository = app.state.evaluation_repository
+    app.state.agent_registry_service.evaluation_repository = (
+        app.state.evaluation_repository
+    )
     app.state.chat_service = ChatService(
         store=app.state.store,
         model_policy_resolver=lambda: app.state.runtime.model_policy,
-        steering_available_resolver=lambda: app.state.runtime.runtime_mode == "loop_v2",
         provider_registry_resolver=lambda: ModelProviderRegistry(
-            providers=effective_model_gateway_providers(
+            providers=effective_chat_model_gateway_providers(
                 app.state.settings,
                 app.state.model_provider_store,
             )
@@ -1725,9 +1832,15 @@ def create_app(
     )
 
     def execute_chat_run_chain(tenant_id: str, run_id: str) -> None:
-        current_run_id = run_id
+        pending_run_ids = [run_id]
         for _ in range(100):
+            if not pending_run_ids:
+                return
+            current_run_id = pending_run_ids.pop(0)
             try:
+                app.state.workflow_coordinator.mark_running(
+                    app.state.store.get_run(tenant_id, current_run_id)
+                )
                 state = app.state.runtime.execute_run(tenant_id, current_run_id)
             except Exception as error:
                 failed_run = app.state.store.get_run(tenant_id, current_run_id)
@@ -1737,18 +1850,41 @@ def create_app(
                     RunStatus.CANCELLED,
                     RunStatus.TIMED_OUT,
                 }:
-                    failed_run = app.state.store.update_run_status(
-                        tenant_id,
-                        current_run_id,
-                        RunStatus.FAILED,
-                    )
-                    app.state.store.append_run_event(
+                    from taroai.agent.loop import AgentExecutionServices
+
+                    execution = AgentExecutionServices(app.state.runtime)
+                    execution._fail(
+                        execution._restore_state(failed_run),
                         failed_run,
-                        "run.failed",
-                        {"reason": "runtime_execution_error", "error_type": error.__class__.__name__},
+                        "runtime_execution_error",
+                        detail=error.__class__.__name__,
+                        metadata={
+                            "reason": "runtime_execution_error",
+                            "error_type": error.__class__.__name__,
+                        },
                     )
                 return
             current_run = app.state.store.get_run(tenant_id, current_run_id)
+            is_workflow_child = (
+                app.state.store.get_workflow_task_for_child_run(
+                    tenant_id, current_run_id
+                )
+                is not None
+            )
+            if state.status in {
+                RunStatus.SUCCEEDED,
+                RunStatus.FAILED,
+                RunStatus.CANCELLED,
+                RunStatus.TIMED_OUT,
+            }:
+                pending_run_ids.extend(
+                    run.id
+                    for run in app.state.workflow_coordinator.complete_child(
+                        current_run, state
+                    )
+                )
+            if is_workflow_child:
+                continue
             if current_run.thread_id is None or state.status not in {
                 RunStatus.SUCCEEDED,
                 RunStatus.FAILED,
@@ -1761,8 +1897,8 @@ def create_app(
                 current_run.thread_id,
             )
             if continuation is None or not continuation.run_started:
-                return
-            current_run_id = continuation.run_id
+                continue
+            pending_run_ids.append(continuation.run_id)
 
     def dispatch_chat_run(
         tenant_id: str,
@@ -1807,6 +1943,37 @@ def create_app(
             run.id,
         )
 
+    def dispatch_workflow_runs(
+        runs: list,
+        requested_by_user_id: str,
+        background_tasks: BackgroundTasks,
+    ) -> None:
+        for run in runs:
+            if app.state.settings.run_execution_dispatch_mode == "queue":
+                queue = app.state.job_queue
+                if queue is None:
+                    raise RedisQueueConfigurationError("job queue backend is disabled")
+                job = queue.enqueue(
+                    JobType.RUN_EXECUTION,
+                    RunExecutionJob(
+                        tenant_id=run.tenant_id,
+                        workspace_id=run.workspace_id,
+                        user_id=run.user_id,
+                        run_id=run.id,
+                        requested_by_user_id=requested_by_user_id,
+                    ),
+                    max_attempts=app.state.settings.worker_job_max_attempts,
+                )
+                app.state.store.append_run_event(
+                    run,
+                    "run.execution_queued",
+                    {"job_id": job.id, "reason": "workflow_dependency_ready"},
+                )
+            else:
+                background_tasks.add_task(
+                    execute_chat_run_chain, run.tenant_id, run.id
+                )
+
     def dispatch_next_after_terminal_run(
         tenant_id: str,
         run_id: str,
@@ -1832,6 +1999,7 @@ def create_app(
                 requested_by_user_id,
                 background_tasks,
             )
+
     app.state.exception_manager = ApiExceptionManager()
     app.state.exception_manager.register(app)
     app.add_event_handler("shutdown", close_database_pools)
@@ -1845,9 +2013,12 @@ def create_app(
         }
 
     @app.get("/readyz")
-    def readyz() -> dict:
-        return {
-            "ready": True,
+    def readyz(response: Response) -> dict:
+        secret_readiness = build_secret_service_readiness(
+            app.state.settings, app.state.secret_service
+        )
+        readiness = {
+            "ready": secret_readiness["configured"],
             "checks": {
                 "settings": "ok",
                 "control_plane_store_backend": app.state.settings.control_plane_store_backend,
@@ -1855,6 +2026,7 @@ def create_app(
                 "storage_catalog_backend": app.state.settings.storage_catalog_backend,
                 "job_queue_backend": app.state.settings.job_queue_backend,
                 "secret_service_backend": app.state.settings.secret_service_backend,
+                "secret_service": secret_readiness,
                 "model_gateway": build_model_gateway_readiness(
                     app.state.settings,
                     app.state.model_provider_store,
@@ -1874,6 +2046,9 @@ def create_app(
                 "browser_provider": app.state.settings.browser_provider,
             },
         }
+        if not readiness["ready"]:
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return readiness
 
     @app.post("/api/auth/login")
     def login(payload: AuthLoginRequest) -> dict:
@@ -1881,8 +2056,63 @@ def create_app(
             tenant_id=payload.tenant_id,
             email=payload.email,
             password=payload.password,
+            remember_me=payload.remember_me,
+        )
+        response = result.model_dump(mode="json")
+        workspace_ids = app.state.store.list_workspace_ids(result.tenant_id)
+        if workspace_ids:
+            response["workspace_id"] = workspace_ids[0]
+        return response
+
+    @app.post("/api/auth/register", status_code=status.HTTP_201_CREATED)
+    def register(payload: AuthRegisterRequest) -> dict:
+        if app.state.settings.environment.strip().lower() not in {
+            "local",
+            "local-cloud-poc",
+            "development",
+            "test",
+        }:
+            raise TenantAccessError("account registration is not enabled")
+        result = app.state.tenant_bootstrap_service.bootstrap(
+            request=TenantBootstrapRequest(
+                tenant_id=new_id("tenant"),
+                owner_email=payload.email.strip().lower(),
+                owner_display_name=payload.display_name.strip(),
+                owner_password=payload.password,
+            ),
+            bootstrap_token=app.state.settings.tenant_bootstrap_token,
         )
         return result.model_dump(mode="json")
+
+    @app.get("/api/auth/session")
+    def get_auth_session(
+        authorization: str | None = Header(default=None, alias="Authorization"),
+        requested_workspace_id: str | None = Header(
+            default=None,
+            alias="X-Workspace-ID",
+        ),
+    ) -> dict[str, Any]:
+        try:
+            claims = app.state.auth_service.authenticate_authorization_header(
+                authorization
+            )
+        except AuthRequiredError:
+            return {"authenticated": False}
+        workspace_ids = app.state.store.list_workspace_ids(claims.tenant_id)
+        workspace_id = (
+            requested_workspace_id
+            if requested_workspace_id in workspace_ids
+            else workspace_ids[0] if workspace_ids else None
+        )
+        return {
+            "authenticated": True,
+            "tenant_id": claims.tenant_id,
+            "user_id": claims.user_id,
+            "email": claims.email,
+            "display_name": claims.display_name,
+            "expires_at": claims.expires_at,
+            "workspace_id": workspace_id,
+        }
 
     @app.post("/api/auth/logout")
     def logout(
@@ -1890,6 +2120,126 @@ def create_app(
     ) -> dict:
         result = app.state.auth_service.logout_authorization_header(authorization)
         return result.model_dump(mode="json")
+
+    @app.get("/api/tenants/current")
+    def get_current_tenant(
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        return app.state.tenant_organization_service.summary(
+            context.tenant_id,
+            context.user_id,
+        ).model_dump(mode="json")
+
+    @app.patch("/api/tenants/current")
+    def patch_current_tenant(
+        payload: TenantPatch,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "organization.manage")
+        return app.state.tenant_organization_service.rename_tenant(
+            context.tenant_id,
+            context.user_id,
+            payload.name,
+        ).model_dump(mode="json")
+
+    @app.post("/api/workspaces", status_code=status.HTTP_201_CREATED)
+    def create_workspace(
+        payload: WorkspaceCreate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "organization.manage")
+        return app.state.tenant_organization_service.create_workspace(
+            context.tenant_id,
+            context.user_id,
+            payload.name,
+        ).model_dump(mode="json")
+
+    @app.patch("/api/workspaces/{workspace_id}")
+    def patch_workspace(
+        workspace_id: str,
+        payload: WorkspacePatch,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "organization.manage")
+        return app.state.tenant_organization_service.rename_workspace(
+            context.tenant_id,
+            context.user_id,
+            workspace_id,
+            payload.name,
+        ).model_dump(mode="json")
+
+    @app.post(
+        "/api/tenants/current/invitations",
+        status_code=status.HTTP_201_CREATED,
+    )
+    def create_tenant_invitation(
+        payload: TenantInvitationCreate,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "organization.manage")
+        return app.state.tenant_organization_service.invite(
+            context.tenant_id,
+            context.user_id,
+            payload.email,
+        ).model_dump(mode="json")
+
+    @app.delete("/api/tenants/current/invitations/{invitation_id}")
+    def revoke_tenant_invitation(
+        invitation_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "organization.manage")
+        return app.state.tenant_organization_service.revoke_invitation(
+            context.tenant_id,
+            context.user_id,
+            invitation_id,
+        ).model_dump(mode="json")
+
+    @app.post("/api/tenant-invitations/accept")
+    def accept_tenant_invitation(payload: TenantInvitationAccept) -> dict:
+        member = app.state.tenant_organization_service.accept_invitation(payload)
+        result = app.state.auth_service.login(
+            tenant_id=payload.tenant_id,
+            email=member.email,
+            password=payload.password,
+        )
+        response = result.model_dump(mode="json")
+        response["email"] = member.email
+        workspace_ids = app.state.store.list_workspace_ids(result.tenant_id)
+        if workspace_ids:
+            response["workspace_id"] = workspace_ids[0]
+        return response
+
+    @app.delete("/api/tenants/current/members/{member_user_id}")
+    def remove_tenant_member(
+        member_user_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "organization.manage")
+        return app.state.tenant_organization_service.remove_member(
+            context.tenant_id,
+            context.user_id,
+            member_user_id,
+        ).model_dump(mode="json")
+
+    @app.post("/api/tenants/current/members/{member_user_id}/restore")
+    def restore_tenant_member(
+        member_user_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "organization.manage")
+        return app.state.tenant_organization_service.restore_member(
+            context.tenant_id,
+            context.user_id,
+            member_user_id,
+        ).model_dump(mode="json")
 
     @app.post("/api/tenants/bootstrap", status_code=status.HTTP_201_CREATED)
     def bootstrap_tenant(
@@ -1979,6 +2329,7 @@ def create_app(
     @app.get("/api/threads")
     def list_chat_threads(
         workspace_id: str | None = None,
+        include_archived: bool = False,
         context: RequestContext = Depends(get_request_context),
     ) -> list[dict[str, Any]]:
         return [
@@ -1986,6 +2337,7 @@ def create_app(
             for thread in app.state.chat_service.list_threads(
                 context.tenant_id,
                 workspace_id,
+                include_archived=include_archived,
             )
         ]
 
@@ -1998,6 +2350,81 @@ def create_app(
             context.tenant_id,
             thread_id,
         ).model_dump(mode="json")
+
+    @app.get("/api/threads/{thread_id}/action-manifests")
+    def list_thread_action_manifests(
+        thread_id: str,
+        context: RequestContext = Depends(get_request_context),
+    ) -> list[dict[str, Any]]:
+        thread = app.state.chat_service.get_thread(context.tenant_id, thread_id)
+        runs = (
+            run
+            for run in app.state.store.list_runs(
+                context.tenant_id,
+                thread.workspace_id,
+            )
+            if run.thread_id == thread_id
+        )
+        return action_manifests_for_runs(app, context.tenant_id, runs)
+
+    @app.post("/api/threads/{thread_id}/action-manifests/{manifest_id}/approve")
+    def approve_thread_action_manifest(
+        thread_id: str,
+        manifest_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "connectors.invoke")
+        approval = action_manifest_for_thread(
+            app,
+            context.tenant_id,
+            thread_id,
+            manifest_id,
+        )
+        resolved = approve_action_manifest(app, approval, context.user_id)
+        emit_action_manifest_event(app, resolved)
+        return action_manifest_payload(app, resolved)
+
+    @app.post("/api/threads/{thread_id}/action-manifests/{manifest_id}/reject")
+    def reject_thread_action_manifest(
+        thread_id: str,
+        manifest_id: str,
+        background_tasks: BackgroundTasks,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "connectors.invoke")
+        approval = action_manifest_for_thread(
+            app,
+            context.tenant_id,
+            thread_id,
+            manifest_id,
+        )
+        rejected = reject_action_manifest(app, approval, context.user_id)
+        emit_action_manifest_event(app, rejected)
+        dispatch_next_after_terminal_run(
+            context.tenant_id,
+            approval.run_id,
+            context.user_id,
+            background_tasks,
+        )
+        return action_manifest_payload(app, rejected)
+
+    @app.post("/api/threads/{thread_id}/action-manifests/{manifest_id}/apply")
+    def apply_thread_action_manifest(
+        thread_id: str,
+        manifest_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "connectors.invoke")
+        approval = action_manifest_for_thread(
+            app,
+            context.tenant_id,
+            thread_id,
+            manifest_id,
+        )
+        return apply_action_manifest(app, approval, request, context)
 
     @app.patch("/api/threads/{thread_id}")
     def update_chat_thread(
@@ -2036,6 +2463,10 @@ def create_app(
         request: Request,
         context: RequestContext = Depends(get_request_context),
     ) -> dict[str, Any]:
+        sandbox_released = app.state.runtime.release_thread_sandbox(
+            context.tenant_id,
+            thread_id,
+        )
         thread = app.state.chat_service.delete_thread(
             context.tenant_id,
             thread_id,
@@ -2047,7 +2478,10 @@ def create_app(
             user_id=context.user_id,
             run_id=None,
             event_type="chat.thread.deleted",
-            metadata={"thread_id": thread.id},
+            metadata={
+                "thread_id": thread.id,
+                "sandbox_released": sandbox_released,
+            },
             request=request,
         )
         return thread.model_dump(mode="json")
@@ -2058,7 +2492,7 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> list[dict[str, Any]]:
         return [
-            message.model_dump(mode="json")
+            message.model_dump(mode="json", exclude={"execution_content"})
             for message in app.state.chat_service.list_messages(
                 context.tenant_id,
                 thread_id,
@@ -2090,7 +2524,7 @@ def create_app(
             metadata={"thread_id": thread_id, "message_id": message_id},
             request=request,
         )
-        return message.model_dump(mode="json")
+        return message.model_dump(mode="json", exclude={"execution_content"})
 
     @app.delete(
         "/api/threads/{thread_id}/messages/{message_id}",
@@ -2132,7 +2566,7 @@ def create_app(
             metadata={"thread_id": thread_id, "message_id": message_id},
             request=request,
         )
-        return message.model_dump(mode="json")
+        return message.model_dump(mode="json", exclude={"execution_content"})
 
     @app.post(
         "/api/threads/{thread_id}/steer",
@@ -2198,6 +2632,9 @@ def create_app(
         def stream() -> Iterator[str]:
             cursor = replay_after_sequence or 0
             deadline = time.monotonic() + app.state.settings.event_stream_follow_seconds
+            next_heartbeat = (
+                time.monotonic() + app.state.settings.event_stream_heartbeat_seconds
+            )
             while True:
                 events = app.state.store.list_thread_events(
                     context.tenant_id,
@@ -2212,13 +2649,20 @@ def create_app(
                     yield f"id: {cursor}\n"
                     yield f"event: {event.type}\n"
                     yield f"data: {payload}\n\n"
-                if not follow or time.monotonic() >= deadline:
+                now = time.monotonic()
+                if not follow or now >= deadline:
                     return
-                yield "event: heartbeat\ndata: {}\n\n"
-                time.sleep(app.state.settings.event_stream_heartbeat_seconds)
+                if now >= next_heartbeat:
+                    yield "event: heartbeat\ndata: {}\n\n"
+                    next_heartbeat = (
+                        now + app.state.settings.event_stream_heartbeat_seconds
+                    )
+                time.sleep(min(0.25, deadline - now, next_heartbeat - now))
 
         return StreamingResponse(
-            stream(), media_type=app.state.settings.event_stream_media_type
+            stream(),
+            media_type=app.state.settings.event_stream_media_type,
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     @app.post(
@@ -2236,7 +2680,20 @@ def create_app(
     ) -> dict[str, Any]:
         thread = app.state.chat_service.get_thread(context.tenant_id, thread_id)
         resolved_attachments = list(payload.attachments)
-        for reference in payload.resource_refs:
+        resolved_resource_refs = list(payload.resource_refs)
+        bound_skills = {
+            reference.id for reference in resolved_resource_refs if reference.type == "skill"
+        }
+        for skill_id in payload.skill_ids:
+            normalized_skill_id = skill_id.strip()
+            if not normalized_skill_id:
+                raise ValueError("skill_ids cannot contain an empty id")
+            if normalized_skill_id not in bound_skills:
+                resolved_resource_refs.append(
+                    ResourceReference(type="skill", id=normalized_skill_id)
+                )
+                bound_skills.add(normalized_skill_id)
+        for reference in resolved_resource_refs:
             if reference.type != "file":
                 continue
             storage_object = app.state.storage_catalog.get(
@@ -2248,7 +2705,10 @@ def create_app(
             if storage_object.id not in resolved_attachments:
                 resolved_attachments.append(storage_object.id)
         resolved_payload = payload.model_copy(
-            update={"attachments": resolved_attachments}
+            update={
+                "attachments": resolved_attachments,
+                "resource_refs": resolved_resource_refs,
+            }
         )
         path = f"/api/threads/{thread_id}/messages"
         idempotency_request = build_idempotency_request(
@@ -2378,9 +2838,7 @@ def create_app(
                 "description": agent.description,
                 "version": agent.published_version,
             }
-            for agent in app.state.agent_registry.list(
-                context.tenant_id, workspace_id
-            )
+            for agent in app.state.agent_registry.list(context.tenant_id, workspace_id)
             if agent.status == "published" and agent.published_version is not None
         ]
         knowledge = [
@@ -2439,6 +2897,11 @@ def create_app(
             )
             if item.status == "active"
         ]
+        enabled_tools = {
+            name
+            for name, policy in app.state.runtime.tool_gateway.policies.items()
+            if policy.enabled
+        }
         return {
             "workspace_id": workspace_id,
             "skills": installed_skills,
@@ -2448,6 +2911,14 @@ def create_app(
             "files": files,
             "browser_profiles": browser_profiles,
             "repositories": repositories,
+            "composer_creation": {
+                "image": "media.image.generate" in enabled_tools,
+                "video": "media.video.generate" in enabled_tools,
+                "voice": "speech.synthesize" in enabled_tools,
+                "browser": "browser.action" in enabled_tools,
+                "workflow": "sandbox.command" in enabled_tools,
+                "slides": "sandbox.command" in enabled_tools,
+            },
             "skill_service_available": app.state.skill_service is not None,
         }
 
@@ -2493,20 +2964,29 @@ def create_app(
         app.state.chat_service.get_thread(context.tenant_id, thread_id)
         messages = app.state.chat_service.list_messages(context.tenant_id, thread_id)
         safe_messages = [
-            message for message in messages
+            message
+            for message in messages
             if message.role.value in {"user", "assistant"}
         ][-6:]
         last_text = safe_messages[-1].content[:500] if safe_messages else ""
-        candidates = [
-            "继续完善这个结果，并说明下一步。",
-            "检查当前结果是否遗漏关键条件。",
-            "把当前结果整理成可复用的 Agent。",
-            "基于现有上下文生成一份简洁总结。",
-            "列出当前产物和仍待处理的问题。",
-            "继续执行下一个排队任务。",
-        ]
-        if "error" in last_text.lower() or "失败" in last_text:
-            candidates.insert(0, "分析刚才的失败原因并尝试修复。")
+        events = app.state.store.list_thread_events(context.tenant_id, thread_id)
+        latest_run_id = next(
+            (
+                event.run_id
+                for event in reversed(events)
+                if event.type == "run.succeeded"
+            ),
+            None,
+        )
+        candidates = next(
+            (
+                [str(item) for item in event.payload.get("options", [])]
+                for event in reversed(events)
+                if event.run_id == latest_run_id
+                and event.type == "assistant.suggestions.generated"
+            ),
+            [],
+        )
         return {
             "thread_id": thread_id,
             "context_summary": last_text,
@@ -2523,11 +3003,53 @@ def create_app(
         messages = app.state.chat_service.list_messages(context.tenant_id, thread_id)
         active_run = app.state.store.get_active_thread_run(context.tenant_id, thread_id)
         events = app.state.store.list_thread_events(context.tenant_id, thread_id)
+        recent_events = events[-event_limit:]
+        recent_event_ids = {event.id for event in recent_events}
+        historic_event_types = {
+            "action_approval",
+            "agent.decision.created",
+            "agent.loop.completed",
+            "agent.loop.started",
+            "agent.waiting_for_user",
+            "app_created",
+            "app_updated",
+            "assistant.message.completed",
+            "assistant.suggestions.generated",
+            "browser.action.performed",
+            "sandbox.command.executed",
+            "tool.failed",
+            "tool_call.cancelled",
+            "tool_call.completed",
+            "tool_call.failed",
+            "ui_render",
+        }
+        bootstrap_events = [
+            event
+            for event in events
+            if event.id in recent_event_ids
+            or event.type in historic_event_types
+            or event.type.startswith(
+                ("approval.", "artifact.", "secret_capture.", "workflow")
+            )
+        ]
+        artifacts = [
+            artifact.model_dump(mode="json")
+            for run_id in dict.fromkeys(
+                event.run_id for event in events if event.run_id is not None
+            )
+            for artifact in app.state.store.list_artifacts(context.tenant_id, run_id)
+        ]
         return {
             "thread": thread.model_dump(mode="json"),
-            "messages": [message.model_dump(mode="json") for message in messages],
+            "messages": [
+                message.model_dump(mode="json", exclude={"execution_content"})
+                for message in messages
+            ],
             "active_run": active_run.model_dump(mode="json") if active_run else None,
-            "events": [event.model_dump(mode="json") for event in events[-event_limit:]],
+            "events": [
+                event.model_dump(mode="json") for event in bootstrap_events
+            ],
+            "artifacts": artifacts,
             "last_event_id": events[-1].thread_sequence if events else 0,
             "reconnect": {
                 "events_url": f"/api/threads/{thread.id}/events",
@@ -2548,7 +3070,7 @@ def create_app(
             "id": link.id,
             "public_id": link.public_id,
             "token": token,
-            "url": f"/public/threads/{link.public_id}#token={token}",
+            "url": f"/public/threads/{link.public_id}?{urlencode({'tenant_id': link.tenant_id, 'token': token})}",
             "expires_at": link.expires_at.isoformat(),
             "redaction_policy": link.redaction_policy,
         }
@@ -2580,9 +3102,18 @@ def create_app(
     @app.get("/public/threads/{public_id}")
     def read_public_thread(
         public_id: str,
-        token: str = Header(alias="X-Share-Token", min_length=20),
+        tenant_id: str = Query(min_length=1),
+        token: str | None = Query(default=None, min_length=20),
+        share_token: str | None = Header(
+            default=None, alias="X-Share-Token", min_length=20
+        ),
     ) -> dict[str, Any]:
-        return app.state.thread_share_service.read_public(public_id, token)
+        resolved_token = share_token or token
+        if resolved_token is None:
+            raise AuthRequiredError("share token required")
+        return app.state.thread_share_service.read_public(
+            tenant_id, public_id, resolved_token
+        )
 
     @app.get("/api/evaluations/suites")
     def list_evaluation_suites(
@@ -2735,8 +3266,24 @@ def create_app(
         workspace_id: str | None = None,
         context: RequestContext = Depends(get_request_context),
     ) -> list[dict[str, Any]]:
+        # ponytail: 当前直接统计；运行量大到影响列表延迟时再下推 SQL 聚合。
+        run_counts: dict[str, int] = {}
+        for run in app.state.store.list_runs(context.tenant_id, workspace_id):
+            if not run.agent_id:
+                continue
+            if run.trigger_message_id and app.state.store.get_chat_message(
+                context.tenant_id, run.trigger_message_id
+            ).kind == "workflow_task":
+                continue
+            run_counts[run.agent_id] = run_counts.get(run.agent_id, 0) + 1
         return [
-            item.model_dump(mode="json")
+            {
+                **item.model_dump(mode="json"),
+                "run_count": run_counts.get(item.id, 0),
+                "skill_bindings": app.state.agent_registry.get_version(
+                    context.tenant_id, item.id, item.latest_version
+                ).spec.skill_bindings,
+            }
             for item in app.state.agent_registry.list(context.tenant_id, workspace_id)
         ]
 
@@ -2750,8 +3297,149 @@ def create_app(
             "agent": definition.model_dump(mode="json"),
             "versions": [
                 item.model_dump(mode="json")
-                for item in app.state.agent_registry.list_versions(context.tenant_id, agent_id)
+                for item in app.state.agent_registry.list_versions(
+                    context.tenant_id, agent_id
+                )
             ],
+        }
+
+    @app.get("/api/agentapps/{agent_id}/action-manifests")
+    @app.get("/api/agents/{agent_id}/action-manifests")
+    def list_agent_action_manifests(
+        agent_id: str,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        definition = app.state.agent_registry.get(context.tenant_id, agent_id)
+        runs = (
+            run
+            for run in app.state.store.list_runs(
+                context.tenant_id,
+                definition.workspace_id,
+            )
+            if run.agent_id == agent_id
+        )
+        return {
+            "items": action_manifests_for_runs(app, context.tenant_id, runs),
+            "nextCursor": None,
+        }
+
+    @app.post(
+        "/api/agentapps/{agent_id}/action-manifests/{manifest_id}/approve"
+    )
+    @app.post("/api/agents/{agent_id}/action-manifests/{manifest_id}/approve")
+    def approve_agent_action_manifest(
+        agent_id: str,
+        manifest_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "connectors.invoke")
+        approval = action_manifest_for_agent(
+            app,
+            context.tenant_id,
+            agent_id,
+            manifest_id,
+        )
+        resolved = approve_action_manifest(app, approval, context.user_id)
+        emit_action_manifest_event(app, resolved)
+        return action_manifest_payload(app, resolved)
+
+    @app.post(
+        "/api/agentapps/{agent_id}/action-manifests/{manifest_id}/reject"
+    )
+    @app.post("/api/agents/{agent_id}/action-manifests/{manifest_id}/reject")
+    def reject_agent_action_manifest(
+        agent_id: str,
+        manifest_id: str,
+        background_tasks: BackgroundTasks,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "connectors.invoke")
+        approval = action_manifest_for_agent(
+            app,
+            context.tenant_id,
+            agent_id,
+            manifest_id,
+        )
+        rejected = reject_action_manifest(app, approval, context.user_id)
+        emit_action_manifest_event(app, rejected)
+        dispatch_next_after_terminal_run(
+            context.tenant_id,
+            approval.run_id,
+            context.user_id,
+            background_tasks,
+        )
+        return action_manifest_payload(app, rejected)
+
+    @app.post("/api/agentapps/{agent_id}/action-manifests/{manifest_id}/apply")
+    @app.post("/api/agents/{agent_id}/action-manifests/{manifest_id}/apply")
+    def apply_agent_action_manifest(
+        agent_id: str,
+        manifest_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "connectors.invoke")
+        approval = action_manifest_for_agent(
+            app,
+            context.tenant_id,
+            agent_id,
+            manifest_id,
+        )
+        return apply_action_manifest(app, approval, request, context)
+
+    @app.get("/api/agents/{agent_id}/files")
+    def get_agent_files(
+        agent_id: str,
+        version: int | None = Query(default=None, ge=1),
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        definition = app.state.agent_registry.get(context.tenant_id, agent_id)
+        version_number = (
+            version or definition.published_version or definition.latest_version
+        )
+        target = app.state.agent_registry.get_version(
+            context.tenant_id, agent_id, version_number
+        )
+        config = {
+            "agent_id": definition.id,
+            "version": target.version,
+            "app_kind": definition.app_kind,
+            "write_autonomy": definition.write_autonomy,
+            "input_schema": target.spec.input_schema,
+            "output_contract": target.spec.output_contract,
+            "skill_bindings": target.spec.skill_bindings,
+            "connector_bindings": target.spec.connector_bindings,
+            "knowledge_bindings": target.spec.knowledge_bindings,
+            "model_policy": target.spec.model_policy,
+        }
+        files = [
+            {
+                "path": "/workspace/agent/SKILL.md",
+                "content_type": "text/markdown",
+                "content": target.spec.instructions,
+            },
+            {
+                "path": "/workspace/agent/config.json",
+                "content_type": "application/json",
+                "content": json.dumps(config, ensure_ascii=False, indent=2),
+            },
+        ]
+        files.extend(
+            {
+                "path": item["sandbox_path"],
+                "storage_object_id": item["storage_object_id"],
+                "content_type": "application/octet-stream",
+                "content": None,
+            }
+            for item in target.spec.runtime_snapshot.get("files", [])
+            if item.get("sandbox_path") and item.get("storage_object_id")
+        )
+        return {
+            "agent_id": agent_id,
+            "version": target.version,
+            "files": files,
         }
 
     @app.patch("/api/agents/{agent_id}")
@@ -2760,8 +3448,9 @@ def create_app(
         payload: AgentDefinitionPatch,
         context: RequestContext = Depends(get_request_context),
     ) -> dict[str, Any]:
-        return app.state.agent_registry.update_definition(
+        return app.state.agent_registry_service.update_definition(
             context.tenant_id,
+            context.user_id,
             agent_id,
             **payload.model_dump(exclude_none=True),
         ).model_dump(mode="json")
@@ -2778,6 +3467,10 @@ def create_app(
         ):
             if run.agent_id != agent_id:
                 continue
+            if run.trigger_message_id and app.state.store.get_chat_message(
+                context.tenant_id, run.trigger_message_id
+            ).kind == "workflow_task":
+                continue
             thread = (
                 app.state.store.get_chat_thread(context.tenant_id, run.thread_id)
                 if run.thread_id
@@ -2788,7 +3481,9 @@ def create_app(
                     "id": run.id,
                     "run_id": run.id,
                     "thread_id": run.thread_id,
-                    "title": thread.title if thread is not None else f"{definition.name} run",
+                    "title": thread.title
+                    if thread is not None
+                    else f"{definition.name} run",
                     "status": run.status.value,
                     "created_at": run.created_at.isoformat(),
                     "updated_at": run.updated_at.isoformat(),
@@ -2796,6 +3491,72 @@ def create_app(
             )
         sessions.sort(key=lambda item: (item["created_at"], item["id"]), reverse=True)
         return {"agent_id": agent_id, "sessions": sessions}
+
+    @app.get("/api/agents/{agent_id}/activity")
+    def list_agent_activity(
+        agent_id: str,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        definition = app.state.agent_registry.get(context.tenant_id, agent_id)
+        activity: list[dict[str, Any]] = [
+            {
+                "id": version.id,
+                "type": "agent.version.created",
+                "status": version.status,
+                "version": version.version,
+                "created_at": version.created_at.isoformat(),
+            }
+            for version in app.state.agent_registry.list_versions(
+                context.tenant_id, agent_id
+            )
+        ]
+        activity.extend(
+            {
+                "id": event.id,
+                "type": event.event_type,
+                "status": "recorded",
+                "run_id": event.run_id,
+                "fields": event.metadata.get("fields", []),
+                "created_at": event.created_at.isoformat(),
+            }
+            for event in app.state.store.list_audit_events(context.tenant_id)
+            if event.event_type in {"agent.created", "agent.updated"}
+            and event.metadata.get("agent_id") == agent_id
+        )
+        for run in app.state.store.list_runs(
+            context.tenant_id, definition.workspace_id
+        ):
+            if run.agent_id != agent_id:
+                continue
+            if run.trigger_message_id and app.state.store.get_chat_message(
+                context.tenant_id, run.trigger_message_id
+            ).kind == "workflow_task":
+                continue
+            activity.append(
+                {
+                    "id": run.id,
+                    "type": "agent.run",
+                    "status": run.status.value,
+                    "run_id": run.id,
+                    "thread_id": run.thread_id,
+                    "created_at": run.created_at.isoformat(),
+                }
+            )
+            activity.extend(
+                {
+                    "id": approval.id,
+                    "type": "agent.approval",
+                    "status": approval.status.value,
+                    "execution_status": approval.execution_status,
+                    "run_id": run.id,
+                    "created_at": approval.created_at.isoformat(),
+                }
+                for approval in app.state.store.list_approval_requests(
+                    context.tenant_id, run.id
+                )
+            )
+        activity.sort(key=lambda item: (item["created_at"], item["id"]), reverse=True)
+        return {"agent_id": agent_id, "activity": activity[:200]}
 
     @app.get("/api/agents/{agent_id}/export")
     def export_agent_definition(
@@ -2805,9 +3566,7 @@ def create_app(
     ) -> dict[str, Any]:
         require_permission(request, context, "storage.read")
         definition = app.state.agent_registry.get(context.tenant_id, agent_id)
-        versions = app.state.agent_registry.list_versions(
-            context.tenant_id, agent_id
-        )
+        versions = app.state.agent_registry.list_versions(context.tenant_id, agent_id)
         storage_object_ids: list[str] = []
         for version in versions:
             storage_object_ids.extend(
@@ -2834,7 +3593,9 @@ def create_app(
             content = app.state.object_storage.download(storage_object).content
             embedded_size += len(content)
             if embedded_size > app.state.settings.upload_max_bytes:
-                raise ValueError("Agent export embedded files exceed the configured size limit")
+                raise ValueError(
+                    "Agent export embedded files exceed the configured size limit"
+                )
             embedded_files.append(
                 {
                     "source_storage_object_id": storage_object.id,
@@ -2873,7 +3634,10 @@ def create_app(
     ) -> dict[str, Any]:
         require_permission(request, context, "storage.write")
         bundle = payload.bundle
-        if bundle.get("apiVersion") != "taroai.ai/v1" or bundle.get("kind") != "AgentBundle":
+        if (
+            bundle.get("apiVersion") != "taroai.ai/v1"
+            or bundle.get("kind") != "AgentBundle"
+        ):
             raise ValueError("Unsupported Agent bundle format")
         bundled_versions = bundle.get("versions")
         if not isinstance(bundled_versions, list) or not bundled_versions:
@@ -2889,10 +3653,14 @@ def create_app(
             try:
                 content = base64.b64decode(item["content_base64"], validate=True)
             except (KeyError, binascii.Error, ValueError) as error:
-                raise ValueError("Agent bundle contains invalid embedded file content") from error
+                raise ValueError(
+                    "Agent bundle contains invalid embedded file content"
+                ) from error
             total_size += len(content)
             if total_size > app.state.settings.upload_max_bytes:
-                raise ValueError("Agent import embedded files exceed the configured size limit")
+                raise ValueError(
+                    "Agent import embedded files exceed the configured size limit"
+                )
             digest = hashlib.sha256(content).hexdigest()
             if digest != item.get("sha256"):
                 raise ValueError("Agent bundle embedded file digest does not match")
@@ -2900,20 +3668,26 @@ def create_app(
                 StorageObjectCreate(
                     tenant_id=context.tenant_id,
                     workspace_id=payload.workspace_id,
-                    purpose=StoragePurpose(item.get("purpose", StoragePurpose.UPLOAD.value)),
+                    purpose=StoragePurpose(
+                        item.get("purpose", StoragePurpose.UPLOAD.value)
+                    ),
                     filename=normalize_workspace_file_path(item["filename"]),
                     content_type=item.get("content_type") or "application/octet-stream",
                     size_bytes=len(content),
                 )
             )
             scan = app.state.storage_content_scanner.scan(
-                StorageContentScanRequest(storage_object=storage_object, content=content)
+                StorageContentScanRequest(
+                    storage_object=storage_object, content=content
+                )
             )
             if not scan.allowed:
                 app.state.storage_catalog.mark_deleted(
                     context.tenant_id, storage_object.id, utc_now()
                 )
-                raise StorageContentRejectedError("Agent bundle file was rejected by the scanner")
+                raise StorageContentRejectedError(
+                    "Agent bundle file was rejected by the scanner"
+                )
             app.state.object_storage.upload(storage_object, content)
             source_id = str(item.get("source_storage_object_id") or "")
             if source_id:
@@ -3008,7 +3782,9 @@ def create_app(
     ) -> list[dict[str, Any]]:
         return [
             item.model_dump(mode="json")
-            for item in app.state.agent_registry.list_versions(context.tenant_id, agent_id)
+            for item in app.state.agent_registry.list_versions(
+                context.tenant_id, agent_id
+            )
         ]
 
     @app.get("/api/agents/{agent_id}/history")
@@ -3100,10 +3876,14 @@ def create_app(
         except (binascii.Error, ValueError) as error:
             raise ValueError("audio_base64 is not valid base64") from error
         if not audio or len(audio) > max_audio_bytes:
-            raise ValueError("Audio is empty or exceeds the configured speech size limit")
+            raise ValueError(
+                "Audio is empty or exceeds the configured speech size limit"
+            )
         return {
             "transcript": app.state.speech_gateway.transcribe(
-                audio=audio, content_type=payload.content_type, language=payload.language
+                audio=audio,
+                content_type=payload.content_type,
+                language=payload.language,
             )
         }
 
@@ -3181,13 +3961,67 @@ def create_app(
         run_status: RunStatus | None = Query(default=None, alias="status"),
         context: RequestContext = Depends(get_request_context),
     ) -> dict[str, Any]:
-        return paginate_created_at_records(
+        result = paginate_created_at_records(
             app.state.store.list_runs(
                 context.tenant_id,
                 workspace_id=workspace_id,
                 status=run_status,
             ),
             page,
+        )
+        # ponytail: pages are capped at 100; use a repository join if this becomes hot.
+        for item in result.items:
+            trigger_message_id = item.get("trigger_message_id")
+            item["message"] = (
+                app.state.store.get_chat_message(
+                    context.tenant_id, trigger_message_id
+                ).content
+                if trigger_message_id
+                else None
+            )
+        return result.model_dump(mode="json")
+
+    @app.get("/api/notifications")
+    def list_notifications(
+        limit: int = Query(default=50, ge=1, le=100),
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        return {
+            "items": [
+                item.model_dump(mode="json")
+                for item in app.state.store.list_notifications(
+                    context.tenant_id, context.user_id, limit
+                )
+            ]
+        }
+
+    @app.get("/api/notifications/unread-count")
+    def count_unread_notifications(
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, int]:
+        return {
+            "count": app.state.store.count_unread_notifications(
+                context.tenant_id, context.user_id
+            )
+        }
+
+    @app.post("/api/notifications/read-all")
+    def mark_all_notifications_read(
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, int]:
+        return {
+            "updated": app.state.store.mark_all_notifications_read(
+                context.tenant_id, context.user_id
+            )
+        }
+
+    @app.post("/api/notifications/{notification_id}/read")
+    def mark_notification_read(
+        notification_id: str,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        return app.state.store.mark_notification_read(
+            context.tenant_id, context.user_id, notification_id
         ).model_dump(mode="json")
 
     @app.post("/api/triggers", status_code=status.HTTP_201_CREATED)
@@ -3358,6 +4192,22 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> dict:
         require_permission(request, context, "connectors.manage")
+        connector = app.state.connector_registry.get_connector(
+            context.tenant_id,
+            connector_id,
+        )
+        if connector.type == ConnectorType.MCP_SERVER:
+            connector = app.state.connector_registry.update_connector(
+                context.tenant_id,
+                connector_id,
+                ConnectorUpdateRequest(
+                    capabilities=(
+                        app.state.connector_dispatcher.discover_mcp_capabilities(
+                            connector
+                        )
+                    )
+                ),
+            )
         connector = app.state.connector_registry.update_connector_status(
             context.tenant_id,
             connector_id,
@@ -3620,6 +4470,22 @@ def create_app(
             "window.setTimeout(()=>window.close(),900);</script>"
         )
 
+    @app.get("/api/connectors/oauth/callback", response_class=HTMLResponse)
+    def complete_connector_oauth_redirect_from_state(
+        background_tasks: BackgroundTasks,
+        request: Request,
+        code: str = Query(min_length=1),
+        state: str = Query(min_length=1),
+    ) -> HTMLResponse:
+        session = app.state.connector_oauth_service.pending_authorization(state)
+        return complete_connector_oauth_redirect(
+            connector_id=session.connector_id,
+            background_tasks=background_tasks,
+            request=request,
+            code=code,
+            state=state,
+        )
+
     @app.post("/api/connectors/{connector_id}/oauth/refresh")
     def refresh_connector_oauth(
         connector_id: str,
@@ -3791,14 +4657,45 @@ def create_app(
             raise TenantAccessError(decision.reason or "connector invocation denied")
 
         if decision.status == ConnectorInvocationStatus.APPROVAL_REQUIRED:
-            approval = get_or_create_connector_approval(
+            try:
+                app.state.connector_dispatcher.preflight(
+                    connector,
+                    payload.tool_input,
+                    decision.tool_name,
+                )
+            except ConnectorDispatchError as error:
+                record_audit_event(
+                    app=app,
+                    tenant_id=context.tenant_id,
+                    workspace_id=connector.workspace_id,
+                    user_id=context.user_id,
+                    run_id=payload.run_id,
+                    event_type="connector.preflight_failed",
+                    metadata=connector_invocation_audit_metadata(
+                        decision,
+                        connector=connector,
+                        error_code="connector_preflight_failed",
+                    ),
+                    request=request,
+                )
+                raise error
+            approval, created = get_or_create_connector_approval(
                 app=app,
                 tenant_id=context.tenant_id,
                 run_id=payload.run_id,
+                provider=connector.display_name,
                 connector_id=connector.id,
                 capability_name=decision.capability_name,
+                tool_name=decision.tool_name,
                 step_id=decision.step_id,
+                risk_level=decision.risk_level,
+                input_keys=decision.input_keys,
+                missing_scopes=decision.missing_scopes,
+                tool_input=payload.tool_input,
+                granted_scopes=payload.granted_scopes,
             )
+            if created:
+                emit_action_manifest_event(app, approval)
             record_audit_event(
                 app=app,
                 tenant_id=context.tenant_id,
@@ -3817,7 +4714,7 @@ def create_app(
             response_body["approval_id"] = approval.id
             return response_body
 
-        approved_approval_id = None
+        approved_approval = None
         if decision.approval_required:
             approved_approval = require_approved_connector_approval(
                 app=app,
@@ -3828,62 +4725,14 @@ def create_app(
                 capability_name=decision.capability_name,
                 step_id=decision.step_id,
             )
-            approved_approval_id = approved_approval.id
-
-        dispatch_result = None
-        try:
-            dispatch_result = app.state.connector_dispatcher.dispatch(
-                connector=connector,
-                tool_input=payload.tool_input,
-                tool_name=decision.tool_name,
-            )
-        except ConnectorDispatchError:
-            record_audit_event(
-                app=app,
-                tenant_id=context.tenant_id,
-                workspace_id=connector.workspace_id,
-                user_id=context.user_id,
-                run_id=payload.run_id,
-                event_type="connector.dispatch_failed",
-                metadata=connector_invocation_audit_metadata(
-                    decision,
-                    connector=connector,
-                    error_code="connector_dispatch_failed",
-                    approval_id=approved_approval_id,
-                ),
-                request=request,
-            )
-            raise
-
-        if decision.billing_meter_type is not None:
-            app.state.store.record_billing_meter(
-                tenant_id=context.tenant_id,
-                run_id=payload.run_id,
-                meter_type=decision.billing_meter_type,
-                quantity=1,
-                unit="invocation",
-                metadata={
-                    "connector_id": connector.id,
-                    "capability_name": decision.capability_name,
-                    "tool_name": decision.tool_name,
-                    "risk_level": decision.risk_level,
-                }
-                | connector_dispatch_billing_metadata(dispatch_result),
-            )
-        record_audit_event(
+        dispatch_result = execute_connector_invocation(
             app=app,
-            tenant_id=context.tenant_id,
-            workspace_id=connector.workspace_id,
-            user_id=context.user_id,
-            run_id=payload.run_id,
-            event_type="connector.invoked",
-            metadata=connector_invocation_audit_metadata(
-                decision,
-                connector=connector,
-                dispatch_result=dispatch_result,
-                approval_id=approved_approval_id,
-            ),
+            context=context,
             request=request,
+            connector=connector,
+            decision=decision,
+            tool_input=payload.tool_input,
+            approval=approved_approval,
         )
         response_body = decision.model_dump(mode="json")
         if dispatch_result is not None:
@@ -4028,6 +4877,28 @@ def create_app(
             user_id=context.user_id,
             run_id=None,
             event_type="trigger.disabled",
+            metadata={"trigger_id": trigger.id, "trigger_type": trigger.type.value},
+            request=request,
+        )
+        return trigger.model_dump(mode="json")
+
+    @app.delete("/api/triggers/{trigger_id}")
+    def delete_trigger(
+        trigger_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "triggers.manage")
+        trigger = app.state.trigger_service.delete_trigger(
+            context.tenant_id, trigger_id
+        )
+        record_audit_event(
+            app=app,
+            tenant_id=context.tenant_id,
+            workspace_id=trigger.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="trigger.deleted",
             metadata={"trigger_id": trigger.id, "trigger_type": trigger.type.value},
             request=request,
         )
@@ -4321,10 +5192,18 @@ def create_app(
         run_id: str,
         context: RequestContext = Depends(get_request_context),
     ) -> dict:
-        return app.state.store.get_runtime_state(
-            context.tenant_id,
-            run_id,
-        ).model_dump(mode="json")
+        try:
+            snapshot = app.state.store.get_runtime_state(context.tenant_id, run_id)
+        except NotFoundError:
+            run = app.state.store.get_run(context.tenant_id, run_id)
+            return {
+                **app.state.runtime._initial_state(run).model_dump(mode="json"),
+                "updated_at": run.updated_at,
+            }
+        return {
+            **snapshot.to_runtime_state_payload(),
+            "updated_at": snapshot.updated_at,
+        }
 
     @app.get("/api/runs/{run_id}/events")
     def get_run_events(
@@ -4399,6 +5278,10 @@ def create_app(
                 queue=app.state.settings.run_execution_queue_name,
             ).model_dump(mode="json")
         state = app.state.runtime.execute_run(context.tenant_id, run_id)
+        if state.graph_failure_code == "model_policy_denied":
+            raise ModelPolicyDeniedError(
+                state.graph_failure_detail or "model request denied by policy"
+            )
         dispatch_next_after_terminal_run(
             context.tenant_id,
             run_id,
@@ -4415,12 +5298,21 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> dict:
         resolved_payload = payload or RunCancelRequest()
-        run = app.state.runtime.cancel_run(
-            tenant_id=context.tenant_id,
-            run_id=run_id,
-            cancelled_by_user_id=context.user_id,
-            reason_code=resolved_payload.reason_code,
+        workflow = app.state.store.get_workflow_for_parent_run(
+            context.tenant_id, run_id
         )
+        if workflow is not None:
+            app.state.workflow_coordinator.cancel(
+                context.tenant_id, workflow.id, context.user_id
+            )
+            run = app.state.store.get_run(context.tenant_id, run_id)
+        else:
+            run = app.state.runtime.cancel_run(
+                tenant_id=context.tenant_id,
+                run_id=run_id,
+                cancelled_by_user_id=context.user_id,
+                reason_code=resolved_payload.reason_code,
+            )
         dispatch_next_after_terminal_run(
             context.tenant_id,
             run_id,
@@ -4484,16 +5376,11 @@ def create_app(
             queue = app.state.job_queue
             if queue is None:
                 raise RedisQueueConfigurationError("job queue backend is disabled")
-            run = app.state.store.request_run_retry(
+            run = app.state.runtime.request_run_retry(
                 tenant_id=context.tenant_id,
                 run_id=run_id,
                 requested_by_user_id=context.user_id,
                 reason_code=resolved_payload.reason_code,
-            )
-            app.state.store.cancel_pending_approval_requests(
-                tenant_id=context.tenant_id,
-                run_id=run_id,
-                cancelled_by_user_id=context.user_id,
             )
             job = queue.enqueue(
                 JobType.RUN_EXECUTION,
@@ -4574,6 +5461,7 @@ def create_app(
                 approval_id=payload.approval_id,
                 approved_by_user_id=context.user_id,
             )
+            emit_action_manifest_event(app, resolved_approval)
             response_body = {
                 "run_id": run_id,
                 "approval_id": resolved_approval.id,
@@ -4587,6 +5475,17 @@ def create_app(
                 approved_by_user_id=context.user_id,
             )
             response_body = state.model_dump(mode="json")
+            workflow = app.state.store.get_workflow_for_parent_run(
+                context.tenant_id, run_id
+            )
+            if workflow is not None and workflow.status == "running":
+                ready = app.state.workflow_coordinator.ready_runs(
+                    context.tenant_id, workflow.id
+                )
+                dispatch_workflow_runs(ready, context.user_id, background_tasks)
+                response_body["workflow"] = workflow.model_dump(
+                    mode="json", by_alias=True
+                )
             dispatch_next_after_terminal_run(
                 context.tenant_id,
                 run_id,
@@ -4629,17 +5528,23 @@ def create_app(
             approval_id=payload.approval_id,
         )
         if connector_approval is not None:
-            rejected_approval = app.state.store.reject_approval_request(
-                tenant_id=context.tenant_id,
-                run_id=run_id,
-                approval_id=payload.approval_id,
-                rejected_by_user_id=context.user_id,
+            rejected_approval = reject_action_manifest(
+                app,
+                connector_approval,
+                context.user_id,
             )
+            emit_action_manifest_event(app, rejected_approval)
             response_body = {
                 "run_id": run_id,
                 "approval_id": rejected_approval.id,
                 "status": rejected_approval.status.value,
             }
+            dispatch_next_after_terminal_run(
+                context.tenant_id,
+                run_id,
+                context.user_id,
+                background_tasks,
+            )
         else:
             state = app.state.runtime.reject_approval(
                 tenant_id=context.tenant_id,
@@ -4661,6 +5566,165 @@ def create_app(
             response_body,
         )
         return response_body
+
+    @app.get("/api/workflows/{workflow_id}")
+    def get_workflow(
+        workflow_id: str,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        workflow = app.state.store.get_workflow(context.tenant_id, workflow_id)
+        return {
+            "workflow": workflow.model_dump(mode="json", by_alias=True),
+            "tasks": [
+                task.model_dump(mode="json")
+                for task in app.state.store.list_workflow_tasks(
+                    context.tenant_id, workflow.id
+                )
+            ],
+        }
+
+    @app.post("/api/workflows/{workflow_id}/pause")
+    def pause_workflow(
+        workflow_id: str,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        return app.state.workflow_coordinator.pause(
+            context.tenant_id, workflow_id
+        ).model_dump(mode="json", by_alias=True)
+
+    @app.post("/api/workflows/{workflow_id}/resume")
+    def resume_workflow(
+        workflow_id: str,
+        background_tasks: BackgroundTasks,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        workflow, ready = app.state.workflow_coordinator.resume(
+            context.tenant_id, workflow_id
+        )
+        dispatch_workflow_runs(ready, context.user_id, background_tasks)
+        return workflow.model_dump(mode="json", by_alias=True)
+
+    @app.post("/api/workflows/{workflow_id}/cancel")
+    def cancel_workflow(
+        workflow_id: str,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        return app.state.workflow_coordinator.cancel(
+            context.tenant_id, workflow_id, context.user_id
+        ).model_dump(mode="json", by_alias=True)
+
+    @app.post("/api/workflows/{workflow_id}/tasks/{task_id}/retry")
+    def retry_workflow_task(
+        workflow_id: str,
+        task_id: str,
+        background_tasks: BackgroundTasks,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        ready = app.state.workflow_coordinator.retry_task(
+            context.tenant_id, workflow_id, task_id
+        )
+        dispatch_workflow_runs(ready, context.user_id, background_tasks)
+        return get_workflow(workflow_id, context)
+
+    @app.get("/api/workflows/{workflow_id}/tasks/{task_id}/messages")
+    def list_workflow_task_messages(
+        workflow_id: str,
+        task_id: str,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        workflow = app.state.store.get_workflow(context.tenant_id, workflow_id)
+        task = next(
+            (
+                item
+                for item in app.state.store.list_workflow_tasks(
+                    context.tenant_id, workflow.id
+                )
+                if item.task_id == task_id
+            ),
+            None,
+        )
+        if task is None:
+            raise NotFoundError(f"Workflow task not found: {task_id}")
+        messages = (
+            app.state.store.list_chat_messages(
+                context.tenant_id, task.child_thread_id
+            )
+            if task.child_thread_id
+            else []
+        )
+        return {
+            "task": task.model_dump(mode="json"),
+            "workerThreadId": task.child_thread_id,
+            "messages": [
+                message.model_dump(mode="json", exclude={"execution_content"})
+                for message in messages
+            ],
+        }
+
+    @app.post("/api/secret-captures/{request_id}")
+    def resolve_secret_capture(
+        request_id: str,
+        payload: SecretCaptureResolveRequest,
+        background_tasks: BackgroundTasks,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        capture = app.state.store.get_secret_capture_request(
+            context.tenant_id, request_id
+        )
+        if capture.status != "pending":
+            raise ValueError("secret capture request is no longer pending")
+        secret = app.state.secret_service.create_secret(
+            tenant_id=context.tenant_id,
+            workspace_id=capture.workspace_id,
+            name=capture.name,
+            value=payload.value.get_secret_value(),
+            scope=SecretScope(
+                tenant_id=context.tenant_id,
+                workspace_id=capture.workspace_id,
+                allowed_tool_names=([capture.tool_name] if capture.tool_name else []),
+                actions=capture.actions,
+            ),
+        )
+        if capture.connector_id:
+            connector = app.state.connector_registry.get_connector(
+                context.tenant_id, capture.connector_id
+            )
+            app.state.connector_registry.update_connector_credential(
+                context.tenant_id,
+                connector.id,
+                ConnectorCredentialRef(
+                    tenant_id=context.tenant_id,
+                    workspace_id=connector.workspace_id,
+                    secret_ref_id=secret.id,
+                    required_actions=capture.actions,
+                    secret_backend=secret.backend,
+                    secret_external_name=secret.external_name,
+                ),
+            )
+        resolved = app.state.store.resolve_secret_capture_request(
+            context.tenant_id, request_id, secret.id
+        )
+        if capture.action_id and capture.connector_id:
+            app.state.store.retry_connector_action_after_reconnect(
+                context.tenant_id,
+                capture.action_id,
+                connector_id=capture.connector_id,
+                resolved_by_user_id=context.user_id,
+            )
+            run = app.state.store.update_run_status(
+                context.tenant_id, capture.run_id, RunStatus.RUNNING
+            )
+            if app.state.settings.run_execution_dispatch_mode == "queue":
+                dispatch_workflow_runs([run], context.user_id, background_tasks)
+            else:
+                background_tasks.add_task(
+                    execute_chat_run_chain, run.tenant_id, run.id
+                )
+        return {
+            "requestId": resolved.id,
+            "status": resolved.status,
+            "secretRefId": resolved.secret_ref_id,
+        }
 
     @app.get("/api/runs/{run_id}/artifacts")
     def list_artifacts(
@@ -4685,9 +5749,9 @@ def create_app(
         require_permission(request, context, "storage.write")
         if payload.run_id != run_id:
             raise ValueError("Artifact Run path and payload must match")
-        return app.state.artifact_service.create(
-            context.tenant_id, payload
-        ).model_dump(mode="json")
+        return app.state.artifact_service.create(context.tenant_id, payload).model_dump(
+            mode="json"
+        )
 
     @app.get("/api/artifacts/{artifact_id}")
     def get_artifact(
@@ -4716,7 +5780,9 @@ def create_app(
             require_storage_read_access(
                 request,
                 context,
-                app.state.storage_catalog.get(context.tenant_id, artifact.storage_object_id),
+                app.state.storage_catalog.get(
+                    context.tenant_id, artifact.storage_object_id
+                ),
             )
         return app.state.artifact_service.preview(
             context.tenant_id, artifact_id
@@ -4847,7 +5913,12 @@ def create_app(
         artifact, download = app.state.artifact_service.download(
             context.tenant_id, artifact_id
         )
-        safe_filename = Path(artifact.name).name.replace('"', "").replace("\r", "").replace("\n", "")
+        safe_filename = (
+            Path(artifact.name)
+            .name.replace('"', "")
+            .replace("\r", "")
+            .replace("\n", "")
+        )
         return Response(
             content=download.content,
             media_type=download.content_type,
@@ -5054,7 +6125,9 @@ def create_app(
         ]
         stored_providers = [
             _model_provider_record_api_payload(app.state.settings, record)
-            for record in app.state.model_provider_store.list_providers(context.tenant_id)
+            for record in app.state.model_provider_store.list_providers(
+                context.tenant_id
+            )
         ]
         return settings_providers + stored_providers
 
@@ -5737,31 +6810,39 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> dict:
         require_permission(request, context, "customer_success.manage")
-        return app.state.customer_feedback_service.update_solution_pack_publication_draft(
-            tenant_id=context.tenant_id,
-            publication_draft_id=publication_draft_id,
-            updated_by_user_id=context.user_id,
-            requested_skill_name=payload.requested_skill_name,
-            proposed_change_summary=payload.proposed_change_summary,
-            proposed_pack_version=payload.proposed_pack_version,
-            proposed_skill_manifest=payload.proposed_skill_manifest,
-            proposed_skill_manifests=payload.proposed_skill_manifests,
-        ).model_dump(mode="json")
+        return (
+            app.state.customer_feedback_service.update_solution_pack_publication_draft(
+                tenant_id=context.tenant_id,
+                publication_draft_id=publication_draft_id,
+                updated_by_user_id=context.user_id,
+                requested_skill_name=payload.requested_skill_name,
+                proposed_change_summary=payload.proposed_change_summary,
+                proposed_pack_version=payload.proposed_pack_version,
+                proposed_skill_manifest=payload.proposed_skill_manifest,
+                proposed_skill_manifests=payload.proposed_skill_manifests,
+            ).model_dump(mode="json")
+        )
 
-    @app.post("/api/customer-success/solution-pack-drafts/{publication_draft_id}/submit")
+    @app.post(
+        "/api/customer-success/solution-pack-drafts/{publication_draft_id}/submit"
+    )
     def submit_customer_success_solution_pack_draft(
         publication_draft_id: str,
         request: Request,
         context: RequestContext = Depends(get_request_context),
     ) -> dict:
         require_permission(request, context, "customer_success.manage")
-        return app.state.customer_feedback_service.submit_solution_pack_publication_draft(
-            tenant_id=context.tenant_id,
-            publication_draft_id=publication_draft_id,
-            submitted_by_user_id=context.user_id,
-        ).model_dump(mode="json")
+        return (
+            app.state.customer_feedback_service.submit_solution_pack_publication_draft(
+                tenant_id=context.tenant_id,
+                publication_draft_id=publication_draft_id,
+                submitted_by_user_id=context.user_id,
+            ).model_dump(mode="json")
+        )
 
-    @app.post("/api/customer-success/solution-pack-drafts/{publication_draft_id}/review")
+    @app.post(
+        "/api/customer-success/solution-pack-drafts/{publication_draft_id}/review"
+    )
     def review_customer_success_solution_pack_draft(
         publication_draft_id: str,
         payload: CustomerSuccessSolutionPackDraftReview,
@@ -5769,13 +6850,15 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> dict:
         require_permission(request, context, "customer_success.manage")
-        return app.state.customer_feedback_service.review_solution_pack_publication_draft(
-            tenant_id=context.tenant_id,
-            publication_draft_id=publication_draft_id,
-            reviewed_by_user_id=context.user_id,
-            status=payload.status,
-            review_note=payload.review_note,
-        ).model_dump(mode="json")
+        return (
+            app.state.customer_feedback_service.review_solution_pack_publication_draft(
+                tenant_id=context.tenant_id,
+                publication_draft_id=publication_draft_id,
+                reviewed_by_user_id=context.user_id,
+                status=payload.status,
+                review_note=payload.review_note,
+            ).model_dump(mode="json")
+        )
 
     @app.post("/api/customer-success/solution-pack-drafts/{publication_draft_id}/apply")
     def apply_customer_success_solution_pack_draft(
@@ -5785,11 +6868,13 @@ def create_app(
     ) -> dict:
         require_permission(request, context, "customer_success.manage")
         require_permission(request, context, "solution_packs.manage")
-        return app.state.customer_feedback_service.apply_solution_pack_publication_draft(
-            tenant_id=context.tenant_id,
-            publication_draft_id=publication_draft_id,
-            applied_by_user_id=context.user_id,
-        ).model_dump(mode="json")
+        return (
+            app.state.customer_feedback_service.apply_solution_pack_publication_draft(
+                tenant_id=context.tenant_id,
+                publication_draft_id=publication_draft_id,
+                applied_by_user_id=context.user_id,
+            ).model_dump(mode="json")
+        )
 
     @app.post("/api/customer-success/solution-pack-candidates/{candidate_id}/review")
     def review_customer_success_solution_pack_candidate(
@@ -6119,7 +7204,8 @@ def create_app(
                 "queue": queue_name,
                 "drill_id": payload.verification_config.drill_id,
                 "has_redis_queue_verification": (
-                    payload.verification_config.redis_queue_verification_path is not None
+                    payload.verification_config.redis_queue_verification_path
+                    is not None
                 ),
             },
             request=request,
@@ -6208,7 +7294,9 @@ def create_app(
         )
         return updated.model_dump(mode="json")
 
-    @app.patch("/api/lifecycle/restore-drill-schedules/{schedule_id}/runs/{run_record_id}")
+    @app.patch(
+        "/api/lifecycle/restore-drill-schedules/{schedule_id}/runs/{run_record_id}"
+    )
     def update_restore_drill_run_record(
         schedule_id: str,
         run_record_id: str,
@@ -6802,6 +7890,100 @@ def create_app(
             page,
         )
 
+    @app.get("/api/store/items")
+    def list_builtin_store_items(
+        request: Request,
+        q: str | None = Query(default=None, min_length=1, max_length=200),
+        kind: str | None = Query(default=None, min_length=1, max_length=40),
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "skills.read")
+        items = app.state.store_catalog.list_items()
+        if kind is not None and kind.casefold() != "solution_pack":
+            items = []
+        if q is not None:
+            needle = q.casefold()
+            items = [
+                item
+                for item in items
+                if needle
+                in " ".join(
+                    [
+                        item.manifest.id,
+                        item.manifest.name,
+                        item.manifest.description,
+                        item.category,
+                        item.publisher,
+                        *item.manifest.use_cases,
+                    ]
+                ).casefold()
+            ]
+        return {"items": [item.summary() for item in items]}
+
+    @app.get("/api/store/items/{item_id}")
+    def get_builtin_store_item(
+        item_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "skills.read")
+        return app.state.store_catalog.get(item_id).detail()
+
+    @app.post(
+        "/api/store/items/{item_id}/install",
+        status_code=status.HTTP_201_CREATED,
+    )
+    def install_builtin_store_catalog_item(
+        item_id: str,
+        payload: StoreItemInstallRequest,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        require_permission(request, context, "skills.install")
+        if payload.workspace_id not in app.state.store.list_workspace_ids(
+            context.tenant_id
+        ):
+            raise NotFoundError(f"Workspace not found: {payload.workspace_id}")
+        item = app.state.store_catalog.get(item_id)
+        if payload.expected_digest is not None and payload.expected_digest != item.digest:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Store item digest changed: {item_id}",
+            )
+        try:
+            install_result = install_builtin_store_item(
+                item=item,
+                skill_service=app.state.skill_service,
+                solution_pack_registry=app.state.solution_pack_registry,
+                tenant_id=context.tenant_id,
+                workspace_id=payload.workspace_id,
+                user_id=context.user_id,
+            )
+        except StoreInstallConflictError as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(error),
+            ) from error
+        response = {
+            "item_id": item.manifest.id,
+            "version": item.manifest.version,
+            "digest": item.digest,
+            "workspace_id": payload.workspace_id,
+            "status": "installed",
+            **install_result,
+        }
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=payload.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="store.item.installed",
+            metadata=response,
+            request=request,
+        )
+        return response
+
     @app.post("/api/solution-packs", status_code=status.HTTP_201_CREATED)
     def register_solution_pack(
         payload: SolutionPackManifest,
@@ -7005,12 +8187,10 @@ def create_app(
                 workspace_id=payload.workspace_id,
                 user_id=context.user_id,
                 skill_id=package.skill_id,
-                meter_type="skill_package_storage_bytes",
+                meter_type="storage_bytes",
                 quantity=float(metadata["size_bytes"]),
                 unit="byte",
-                metadata={key: metadata[key] for key in (
-                    "version", "package_digest", "source_digest", "source_type"
-                )},
+                metadata=metadata | {"resource_type": "skill_package"},
             )
         return package.model_dump(mode="json")
 
@@ -7055,12 +8235,10 @@ def create_app(
                 workspace_id=payload.workspace_id,
                 user_id=context.user_id,
                 skill_id=package.skill_id,
-                meter_type="skill_package_storage_bytes",
+                meter_type="storage_bytes",
                 quantity=float(metadata["size_bytes"]),
                 unit="byte",
-                metadata={key: metadata[key] for key in (
-                    "version", "package_digest", "source_digest", "source_type"
-                )},
+                metadata=metadata | {"resource_type": "skill_package"},
             )
         return package.model_dump(mode="json")
 
@@ -7501,10 +8679,15 @@ def create_app(
             request=request,
         )
         app.state.store.record_billing_meter(
-            tenant_id=context.tenant_id, run_id=None, workspace_id=workspace_id,
-            user_id=context.user_id, skill_id=skill_id,
-            meter_type="skill_management_operation_count", quantity=1,
-            unit="operation", metadata=metadata,
+            tenant_id=context.tenant_id,
+            run_id=None,
+            workspace_id=workspace_id,
+            user_id=context.user_id,
+            skill_id=skill_id,
+            meter_type="skill_management_operation_count",
+            quantity=1,
+            unit="operation",
+            metadata=metadata,
         )
         return installation.model_dump(mode="json")
 
@@ -7543,10 +8726,15 @@ def create_app(
             request=request,
         )
         app.state.store.record_billing_meter(
-            tenant_id=context.tenant_id, run_id=None, workspace_id=workspace_id,
-            user_id=context.user_id, skill_id=skill_id,
-            meter_type="skill_management_operation_count", quantity=1,
-            unit="operation", metadata=metadata,
+            tenant_id=context.tenant_id,
+            run_id=None,
+            workspace_id=workspace_id,
+            user_id=context.user_id,
+            skill_id=skill_id,
+            meter_type="skill_management_operation_count",
+            quantity=1,
+            unit="operation",
+            metadata=metadata,
         )
         return installation.model_dump(mode="json")
 
@@ -7580,10 +8768,15 @@ def create_app(
             request=request,
         )
         app.state.store.record_billing_meter(
-            tenant_id=context.tenant_id, run_id=None, workspace_id=workspace_id,
-            user_id=context.user_id, skill_id=skill_id,
-            meter_type="skill_management_operation_count", quantity=1,
-            unit="operation", metadata={"operation": "uninstall", **metadata},
+            tenant_id=context.tenant_id,
+            run_id=None,
+            workspace_id=workspace_id,
+            user_id=context.user_id,
+            skill_id=skill_id,
+            meter_type="skill_management_operation_count",
+            quantity=1,
+            unit="operation",
+            metadata={"operation": "uninstall", **metadata},
         )
         return installation.model_dump(mode="json")
 
@@ -7659,10 +8852,9 @@ def create_app(
                 set(entry.manifest.required_scopes) - set(granted_scopes)
             )
             invocation_mode = skill_invocation_mode(entry.manifest)
-            executable = (
-                is_agent_run_skill(entry.manifest)
-                or app.state.runtime.tool_gateway.can_execute_tool(entry.manifest.id)
-            )
+            executable = is_agent_run_skill(
+                entry.manifest
+            ) or app.state.runtime.tool_gateway.can_execute_tool(entry.manifest.id)
             item.update(
                 {
                     "invocation_mode": invocation_mode,
@@ -7699,15 +8891,25 @@ def create_app(
             "status": installation.status.value,
         }
         record_audit_event(
-            app, tenant_id=context.tenant_id, workspace_id=workspace_id,
-            user_id=context.user_id, run_id=None, event_type="skill.enabled",
-            metadata=metadata, request=request,
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="skill.enabled",
+            metadata=metadata,
+            request=request,
         )
         app.state.store.record_billing_meter(
-            tenant_id=context.tenant_id, run_id=None, workspace_id=workspace_id,
-            user_id=context.user_id, skill_id=skill_id,
-            meter_type="skill_management_operation_count", quantity=1,
-            unit="operation", metadata={"operation": "enable", **metadata},
+            tenant_id=context.tenant_id,
+            run_id=None,
+            workspace_id=workspace_id,
+            user_id=context.user_id,
+            skill_id=skill_id,
+            meter_type="skill_management_operation_count",
+            quantity=1,
+            unit="operation",
+            metadata={"operation": "enable", **metadata},
         )
         return installation.model_dump(mode="json")
 
@@ -7732,15 +8934,25 @@ def create_app(
             "status": installation.status.value,
         }
         record_audit_event(
-            app, tenant_id=context.tenant_id, workspace_id=workspace_id,
-            user_id=context.user_id, run_id=None, event_type="skill.disabled",
-            metadata=metadata, request=request,
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="skill.disabled",
+            metadata=metadata,
+            request=request,
         )
         app.state.store.record_billing_meter(
-            tenant_id=context.tenant_id, run_id=None, workspace_id=workspace_id,
-            user_id=context.user_id, skill_id=skill_id,
-            meter_type="skill_management_operation_count", quantity=1,
-            unit="operation", metadata={"operation": "disable", **metadata},
+            tenant_id=context.tenant_id,
+            run_id=None,
+            workspace_id=workspace_id,
+            user_id=context.user_id,
+            skill_id=skill_id,
+            meter_type="skill_management_operation_count",
+            quantity=1,
+            unit="operation",
+            metadata={"operation": "disable", **metadata},
         )
         return installation.model_dump(mode="json")
 
@@ -7782,7 +8994,9 @@ def create_app(
             context,
             entry.manifest.required_scopes,
         )
-        missing_scopes = sorted(set(entry.manifest.required_scopes) - set(granted_scopes))
+        missing_scopes = sorted(
+            set(entry.manifest.required_scopes) - set(granted_scopes)
+        )
         if missing_scopes:
             raise TenantAccessError(
                 f"Permission denied: missing skill scopes: {', '.join(missing_scopes)}"
@@ -7911,7 +9125,10 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> dict[str, Any]:
         require_permission(request, context, "storage.write")
-        if Path(payload.filename).name != payload.filename or payload.filename in {".", ".."}:
+        if Path(payload.filename).name != payload.filename or payload.filename in {
+            ".",
+            "..",
+        }:
             raise ValueError("Upload filename must not contain a path")
         if payload.content_type not in app.state.settings.upload_allowed_content_types:
             raise ValueError("Upload content type is not allowed")
@@ -7938,7 +9155,9 @@ def create_app(
         )
         try:
             scan = app.state.storage_content_scanner.scan(
-                StorageContentScanRequest(storage_object=storage_object, content=content)
+                StorageContentScanRequest(
+                    storage_object=storage_object, content=content
+                )
             )
             if not scan.allowed:
                 raise StorageContentRejectedError(
@@ -8028,7 +9247,9 @@ def create_app(
             if not include_run_files and storage_object.run_id is not None:
                 continue
             logical_path = storage_object.filename.replace("\\", "/")
-            if normalized_folder and not logical_path.startswith(f"{normalized_folder}/"):
+            if normalized_folder and not logical_path.startswith(
+                f"{normalized_folder}/"
+            ):
                 continue
             if normalized_query and normalized_query not in logical_path.casefold():
                 continue
@@ -8234,13 +9455,17 @@ def create_app(
                 f'{escape(preview.srcdoc or "", quote=True)}"></iframe>'
             )
         elif preview.mode == "dashboard" and preview.dashboard is not None:
-            content = "<pre>" + escape(
-                json.dumps(
-                    preview.dashboard.model_dump(mode="json"),
-                    ensure_ascii=False,
-                    indent=2,
+            content = (
+                "<pre>"
+                + escape(
+                    json.dumps(
+                        preview.dashboard.model_dump(mode="json"),
+                        ensure_ascii=False,
+                        indent=2,
+                    )
                 )
-            ) + "</pre>"
+                + "</pre>"
+            )
         elif preview.text is not None:
             content = f"<pre>{escape(preview.text)}</pre>"
         else:
@@ -8275,9 +9500,7 @@ def create_app(
             },
         )
 
-    @app.get(
-        "/api/share-links/{external_link_id}/artifacts/{artifact_id}/download"
-    )
+    @app.get("/api/share-links/{external_link_id}/artifacts/{artifact_id}/download")
     def download_external_artifact(
         external_link_id: str,
         artifact_id: str,
@@ -8295,7 +9518,12 @@ def create_app(
             _, result = app.state.artifact_service.download(tenant_id, artifact.id)
             content = result.content
             content_type = result.content_type
-        safe_filename = Path(artifact.name).name.replace('"', "").replace("\r", "").replace("\n", "")
+        safe_filename = (
+            Path(artifact.name)
+            .name.replace('"', "")
+            .replace("\r", "")
+            .replace("\n", "")
+        )
         return Response(
             content=content,
             media_type=content_type,
@@ -8565,6 +9793,36 @@ def create_app(
             request,
             page,
         )
+
+    @app.delete("/api/memory/{memory_id}")
+    def forget_memory(
+        memory_id: str,
+        request: Request,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict:
+        require_permission(request, context, "memory.write")
+        existing = app.state.long_term_memory_service.get(
+            context.tenant_id, memory_id
+        )
+        if (
+            existing.scope_type == MemoryScopeType.USER
+            and existing.scope_id != context.user_id
+        ):
+            require_permission(request, context, "memory.review")
+        memory = app.state.long_term_memory_service.forget(
+            context.tenant_id, memory_id
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=memory.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="memory.forgotten",
+            metadata=memory_audit_metadata(memory),
+            request=request,
+        )
+        return {"id": memory.id, "status": memory.status.value}
 
     @app.post("/api/memory/{memory_id}/approve")
     def approve_memory_candidate(
@@ -8929,17 +10187,20 @@ def create_app(
     ) -> dict:
         require_permission(request, context, "sandbox.execute")
         session = app.state.sandbox_adapter.get_session(context.tenant_id, session_id)
-        file_ref = app.state.sandbox_adapter.upload_file(
-            SandboxFileWrite(
-                tenant_id=context.tenant_id,
-                workspace_id=session.workspace_id,
-                run_id=session.run_id,
-                session_id=session.id,
-                path=payload.path,
-                content=payload.content,
-                content_type=payload.content_type,
-            )
+        file_write = SandboxFileWrite(
+            tenant_id=context.tenant_id,
+            workspace_id=session.workspace_id,
+            run_id=session.run_id,
+            session_id=session.id,
+            path=payload.path,
+            content=payload.content,
+            content_base64=payload.content_base64,
+            content_type=payload.content_type,
         )
+        content = file_write.content_bytes()
+        if len(content) > app.state.settings.upload_max_bytes:
+            raise ValueError("Sandbox file exceeds the configured size limit")
+        file_ref = app.state.sandbox_adapter.upload_file(file_write)
         run_id = existing_run_id_or_none(app, context.tenant_id, session.run_id)
         file_storage_object = None
         if run_id is not None:
@@ -8957,7 +10218,7 @@ def create_app(
             upload_storage_object(
                 app=app,
                 storage_object=file_storage_object,
-                content=sandbox_file_content(file_ref),
+                content=content,
                 request=request,
                 context=context,
             )
@@ -8994,11 +10255,26 @@ def create_app(
     ) -> dict:
         require_permission(request, context, "sandbox.execute")
         session = app.state.sandbox_adapter.get_session(context.tenant_id, session_id)
+        max_bytes = app.state.settings.upload_max_bytes
+        listed_file = next(
+            (
+                file_ref
+                for file_ref in app.state.sandbox_adapter.list_files(
+                    context.tenant_id, session_id
+                )
+                if file_ref.path == path
+            ),
+            None,
+        )
+        if listed_file is not None and listed_file.size_bytes > max_bytes:
+            raise ValueError("Sandbox file exceeds the configured size limit")
         file_ref = app.state.sandbox_adapter.download_file(
             tenant_id=context.tenant_id,
             session_id=session_id,
             path=path,
         )
+        if file_ref.size_bytes > max_bytes:
+            raise ValueError("Sandbox file exceeds the configured size limit")
         run_id = existing_run_id_or_none(app, context.tenant_id, session.run_id)
         record_audit_event(
             app,
@@ -9091,7 +10367,15 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> dict[str, Any]:
         require_permission(request, context, "connectors.manage")
-        return {"workspace_id": workspace_id, "repositories": [item.model_dump(mode="json") for item in app.state.coding_workspace_registry.list_repositories(context.tenant_id, workspace_id)]}
+        return {
+            "workspace_id": workspace_id,
+            "repositories": [
+                item.model_dump(mode="json")
+                for item in app.state.coding_workspace_registry.list_repositories(
+                    context.tenant_id, workspace_id
+                )
+            ],
+        }
 
     @app.post("/api/repositories", status_code=status.HTTP_201_CREATED)
     def create_repository_binding(
@@ -9100,8 +10384,23 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> dict[str, Any]:
         require_permission(request, context, "connectors.manage")
-        item = app.state.coding_workspace_service.create_repository(context.tenant_id, context.user_id, payload)
-        record_audit_event(app, tenant_id=context.tenant_id, workspace_id=item.workspace_id, user_id=context.user_id, run_id=None, event_type="coding.repository.connected", metadata={"repository_id": item.id, "provider": item.provider, "connector_id_present": item.connector_id is not None}, request=request)
+        item = app.state.coding_workspace_service.create_repository(
+            context.tenant_id, context.user_id, payload
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=item.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="coding.repository.connected",
+            metadata={
+                "repository_id": item.id,
+                "provider": item.provider,
+                "connector_id_present": item.connector_id is not None,
+            },
+            request=request,
+        )
         return item.model_dump(mode="json")
 
     @app.patch("/api/repositories/{repository_id}")
@@ -9112,7 +10411,9 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> dict[str, Any]:
         require_permission(request, context, "connectors.manage")
-        return app.state.coding_workspace_service.update_repository(context.tenant_id, repository_id, payload).model_dump(mode="json")
+        return app.state.coding_workspace_service.update_repository(
+            context.tenant_id, repository_id, payload
+        ).model_dump(mode="json")
 
     @app.get("/api/coding-workspaces")
     def list_coding_workspaces(
@@ -9121,7 +10422,15 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> dict[str, Any]:
         require_permission(request, context, "sandbox.create")
-        return {"workspace_id": workspace_id, "coding_workspaces": [item.model_dump(mode="json") for item in app.state.coding_workspace_registry.list_workspaces(context.tenant_id, workspace_id)]}
+        return {
+            "workspace_id": workspace_id,
+            "coding_workspaces": [
+                item.model_dump(mode="json")
+                for item in app.state.coding_workspace_registry.list_workspaces(
+                    context.tenant_id, workspace_id
+                )
+            ],
+        }
 
     @app.post("/api/coding-workspaces", status_code=status.HTTP_201_CREATED)
     def create_coding_workspace(
@@ -9130,8 +10439,24 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> dict[str, Any]:
         require_permission(request, context, "sandbox.create")
-        item = app.state.coding_workspace_service.create_workspace(context.tenant_id, context.user_id, payload)
-        record_audit_event(app, tenant_id=context.tenant_id, workspace_id=item.workspace_id, user_id=context.user_id, run_id=item.run_id, event_type="coding.workspace.created", metadata={"coding_workspace_id": item.id, "repository_id": item.repository_id, "branch": item.branch, "engine_session_id": item.engine_session_id}, request=request)
+        item = app.state.coding_workspace_service.create_workspace(
+            context.tenant_id, context.user_id, payload
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=item.workspace_id,
+            user_id=context.user_id,
+            run_id=item.run_id,
+            event_type="coding.workspace.created",
+            metadata={
+                "coding_workspace_id": item.id,
+                "repository_id": item.repository_id,
+                "branch": item.branch,
+                "engine_session_id": item.engine_session_id,
+            },
+            request=request,
+        )
         return item.model_dump(mode="json")
 
     @app.get("/api/coding-workspaces/{coding_workspace_id}")
@@ -9141,7 +10466,9 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> dict[str, Any]:
         require_permission(request, context, "sandbox.create")
-        return app.state.coding_workspace_service.detail(context.tenant_id, coding_workspace_id)
+        return app.state.coding_workspace_service.detail(
+            context.tenant_id, coding_workspace_id
+        )
 
     @app.get("/api/runs/{run_id}/coding-workspace")
     def get_run_coding_workspace(
@@ -9151,8 +10478,25 @@ def create_app(
     ) -> dict[str, Any]:
         require_permission(request, context, "sandbox.create")
         run = app.state.store.get_run(context.tenant_id, run_id)
-        item = next((candidate for candidate in app.state.coding_workspace_registry.list_workspaces(context.tenant_id, run.workspace_id) if candidate.run_id == run_id), None)
-        return {"run_id": run_id, "available": item is not None, "detail": app.state.coding_workspace_service.detail(context.tenant_id, item.id) if item is not None else None}
+        item = next(
+            (
+                candidate
+                for candidate in app.state.coding_workspace_registry.list_workspaces(
+                    context.tenant_id, run.workspace_id
+                )
+                if candidate.run_id == run_id
+            ),
+            None,
+        )
+        return {
+            "run_id": run_id,
+            "available": item is not None,
+            "detail": app.state.coding_workspace_service.detail(
+                context.tenant_id, item.id
+            )
+            if item is not None
+            else None,
+        }
 
     @app.put("/api/coding-workspaces/{coding_workspace_id}/changes")
     def submit_coding_changes(
@@ -9162,12 +10506,25 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> dict[str, Any]:
         require_permission(request, context, "sandbox.create")
-        item = app.state.coding_workspace_service.submit_changes(context.tenant_id, coding_workspace_id, payload)
+        item = app.state.coding_workspace_service.submit_changes(
+            context.tenant_id, coding_workspace_id, payload
+        )
         run = app.state.store.get_run(context.tenant_id, item.run_id)
-        app.state.store.append_run_event(run, "coding.changes.updated", {"coding_workspace_id": item.id, "file_count": len(payload.changes), "head_revision": payload.head_revision})
+        app.state.store.append_run_event(
+            run,
+            "coding.changes.updated",
+            {
+                "coding_workspace_id": item.id,
+                "file_count": len(payload.changes),
+                "head_revision": payload.head_revision,
+            },
+        )
         return item.model_dump(mode="json")
 
-    @app.post("/api/coding-workspaces/{coding_workspace_id}/tests", status_code=status.HTTP_201_CREATED)
+    @app.post(
+        "/api/coding-workspaces/{coding_workspace_id}/tests",
+        status_code=status.HTTP_201_CREATED,
+    )
     def add_coding_test_result(
         coding_workspace_id: str,
         payload: CodingTestResultCreate,
@@ -9175,13 +10532,30 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> dict[str, Any]:
         require_permission(request, context, "sandbox.create")
-        result = app.state.coding_workspace_service.add_test(context.tenant_id, coding_workspace_id, payload)
-        workspace = app.state.coding_workspace_registry.get_workspace(context.tenant_id, coding_workspace_id)
+        result = app.state.coding_workspace_service.add_test(
+            context.tenant_id, coding_workspace_id, payload
+        )
+        workspace = app.state.coding_workspace_registry.get_workspace(
+            context.tenant_id, coding_workspace_id
+        )
         run = app.state.store.get_run(context.tenant_id, workspace.run_id)
-        app.state.store.append_run_event(run, "coding.test.completed", {"coding_workspace_id": workspace.id, "test_result_id": result.id, "status": result.status, "command": result.command, "duration_seconds": result.duration_seconds})
+        app.state.store.append_run_event(
+            run,
+            "coding.test.completed",
+            {
+                "coding_workspace_id": workspace.id,
+                "test_result_id": result.id,
+                "status": result.status,
+                "command": result.command,
+                "duration_seconds": result.duration_seconds,
+            },
+        )
         return result.model_dump(mode="json")
 
-    @app.post("/api/coding-workspaces/{coding_workspace_id}/checkpoints", status_code=status.HTTP_201_CREATED)
+    @app.post(
+        "/api/coding-workspaces/{coding_workspace_id}/checkpoints",
+        status_code=status.HTTP_201_CREATED,
+    )
     def add_coding_checkpoint(
         coding_workspace_id: str,
         payload: CodingCheckpointCreate,
@@ -9189,13 +10563,29 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> dict[str, Any]:
         require_permission(request, context, "sandbox.create")
-        checkpoint = app.state.coding_workspace_service.add_checkpoint(context.tenant_id, context.user_id, coding_workspace_id, payload)
-        workspace = app.state.coding_workspace_registry.get_workspace(context.tenant_id, coding_workspace_id)
+        checkpoint = app.state.coding_workspace_service.add_checkpoint(
+            context.tenant_id, context.user_id, coding_workspace_id, payload
+        )
+        workspace = app.state.coding_workspace_registry.get_workspace(
+            context.tenant_id, coding_workspace_id
+        )
         run = app.state.store.get_run(context.tenant_id, workspace.run_id)
-        app.state.store.append_run_event(run, "coding.checkpoint.created", {"coding_workspace_id": workspace.id, "checkpoint_id": checkpoint.id, "revision": checkpoint.revision, "label": checkpoint.label})
+        app.state.store.append_run_event(
+            run,
+            "coding.checkpoint.created",
+            {
+                "coding_workspace_id": workspace.id,
+                "checkpoint_id": checkpoint.id,
+                "revision": checkpoint.revision,
+                "label": checkpoint.label,
+            },
+        )
         return checkpoint.model_dump(mode="json")
 
-    @app.post("/api/coding-workspaces/{coding_workspace_id}/deliveries", status_code=status.HTTP_201_CREATED)
+    @app.post(
+        "/api/coding-workspaces/{coding_workspace_id}/deliveries",
+        status_code=status.HTTP_201_CREATED,
+    )
     def add_coding_delivery(
         coding_workspace_id: str,
         payload: CodingDeliveryCreate,
@@ -9203,11 +10593,40 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> dict[str, Any]:
         require_permission(request, context, "sandbox.create")
-        item = app.state.coding_workspace_service.add_delivery(context.tenant_id, context.user_id, coding_workspace_id, payload)
-        workspace = app.state.coding_workspace_registry.get_workspace(context.tenant_id, coding_workspace_id)
+        item = app.state.coding_workspace_service.add_delivery(
+            context.tenant_id, context.user_id, coding_workspace_id, payload
+        )
+        workspace = app.state.coding_workspace_registry.get_workspace(
+            context.tenant_id, coding_workspace_id
+        )
         run = app.state.store.get_run(context.tenant_id, workspace.run_id)
-        app.state.store.append_run_event(run, "coding.delivery.updated", {"coding_workspace_id": workspace.id, "delivery_id": item.id, "status": item.status, "commit_sha": item.commit_sha, "pull_request_url": item.pull_request_url})
-        record_audit_event(app, tenant_id=context.tenant_id, workspace_id=workspace.workspace_id, user_id=context.user_id, run_id=workspace.run_id, event_type="coding.delivery.recorded", metadata={"coding_workspace_id": workspace.id, "delivery_id": item.id, "status": item.status, "commit_sha_present": item.commit_sha is not None, "pull_request_present": item.pull_request_url is not None}, request=request)
+        app.state.store.append_run_event(
+            run,
+            "coding.delivery.updated",
+            {
+                "coding_workspace_id": workspace.id,
+                "delivery_id": item.id,
+                "status": item.status,
+                "commit_sha": item.commit_sha,
+                "pull_request_url": item.pull_request_url,
+            },
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=workspace.workspace_id,
+            user_id=context.user_id,
+            run_id=workspace.run_id,
+            event_type="coding.delivery.recorded",
+            metadata={
+                "coding_workspace_id": workspace.id,
+                "delivery_id": item.id,
+                "status": item.status,
+                "commit_sha_present": item.commit_sha is not None,
+                "pull_request_present": item.pull_request_url is not None,
+            },
+            request=request,
+        )
         return item.model_dump(mode="json")
 
     @app.post("/api/coding-workspaces/{coding_workspace_id}/actions")
@@ -9218,9 +10637,13 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> dict[str, Any]:
         require_permission(request, context, "sandbox.create")
-        workspace = app.state.coding_workspace_registry.get_workspace(context.tenant_id, coding_workspace_id)
+        workspace = app.state.coding_workspace_registry.get_workspace(
+            context.tenant_id, coding_workspace_id
+        )
         if workspace.engine_session_id is None:
-            raise ValueError("Coding Workspace is not attached to an Agent Engine session")
+            raise ValueError(
+                "Coding Workspace is not attached to an Agent Engine session"
+            )
         session = app.state.agent_engine_service.operation(
             context.tenant_id,
             workspace.engine_session_id,
@@ -9228,9 +10651,36 @@ def create_app(
             {"coding_workspace_id": workspace.id, **payload.model_dump(mode="json")},
         )
         run = app.state.store.get_run(context.tenant_id, workspace.run_id)
-        app.state.store.append_run_event(run, "coding.action.requested", {"coding_workspace_id": workspace.id, "engine_session_id": session.id, "action": payload.action, "message_present": payload.message is not None, "command_present": payload.command is not None})
-        record_audit_event(app, tenant_id=context.tenant_id, workspace_id=workspace.workspace_id, user_id=context.user_id, run_id=workspace.run_id, event_type="coding.action.requested", metadata={"coding_workspace_id": workspace.id, "engine_session_id": session.id, "action": payload.action}, request=request)
-        return {"accepted": True, "coding_workspace_id": workspace.id, "engine_session": session.model_dump(mode="json")}
+        app.state.store.append_run_event(
+            run,
+            "coding.action.requested",
+            {
+                "coding_workspace_id": workspace.id,
+                "engine_session_id": session.id,
+                "action": payload.action,
+                "message_present": payload.message is not None,
+                "command_present": payload.command is not None,
+            },
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=workspace.workspace_id,
+            user_id=context.user_id,
+            run_id=workspace.run_id,
+            event_type="coding.action.requested",
+            metadata={
+                "coding_workspace_id": workspace.id,
+                "engine_session_id": session.id,
+                "action": payload.action,
+            },
+            request=request,
+        )
+        return {
+            "accepted": True,
+            "coding_workspace_id": workspace.id,
+            "engine_session": session.model_dump(mode="json"),
+        }
 
     @app.get("/api/agent-engines/connections")
     def list_agent_engine_connections(
@@ -9260,9 +10710,18 @@ def create_app(
             context.tenant_id, context.user_id, payload
         )
         record_audit_event(
-            app, tenant_id=context.tenant_id, workspace_id=connection.workspace_id,
-            user_id=context.user_id, run_id=None, event_type="agent_engine.connection.created",
-            metadata={"connection_id": connection.id, "engine_type": connection.engine_type.value, "secret_ref_present": connection.secret_ref_id is not None}, request=request,
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=connection.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="agent_engine.connection.created",
+            metadata={
+                "connection_id": connection.id,
+                "engine_type": connection.engine_type.value,
+                "secret_ref_present": connection.secret_ref_id is not None,
+            },
+            request=request,
         )
         return agent_engine_connection_payload(connection)
 
@@ -9278,9 +10737,18 @@ def create_app(
             context.tenant_id, connection_id, payload
         )
         record_audit_event(
-            app, tenant_id=context.tenant_id, workspace_id=connection.workspace_id,
-            user_id=context.user_id, run_id=None, event_type="agent_engine.connection.updated",
-            metadata={"connection_id": connection.id, "engine_type": connection.engine_type.value, "status": connection.status}, request=request,
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=connection.workspace_id,
+            user_id=context.user_id,
+            run_id=None,
+            event_type="agent_engine.connection.updated",
+            metadata={
+                "connection_id": connection.id,
+                "engine_type": connection.engine_type.value,
+                "status": connection.status,
+            },
+            request=request,
         )
         return agent_engine_connection_payload(connection)
 
@@ -9293,7 +10761,12 @@ def create_app(
         require_permission(request, context, "sandbox.create")
         return {
             "workspace_id": workspace_id,
-            "sessions": [item.model_dump(mode="json") for item in app.state.agent_engine_registry.list_sessions(context.tenant_id, workspace_id)],
+            "sessions": [
+                item.model_dump(mode="json")
+                for item in app.state.agent_engine_registry.list_sessions(
+                    context.tenant_id, workspace_id
+                )
+            ],
         }
 
     @app.post("/api/agent-engines/sessions", status_code=status.HTTP_201_CREATED)
@@ -9311,9 +10784,18 @@ def create_app(
             context.tenant_id, context.user_id, payload
         )
         record_audit_event(
-            app, tenant_id=context.tenant_id, workspace_id=session.workspace_id,
-            user_id=context.user_id, run_id=session.run_id, event_type="agent_engine.session.started",
-            metadata={"session_id": session.id, "connection_id": session.connection_id, "engine_type": session.engine_type.value}, request=request,
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=session.workspace_id,
+            user_id=context.user_id,
+            run_id=session.run_id,
+            event_type="agent_engine.session.started",
+            metadata={
+                "session_id": session.id,
+                "connection_id": session.connection_id,
+                "engine_type": session.engine_type.value,
+            },
+            request=request,
         )
         return session.model_dump(mode="json")
 
@@ -9329,9 +10811,18 @@ def create_app(
         events = (
             app.state.agent_engine_service.refresh_events(context.tenant_id, session_id)
             if refresh
-            else app.state.agent_engine_registry.list_events(context.tenant_id, session_id, after_sequence)
+            else app.state.agent_engine_registry.list_events(
+                context.tenant_id, session_id, after_sequence
+            )
         )
-        return {"session_id": session_id, "events": [item.model_dump(mode="json") for item in events if item.sequence > after_sequence]}
+        return {
+            "session_id": session_id,
+            "events": [
+                item.model_dump(mode="json")
+                for item in events
+                if item.sequence > after_sequence
+            ],
+        }
 
     @app.post("/api/agent-engines/sessions/{session_id}/turns")
     def send_agent_engine_turn(
@@ -9341,7 +10832,9 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> dict[str, Any]:
         require_permission(request, context, "sandbox.create")
-        return app.state.agent_engine_service.operation(context.tenant_id, session_id, "turns", payload.model_dump()).model_dump(mode="json")
+        return app.state.agent_engine_service.operation(
+            context.tenant_id, session_id, "turns", payload.model_dump()
+        ).model_dump(mode="json")
 
     @app.post("/api/agent-engines/sessions/{session_id}/steer")
     def steer_agent_engine_session(
@@ -9351,7 +10844,9 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> dict[str, Any]:
         require_permission(request, context, "sandbox.create")
-        return app.state.agent_engine_service.operation(context.tenant_id, session_id, "steer", payload.model_dump()).model_dump(mode="json")
+        return app.state.agent_engine_service.operation(
+            context.tenant_id, session_id, "steer", payload.model_dump()
+        ).model_dump(mode="json")
 
     @app.post("/api/agent-engines/sessions/{session_id}/approvals/{approval_id}")
     def decide_agent_engine_approval(
@@ -9362,12 +10857,21 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> dict[str, Any]:
         require_permission(request, context, "sandbox.create")
-        session = app.state.agent_engine_service.operation(context.tenant_id, session_id, f"approvals/{approval_id}", payload.model_dump())
+        session = app.state.agent_engine_service.operation(
+            context.tenant_id,
+            session_id,
+            f"approvals/{approval_id}",
+            payload.model_dump(),
+        )
         record_audit_event(
-            app, tenant_id=context.tenant_id, workspace_id=session.workspace_id,
-            user_id=context.user_id, run_id=session.run_id,
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=session.workspace_id,
+            user_id=context.user_id,
+            run_id=session.run_id,
             event_type=f"agent_engine.approval.{payload.decision}",
-            metadata={"session_id": session.id, "approval_id": approval_id}, request=request,
+            metadata={"session_id": session.id, "approval_id": approval_id},
+            request=request,
         )
         return session.model_dump(mode="json")
 
@@ -9379,12 +10883,21 @@ def create_app(
         context: RequestContext = Depends(get_request_context),
     ) -> dict[str, Any]:
         require_permission(request, context, "sandbox.create")
-        session = app.state.agent_engine_service.operation(context.tenant_id, session_id, operation)
+        session = app.state.agent_engine_service.operation(
+            context.tenant_id, session_id, operation
+        )
         record_audit_event(
-            app, tenant_id=context.tenant_id, workspace_id=session.workspace_id,
-            user_id=context.user_id, run_id=session.run_id,
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=session.workspace_id,
+            user_id=context.user_id,
+            run_id=session.run_id,
             event_type=f"agent_engine.session.{operation}",
-            metadata={"session_id": session.id, "engine_type": session.engine_type.value}, request=request,
+            metadata={
+                "session_id": session.id,
+                "engine_type": session.engine_type.value,
+            },
+            request=request,
         )
         return session.model_dump(mode="json")
 
@@ -9765,7 +11278,9 @@ def build_share_grant_store(settings: Settings) -> ShareGrantStore:
 def build_agent_registry(settings: Settings):
     if settings.agent_registry_backend == "sql":
         config = settings.database_config()
-        MigrationRunner(config=config, migrations_path=Path("apps/api/migrations")).apply()
+        MigrationRunner(
+            config=config, migrations_path=Path("apps/api/migrations")
+        ).apply()
         return SqlAgentRegistry(config=config)
     return InMemoryAgentRegistry()
 
@@ -9773,7 +11288,9 @@ def build_agent_registry(settings: Settings):
 def build_evaluation_repository(settings: Settings) -> EvaluationRepository:
     if settings.evaluation_repository_backend == "sql":
         config = settings.database_config()
-        MigrationRunner(config=config, migrations_path=Path("apps/api/migrations")).apply()
+        MigrationRunner(
+            config=config, migrations_path=Path("apps/api/migrations")
+        ).apply()
         return SqlEvaluationRepository(config=config)
     return InMemoryEvaluationRepository()
 
@@ -9781,7 +11298,9 @@ def build_evaluation_repository(settings: Settings) -> EvaluationRepository:
 def build_browser_profile_registry(settings: Settings) -> BrowserProfileRegistry:
     if settings.browser_profile_store_backend == "sql":
         config = settings.database_config()
-        MigrationRunner(config=config, migrations_path=Path("apps/api/migrations")).apply()
+        MigrationRunner(
+            config=config, migrations_path=Path("apps/api/migrations")
+        ).apply()
         return SqlBrowserProfileRegistry(config=config)
     return InMemoryBrowserProfileRegistry()
 
@@ -9789,7 +11308,9 @@ def build_browser_profile_registry(settings: Settings) -> BrowserProfileRegistry
 def build_agent_engine_registry(settings: Settings) -> AgentEngineRegistry:
     if settings.agent_engine_store_backend == "sql":
         config = settings.database_config()
-        MigrationRunner(config=config, migrations_path=Path("apps/api/migrations")).apply()
+        MigrationRunner(
+            config=config, migrations_path=Path("apps/api/migrations")
+        ).apply()
         return SqlAgentEngineRegistry(config=config)
     return InMemoryAgentEngineRegistry()
 
@@ -9797,7 +11318,9 @@ def build_agent_engine_registry(settings: Settings) -> AgentEngineRegistry:
 def build_coding_workspace_registry(settings: Settings) -> CodingWorkspaceRegistry:
     if settings.coding_workspace_store_backend == "sql":
         config = settings.database_config()
-        MigrationRunner(config=config, migrations_path=Path("apps/api/migrations")).apply()
+        MigrationRunner(
+            config=config, migrations_path=Path("apps/api/migrations")
+        ).apply()
         return SqlCodingWorkspaceRegistry(config=config)
     return CodingWorkspaceRegistry()
 
@@ -9805,7 +11328,9 @@ def build_coding_workspace_registry(settings: Settings) -> CodingWorkspaceRegist
 def build_thread_share_store(settings: Settings) -> ThreadShareStore:
     if settings.thread_share_store_backend == "sql":
         config = settings.database_config()
-        MigrationRunner(config=config, migrations_path=Path("apps/api/migrations")).apply()
+        MigrationRunner(
+            config=config, migrations_path=Path("apps/api/migrations")
+        ).apply()
         return SqlThreadShareStore(config=config)
     return InMemoryThreadShareStore()
 
@@ -9867,9 +11392,7 @@ def build_model_gateway(
     providers = effective_model_gateway_providers(settings, model_provider_store)
     if providers:
         return ModelGatewayRouter(
-            provider_registry=ModelProviderRegistry(
-                providers=providers
-            ),
+            provider_registry=ModelProviderRegistry(providers=providers),
             secret_service=secret_service,
             rate_limiter=build_model_provider_rate_limiter(settings),
         )
@@ -9896,7 +11419,36 @@ def effective_model_gateway_providers(
             for record in model_provider_store.list_all_providers()
             if record.status == "active"
         )
+    if providers and settings.model_gateway_model:
+        providers.append(_direct_model_gateway_provider(settings))
     return providers
+
+
+def effective_chat_model_gateway_providers(
+    settings: Settings,
+    model_provider_store: ModelProviderStore | None = None,
+) -> list[ModelProviderConfig]:
+    providers = effective_model_gateway_providers(settings, model_provider_store)
+    if providers or not settings.model_gateway_model:
+        return providers
+    return [_direct_model_gateway_provider(settings)]
+
+
+def _direct_model_gateway_provider(settings: Settings) -> ModelProviderConfig:
+    return ModelProviderConfig(
+        id="default",
+        display_name="Default",
+        base_url=settings.model_gateway_base_url,
+        api_key=settings.model_gateway_api_key,
+        api_key_secret_ref_id=settings.model_gateway_api_key_secret_ref_id or None,
+        secret_lease_ttl_seconds=settings.model_gateway_secret_lease_ttl_seconds,
+        default_model=settings.model_gateway_model,
+        model_ids=[settings.model_gateway_model] if settings.model_gateway_model else [],
+        reasoning_efforts=settings.model_gateway_reasoning_efforts,
+        default_reasoning_effort=settings.model_gateway_default_reasoning_effort,
+        timeout_seconds=settings.model_gateway_timeout_seconds,
+        chat_request_options=settings.model_gateway_chat_request_options,
+    )
 
 
 def build_model_provider_rate_limiter(settings: Settings) -> ModelProviderRateLimiter:
@@ -9914,6 +11466,51 @@ def build_model_provider_rate_limiter(settings: Settings) -> ModelProviderRateLi
             store=RedisModelProviderRateLimitStore(url=settings.redis_url)
         )
     return ModelProviderRateLimiter()
+
+
+def build_secret_service_readiness(
+    settings: Settings,
+    secret_service: SecretService,
+) -> dict[str, Any]:
+    if settings.secret_service_backend == "memory":
+        missing = (
+            ["durable_secret_backend"]
+            if settings.run_execution_dispatch_mode == "queue"
+            else []
+        )
+        return {
+            "configured": not missing,
+            "backend": "memory",
+            "credentials_configured": None,
+            "endpoint_configured": False,
+            "missing": missing,
+        }
+
+    if settings.secret_service_backend == "local":
+        configured = (
+            isinstance(secret_service, LocalEncryptedSecretService)
+            and secret_service.is_ready()
+        )
+        return {
+            "configured": configured,
+            "backend": "local",
+            "credentials_configured": None,
+            "endpoint_configured": False,
+            "missing": [] if configured else ["local_secret_store"],
+        }
+
+    credentials_configured = (
+        isinstance(secret_service, AwsSecretsManagerSecretService)
+        and secret_service.credentials_available()
+    )
+    missing = [] if credentials_configured else ["aws_credentials"]
+    return {
+        "configured": not missing,
+        "backend": "aws_secrets_manager",
+        "credentials_configured": credentials_configured,
+        "endpoint_configured": bool(settings.secret_service_endpoint_url),
+        "missing": missing,
+    }
 
 
 def build_model_gateway_readiness(
@@ -9948,7 +11545,10 @@ def build_sandbox_readiness(
     sandbox_adapter: SandboxAdapter | None = None,
 ) -> SandboxReadiness:
     missing: list[str] = []
-    controller_required = settings.sandbox_provider in ENTERPRISE_SANDBOX_PROVIDERS
+    direct_e2b = settings.sandbox_provider == "e2b" and bool(settings.e2b_api_key)
+    controller_required = (
+        settings.sandbox_provider in ENTERPRISE_SANDBOX_PROVIDERS and not direct_e2b
+    )
     controller_endpoint_configured = bool(settings.sandbox_controller_base_url.strip())
     controller_auth_configured = bool(settings.sandbox_controller_api_key.strip())
     controller_configured = (
@@ -10101,10 +11701,7 @@ def _build_provider_model_gateway_readiness(
             has_model = True
         if provider_credential_source != "none":
             has_credential = True
-        if (
-            provider_model_source != "none"
-            and provider_credential_source != "none"
-        ):
+        if provider_model_source != "none" and provider_credential_source != "none":
             configured_provider_count += 1
             configured_provider_ids.append(provider.id)
     missing: list[str] = []
@@ -11044,28 +12641,436 @@ def connector_invocation_audit_metadata(
     return metadata
 
 
+def action_manifests_for_runs(
+    app: FastAPI,
+    tenant_id: str,
+    runs: Iterable,
+) -> list[dict[str, Any]]:
+    approvals = [
+        approval
+        for run in runs
+        for approval in app.state.store.list_approval_requests(tenant_id, run.id)
+        if approval.kind == "connector_action"
+        or is_connector_approval_reason(approval.reason)
+    ]
+    approvals.sort(key=lambda item: (item.created_at, item.id), reverse=True)
+    return [action_manifest_payload(app, approval) for approval in approvals]
+
+
+def action_manifest_payload(
+    app: FastAPI,
+    approval: ApprovalRequest,
+) -> dict[str, Any]:
+    run = app.state.store.get_run(approval.tenant_id, approval.run_id)
+    preview = approval.preview_payload
+    execution_status = approval.execution_status
+    if execution_status != "not_started":
+        manifest_status = execution_status
+    elif approval.status == ApprovalStatus.PENDING:
+        manifest_status = "approval_required"
+    elif approval.status == ApprovalStatus.APPROVED:
+        manifest_status = "approved"
+    elif approval.status == ApprovalStatus.REJECTED:
+        manifest_status = "rejected"
+    else:
+        manifest_status = "superseded"
+    approval_status = {
+        ApprovalStatus.PENDING: "approval_required",
+        ApprovalStatus.APPROVED: "approved",
+        ApprovalStatus.REJECTED: "rejected",
+        ApprovalStatus.CANCELLED: "superseded",
+    }[approval.status]
+    payload = {
+        "manifestId": approval.id,
+        "runId": approval.run_id,
+        "provider": preview.get("provider") or approval.subject_id or "connector",
+        "toolName": preview.get("toolName")
+        or connector_tool_name_from_preview(approval),
+        "status": manifest_status,
+        "approvalStatus": approval_status,
+        "preview": {
+            key: preview[key]
+            for key in (
+                "connectorId",
+                "capability",
+                "riskLevel",
+                "inputKeys",
+                "input",
+            )
+            if key in preview
+        },
+        "validationResults": approval.validation_payload,
+        "createdAt": approval.created_at.isoformat(),
+        "resolvedAt": approval.resolved_at.isoformat()
+        if approval.resolved_at
+        else None,
+        "error": approval.error,
+    }
+    if run.agent_id:
+        payload["appId"] = run.agent_id
+    if run.thread_id:
+        payload["threadId"] = run.thread_id
+    return payload
+
+
+def connector_tool_name_from_preview(approval: ApprovalRequest) -> str:
+    connector_id = approval.preview_payload.get("connectorId") or approval.subject_id
+    capability = approval.preview_payload.get("capability")
+    if connector_id and capability:
+        return f"connector.{connector_id}.{capability}"
+    return "connector.action"
+
+
+def action_manifest_for_thread(
+    app: FastAPI,
+    tenant_id: str,
+    thread_id: str,
+    manifest_id: str,
+) -> ApprovalRequest:
+    thread = app.state.chat_service.get_thread(tenant_id, thread_id)
+    for run in app.state.store.list_runs(tenant_id, thread.workspace_id):
+        if run.thread_id != thread_id:
+            continue
+        approval = find_connector_approval(app, tenant_id, run.id, manifest_id)
+        if approval is not None:
+            return approval
+    raise HTTPException(status_code=404, detail="Action manifest not found")
+
+
+def action_manifest_for_agent(
+    app: FastAPI,
+    tenant_id: str,
+    agent_id: str,
+    manifest_id: str,
+) -> ApprovalRequest:
+    definition = app.state.agent_registry.get(tenant_id, agent_id)
+    for run in app.state.store.list_runs(tenant_id, definition.workspace_id):
+        if run.agent_id != agent_id:
+            continue
+        approval = find_connector_approval(app, tenant_id, run.id, manifest_id)
+        if approval is not None:
+            return approval
+    raise HTTPException(status_code=404, detail="Action manifest not found")
+
+
+def approve_action_manifest(
+    app: FastAPI,
+    approval: ApprovalRequest,
+    user_id: str,
+) -> ApprovalRequest:
+    if approval.status == ApprovalStatus.APPROVED:
+        return approval
+    if approval.status != ApprovalStatus.PENDING:
+        raise HTTPException(status_code=409, detail="Action manifest is not pending")
+    return app.state.store.resolve_approval_request(
+        approval.tenant_id,
+        approval.run_id,
+        approval.id,
+        user_id,
+    )
+
+
+def reject_action_manifest(
+    app: FastAPI,
+    approval: ApprovalRequest,
+    user_id: str,
+) -> ApprovalRequest:
+    if approval.status == ApprovalStatus.REJECTED:
+        return approval
+    if approval.status != ApprovalStatus.PENDING:
+        raise HTTPException(status_code=409, detail="Action manifest is not pending")
+    run = app.state.store.get_run(approval.tenant_id, approval.run_id)
+    if run.status == RunStatus.AWAITING_APPROVAL:
+        state = app.state.runtime._load_state(approval.tenant_id, approval.run_id)
+        if state.approval_id == approval.id:
+            app.state.runtime.reject_approval(
+                tenant_id=approval.tenant_id,
+                run_id=approval.run_id,
+                approval_id=approval.id,
+                rejected_by_user_id=user_id,
+            )
+            rejected = find_connector_approval(
+                app,
+                approval.tenant_id,
+                approval.run_id,
+                approval.id,
+            )
+            if rejected is None:
+                raise HTTPException(status_code=404, detail="Action manifest not found")
+            return rejected
+    return app.state.store.reject_approval_request(
+        approval.tenant_id,
+        approval.run_id,
+        approval.id,
+        user_id,
+    )
+
+
+def emit_action_manifest_event(app: FastAPI, approval: ApprovalRequest) -> None:
+    run = app.state.store.get_run(approval.tenant_id, approval.run_id)
+    app.state.store.append_run_event(
+        run,
+        "action_approval",
+        action_manifest_payload(app, approval),
+    )
+
+
+def apply_action_manifest(
+    app: FastAPI,
+    approval: ApprovalRequest,
+    request: Request,
+    context: RequestContext,
+) -> dict[str, Any]:
+    if approval.execution_status == "applied":
+        return action_manifest_payload(app, approval)
+    if approval.status != ApprovalStatus.APPROVED:
+        raise HTTPException(status_code=409, detail="Approve the action before applying it")
+    if approval.validation_payload.get("valid") is False:
+        blocked = app.state.store.update_approval_execution(
+            approval.tenant_id,
+            approval.run_id,
+            approval.id,
+            "blocked_by_validation",
+            "action manifest validation failed",
+        )
+        emit_action_manifest_event(app, blocked)
+        raise HTTPException(status_code=409, detail="Action manifest validation failed")
+
+    run = app.state.store.get_run(approval.tenant_id, approval.run_id)
+    if run.status == RunStatus.AWAITING_APPROVAL:
+        state = app.state.runtime._load_state(approval.tenant_id, approval.run_id)
+        if state.approval_id == approval.id:
+            app.state.runtime.resume_after_approval(
+                tenant_id=approval.tenant_id,
+                run_id=approval.run_id,
+                approval_id=approval.id,
+                approved_by_user_id=context.user_id,
+            )
+            applied = find_connector_approval(
+                app,
+                approval.tenant_id,
+                approval.run_id,
+                approval.id,
+            )
+            if applied is None:
+                raise HTTPException(status_code=404, detail="Action manifest not found")
+            emit_action_manifest_event(app, applied)
+            return action_manifest_payload(app, applied)
+
+    preview = approval.preview_payload
+    connector_id = preview.get("connectorId") or approval.subject_id
+    capability_name = preview.get("capability")
+    tool_input = preview.get("input")
+    granted_scopes = preview.get("grantedScopes", [])
+    if (
+        not isinstance(connector_id, str)
+        or not isinstance(capability_name, str)
+        or not isinstance(tool_input, dict)
+        or not isinstance(granted_scopes, list)
+    ):
+        raise HTTPException(status_code=409, detail="Action manifest is incomplete")
+
+    connector = app.state.connector_registry.get_connector(
+        approval.tenant_id,
+        connector_id,
+    )
+    invocation = ConnectorInvocationCreate(
+        run_id=approval.run_id,
+        step_id=approval.step_id,
+        capability_name=capability_name,
+        tool_input=tool_input,
+        granted_scopes=granted_scopes,
+        approved=True,
+        approval_id=approval.id,
+    )
+    decision = app.state.connector_invocation_service.evaluate(
+        connector,
+        invocation.to_invocation_request(
+            tenant_id=approval.tenant_id,
+            workspace_id=approval.workspace_id,
+            user_id=context.user_id,
+            connector_id=connector.id,
+        ),
+    )
+    if decision.status != ConnectorInvocationStatus.READY:
+        blocked = app.state.store.update_approval_execution(
+            approval.tenant_id,
+            approval.run_id,
+            approval.id,
+            "blocked_by_validation",
+            decision.reason or "connector action is no longer valid",
+        )
+        emit_action_manifest_event(app, blocked)
+        raise HTTPException(
+            status_code=409,
+            detail=decision.reason or "Connector action is no longer valid",
+        )
+    result = execute_connector_invocation(
+        app=app,
+        context=context,
+        request=request,
+        connector=connector,
+        decision=decision,
+        tool_input=tool_input,
+        approval=approval,
+    )
+    applied = find_connector_approval(
+        app,
+        approval.tenant_id,
+        approval.run_id,
+        approval.id,
+    )
+    if applied is None:
+        raise HTTPException(status_code=404, detail="Action manifest not found")
+    payload = action_manifest_payload(app, applied)
+    if result is not None:
+        payload["result"] = result.output
+    return payload
+
+
+def execute_connector_invocation(
+    *,
+    app: FastAPI,
+    context: RequestContext,
+    request: Request,
+    connector: ConnectorDefinition,
+    decision: ConnectorInvocationDecision,
+    tool_input: dict[str, Any],
+    approval: ApprovalRequest | None = None,
+) -> ConnectorDispatchResult | None:
+    if approval is not None and approval.execution_status == "applied":
+        return None
+    approval_id = approval.id if approval is not None else None
+    if approval is not None:
+        applying = app.state.store.update_approval_execution(
+            context.tenant_id,
+            decision.run_id,
+            approval.id,
+            "applying",
+        )
+        emit_action_manifest_event(app, applying)
+    try:
+        dispatch_result = app.state.connector_dispatcher.dispatch(
+            connector=connector,
+            tool_input=tool_input,
+            tool_name=decision.tool_name,
+        )
+    except ConnectorDispatchError as error:
+        if approval is not None:
+            failed = app.state.store.update_approval_execution(
+                context.tenant_id,
+                decision.run_id,
+                approval.id,
+                "apply_failed",
+                str(error),
+            )
+            emit_action_manifest_event(app, failed)
+        record_audit_event(
+            app=app,
+            tenant_id=context.tenant_id,
+            workspace_id=connector.workspace_id,
+            user_id=context.user_id,
+            run_id=decision.run_id,
+            event_type="connector.dispatch_failed",
+            metadata=connector_invocation_audit_metadata(
+                decision,
+                connector=connector,
+                error_code="connector_dispatch_failed",
+                approval_id=approval_id,
+            ),
+            request=request,
+        )
+        raise
+
+    if approval is not None:
+        applied = app.state.store.update_approval_execution(
+            context.tenant_id,
+            decision.run_id,
+            approval.id,
+            "applied",
+        )
+        emit_action_manifest_event(app, applied)
+    if decision.billing_meter_type is not None:
+        app.state.store.record_billing_meter(
+            tenant_id=context.tenant_id,
+            run_id=decision.run_id,
+            meter_type=decision.billing_meter_type,
+            quantity=1,
+            unit="invocation",
+            metadata={
+                "connector_id": connector.id,
+                "capability_name": decision.capability_name,
+                "tool_name": decision.tool_name,
+                "risk_level": decision.risk_level,
+            }
+            | connector_dispatch_billing_metadata(dispatch_result),
+        )
+    record_audit_event(
+        app=app,
+        tenant_id=context.tenant_id,
+        workspace_id=connector.workspace_id,
+        user_id=context.user_id,
+        run_id=decision.run_id,
+        event_type="connector.invoked",
+        metadata=connector_invocation_audit_metadata(
+            decision,
+            connector=connector,
+            dispatch_result=dispatch_result,
+            approval_id=approval_id,
+        ),
+        request=request,
+    )
+    return dispatch_result
+
+
 def get_or_create_connector_approval(
     app: FastAPI,
     tenant_id: str,
     run_id: str,
+    provider: str,
     connector_id: str,
     capability_name: str,
+    tool_name: str,
     step_id: str,
-):
+    risk_level: str | None = None,
+    input_keys: list[str] | None = None,
+    missing_scopes: list[str] | None = None,
+    tool_input: dict[str, Any] | None = None,
+    granted_scopes: list[str] | None = None,
+) -> tuple[ApprovalRequest, bool]:
     reason = connector_approval_reason(connector_id, capability_name)
     for approval in app.state.store.list_approval_requests(tenant_id, run_id):
         if (
             approval.status == ApprovalStatus.PENDING
             and approval.step_id == step_id
             and approval.reason == reason
+            and approval.preview_payload.get("input") == (tool_input or {})
         ):
-            return approval
-    return app.state.store.create_approval_request(
+            return approval, False
+    approval = app.state.store.create_approval_request(
         tenant_id=tenant_id,
         run_id=run_id,
         step_id=step_id,
         reason=reason,
+        kind="connector_action",
+        subject_type="connector",
+        subject_id=connector_id,
+        preview_payload={
+            "provider": provider,
+            "connectorId": connector_id,
+            "capability": capability_name,
+            "toolName": tool_name,
+            "riskLevel": risk_level,
+            "inputKeys": input_keys or [],
+            "input": tool_input or {},
+            "grantedScopes": granted_scopes or [],
+        },
+        validation_payload={
+            "valid": not missing_scopes,
+            "missingScopes": missing_scopes or [],
+        },
     )
+    return approval, True
 
 
 def find_connector_approval(
@@ -11075,7 +13080,10 @@ def find_connector_approval(
     approval_id: str,
 ) -> ApprovalRequest | None:
     for approval in app.state.store.list_approval_requests(tenant_id, run_id):
-        if approval.id == approval_id and is_connector_approval_reason(approval.reason):
+        if approval.id == approval_id and (
+            approval.kind == "connector_action"
+            or is_connector_approval_reason(approval.reason)
+        ):
             return approval
     return None
 
@@ -11255,7 +13263,9 @@ def restore_drill_schedule_audit_metadata(schedule) -> dict:
         "interval_days": schedule.interval_days,
         "max_catch_up_runs": schedule.max_catch_up_runs,
         "next_run_at": (
-            schedule.next_run_at.isoformat() if schedule.next_run_at is not None else None
+            schedule.next_run_at.isoformat()
+            if schedule.next_run_at is not None
+            else None
         ),
         "has_service_account": schedule.service_account_id is not None,
         "created_by_user_id": schedule.created_by_user_id,
@@ -11498,10 +13508,6 @@ def sandbox_file_audit_metadata(file_ref) -> dict:
 def sandbox_file_storage_filename(path: str) -> str:
     filename = path.rstrip("/").rsplit("/", 1)[-1]
     return filename or "sandbox-file"
-
-
-def sandbox_file_content(file_ref) -> bytes:
-    return (file_ref.content or "").encode("utf-8")
 
 
 def sandbox_snapshot_audit_metadata(snapshot) -> dict:

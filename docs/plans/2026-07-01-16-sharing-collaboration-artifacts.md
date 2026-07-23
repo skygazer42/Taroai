@@ -1,6 +1,5 @@
 # Sharing, Collaboration, and Artifact Delivery Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Build the enterprise sharing layer for runs, artifacts, skills, knowledge spaces, memory candidates, and cloud workspace outputs so teams can reuse agent work without leaking data across tenant/workspace/user boundaries.
 

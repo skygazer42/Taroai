@@ -67,15 +67,14 @@ class InMemorySandboxAdapter(SandboxAdapter):
         session = self._get_active_session(file_write.tenant_id, file_write.session_id)
         if session.workspace_id != file_write.workspace_id or session.run_id != file_write.run_id:
             raise NotFoundError(f"Sandbox session not found: {file_write.session_id}")
-        file_ref = SandboxFileRef(
+        file_ref = SandboxFileRef.from_bytes(
+            file_write.content_bytes(),
             tenant_id=file_write.tenant_id,
             workspace_id=file_write.workspace_id,
             run_id=file_write.run_id,
             session_id=file_write.session_id,
             path=file_write.path,
             content_type=file_write.content_type,
-            size_bytes=len(file_write.content.encode("utf-8")),
-            content=file_write.content,
         )
         self.files[self._file_key(file_write.tenant_id, file_write.session_id, file_write.path)] = file_ref
         return file_ref

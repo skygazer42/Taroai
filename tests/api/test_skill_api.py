@@ -1,3 +1,7 @@
+import base64
+from io import BytesIO
+from zipfile import ZipFile
+
 from fastapi.testclient import TestClient
 
 from taroai.agent import AgentRuntime
@@ -12,7 +16,7 @@ from taroai.identity import (
     Role,
     UserAccountCreate,
 )
-from taroai.skills import InMemorySkillRegistry, SkillManifest
+from taroai.skills import InMemorySkillRegistry, SkillManifest, parse_skill_frontmatter
 from taroai.tool_gateway import ToolPolicy, ToolResult
 from tests.api.adapters import DeterministicModelGateway, DeterministicToolGateway
 
@@ -96,6 +100,90 @@ def workflow_skill_manifest_payload() -> dict:
         "runtime": {"sandbox": "workflow", "timeout_seconds": 120},
         "billing_meters": ["skill_call_count"],
     }
+
+
+def test_skill_frontmatter_accepts_portable_folded_description():
+    frontmatter, body = parse_skill_frontmatter(
+        """---
+name: ponytail
+description: >
+  Prefer the simplest solution that works.
+  Avoid speculative abstractions.
+argument-hint: "[lite|full|ultra]"
+license: MIT
+---
+# Ponytail
+"""
+    )
+
+    assert frontmatter.description == (
+        "Prefer the simplest solution that works. Avoid speculative abstractions."
+    )
+    assert body == "# Ponytail\n"
+
+
+def test_portable_skill_zip_import_evaluate_publish_and_install():
+    identity, account = create_skill_admin_identity()
+    app = create_app(
+        identity_service=identity,
+        skill_registry=InMemorySkillRegistry(),
+        settings=Settings(_env_file=None),
+    )
+    client = TestClient(app)
+    archive = BytesIO()
+    with ZipFile(archive, "w") as package:
+        package.writestr(
+            "SKILL.md",
+            """---
+name: portable-skill
+description: A portable test skill.
+---
+# Portable skill
+""",
+        )
+
+    response = client.post(
+        "/api/skills/import/zip",
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": account.id},
+        json={
+            "archive_base64": base64.b64encode(archive.getvalue()).decode("ascii"),
+            "workspace_id": "workspace_sales",
+        },
+    )
+
+    assert response.status_code == 201
+    meter = app.state.store.list_billing_meters("tenant_acme")[-1]
+    assert meter.meter_type == "storage_bytes"
+    assert meter.metadata["resource_type"] == "skill_package"
+    assert meter.metadata["skill_id"] == "portable-skill"
+
+    evaluation = client.post(
+        "/api/skills/portable-skill/packages/0.0.0/evaluate",
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": account.id},
+        json={"workspace_id": "workspace_sales"},
+    )
+    assert evaluation.status_code == 200
+    assert evaluation.json()["evaluator_version"] == "package-validation.v1"
+    assert evaluation.json()["passed"] is True
+
+    published = client.post(
+        "/api/skills/portable-skill/packages/0.0.0/publish",
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": account.id},
+        json={"evaluation_run_id": evaluation.json()["id"]},
+    )
+    assert published.status_code == 200
+    assert published.json()["status"] == "published"
+
+    installed = client.post(
+        "/api/workspaces/workspace_sales/skills/portable-skill/install",
+        headers={"X-Tenant-ID": "tenant_acme", "X-User-ID": account.id},
+        json={
+            "version": "0.0.0",
+            "package_digest": response.json()["package_digest"],
+        },
+    )
+    assert installed.status_code == 201
+    assert installed.json()["status"] == "enabled"
 
 
 def login_skill_admin(client: TestClient) -> dict[str, str]:
@@ -763,8 +851,11 @@ def test_workflow_skill_invoke_starts_agent_run_without_registered_tool_handler(
     assert body["skill_id"] == "sales.renewal_brief"
     assert body["tool_name"] == "agent.workflow"
     assert body["output"]["run_id"].startswith("run_")
-    assert body["output"]["status"] == "succeeded"
+    assert body["output"]["status"] == "awaiting_approval"
     assert body["run_id"] == body["output"]["run_id"]
+    approvals = store.list_approval_requests("tenant_acme", body["run_id"])
+    assert len(approvals) == 1
+    assert approvals[0].status.value == "pending"
     events = store.list_run_events("tenant_acme", body["run_id"])
     assert "skill.workflow_invoked" in [event.type for event in events]
 

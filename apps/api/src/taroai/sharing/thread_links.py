@@ -57,9 +57,9 @@ class InMemoryThreadShareStore(ThreadShareStore):
             raise NotFoundError(f"Thread share link not found: {link_id}")
         return link.model_copy(deep=True)
 
-    def get_public(self, public_id: str):
+    def get_public(self, tenant_id: str, public_id: str):
         for link in self.links.values():
-            if link.public_id == public_id:
+            if link.tenant_id == tenant_id and link.public_id == public_id:
                 return link.model_copy(deep=True)
         raise NotFoundError("Thread share link not found")
 
@@ -112,11 +112,14 @@ class SqlThreadShareStore(ThreadShareStore):
             raise NotFoundError(f"Thread share link not found: {link_id}")
         return self._from_row(row)
 
-    def get_public(self, public_id: str):
+    def get_public(self, tenant_id: str, public_id: str):
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT * FROM thread_share_links WHERE public_id = ?",
-                (public_id,),
+                """
+                SELECT * FROM thread_share_links
+                WHERE tenant_id = ? AND public_id = ?
+                """,
+                (tenant_id, public_id),
             ).fetchone()
         if row is None:
             raise NotFoundError("Thread share link not found")
@@ -197,8 +200,8 @@ class ThreadShareService:
         self.link_store.create(link)
         return link, token
 
-    def read_public(self, public_id: str, token: str):
-        link = self.link_store.get_public(public_id)
+    def read_public(self, tenant_id: str, public_id: str, token: str):
+        link = self.link_store.get_public(tenant_id, public_id)
         if not link.active() or not hmac.compare_digest(link.token_hash, self._hash(token)):
             raise NotFoundError("Thread share link not found")
         thread = self.store.get_chat_thread(link.tenant_id, link.thread_id)

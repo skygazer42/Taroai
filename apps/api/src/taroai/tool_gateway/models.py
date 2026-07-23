@@ -20,6 +20,7 @@ class ToolGatewayRequest(BaseModel):
     workspace_id: str = Field(min_length=1)
     user_id: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
+    thread_id: str | None = None
     step_id: str = Field(min_length=1)
     tool_name: str = Field(min_length=1)
     skill_id: str | None = None
@@ -37,6 +38,7 @@ class ToolSecretRequirement(BaseModel):
 
 class ToolPolicy(BaseModel):
     tool_name: str = Field(min_length=1)
+    description: str = ""
     required_scopes: list[str] = Field(default_factory=list)
     secret_requirements: list[ToolSecretRequirement] = Field(default_factory=list)
     risk_level: ToolRiskLevel = ToolRiskLevel.LOW

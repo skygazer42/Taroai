@@ -1,8 +1,10 @@
-from pathlib import Path
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+from pathlib import Path
 from threading import Barrier
 from typing import ClassVar
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
@@ -63,7 +65,6 @@ def chat_settings(**updates) -> Settings:
     values = {
         "_env_file": None,
         "run_execution_dispatch_mode": "queue",
-        "agent_runtime_mode": "loop_v2",
         "model_gateway_allowed_models": ["deepseek-chat"],
         "model_gateway_policy_scopes": [
             ModelPolicyScope(
@@ -152,6 +153,28 @@ def create_thread(client: TestClient, **overrides) -> dict:
     return response.json()
 
 
+def test_thread_event_follow_polling_is_not_blocked_by_the_heartbeat_interval():
+    client = create_chat_client(
+        settings=chat_settings(
+            event_stream_follow_seconds=1,
+            event_stream_heartbeat_seconds=10,
+        )
+    )
+    thread = create_thread(client)
+
+    started = time.monotonic()
+    response = client.get(
+        f"/api/threads/{thread['id']}/events",
+        headers=TENANT_HEADERS,
+        params={"follow": "true"},
+    )
+
+    assert response.status_code == 200
+    assert time.monotonic() - started < 2.5
+    assert response.headers["cache-control"] == "no-cache"
+    assert response.headers["x-accel-buffering"] == "no"
+
+
 def test_thread_crud_orders_by_latest_update_and_soft_deletes():
     client = create_chat_client()
     first = create_thread(client, title="First")
@@ -172,10 +195,13 @@ def test_thread_crud_orders_by_latest_update_and_soft_deletes():
     assert patched.status_code == 200
     assert patched.json()["title"] == "First, updated"
     assert patched.json()["pinned"] is True
-    assert client.get(
-        "/api/threads?workspace_id=workspace_sales",
-        headers=TENANT_HEADERS,
-    ).json()[0]["id"] == first["id"]
+    assert (
+        client.get(
+            "/api/threads?workspace_id=workspace_sales",
+            headers=TENANT_HEADERS,
+        ).json()[0]["id"]
+        == first["id"]
+    )
 
     deleted = client.delete(
         f"/api/threads/{first['id']}",
@@ -195,6 +221,29 @@ def test_thread_crud_orders_by_latest_update_and_soft_deletes():
             headers=TENANT_HEADERS,
         ).json()
     ] == [second["id"]]
+
+
+def test_thread_archive_is_persisted_and_hidden_by_default():
+    client = create_chat_client()
+    thread = create_thread(client)
+
+    archived = client.patch(
+        f"/api/threads/{thread['id']}",
+        headers=TENANT_HEADERS,
+        json={"status": "archived"},
+    )
+
+    assert archived.status_code == 200
+    assert archived.json()["status"] == "archived"
+    assert client.get(
+        "/api/threads?workspace_id=workspace_sales",
+        headers=TENANT_HEADERS,
+    ).json() == []
+    visible = client.get(
+        "/api/threads?workspace_id=workspace_sales&include_archived=true",
+        headers=TENANT_HEADERS,
+    ).json()
+    assert [item["id"] for item in visible] == [thread["id"]]
 
 
 def test_thread_create_resolves_default_provider_model_and_reasoning_snapshot():
@@ -253,6 +302,38 @@ def test_thread_routes_do_not_reveal_cross_tenant_resources():
         assert response.json()["code"] == "not_found"
 
 
+def test_thread_share_url_opens_and_header_access_remains_supported():
+    client = create_chat_client()
+    thread = create_thread(client)
+
+    created = client.post(
+        f"/api/threads/{thread['id']}/shares",
+        headers=TENANT_HEADERS,
+        json={},
+    )
+    body = created.json()
+    public_url = urlsplit(body["url"])
+    query = parse_qs(public_url.query)
+    token = query["token"][0]
+
+    assert created.status_code == 201
+    assert query["tenant_id"] == ["tenant_acme"]
+    assert client.get(body["url"]).status_code == 200
+    assert (
+        client.get(
+            f"{public_url.path}?tenant_id=tenant_acme",
+            headers={"X-Share-Token": token},
+        ).status_code
+        == 200
+    )
+    assert (
+        client.get(
+            f"{public_url.path}?tenant_id=tenant_other&token={token}",
+        ).status_code
+        == 404
+    )
+
+
 def test_post_thread_message_starts_run_with_immutable_model_snapshot():
     client = create_chat_client()
     thread = create_thread(client)
@@ -263,6 +344,7 @@ def test_post_thread_message_starts_run_with_immutable_model_snapshot():
         json={
             "content": "Repair the report",
             "delivery_mode": "queue",
+            "mode": "autonomous",
             "attachments": ["storage://report.csv"],
             "resource_refs": [
                 {"type": "skill", "id": "spreadsheet-repair", "version": "1.2.0"}
@@ -287,9 +369,269 @@ def test_post_thread_message_starts_run_with_immutable_model_snapshot():
         "medium",
     )
     assert run["attachments"] == ["storage://report.csv"]
+    assert run["mode"] == "autonomous"
     assert run["resource_refs"] == [
         {"type": "skill", "id": "spreadsheet-repair", "version": "1.2.0"}
     ]
+
+
+def test_message_separates_visible_content_from_execution_prompt_and_skill_binding():
+    client = create_chat_client()
+    thread = create_thread(client)
+
+    sent = client.post(
+        f"/api/threads/{thread['id']}/messages",
+        headers=TENANT_HEADERS,
+        json={
+            "content": "Use the document skill and return a concise Markdown brief.\n\nReview Q2.",
+            "display_content": "Review Q2.",
+            "skill_ids": ["document-review"],
+            "mode": "autonomous",
+        },
+    )
+
+    assert sent.status_code == 202
+    message = client.get(
+        f"/api/threads/{thread['id']}/messages",
+        headers=TENANT_HEADERS,
+    ).json()[0]
+    run = client.get(
+        f"/api/runs/{sent.json()['run_id']}",
+        headers=TENANT_HEADERS,
+    ).json()
+    stored = client.app.state.store.get_chat_message(
+        "tenant_acme", sent.json()["message_id"]
+    )
+
+    assert message["content"] == "Review Q2."
+    assert "execution_content" not in message
+    assert stored.execution_content.startswith("Use the document skill")
+    assert run["message"] == stored.execution_content
+    assert run["resource_refs"] == [
+        {"type": "skill", "id": "document-review", "version": None}
+    ]
+
+
+def test_message_adds_browser_timezone_only_to_execution_prompt():
+    client = create_chat_client()
+    thread = create_thread(client)
+
+    sent = client.post(
+        f"/api/threads/{thread['id']}/messages",
+        headers=TENANT_HEADERS,
+        json={"content": "Book dinner tomorrow", "timezone": "Asia/Shanghai"},
+    )
+
+    assert sent.status_code == 202
+    message = client.get(
+        f"/api/threads/{thread['id']}/messages", headers=TENANT_HEADERS
+    ).json()[0]
+    stored = client.app.state.store.get_chat_message(
+        "tenant_acme", sent.json()["message_id"]
+    )
+    run = client.get(
+        f"/api/runs/{sent.json()['run_id']}", headers=TENANT_HEADERS
+    ).json()
+    assert message["content"] == "Book dinner tomorrow"
+    assert "execution_content" not in message
+    assert "user_timezone=Asia/Shanghai" in stored.execution_content
+    assert "current_local_datetime=" in stored.execution_content
+    assert "+08:00]" in stored.execution_content
+    assert stored.execution_content.endswith("Book dinner tomorrow")
+    assert run["message"] == stored.execution_content
+
+
+def test_run_list_uses_visible_chat_content_and_hides_background_prompts():
+    client = create_chat_client()
+    thread = create_thread(client)
+    chat_run = client.post(
+        f"/api/threads/{thread['id']}/messages",
+        headers=TENANT_HEADERS,
+        json={"content": "Book dinner tomorrow", "timezone": "Asia/Shanghai"},
+    ).json()
+    background_run = client.post(
+        "/api/runs",
+        headers=TENANT_HEADERS,
+        json={
+            "workspace_id": "workspace_sales",
+            "message": "INTERNAL WORKFLOW PREFIX",
+        },
+    ).json()
+
+    runs = {
+        run["id"]: run
+        for run in client.get("/api/runs", headers=TENANT_HEADERS).json()["items"]
+    }
+
+    assert runs[chat_run["run_id"]]["message"] == "Book dinner tomorrow"
+    assert "Platform context" not in runs[chat_run["run_id"]]["message"]
+    assert runs[background_run["run_id"]]["message"] is None
+
+
+def test_message_rejects_unknown_timezone():
+    client = create_chat_client()
+    thread = create_thread(client)
+
+    response = client.post(
+        f"/api/threads/{thread['id']}/messages",
+        headers=TENANT_HEADERS,
+        json={"content": "Book dinner tomorrow", "timezone": "Mars/Olympus"},
+    )
+
+    assert response.status_code == 422
+    assert client.get(
+        f"/api/threads/{thread['id']}/messages", headers=TENANT_HEADERS
+    ).json() == []
+
+
+def test_queued_message_keeps_its_execution_prompt_until_the_next_run():
+    client = create_chat_client()
+    thread = create_thread(client)
+    first = client.post(
+        f"/api/threads/{thread['id']}/messages",
+        headers=TENANT_HEADERS,
+        json={"content": "Start"},
+    ).json()
+    queued = client.post(
+        f"/api/threads/{thread['id']}/messages",
+        headers=TENANT_HEADERS,
+        json={
+            "content": "Create a slide deck.\n\nQuarterly review",
+            "display_content": "Quarterly review",
+            "delivery_mode": "queue",
+            "mode": "autonomous",
+        },
+    ).json()
+    client.app.state.store.update_run_status(
+        "tenant_acme", first["run_id"], RunStatus.SUCCEEDED
+    )
+
+    continued = client.post(
+        f"/api/threads/{thread['id']}/continue",
+        headers=TENANT_HEADERS,
+    )
+
+    assert continued.status_code == 202
+    assert continued.json()["message_id"] == queued["message_id"]
+    next_run = client.get(
+        f"/api/runs/{continued.json()['run_id']}",
+        headers=TENANT_HEADERS,
+    ).json()
+    assert next_run["message"] == "Create a slide deck.\n\nQuarterly review"
+    messages = client.get(
+        f"/api/threads/{thread['id']}/messages",
+        headers=TENANT_HEADERS,
+    ).json()
+    assert messages[1]["content"] == "Quarterly review"
+
+
+def test_thread_returns_follow_ups_generated_by_the_model():
+    client = create_chat_client()
+    thread = create_thread(client)
+    sent = client.post(
+        f"/api/threads/{thread['id']}/messages",
+        headers=TENANT_HEADERS,
+        json={"content": "查找 Python 官网发布公告和来源链接。"},
+    )
+
+    assert sent.status_code == 202
+    run = client.app.state.store.get_run("tenant_acme", sent.json()["run_id"])
+    client.app.state.store.append_run_event(
+        run,
+        "assistant.suggestions.generated",
+        {
+            "options": [
+                "只看安全相关变化",
+                "对比上一个稳定版",
+            ]
+        },
+    )
+    client.app.state.store.append_run_event(run, "run.succeeded", {})
+    suggestions = client.get(
+        f"/api/threads/{thread['id']}/suggestions",
+        headers=TENANT_HEADERS,
+    ).json()["suggestions"]
+    assert suggestions == ["只看安全相关变化", "对比上一个稳定版"]
+
+
+def test_thread_bootstrap_restores_created_artifacts():
+    client = create_chat_client()
+    thread = create_thread(client)
+    sent = client.post(
+        f"/api/threads/{thread['id']}/messages",
+        headers=TENANT_HEADERS,
+        json={"content": "Create a report"},
+    ).json()
+    artifact = client.app.state.store.create_artifact(
+        "tenant_acme",
+        sent["run_id"],
+        "report.md",
+        "document",
+        "s3://artifacts/report.md",
+    )
+
+    bootstrap = client.get(
+        f"/api/threads/{thread['id']}/bootstrap",
+        headers=TENANT_HEADERS,
+    )
+
+    assert bootstrap.status_code == 200
+    assert bootstrap.json()["artifacts"] == [artifact.model_dump(mode="json")]
+
+
+def test_thread_bootstrap_keeps_historical_transcript_events_outside_recent_window():
+    client = create_chat_client()
+    thread = create_thread(client)
+    sent = client.post(
+        f"/api/threads/{thread['id']}/messages",
+        headers=TENANT_HEADERS,
+        json={"content": "Search, then answer"},
+    ).json()
+    run = client.app.state.store.get_run("tenant_acme", sent["run_id"])
+    completed = client.app.state.store.append_run_event(
+        run,
+        "assistant.message.completed",
+        {"message_id": "message_answer", "content": "Done"},
+    )
+    workflow = client.app.state.store.append_run_event(
+        run,
+        "workflow_preview",
+        {"previewId": "workflow:test", "status": "pending"},
+    )
+    for index in range(4):
+        client.app.state.store.append_run_event(
+            run,
+            "assistant.delta",
+            {"delta": str(index)},
+        )
+
+    bootstrap = client.get(
+        f"/api/threads/{thread['id']}/bootstrap?event_limit=2",
+        headers=TENANT_HEADERS,
+    )
+
+    assert bootstrap.status_code == 200
+    events = bootstrap.json()["events"]
+    event_ids = {event["id"] for event in events}
+    assert {completed.id, workflow.id} <= event_ids
+    assert [event["payload"]["delta"] for event in events[-2:]] == ["2", "3"]
+
+
+def test_memory_acknowledgements_do_not_get_generic_follow_ups():
+    client = create_chat_client()
+    thread = create_thread(client)
+    sent = client.post(
+        f"/api/threads/{thread['id']}/messages",
+        headers=TENANT_HEADERS,
+        json={"content": "请记住我偏好简洁的中文回答。"},
+    )
+
+    assert sent.status_code == 202
+    suggestions = client.get(
+        f"/api/threads/{thread['id']}/suggestions",
+        headers=TENANT_HEADERS,
+    ).json()["suggestions"]
+    assert suggestions == []
 
 
 def test_active_run_queues_or_steers_messages_without_creating_duplicate_run():
@@ -314,7 +656,9 @@ def test_active_run_queues_or_steers_messages_without_creating_duplicate_run():
     )
 
     assert queued.status_code == steering.status_code == 202
-    assert queued.json()["run_id"] == steering.json()["run_id"] == first.json()["run_id"]
+    assert (
+        queued.json()["run_id"] == steering.json()["run_id"] == first.json()["run_id"]
+    )
     assert queued.json()["dispatch_status"] == "queued"
     assert steering.json()["dispatch_status"] == "steering"
     messages = client.get(
@@ -550,7 +894,9 @@ def test_sql_instances_converge_concurrent_first_messages_to_one_active_run(tmp_
 
 
 def test_sql_instances_reserve_same_idempotency_key_before_side_effects(tmp_path):
-    settings = chat_settings(database_url=f"sqlite:///{tmp_path / 'idempotency.sqlite3'}")
+    settings = chat_settings(
+        database_url=f"sqlite:///{tmp_path / 'idempotency.sqlite3'}"
+    )
     first_store = BarrierSqlControlPlaneRepository(config=settings.database_config())
     first_store.initialize_schema(Path("apps/api/migrations"))
     second_store = BarrierSqlControlPlaneRepository(config=settings.database_config())
@@ -619,10 +965,13 @@ def test_dispatch_policy_rejection_is_atomic_and_leaves_no_message_or_run():
 
     assert rejected.status_code == 403
     assert rejected.json()["code"] == "model_policy_denied"
-    assert client.get(
-        f"/api/threads/{thread['id']}/messages",
-        headers=TENANT_HEADERS,
-    ).json() == []
+    assert (
+        client.get(
+            f"/api/threads/{thread['id']}/messages",
+            headers=TENANT_HEADERS,
+        ).json()
+        == []
+    )
     assert client.get("/api/runs", headers=TENANT_HEADERS).json()["items"] == []
 
 
@@ -759,6 +1108,8 @@ def test_model_catalog_applies_workspace_policy_and_redacts_provider_secrets():
             "model_id": "deepseek-chat",
             "display_name": "DeepSeek / deepseek-chat",
             "reasoning_efforts": ["low", "medium", "high"],
+            "default_reasoning_effort": "medium",
+            "configured": True,
         }
     ]
     serialized = response.text.lower()
@@ -775,6 +1126,171 @@ def test_model_catalog_applies_workspace_policy_and_redacts_provider_secrets():
         "deepseek-reasoner",
     ]:
         assert forbidden not in serialized
+
+
+def test_model_catalog_lists_the_workspace_default_first():
+    client = create_chat_client(
+        settings=chat_settings(
+            model_gateway_allowed_models=["economy", "preferred"],
+            model_gateway_policy_scopes=[
+                ModelPolicyScope(
+                    tenant_id="tenant_acme",
+                    workspace_id="workspace_sales",
+                    default_model="preferred",
+                    allowed_models=["economy", "preferred"],
+                )
+            ],
+            model_gateway_providers=[
+                ModelProviderConfig(
+                    id="aaa-economy",
+                    default_model="economy",
+                    api_key="configured",
+                ),
+                ModelProviderConfig(
+                    id="zzz-preferred",
+                    default_model="preferred",
+                    api_key="configured",
+                ),
+            ],
+        )
+    )
+
+    catalog = client.get(
+        "/api/model-catalog?workspace_id=workspace_sales",
+        headers=TENANT_HEADERS,
+    )
+
+    assert catalog.status_code == 200
+    assert [entry["model_id"] for entry in catalog.json()] == [
+        "preferred",
+        "economy",
+    ]
+
+
+def test_model_catalog_uses_runtime_priority_for_duplicate_models():
+    client = create_chat_client(
+        settings=chat_settings(
+            model_gateway_allowed_models=["shared-model"],
+            model_gateway_policy_scopes=[
+                ModelPolicyScope(
+                    tenant_id="tenant_acme",
+                    workspace_id="workspace_sales",
+                    default_model="shared-model",
+                    allowed_models=["shared-model"],
+                )
+            ],
+            model_gateway_providers=[
+                ModelProviderConfig(
+                    id="aaa-fallback",
+                    default_model="shared-model",
+                    model_ids=["shared-model"],
+                    api_key="configured",
+                    priority=90,
+                ),
+                ModelProviderConfig(
+                    id="zzz-preferred",
+                    default_model="shared-model",
+                    model_ids=["shared-model"],
+                    api_key="configured",
+                    priority=10,
+                ),
+            ],
+        )
+    )
+
+    catalog = client.get(
+        "/api/model-catalog?workspace_id=workspace_sales",
+        headers=TENANT_HEADERS,
+    )
+    created = client.post(
+        "/api/threads",
+        headers=TENANT_HEADERS,
+        json={"workspace_id": "workspace_sales"},
+    )
+
+    assert [entry["provider_id"] for entry in catalog.json()] == [
+        "zzz-preferred",
+        "aaa-fallback",
+    ]
+    assert created.json()["provider_id"] == catalog.json()[0]["provider_id"]
+
+
+def test_model_catalog_supports_direct_gateway_settings():
+    settings = chat_settings(
+        model_gateway_providers=[],
+        model_gateway_base_url="https://direct.example/v1",
+        model_gateway_api_key="direct-secret",
+        model_gateway_model="deepseek-chat",
+    )
+    client = create_chat_client(settings=settings)
+
+    catalog = client.get(
+        "/api/model-catalog?workspace_id=workspace_sales",
+        headers=TENANT_HEADERS,
+    )
+    created = client.post(
+        "/api/threads",
+        headers=TENANT_HEADERS,
+        json={"workspace_id": "workspace_sales"},
+    )
+
+    assert catalog.json() == [
+        {
+            "provider_id": "default",
+            "model_id": "deepseek-chat",
+            "display_name": "Default / deepseek-chat",
+            "reasoning_efforts": [],
+            "default_reasoning_effort": None,
+            "configured": True,
+        }
+    ]
+    assert created.status_code == 201
+    assert created.json()["provider_id"] == "default"
+    assert created.json()["model_id"] == "deepseek-chat"
+
+
+def test_direct_gateway_exposes_and_defaults_configured_reasoning_effort():
+    settings = chat_settings(
+        model_gateway_providers=[],
+        model_gateway_base_url="https://direct.example/v1",
+        model_gateway_api_key="direct-secret",
+        model_gateway_model="deepseek-chat",
+        model_gateway_reasoning_efforts=["none", "high"],
+        model_gateway_default_reasoning_effort="high",
+    )
+    client = create_chat_client(settings=settings)
+
+    catalog = client.get(
+        "/api/model-catalog?workspace_id=workspace_sales",
+        headers=TENANT_HEADERS,
+    )
+    created = client.post(
+        "/api/threads",
+        headers=TENANT_HEADERS,
+        json={"workspace_id": "workspace_sales"},
+    )
+
+    assert catalog.json()[0]["reasoning_efforts"] == ["none", "high"]
+    assert catalog.json()[0]["default_reasoning_effort"] == "high"
+    assert created.status_code == 201
+    assert created.json()["reasoning_effort"] == "high"
+
+
+def test_workspace_capabilities_hide_unconfigured_media_creation_tools():
+    response = create_chat_client().get(
+        "/api/workspaces/workspace_sales/capabilities",
+        headers=TENANT_HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["composer_creation"] == {
+        "image": False,
+        "video": False,
+        "voice": False,
+        "browser": False,
+        "workflow": False,
+        "slides": False,
+    }
 
 
 def test_model_catalog_and_selection_refresh_after_provider_is_disabled():

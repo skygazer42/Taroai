@@ -1,6 +1,10 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.grok/
+.interface-design/
+.playwright-cli/
+.playwright-mcp/
 .venv/
 venv/
 node_modules/

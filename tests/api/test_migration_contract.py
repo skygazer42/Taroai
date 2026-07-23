@@ -1321,6 +1321,129 @@ def test_run_event_sequence_migration_applies_after_existing_schema(tmp_path):
     assert "sequence" in [column[1] for column in columns]
 
 
+def test_unique_run_event_sequence_migration_repairs_existing_duplicates(tmp_path):
+    sqlite_path = tmp_path / "unique-run-event-sequence-upgrade.sqlite3"
+    migrations_path = Path("apps/api/migrations")
+    with sqlite3.connect(sqlite_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE schema_migrations (
+                version TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE run_events (
+                id TEXT PRIMARY KEY,
+                sequence INTEGER NOT NULL,
+                tenant_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                payload TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO schema_migrations (version) VALUES (?)",
+            [
+                (path.name,)
+                for path in sorted(migrations_path.glob("0*.sql"))
+                if path.name < "040_unique_run_event_sequence.sql"
+            ],
+        )
+        connection.executemany(
+            """
+            INSERT INTO run_events (
+                id, sequence, tenant_id, workspace_id, run_id, type, created_at
+            ) VALUES (?, ?, 'tenant_1', 'workspace_1', 'run_1', ?, ?)
+            """,
+            [
+                ("event_1", 1, "run.created", "2026-07-13T00:00:00Z"),
+                ("event_2", 2, "audit.recorded", "2026-07-13T00:00:01Z"),
+                ("event_3", 2, "audit.recorded", "2026-07-13T00:00:02Z"),
+            ],
+        )
+
+    result = MigrationRunner(
+        config=DatabaseConfig(url=f"sqlite:///{sqlite_path}"),
+        migrations_path=migrations_path,
+    ).apply()
+
+    assert result.applied_versions == [
+        "040_unique_run_event_sequence.sql",
+        "041_chat_message_execution_content.sql",
+        "042_workflow_agent_approvals.sql",
+        "043_owner_connector_invoke_permission.sql",
+        "044_notifications.sql",
+        "045_tenant_invitations.sql",
+    ]
+    with sqlite3.connect(sqlite_path) as connection:
+        sequences = connection.execute(
+            "SELECT sequence FROM run_events ORDER BY sequence"
+        ).fetchall()
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO run_events (
+                    id, sequence, tenant_id, workspace_id, run_id, type, created_at
+                ) VALUES (
+                    'event_4', 3, 'tenant_1', 'workspace_1', 'run_1',
+                    'audit.recorded', '2026-07-13T00:00:03Z'
+                )
+                """
+            )
+
+    assert sequences == [(1,), (2,), (3,)]
+
+
+def test_owner_connector_invoke_permission_migration_upgrades_existing_role(
+    tmp_path: Path,
+):
+    sqlite_path = tmp_path / "owner-permission.sqlite3"
+    with sqlite3.connect(sqlite_path) as connection:
+        connection.execute(
+            "CREATE TABLE schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT)"
+        )
+        connection.execute(
+            "CREATE TABLE roles (id TEXT, tenant_id TEXT, permissions TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO roles VALUES ('tenant_owner', 'tenant_acme', '[]')"
+        )
+        connection.executemany(
+            "INSERT INTO schema_migrations (version) VALUES (?)",
+            [
+                (path.name,)
+                for path in sorted(Path("apps/api/migrations").glob("*.sql"))
+                if path.name < "043_owner_connector_invoke_permission.sql"
+            ],
+        )
+
+    result = MigrationRunner(
+        config=DatabaseConfig(url=f"sqlite:///{sqlite_path}"),
+        migrations_path=Path("apps/api/migrations"),
+    ).apply()
+
+    with sqlite3.connect(sqlite_path) as connection:
+        permission = connection.execute(
+            """
+            SELECT json_extract(value, '$.resource')
+            FROM roles, json_each(roles.permissions)
+            WHERE json_extract(value, '$.action') = 'connectors.invoke'
+            """
+        ).fetchone()
+    assert result.applied_versions == [
+        "043_owner_connector_invoke_permission.sql",
+        "044_notifications.sql",
+        "045_tenant_invitations.sql",
+    ]
+    assert permission == ("tenant:tenant_acme",)
+
+
 def test_migration_runner_ignores_duplicate_column_errors_from_postgresql():
     class DuplicateColumnError(Exception):
         sqlstate = "42701"

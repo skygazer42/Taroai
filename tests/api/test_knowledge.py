@@ -327,6 +327,49 @@ def test_knowledge_retrieval_uses_chunk_embeddings_after_acl_filtering():
     assert denied_results == []
 
 
+def test_knowledge_retrieval_supports_chinese_without_embeddings():
+    service = InMemoryKnowledgeService()
+    knowledge_base = service.create_base(
+        tenant_id="tenant_acme",
+        user_id="user_1",
+        request=KnowledgeBaseCreate(
+            workspace_id="workspace_sales", name="Finance Policy"
+        ),
+    )
+    service.register_document(
+        KnowledgeDocumentCreate(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_sales",
+            knowledge_base_id=knowledge_base.id,
+            source_uri="s3://tenant_acme/reimbursement.md",
+            source_document_id="reimbursement_policy",
+            uploaded_by_user_id="user_1",
+            title="松塔协议",
+            acl_subjects=["user:user_1"],
+            document_version="v1",
+            content_hash="sha256:chinese-policy",
+            chunks=[
+                DocumentChunkCreate(
+                    content="松塔协议规定，报销金额超过 7777 元时必须由财务总监审批。"
+                )
+            ],
+        )
+    )
+
+    results = service.retrieve(
+        RetrievalRequest(
+            tenant_id="tenant_acme",
+            query="松塔协议的报销审批要求是什么？",
+            allowed_workspace_ids=["workspace_sales"],
+            acl_subjects=["user:user_1"],
+        )
+    )
+
+    assert [result.source_document_id for result in results] == [
+        "reimbursement_policy"
+    ]
+
+
 def test_knowledge_document_workspace_must_match_knowledge_base_workspace():
     service = InMemoryKnowledgeService()
     knowledge_base = service.create_base(

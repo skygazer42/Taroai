@@ -1,7 +1,9 @@
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 import json
 from secrets import compare_digest
+from typing import Any
 from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
@@ -24,6 +26,14 @@ from taroai.sandbox.models import (
 
 
 BROWSER_CONTROLLER_API_KEY_MIN_LENGTH = 32
+_PLAYWRIGHT_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="taroai-playwright",
+)
+
+
+def run_playwright(operation, /, *args, **kwargs):
+    return _PLAYWRIGHT_EXECUTOR.submit(operation, *args, **kwargs).result()
 
 
 class BrowserSessionOpenRequest(BaseModel):
@@ -31,6 +41,8 @@ class BrowserSessionOpenRequest(BaseModel):
     workspace_id: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
     session_id: str = Field(min_length=1)
+    storage_state: dict[str, Any] | None = None
+    profile_id: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -81,7 +93,7 @@ def create_playwright_browser_app(
         try:
             yield
         finally:
-            browser_controller.close()
+            run_playwright(browser_controller.close)
 
     browser_app = FastAPI(title="Taroai Browser Controller", lifespan=lifespan)
     browser_app.state.browser_controller = browser_controller
@@ -111,7 +123,11 @@ def create_playwright_browser_app(
     def prepare_controller_request(
         _auth: None = Depends(require_controller_auth),
     ) -> None:
-        cleanup_expired_browser_sessions(browser_controller, service_settings)
+        run_playwright(
+            cleanup_expired_browser_sessions,
+            browser_controller,
+            service_settings,
+        )
 
     def prepare_session_creation(
         _request: None = Depends(prepare_controller_request),
@@ -157,30 +173,35 @@ def create_playwright_browser_app(
         request: BrowserSessionOpenRequest,
         _request: None = Depends(prepare_session_creation),
     ) -> BrowserSession:
-        if browser_session_exists(browser_controller, request.session_id):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Browser session already exists: {request.session_id}",
+        def create_session() -> BrowserSession:
+            if browser_session_exists(browser_controller, request.session_id):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Browser session already exists: {request.session_id}",
+                )
+            enforce_browser_session_limits(
+                browser_controller,
+                service_settings,
+                tenant_id=request.tenant_id,
+                run_id=request.run_id,
             )
-        enforce_browser_session_limits(
-            browser_controller,
-            service_settings,
-            tenant_id=request.tenant_id,
-            run_id=request.run_id,
-        )
-        return browser_controller.open_session(
-            tenant_id=request.tenant_id,
-            workspace_id=request.workspace_id,
-            run_id=request.run_id,
-            session_id=request.session_id,
-        )
+            return browser_controller.open_session(
+                tenant_id=request.tenant_id,
+                workspace_id=request.workspace_id,
+                run_id=request.run_id,
+                session_id=request.session_id,
+                storage_state=request.storage_state,
+                profile_id=request.profile_id,
+            )
+
+        return run_playwright(create_session)
 
     @browser_app.get("/sessions")
     def list_sessions(
         tenant_id: str | None = Query(default=None, min_length=1),
         _request: None = Depends(prepare_controller_request),
     ) -> dict[str, list[BrowserSession]]:
-        return {"sessions": browser_controller.list_sessions(tenant_id)}
+        return {"sessions": run_playwright(browser_controller.list_sessions, tenant_id)}
 
     @browser_app.get("/sessions/{session_id}")
     def get_session(
@@ -190,7 +211,8 @@ def create_playwright_browser_app(
         run_id: str = Query(min_length=1),
         _request: None = Depends(prepare_controller_request),
     ) -> BrowserSession:
-        return require_browser_session_scope(
+        return run_playwright(
+            require_browser_session_scope,
             browser_controller,
             tenant_id=tenant_id,
             workspace_id=workspace_id,
@@ -206,19 +228,22 @@ def create_playwright_browser_app(
         run_id: str = Query(min_length=1),
         _request: None = Depends(prepare_controller_request),
     ) -> BrowserSession:
-        require_browser_session_scope(
-            browser_controller,
-            tenant_id=tenant_id,
-            workspace_id=workspace_id,
-            run_id=run_id,
-            session_id=session_id,
-        )
-        return browser_controller.delete_session(
-            tenant_id=tenant_id,
-            workspace_id=workspace_id,
-            run_id=run_id,
-            session_id=session_id,
-        )
+        def delete_scoped_session() -> BrowserSession:
+            require_browser_session_scope(
+                browser_controller,
+                tenant_id=tenant_id,
+                workspace_id=workspace_id,
+                run_id=run_id,
+                session_id=session_id,
+            )
+            return browser_controller.delete_session(
+                tenant_id=tenant_id,
+                workspace_id=workspace_id,
+                run_id=run_id,
+                session_id=session_id,
+            )
+
+        return run_playwright(delete_scoped_session)
 
     @browser_app.post("/actions", status_code=status.HTTP_201_CREATED)
     def apply_action(
@@ -226,7 +251,7 @@ def create_playwright_browser_app(
         _request: None = Depends(prepare_controller_request),
     ) -> dict:
         enforce_browser_navigation_policy(action, service_settings)
-        return _serialize_observation(browser_controller.apply(action))
+        return _serialize_observation(run_playwright(browser_controller.apply, action))
 
     return browser_app
 

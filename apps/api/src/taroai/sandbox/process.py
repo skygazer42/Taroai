@@ -4,10 +4,12 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 from pathlib import Path
+from threading import RLock
 
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, PrivateAttr
 
 from taroai.domain import utc_now
 from taroai.sandbox.adapter import (
@@ -39,6 +41,10 @@ class LocalProcessSandboxAdapter(SandboxAdapter):
     max_sessions_per_tenant: int = Field(default=20, ge=1)
     max_sessions_per_run: int = Field(default=3, ge=1)
     sessions: dict[str, SandboxSession] = Field(default_factory=dict)
+    _active_processes: dict[str, set[subprocess.Popen[str]]] = PrivateAttr(
+        default_factory=dict
+    )
+    _process_lock: RLock = PrivateAttr(default_factory=RLock)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -95,30 +101,53 @@ class LocalProcessSandboxAdapter(SandboxAdapter):
             raise SandboxProviderUnavailableError(
                 "local process sandbox requires a POSIX-compatible shell"
             )
+        process = None
         try:
-            completed = subprocess.run(
-                [shell, "-lc", local_command],
-                cwd=cwd,
-                env=self._command_env(command.env, session),
-                capture_output=True,
-                text=True,
-                timeout=command.timeout_seconds,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as error:
-            stdout = self._coerce_process_output(error.stdout)
-            stderr = self._coerce_process_output(error.stderr)
-            if stderr:
-                stderr = f"{stderr}\n"
-            stderr = f"{stderr}command timed out after {command.timeout_seconds} seconds"
-            return self._command_result(command, 124, stdout, stderr)
+            with self._process_lock:
+                self._get_active_session(command.tenant_id, command.session_id)
+                process = subprocess.Popen(
+                    [shell, "-lc", local_command],
+                    cwd=cwd,
+                    env=self._command_env(command.env, session),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    start_new_session=os.name != "nt",
+                    creationflags=(
+                        subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+                    ),
+                )
+                self._active_processes.setdefault(command.session_id, set()).add(process)
+            try:
+                stdout, stderr = process.communicate(timeout=command.timeout_seconds)
+            except subprocess.TimeoutExpired:
+                self._terminate_process_group(process)
+                stdout, stderr = process.communicate()
+                stdout = self._coerce_process_output(stdout)
+                stderr = self._coerce_process_output(stderr)
+                if stderr:
+                    stderr = f"{stderr}\n"
+                stderr = (
+                    f"{stderr}command timed out after {command.timeout_seconds} seconds"
+                )
+                return self._command_result(command, 124, stdout, stderr)
         except OSError as error:
-            raise SandboxExecutionError(f"local process sandbox command failed: {error}") from error
+            raise SandboxExecutionError(
+                f"local process sandbox command failed: {error}"
+            ) from error
+        finally:
+            if process is not None:
+                with self._process_lock:
+                    active = self._active_processes.get(command.session_id)
+                    if active is not None:
+                        active.discard(process)
+                        if not active:
+                            self._active_processes.pop(command.session_id, None)
         return self._command_result(
             command,
-            completed.returncode,
-            completed.stdout,
-            completed.stderr,
+            process.returncode,
+            stdout,
+            stderr,
         )
 
     def upload_file(self, file_write: SandboxFileWrite) -> SandboxFileRef:
@@ -128,15 +157,14 @@ class LocalProcessSandboxAdapter(SandboxAdapter):
         path.parent.mkdir(parents=True, exist_ok=True)
         content_bytes = file_write.content_bytes()
         path.write_bytes(content_bytes)
-        return SandboxFileRef(
+        return SandboxFileRef.from_bytes(
+            content_bytes,
             tenant_id=file_write.tenant_id,
             workspace_id=file_write.workspace_id,
             run_id=file_write.run_id,
             session_id=file_write.session_id,
             path=self._workspace_display_path(path, session),
             content_type=file_write.content_type,
-            size_bytes=len(content_bytes),
-            content=file_write.content if file_write.content_base64 is None else None,
         )
 
     def download_file(
@@ -149,16 +177,15 @@ class LocalProcessSandboxAdapter(SandboxAdapter):
         resolved_path = self._resolve_workspace_path(session, path)
         if not resolved_path.exists() or not resolved_path.is_file():
             raise NotFoundError(f"Sandbox file not found: {path}")
-        content = resolved_path.read_text(encoding="utf-8")
-        return SandboxFileRef(
+        content = resolved_path.read_bytes()
+        return SandboxFileRef.from_bytes(
+            content,
             tenant_id=session.tenant_id,
             workspace_id=session.workspace_id,
             run_id=session.run_id,
             session_id=session.id,
             path=self._workspace_display_path(resolved_path, session),
             content_type=self._content_type(resolved_path),
-            size_bytes=len(content.encode("utf-8")),
-            content=content,
         )
 
     def list_files(self, tenant_id: str, session_id: str) -> list[SandboxFileRef]:
@@ -220,14 +247,18 @@ class LocalProcessSandboxAdapter(SandboxAdapter):
         return snapshot
 
     def destroy(self, tenant_id: str, session_id: str) -> SandboxSession:
-        session = self._get_session(tenant_id, session_id)
-        destroyed = session.model_copy(
-            update={
-                "status": SandboxSessionStatus.DESTROYED,
-                "destroyed_at": utc_now(),
-            }
-        )
-        self.sessions[session_id] = destroyed
+        with self._process_lock:
+            session = self._get_session(tenant_id, session_id)
+            destroyed = session.model_copy(
+                update={
+                    "status": SandboxSessionStatus.DESTROYED,
+                    "destroyed_at": utc_now(),
+                }
+            )
+            self.sessions[session_id] = destroyed
+            processes = list(self._active_processes.pop(session_id, set()))
+        for process in processes:
+            self._terminate_process_group(process)
         shutil.rmtree(self._workspace_path(session), ignore_errors=True)
         return destroyed
 
@@ -374,3 +405,28 @@ class LocalProcessSandboxAdapter(SandboxAdapter):
         if isinstance(value, bytes):
             return value.decode("utf-8", errors="replace")
         return str(value)
+
+    def _terminate_process_group(self, process: subprocess.Popen[str]) -> None:
+        if process.poll() is not None:
+            return
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            else:
+                os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
+            if process.poll() is None:
+                try:
+                    if os.name == "nt":
+                        process.kill()
+                    else:
+                        os.killpg(process.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                process.wait()

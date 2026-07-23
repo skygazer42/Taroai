@@ -1,6 +1,5 @@
 # Skills and Tool Gateway Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Build the governed skill and tool execution layer so enterprise custom skills can be uploaded, validated, permissioned, approved, billed, audited, and reused by agents.
 

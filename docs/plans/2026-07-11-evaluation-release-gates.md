@@ -1,6 +1,5 @@
 # Evaluation and Release Gates Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Wire the existing unified Evaluation engine to real Agent Runs, publication gates, and a workspace Evaluation UI.
 

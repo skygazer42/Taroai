@@ -18,6 +18,7 @@ from taroai.connectors import (
     InMemoryConnectorRegistry,
     SourceAclPrincipal,
 )
+from taroai.domain import RunCreate, RunMode
 from taroai.identity import (
     InMemoryIdentityService,
     PasswordHasher,
@@ -435,4 +436,3 @@ def test_connector_sync_worker_persists_failed_sync_state_without_raw_content():
     assert sync_state.error_code == "NotFoundError"
     assert sync_state.completed_at is not None
     assert "Do not store this raw failed document text" not in str(sync_state.model_dump(mode="json"))
-from taroai.domain import RunCreate, RunMode

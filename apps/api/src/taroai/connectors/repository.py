@@ -61,14 +61,12 @@ class SqlConnectorRegistry(BaseModel):
     ) -> ConnectorDefinition:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT * FROM connector_definitions WHERE id = ?",
-                (connector_id,),
+                "SELECT * FROM connector_definitions WHERE tenant_id = ? AND id = ?",
+                (tenant_id, connector_id),
             ).fetchone()
         if row is None:
             raise ConnectorNotFoundError(f"connector not found: {connector_id}")
         connector = self._connector_from_row(row)
-        if connector.tenant_id != tenant_id:
-            raise ConnectorAccessDeniedError("connector is not in tenant")
         return connector
 
     def list_connectors(
@@ -127,6 +125,35 @@ class SqlConnectorRegistry(BaseModel):
         updated = connector.apply_status(status)
         self._save_connector(updated)
         return updated
+
+    def update_connector_credential(
+        self,
+        tenant_id: str,
+        connector_id: str,
+        credential_ref: ConnectorCredentialRef,
+    ) -> ConnectorDefinition:
+        connector = self.get_connector(tenant_id, connector_id)
+        if credential_ref.tenant_id != tenant_id or credential_ref.workspace_id not in {
+            None,
+            connector.workspace_id,
+        }:
+            raise ConnectorAccessDeniedError("connector credential is not in workspace")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE connector_definitions
+                SET credential_ref = ?, status = ?, updated_at = ?
+                WHERE tenant_id = ? AND id = ?
+                """,
+                (
+                    self._credential_ref_json(credential_ref),
+                    ConnectorStatus.ENABLED.value,
+                    self._dt(utc_now()),
+                    tenant_id,
+                    connector_id,
+                ),
+            )
+        return self.get_connector(tenant_id, connector_id)
 
     def _connect(self):
         return connect_database(self.config)
@@ -248,7 +275,12 @@ class SqlConnectorRegistry(BaseModel):
     def _credential_ref_json(self, value: ConnectorCredentialRef | None) -> str | None:
         if value is None:
             return None
-        return self._json(value.model_dump(mode="json"))
+        payload = value.model_dump(mode="json")
+        if value.secret_backend is not None:
+            payload["secret_backend"] = value.secret_backend
+        if value.secret_external_name is not None:
+            payload["secret_external_name"] = value.secret_external_name
+        return self._json(payload)
 
     def _sync_state_json(self, value: ConnectorSyncState | None) -> str | None:
         if value is None:
@@ -258,8 +290,8 @@ class SqlConnectorRegistry(BaseModel):
     def _json(self, value: Any) -> str:
         return json.dumps(value, separators=(",", ":"))
 
-    def _loads(self, value: str) -> Any:
-        return json.loads(value)
+    def _loads(self, value: Any) -> Any:
+        return value if isinstance(value, (dict, list)) else json.loads(value)
 
     def _dt(self, value: datetime) -> str:
         resolved = value

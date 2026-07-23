@@ -69,7 +69,7 @@ def test_tenant_readiness_service_reports_ready_for_seeded_tenant(tmp_path: Path
     assert checks["owner_roles"].metadata["role_ids"] == ["tenant_owner"]
     assert checks["auth_mode"].status == ReadinessCheckStatus.PASSED
     assert checks["quota_profile"].metadata["profile"] == "poc"
-    assert checks["starter_skills"].status == ReadinessCheckStatus.WARNING
+    assert checks["skills_runtime"].status == ReadinessCheckStatus.WARNING
 
 
 def test_tenant_readiness_service_reports_missing_owner_and_role(tmp_path: Path):
@@ -275,6 +275,12 @@ def test_tenant_bootstrap_upgrades_existing_owner_role_permissions(tmp_path: Pat
     assert ("model_providers.read", "tenant:tenant_acme") in permissions
     assert ("model_providers.manage", "tenant:tenant_acme") in permissions
     assert ("model_providers.approve", "tenant:tenant_acme") in permissions
+    assert ("connectors.read", "tenant:tenant_acme") in permissions
+    assert ("connectors.manage", "tenant:tenant_acme") in permissions
+    assert ("connectors.invoke", "tenant:tenant_acme") in permissions
+    assert ("triggers.read", "tenant:tenant_acme") in permissions
+    assert ("triggers.manage", "tenant:tenant_acme") in permissions
+    assert ("triggers.invoke", "tenant:tenant_acme") in permissions
 
 
 def test_tenant_bootstrap_endpoint_is_idempotent_and_seeds_starter_resources(tmp_path: Path):
@@ -344,11 +350,11 @@ def test_tenant_bootstrap_endpoint_is_idempotent_and_seeds_starter_resources(tmp
     assert created_body["owner_user_id"] == repeated_body["owner_user_id"]
     assert created_body["starter_knowledge_base_id"] == repeated_body["starter_knowledge_base_id"]
     assert created_body["starter_skill_ids"] == repeated_body["starter_skill_ids"]
-    assert len(created_body["starter_skill_ids"]) >= 2
+    assert created_body["starter_skill_ids"] == []
 
     readiness_checks = {check["name"]: check for check in readiness.json()["checks"]}
     assert readiness.status_code == 200
-    assert readiness_checks["starter_skills"]["status"] == "passed"
+    assert readiness_checks["skills_runtime"]["status"] == "passed"
     assert readiness_checks["knowledge_spaces"]["status"] == "passed"
     assert workspace_skills.status_code == 200
     assert [skill["skill_id"] for skill in workspace_skills.json()] == created_body["starter_skill_ids"]

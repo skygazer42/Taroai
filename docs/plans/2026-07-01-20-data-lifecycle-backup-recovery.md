@@ -1,6 +1,5 @@
 # Data Lifecycle, Backup, and Recovery Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Define and implement the data lifecycle controls required for enterprise deployment: retention, deletion, export, backup, restore, disaster recovery, data residency, and tenant offboarding.
 

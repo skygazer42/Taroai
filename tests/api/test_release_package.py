@@ -256,10 +256,10 @@ def test_release_package_builder_creates_clean_zip_with_generated_manifest(tmp_p
 
     image_names = {image["name"] for image in manifest["images"]}
     assert {"api", "worker", "browser-controller", "web"}.issubset(image_names)
-    assert len(manifest["migrations"]) == 39
+    assert len(manifest["migrations"]) == 45
     assert (
         manifest["migrations"][-1]["id"]
-        == "039_evaluation_runtime"
+        == "045_tenant_invitations"
     )
 
     forbidden_exact = {".env", "a.md"}
@@ -334,6 +334,7 @@ def test_release_package_required_entries_cover_private_delivery_runbooks_and_pr
         "infra/config/byoc.env.example",
         "infra/config/private.env.example",
         "infra/config/deepseek.env.example",
+        "infra/config/zhipu.env.example",
         "docs/customer-success/admin-training.md",
         "docs/customer-success/employee-training.md",
         "docs/customer-success/rollout-playbook.md",
@@ -2633,7 +2634,7 @@ def test_release_package_verifier_rejects_stale_upgrade_matrix(tmp_path: Path):
     assert report.upgrade_matrix_errors == [
         (
             "upgrade matrix must cover migration range "
-            "001_initial to 039_evaluation_runtime"
+            "001_initial to 045_tenant_invitations"
         )
     ]
 

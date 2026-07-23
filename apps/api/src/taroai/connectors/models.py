@@ -78,6 +78,10 @@ class ConnectorCredentialRef(BaseModel):
     workspace_id: str | None = None
     secret_ref_id: str = Field(min_length=1)
     required_actions: list[str] = Field(default_factory=list)
+    secret_backend: Literal["memory", "local", "aws_secrets_manager"] | None = Field(
+        default=None, exclude=True
+    )
+    secret_external_name: str | None = Field(default=None, exclude=True)
 
 
 class ConnectorCredentialCreate(BaseModel):
@@ -91,6 +95,7 @@ class ConnectorCapability(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(min_length=1)
+    description: str = Field(default="", max_length=4000)
     input_schema: dict[str, Any] = Field(default_factory=lambda: {"type": "object"})
     output_schema: dict[str, Any] = Field(default_factory=lambda: {"type": "object"})
     required_scopes: list[str] = Field(default_factory=list)

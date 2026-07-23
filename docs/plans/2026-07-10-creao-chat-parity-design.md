@@ -17,7 +17,7 @@ This slice does not claim backend capabilities that do not exist. In particular,
 - Model selector: `32px` high, `14px/20px`, `6px 10px` padding.
 - Primary Create Agent action: dark pill, `28px` high, `12px/16px` label.
 
-Reference screenshots and extraction metadata live under `.omx/state/taroai-creao-chat/`.
+Reference screenshots and extraction metadata are external test evidence and are not required at runtime.
 
 ## Information Architecture
 

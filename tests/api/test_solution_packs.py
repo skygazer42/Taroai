@@ -4,7 +4,6 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from taroai.app import create_app
-from taroai.config import Settings
 from taroai.db import DatabaseConfig, MigrationRunner
 from taroai.identity import (
     InMemoryIdentityService,
@@ -19,7 +18,7 @@ from taroai.licensing import (
     LicenseService,
     LicensedFeature,
 )
-from taroai.skills import InMemorySkillRegistry, SkillManifest
+from taroai.skills import InMemorySkillRegistry
 from taroai.solution_packs import (
     InMemorySolutionPackRegistry,
     SolutionPackInstallationStatus,
@@ -483,3 +482,40 @@ def test_sql_solution_pack_registry_persists_pack_and_installation(tmp_path: Pat
         config=DatabaseConfig(url=database_url)
     ).get_installation("tenant_acme", "sales.renewal_ops")
     assert persisted_status.status == SolutionPackInstallationStatus.ROLLED_BACK
+
+
+def test_sql_solution_pack_registry_hydrates_postgresql_values():
+    registry = SqlSolutionPackRegistry(
+        config=DatabaseConfig(url="postgresql://example")
+    )
+    now = datetime(2026, 7, 13, tzinfo=timezone.utc)
+
+    entry = registry._entry_from_row(
+        {
+            "tenant_id": "tenant_acme",
+            "manifest": solution_pack_payload(),
+            "status": "published",
+            "created_by_user_id": "user_admin",
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    installation = registry._installation_from_row(
+        {
+            "tenant_id": "tenant_acme",
+            "pack_id": "sales.renewal_ops",
+            "version": "1.0.0",
+            "workspace_ids": {"items": ["workspace_sales"]},
+            "installed_skill_ids": {"items": ["sales.crm_lookup"]},
+            "status": "installed",
+            "installed_by_user_id": "user_admin",
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+
+    assert entry.manifest.name == "Renewal Operations"
+    assert entry.created_at == now
+    assert installation.workspace_ids == ["workspace_sales"]
+    assert installation.installed_skill_ids == ["sales.crm_lookup"]
+    assert installation.created_at == now

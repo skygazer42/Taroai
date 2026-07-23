@@ -1,6 +1,5 @@
 # Prompt and Guardrail Governance Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Build a governed prompt and guardrail layer so system prompts, agent prompts, workflow prompt nodes, safety rules, redaction rules, and prompt-injection defenses are versioned, testable, auditable, and tenant-aware.
 

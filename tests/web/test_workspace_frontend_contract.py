@@ -93,12 +93,9 @@ def test_chat_column_preserves_creao_selector_contract():
 
     composer_shell = chat_column.find_by_attr("data-testid", "chat-composer")
     assert composer_shell is not None
-    composer_divs = composer_shell.direct_children("div")
-    assert len(composer_divs) >= 2
-    assert (
-        "Press Enter to send, Shift+Enter for a new line."
-        in composer_divs[1].text
-    )
+    assert "Press Enter to send, Shift+Enter for a new line." in composer_shell.text
+    network_status = composer_shell.find_by_attr("data-chat-network-state", "")
+    assert network_status is not None and network_status.attrs.get("role") == "status"
 
 
 def test_workspace_surfaces_cover_execution_mvp():
@@ -206,6 +203,8 @@ def test_workspace_renders_delivery_chain_evidence():
         "deliveryChainStatus",
         "buildDeliveryChainEvidence()",
         "storageObjectForTerminalOutputUri(",
+        'storageObject.purpose === "sandbox-command-outputs"',
+        "outputs.at(-1)",
         "storageObjectForBrowserCapture(",
         "readyStorageBackedArtifacts()",
         'chain.sandboxSessionId !== "--"',
@@ -363,18 +362,25 @@ def test_workspace_can_use_bearer_auth_when_dev_headers_are_disabled():
         '`/api/auth/logout`',
         '"Authorization"',
         '"Bearer "',
-        "sessionStorage.setItem",
+        'sessionStorage.setItem("taroai.accessToken", state.accessToken)',
+        'localStorage.setItem("taroai.accessToken", state.accessToken)',
         "sessionStorage.removeItem",
+        'localStorage.getItem("taroai.accessToken")',
+        "elements.rememberLogin.checked",
+        "remember_me: elements.rememberLogin.checked",
+        "elements.passwordToggle.setAttribute",
         "access_token",
         "result.tenant_id",
         "result.user_id",
+        "result.workspace_id",
         'localStorage.setItem("taroai.tenantId"',
         'localStorage.setItem("taroai.userId"',
+        'localStorage.setItem("taroai.workspaceId"',
         'clearAuthenticatedWorkspaceState("Authentication failed.");',
         "handleAuthExpired(response.status)",
-        "status === 401 || status === 403",
+        "status === 401 && state.accessToken",
         'clearAuthenticatedWorkspaceState("Authentication expired.");',
-        'renderAuth("Auth required")',
+        'renderAuth("Session expired")',
         "parseResponseBody(text)",
         "return { message: text }",
         "login()",
@@ -382,6 +388,11 @@ def test_workspace_can_use_bearer_auth_when_dev_headers_are_disabled():
     ]
     for fragment in required_fragments:
         assert fragment in source
+    login_source = source[
+        source.index("async function login(") : source.index("async function logout()")
+    ]
+    assert "tenant_id: state.tenantId" not in login_source
+    assert "email,\n        password," in login_source
 
 
 def test_workspace_can_bootstrap_first_tenant_without_persisting_bootstrap_token():
@@ -429,6 +440,8 @@ def test_workspace_can_prefill_connection_from_url_without_url_secrets():
         'userId: "taroai.userId"',
         'workspaceId: "taroai.workspaceId"',
         'email: "taroai.authEmail"',
+        'urlParams.get("runId")',
+        "await refreshRun()",
         "state[key] = value",
         "localStorage.setItem(storageKey, value)",
         'urlParams.has("accessToken")',
@@ -472,6 +485,20 @@ def test_workspace_logout_clears_execution_surfaces():
         assert fragment in source
 
 
+def test_chat_topbar_keeps_runtime_status_screen_reader_only():
+    root = parse_index()
+    status = root.find_by_attr("data-thread-presence", "")
+    assert status is not None
+    assert "visually-hidden" in status.attrs["class"]
+    assert status.attrs["aria-live"] == "polite"
+
+    source = (WEB_ROOT / "assets" / "main.js").read_text()
+    styles = (WEB_ROOT / "assets" / "styles.css").read_text()
+    assert 'elements.status.className = "visually-hidden"' in source
+    assert 'elements.status.className = "status-pill"' not in source
+    assert ".status-pill" not in styles
+
+
 def test_workspace_storage_content_fetches_clear_auth_expiry():
     script_path = WEB_ROOT / "assets" / "main.js"
     source = script_path.read_text()
@@ -507,6 +534,9 @@ def test_workspace_surfaces_model_and_sandbox_readiness_before_execution():
         "Sandbox PoC:",
         "Sandbox isolated:",
         "state.readiness",
+        "readiness.ready && modelGateway.configured && sandbox.configured",
+        "error.status === 503",
+        "error.body?.ready === false",
         "elements.readinessStatus",
         "elements.readinessModel",
         "elements.readinessSandbox",
@@ -518,7 +548,7 @@ def test_workspace_surfaces_model_and_sandbox_readiness_before_execution():
 def test_workspace_refreshes_readiness_after_bearer_login():
     script_path = WEB_ROOT / "assets" / "main.js"
     source = script_path.read_text()
-    assert 'renderAuth("Bearer");\n    await loadReadiness();' in source
+    assert 'renderAuth("Signed in");\n    await loadReadiness();' in source
 
 
 def test_workspace_surfaces_customer_success_dashboard_data():
@@ -586,6 +616,7 @@ def test_workspace_can_generate_customer_success_candidates_from_feedback():
         "Pack candidates generated",
         "renderEvaluationCandidateReview(",
         "selectedEvaluationCandidate(",
+        "candidates.findLast(",
         "reviewSelectedEvaluationCandidate(",
         "`/api/customer-success/evaluation-candidates/${candidate.id}/review`",
         "renderSolutionPackCandidateReview(",
@@ -657,6 +688,23 @@ def test_workspace_can_manage_solution_pack_publication_drafts():
     ]
     for fragment in required_fragments:
         assert fragment in source
+
+    save_draft_source = source.split(
+        "async function saveSelectedSolutionPackDraft() {", 1
+    )[1].split("\n}\n\nfunction parseDraftSkillManifest", 1)[0]
+    assert "renderSolutionPackDrafts(" not in save_draft_source
+    assert save_draft_source.index("const payload = {") < save_draft_source.index(
+        'textContent = "Saving draft"'
+    )
+
+    review_candidate_source = source.split(
+        "async function reviewSelectedSolutionPackCandidate(status) {", 1
+    )[1].split("\n}\n\nfunction solutionPackCandidateReviewPayload", 1)[0]
+    assert review_candidate_source.index(
+        "await loadCustomerSuccess();"
+    ) < review_candidate_source.index(
+        "selectSolutionPackDraft(updated.publication_draft_id);"
+    )
 
 
 def test_workspace_can_download_storage_backed_artifacts():
@@ -849,10 +897,24 @@ def test_workspace_can_list_and_invoke_installed_skills():
         "data-workspace-skill-id",
         "invokeSelectedWorkspaceSkill()",
         "state.currentRunId = result.run_id || result.output?.run_id",
+        "state.runTrace = null",
+        "state.runtimeState = null",
+        "clearArtifactPreview()",
+        "clearArtifactDownloadStatus()",
         "refreshRun()",
     ]
     for fragment in required_fragments:
         assert fragment in source
+    invoke_skill = source.split(
+        "async function invokeSelectedWorkspaceSkill()", 1
+    )[1].split("function renderCustomerSuccess", 1)[0]
+    for fragment in [
+        "state.runTrace = null",
+        "state.runtimeState = null",
+        "clearArtifactPreview()",
+        "clearArtifactDownloadStatus()",
+    ]:
+        assert fragment in invoke_skill
 
 
 def test_workspace_can_install_solution_pack_and_refresh_skills():
@@ -1129,6 +1191,12 @@ def test_workspace_can_render_run_trace_evidence():
     ]
     for fragment in required_fragments:
         assert fragment in source
+    refresh_run = source.split("async function refreshRun()", 1)[1].split(
+        "async function loadRunStatus()", 1
+    )[0]
+    assert refresh_run.index("await announceRunDelivery();") < refresh_run.index(
+        "await loadRunTrace();"
+    )
 
 
 def test_workspace_can_render_runtime_state_snapshot():
@@ -1185,8 +1253,9 @@ def test_workspace_surfaces_execution_loop_progress():
         "executionLoopSummary",
         "executionModelRoute",
         "modelRouteLabel()",
-        "latestPlanCreatedEvent()",
-        'event.type === "model.plan.created"',
+        "latestModelRouteEvent()",
+        '"model.plan.created"',
+        '"model.operation.recorded"',
         "provider_attempts",
         "total_tokens",
         "executionLoopStageLabel(",
@@ -1200,6 +1269,27 @@ def test_workspace_surfaces_execution_loop_progress():
     ]
     for fragment in required_fragments:
         assert fragment in source
+
+
+def test_workspace_exposes_its_sidecar_state():
+    root = parse_index()
+    state = root.find_by_attr("data-sidecar-state", "")
+    source = (WEB_ROOT / "assets" / "main.js").read_text()
+
+    assert state is not None
+    assert state.text.strip() == "closed"
+    assert "elements.sidecarState.textContent" in source
+
+
+def test_bootstrap_waits_for_automatic_login_before_reporting_ready():
+    source = (WEB_ROOT / "assets" / "main.js").read_text()
+    start = source.index("async function bootstrapTenant()")
+    end = source.index("async function login(", start)
+    bootstrap = source[start:end]
+
+    assert bootstrap.index("await login();") < bootstrap.index(
+        'renderBootstrap("Tenant ready");'
+    )
 
 
 def test_workspace_surfaces_run_evidence_checklist():
@@ -1235,9 +1325,17 @@ def test_workspace_surfaces_run_evidence_checklist():
 def test_static_workspace_is_packaged_with_local_cloud_poc():
     compose_path = ROOT / "infra" / "docker-compose.yml"
     compose = compose_path.read_text()
+    nginx = (ROOT / "infra" / "nginx" / "local.conf").read_text()
+    main = (WEB_ROOT / "assets" / "main.js").read_text()
+    chat_api = (WEB_ROOT / "assets" / "chat-api.js").read_text()
     assert "web:" in compose
     assert "../apps/web:/usr/share/nginx/html:ro" in compose
+    assert "./nginx/local.conf:/etc/nginx/conf.d/default.conf:ro" in compose
     assert "${TAROAI_WEB_PORT:-3000}:80" in compose
+    assert "location /api/" in nginx
+    assert "proxy_pass http://api:8000" in nginx
+    assert 'localStorage.getItem("taroai.apiBase") || window.location.origin' in main
+    assert '"taroai.apiBase", window.location.origin' in chat_api
 
 
 def test_frontend_uses_plain_static_assets_without_runtime_fixtures():

@@ -83,6 +83,22 @@ class InMemoryLongTermMemoryService(BaseModel):
             and record.status == MemoryStatus.ACTIVE
         ]
 
+    def forget(self, tenant_id: str, memory_id: str) -> MemoryRecord:
+        record = self.get(tenant_id, memory_id)
+        forgotten = record.model_copy(
+            update={
+                "content": "",
+                "metadata": {},
+                "status": MemoryStatus.EXPIRED,
+                "expires_at": utc_now(),
+            }
+        )
+        for index, existing in enumerate(self.records):
+            if existing.id == memory_id:
+                self.records[index] = forgotten
+                return forgotten
+        raise NotFoundError(f"Memory not found: {memory_id}")
+
     def delete_for_tenant(self, tenant_id: str) -> list[str]:
         deleted_ids: list[str] = []
         for index, record in enumerate(self.records):
@@ -387,6 +403,9 @@ class GuardedLongTermMemoryService(BaseModel):
         scope_id: str,
     ) -> list[MemoryRecord]:
         return self.service.list_by_scope(tenant_id, scope_type, scope_id)
+
+    def forget(self, tenant_id: str, memory_id: str) -> MemoryRecord:
+        return self.service.forget(tenant_id, memory_id)
 
     def delete_for_tenant(self, tenant_id: str) -> list[str]:
         return self.service.delete_for_tenant(tenant_id)

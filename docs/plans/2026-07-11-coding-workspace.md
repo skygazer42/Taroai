@@ -1,6 +1,5 @@
 # Coding Workspace Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Add isolated repository workspaces and a complete code-change delivery surface.
 

@@ -14,6 +14,7 @@ from taroai.model_gateway.providers import (
     ModelProviderFallbackPolicy,
     ModelProviderRateLimit,
     validate_chat_request_options,
+    validate_model_provider_base_url,
 )
 from taroai.store import NotFoundError
 
@@ -237,6 +238,7 @@ class ModelProviderApiUpsert(BaseModel):
 
     @model_validator(mode="after")
     def validate_provider_chat_request_options(self) -> "ModelProviderApiUpsert":
+        validate_model_provider_base_url(self.base_url)
         validate_chat_request_options(self.chat_request_options)
         return self
 
@@ -356,6 +358,7 @@ class ModelProviderUpsert(BaseModel):
 
     @model_validator(mode="after")
     def validate_provider_chat_request_options(self) -> "ModelProviderUpsert":
+        validate_model_provider_base_url(self.base_url)
         validate_chat_request_options(self.chat_request_options)
         return self
 
@@ -891,13 +894,12 @@ class SqlModelProviderStore(ModelProviderStore):
 
     def list_all_providers(self) -> list[ModelProviderRecord]:
         with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT * FROM model_provider_records
-                ORDER BY tenant_id, provider_id
-                """
-            ).fetchall()
-        return [self._provider_record_from_row(row) for row in rows]
+            tenants = connection.execute("SELECT id FROM tenants ORDER BY id").fetchall()
+        return [
+            record
+            for tenant in tenants
+            for record in self.list_providers(str(tenant["id"]))
+        ]
 
     def get_provider(self, tenant_id: str, provider_id: str) -> ModelProviderRecord:
         record = self._get_provider_optional(tenant_id, provider_id)
@@ -1432,14 +1434,14 @@ class SqlModelProviderStore(ModelProviderStore):
     def _json(self, value) -> str:
         return json.dumps(value)
 
-    def _loads(self, value: str):
-        return json.loads(value)
+    def _loads(self, value: Any):
+        return json.loads(value) if isinstance(value, (str, bytes, bytearray)) else value
 
     def _dt(self, value: datetime) -> str:
         return value.isoformat()
 
-    def _parse_dt(self, value: str) -> datetime:
-        return datetime.fromisoformat(value)
+    def _parse_dt(self, value: datetime | str) -> datetime:
+        return value if isinstance(value, datetime) else datetime.fromisoformat(value)
 
     def _row_value(self, row, key: str, default):
         try:
@@ -1734,13 +1736,12 @@ class SqlModelPolicyStore(ModelPolicyStore):
 
     def list_all_scopes(self) -> list[ModelPolicyScopeRecord]:
         with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT * FROM model_policy_scopes
-                ORDER BY tenant_id, workspace_id, updated_at
-                """
-            ).fetchall()
-        return [self._record_from_row(row) for row in rows]
+            tenants = connection.execute("SELECT id FROM tenants ORDER BY id").fetchall()
+        return [
+            scope
+            for tenant in tenants
+            for scope in self.list_scopes(str(tenant["id"]))
+        ]
 
     def list_policy_versions(
         self,
@@ -1914,7 +1915,9 @@ class SqlModelPolicyStore(ModelPolicyStore):
             raise ValueError(f"Model policy change request is not pending: {request.id}")
 
     def _change_request_from_row(self, row) -> ModelPolicyChangeRequestRecord:
-        payload = ModelPolicyChangePayload.model_validate(json.loads(row["payload"]))
+        payload = ModelPolicyChangePayload.model_validate(
+            self._load_json(row["payload"])
+        )
         reviewed_at = row["reviewed_at"]
         return ModelPolicyChangeRequestRecord(
             id=row["request_id"],
@@ -2058,20 +2061,23 @@ class SqlModelPolicyStore(ModelPolicyStore):
     def _json(self, value) -> str:
         return json.dumps(value)
 
-    def _loads(self, value: str) -> list[str]:
-        loaded = json.loads(value)
+    def _loads(self, value: Any) -> list[str]:
+        loaded = self._load_json(value)
         if not isinstance(loaded, list):
             return []
         return [str(item) for item in loaded]
 
-    def _loads_dict_int(self, value: str) -> dict[str, int]:
-        loaded = json.loads(value)
+    def _loads_dict_int(self, value: Any) -> dict[str, int]:
+        loaded = self._load_json(value)
         if not isinstance(loaded, dict):
             return {}
         return {str(key): int(item) for key, item in loaded.items()}
 
+    def _load_json(self, value: Any) -> Any:
+        return json.loads(value) if isinstance(value, (str, bytes, bytearray)) else value
+
     def _dt(self, value: datetime) -> str:
         return value.isoformat()
 
-    def _parse_dt(self, value: str) -> datetime:
-        return datetime.fromisoformat(value)
+    def _parse_dt(self, value: datetime | str) -> datetime:
+        return value if isinstance(value, datetime) else datetime.fromisoformat(value)

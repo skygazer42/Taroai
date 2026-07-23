@@ -1,6 +1,5 @@
 # Incident, SLO, and Support Operations Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Build operational controls for production incidents, customer support, SLO tracking, run quarantine, support access, and post-incident learning.
 

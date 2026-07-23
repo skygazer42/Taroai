@@ -49,6 +49,7 @@ def build_runtime_graph(runtime: "AgentRuntime") -> StateGraph:
         {
             "policy": "policy",
             "verify": "verify",
+            "complete": "complete",
             "replan": "replan",
             "wait_user": "wait_user",
             "fail": "fail",
@@ -69,7 +70,8 @@ def build_runtime_graph(runtime: "AgentRuntime") -> StateGraph:
         "observe_result",
         _route,
         {
-            "verify": "verify",
+            "decide": "decide",
+            "complete": "complete",
             "repair": "repair",
             "fail": "fail",
             "end": END,

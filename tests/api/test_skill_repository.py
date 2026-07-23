@@ -1,8 +1,24 @@
+import hashlib
 from pathlib import Path
 from datetime import datetime, timezone
 
+import pytest
+
 from taroai.db import DatabaseConfig, MigrationRunner
-from taroai.skills import SkillManifest, SkillRuntime, SkillType
+from taroai.skills import (
+    InMemorySkillRegistry,
+    SkillFrontmatter,
+    SkillManifest,
+    SkillPackage,
+    SkillPackageFile,
+    SkillPackageFileKind,
+    SkillPackageProvenance,
+    SkillPackageSourceType,
+    SkillRuntime,
+    SkillType,
+)
+from taroai.store import NotFoundError
+from taroai.skills.discovery import SkillDiscoveryService
 
 
 def skill_manifest() -> SkillManifest:
@@ -27,6 +43,105 @@ def skill_manifest() -> SkillManifest:
         runtime=SkillRuntime(sandbox="workflow", timeout_seconds=120),
         billing_meters=["tool_call_count"],
     )
+
+
+def skill_package() -> SkillPackage:
+    content = b"---\nname: Ticket Triage\ndescription: Triage support tickets.\n---\n"
+    return SkillPackage(
+        manifest=skill_manifest(),
+        frontmatter=SkillFrontmatter(
+            name="Ticket Triage",
+            description="Triage support tickets.",
+        ),
+        skill_md=content.decode(),
+        files=(
+            SkillPackageFile(
+                path="SKILL.md",
+                kind=SkillPackageFileKind.INSTRUCTIONS,
+                size_bytes=len(content),
+                content_digest=hashlib.sha256(content).hexdigest(),
+                content=content,
+            ),
+        ),
+        package_digest="a" * 64,
+        provenance=SkillPackageProvenance(
+            source_type=SkillPackageSourceType.ZIP,
+            source_digest="b" * 64,
+        ),
+    )
+
+
+def assert_package_publish_install_uninstall(registry) -> None:
+    registry.register_package_for_tenant(
+        "tenant_acme",
+        "user_1",
+        skill_package(),
+    )
+    published = registry.publish_package(
+        "tenant_acme",
+        "support.ticket_triage",
+        "1.0.0",
+    )
+    installed = registry.install_for_workspace(
+        "tenant_acme",
+        "workspace_support",
+        "support.ticket_triage",
+        "user_1",
+        version="1.0.0",
+        package_digest="a" * 64,
+    )
+    removed = registry.uninstall_for_workspace(
+        "tenant_acme",
+        "workspace_support",
+        "support.ticket_triage",
+    )
+
+    assert published.status == "published"
+    assert installed.package_digest == "a" * 64
+    assert removed == installed
+    with pytest.raises(NotFoundError):
+        registry.get_installation(
+            "tenant_acme",
+            "workspace_support",
+            "support.ticket_triage",
+        )
+
+
+def test_in_memory_skill_registry_package_lifecycle():
+    assert_package_publish_install_uninstall(InMemorySkillRegistry())
+
+
+def test_skill_discovery_exposes_the_selection_contract():
+    registry = InMemorySkillRegistry()
+    package = skill_package().model_copy(
+        update={
+            "taroai_config": {
+                "spec": {
+                    "tools": ["support.lookup", {"id": "artifact.write"}],
+                }
+            }
+        }
+    )
+    registry.register_package_for_tenant("tenant_acme", "user_1", package)
+    registry.publish_package("tenant_acme", package.skill_id, package.version)
+    registry.install_for_workspace(
+        "tenant_acme",
+        "workspace_support",
+        package.skill_id,
+        "user_1",
+        version=package.version,
+        package_digest=package.package_digest,
+    )
+
+    summaries = SkillDiscoveryService(registry).discover(
+        tenant_id="tenant_acme",
+        workspace_id="workspace_support",
+        user_id="user_1",
+    )
+
+    assert len(summaries) == 1
+    assert summaries[0].input_schema == skill_manifest().input_schema
+    assert summaries[0].allowed_tools == ["support.lookup", "artifact.write"]
 
 
 def test_sql_skill_registry_persists_tenant_skill_lifecycle(tmp_path: Path):
@@ -56,6 +171,28 @@ def test_sql_skill_registry_persists_tenant_skill_lifecycle(tmp_path: Path):
     assert entries[0].manifest.id == "support.ticket_triage"
     assert entries[0].manifest.required_scopes == ["support.read", "support.route"]
     assert restarted.list_for_tenant("tenant_other") == []
+
+
+def test_sql_skill_registry_package_lifecycle(tmp_path: Path):
+    from taroai.skills.repository import SqlSkillRegistry
+
+    database_url = f"sqlite:///{tmp_path / 'taroai.sqlite3'}"
+    MigrationRunner(
+        config=DatabaseConfig(url=database_url),
+        migrations_path=Path("apps/api/migrations"),
+    ).apply()
+
+    registry = SqlSkillRegistry(config=DatabaseConfig(url=database_url))
+    assert_package_publish_install_uninstall(registry)
+
+    restarted = SqlSkillRegistry(config=DatabaseConfig(url=database_url))
+    record = restarted.get_package_record(
+        "tenant_acme",
+        "support.ticket_triage",
+        "1.0.0",
+    )
+    assert record.status == "published"
+    assert restarted.list_for_workspace("tenant_acme", "workspace_support") == []
 
 
 def test_sql_skill_registry_hydrates_postgresql_native_json_and_datetime_values():

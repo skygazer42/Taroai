@@ -71,17 +71,20 @@ class SqlStorageCatalog(BaseModel):
         workspace_id: str | None = None,
         run_id: str | None = None,
     ) -> list[StorageObject]:
+        filters = ["tenant_id = ?", "deleted_at IS NULL"]
+        params = [tenant_id]
+        if workspace_id is not None:
+            filters.append("workspace_id = ?")
+            params.append(workspace_id)
+        if run_id is not None:
+            filters.append("run_id = ?")
+            params.append(run_id)
         with self._connect() as connection:
             rows = connection.execute(
-                """
-                SELECT * FROM storage_objects
-                WHERE tenant_id = ?
-                  AND (? IS NULL OR workspace_id = ?)
-                  AND (? IS NULL OR run_id = ?)
-                  AND deleted_at IS NULL
-                ORDER BY created_at, id
-                """,
-                (tenant_id, workspace_id, workspace_id, run_id, run_id),
+                "SELECT * FROM storage_objects WHERE "
+                + " AND ".join(filters)
+                + " ORDER BY created_at, id",
+                tuple(params),
             ).fetchall()
         return [self._from_row(row) for row in rows]
 
@@ -91,18 +94,22 @@ class SqlStorageCatalog(BaseModel):
         now: datetime,
         workspace_id: str | None = None,
     ) -> list[StorageObject]:
+        filters = [
+            "tenant_id = ?",
+            "retention_expires_at IS NOT NULL",
+            "retention_expires_at <= ?",
+            "deleted_at IS NULL",
+        ]
+        params = [tenant_id, self._dt(now)]
+        if workspace_id is not None:
+            filters.insert(1, "workspace_id = ?")
+            params.insert(1, workspace_id)
         with self._connect() as connection:
             rows = connection.execute(
-                """
-                SELECT * FROM storage_objects
-                WHERE tenant_id = ?
-                  AND (? IS NULL OR workspace_id = ?)
-                  AND retention_expires_at IS NOT NULL
-                  AND retention_expires_at <= ?
-                  AND deleted_at IS NULL
-                ORDER BY retention_expires_at, created_at, id
-                """,
-                (tenant_id, workspace_id, workspace_id, self._dt(now)),
+                "SELECT * FROM storage_objects WHERE "
+                + " AND ".join(filters)
+                + " ORDER BY retention_expires_at, created_at, id",
+                tuple(params),
             ).fetchall()
         return [self._from_row(row) for row in rows]
 

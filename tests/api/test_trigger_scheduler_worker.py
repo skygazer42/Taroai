@@ -140,6 +140,13 @@ def test_trigger_due_worker_creates_run_and_queues_execution():
     assert run.user_id == "svc_scheduler"
     assert run.agent_id == "agent_sla"
     assert run.message == "Check open SLA risk."
+    assert run.thread_id is not None
+    assert run.trigger_message_id is not None
+    thread = store.get_chat_thread("tenant_acme", run.thread_id)
+    messages = store.list_chat_messages("tenant_acme", thread.id)
+    assert thread.title == "Check open SLA risk."
+    assert messages[0].id == run.trigger_message_id
+    assert messages[0].resource_refs[0].id == "agent_sla"
     assert queue.get(due_job.id).status == JobStatus.SUCCEEDED
     execution_jobs = [job for job in queue.jobs if job.type == JobType.RUN_EXECUTION]
     assert len(execution_jobs) == 1

@@ -143,5 +143,17 @@ def test_sql_connector_registry_enforces_tenant_scope(tmp_path):
     connector = registry.register_connector(connector_payload())
 
     assert registry.list_connectors("tenant_other") == []
-    with pytest.raises(PermissionError):
+    with pytest.raises(connectors_module.ConnectorNotFoundError):
         registry.get_connector("tenant_other", connector.id)
+
+
+def test_sql_connector_registry_accepts_postgresql_jsonb_values(tmp_path):
+    registry = SqlConnectorRegistry(
+        config=prepare_database(tmp_path / "connectors-jsonb.sqlite3")
+    )
+
+    capabilities = [{"name": "search_accounts"}]
+    metadata = {"provider": "crm"}
+
+    assert registry._loads(capabilities) is capabilities
+    assert registry._loads(metadata) is metadata

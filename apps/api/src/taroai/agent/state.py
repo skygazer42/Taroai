@@ -85,4 +85,5 @@ class AgentRuntimeState(BaseModel):
     current_action_id: str | None = None
     graph_failure_code: str | None = None
     graph_failure_detail: str | None = None
+    graph_failure_metadata: dict[str, Any] = Field(default_factory=dict)
     runtime_metadata: dict[str, Any] = Field(default_factory=dict)

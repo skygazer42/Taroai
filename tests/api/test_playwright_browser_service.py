@@ -1,9 +1,10 @@
 import base64
 from datetime import timedelta
+from threading import current_thread
 
 import pytest
 from fastapi.testclient import TestClient
-from pydantic import ValidationError
+from pydantic import PrivateAttr, ValidationError
 
 from taroai.domain import utc_now
 from taroai.sandbox import BrowserAction, BrowserActionType
@@ -87,8 +88,10 @@ class RecordingBrowser:
         self.calls = calls
         self.context = RecordingContext(calls)
 
-    def new_context(self):
-        self.calls.append(("new_context",))
+    def new_context(self, storage_state=None):
+        self.calls.append(
+            ("new_context", storage_state) if storage_state else ("new_context",)
+        )
         return self.context
 
     def close(self):
@@ -124,6 +127,18 @@ class RecordingPlaywrightFactory:
 
     def __call__(self):
         return self.runtime
+
+
+class ThreadRecordingController(PlaywrightBrowserController):
+    _service_threads: list[str] = PrivateAttr(default_factory=list)
+
+    def open_session(self, *args, **kwargs):
+        self._service_threads.append(current_thread().name)
+        return super().open_session(*args, **kwargs)
+
+    def apply(self, action):
+        self._service_threads.append(current_thread().name)
+        return super().apply(action)
 
 
 def browser_action(action_type: BrowserActionType, **updates) -> BrowserAction:
@@ -249,8 +264,10 @@ def test_playwright_browser_controller_extracts_form_control_values():
 
 
 def test_playwright_browser_service_matches_http_controller_contract():
-    controller = PlaywrightBrowserController(playwright_factory=RecordingPlaywrightFactory())
+    factory = RecordingPlaywrightFactory()
+    controller = PlaywrightBrowserController(playwright_factory=factory)
     client = TestClient(create_playwright_browser_app(controller=controller))
+    storage_state = {"cookies": [], "origins": []}
 
     session_response = client.post(
         "/sessions",
@@ -259,6 +276,8 @@ def test_playwright_browser_service_matches_http_controller_contract():
             "workspace_id": "workspace_sales",
             "run_id": "run_1",
             "session_id": "browser_1",
+            "storage_state": storage_state,
+            "profile_id": "profile_1",
         },
     )
     action_response = client.post(
@@ -279,6 +298,32 @@ def test_playwright_browser_service_matches_http_controller_contract():
     assert "screenshot_content" not in action_response.json()
     assert fetched_response.status_code == 200
     assert fetched_response.json()["session_id"] == "browser_1"
+    assert ("new_context", storage_state) in factory.runtime.calls
+
+
+def test_playwright_browser_service_keeps_sync_runtime_on_one_thread():
+    controller = ThreadRecordingController(
+        playwright_factory=RecordingPlaywrightFactory()
+    )
+    client = TestClient(create_playwright_browser_app(controller=controller))
+
+    opened = client.post(
+        "/sessions",
+        json={
+            "tenant_id": "tenant_acme",
+            "workspace_id": "workspace_sales",
+            "run_id": "run_1",
+            "session_id": "browser_1",
+        },
+    )
+    acted = client.post(
+        "/actions",
+        json=browser_action(BrowserActionType.SCREENSHOT).model_dump(mode="json"),
+    )
+
+    assert opened.status_code == 201
+    assert acted.status_code == 201
+    assert set(controller._service_threads) == {"taroai-playwright_0"}
 
 
 def test_playwright_browser_service_rejects_duplicate_session_id_without_replacing_context():

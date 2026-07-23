@@ -105,11 +105,11 @@ def test_list_runs_returns_cursor_page_ordered_by_created_at_desc():
         headers=headers,
         json={"workspace_id": "workspace_sales", "message": "Second run."},
     ).json()
-    other = client.post(
+    client.post(
         "/api/runs",
         headers={"X-Tenant-ID": "tenant_other", "X-User-ID": "user_2"},
         json={"workspace_id": "workspace_sales", "message": "Other tenant run."},
-    ).json()
+    )
     third = client.post(
         "/api/runs",
         headers=headers,
@@ -205,11 +205,11 @@ def test_billing_meters_support_cursor_page_response_when_requested():
     store = InMemoryControlPlaneStore()
     client = TestClient(create_app(identity_service=identity, store=store))
     headers = {"X-Tenant-ID": "tenant_acme", "X-User-ID": reader.id}
-    first = client.post(
+    client.post(
         "/api/runs",
         headers=headers,
         json={"workspace_id": "workspace_sales", "message": "First run."},
-    ).json()
+    )
     second = client.post(
         "/api/runs",
         headers=headers,
@@ -258,11 +258,11 @@ def test_audit_events_support_cursor_page_response_when_requested():
     store = InMemoryControlPlaneStore()
     client = TestClient(create_app(identity_service=identity, store=store))
     headers = {"X-Tenant-ID": "tenant_acme", "X-User-ID": reader.id}
-    first = client.post(
+    client.post(
         "/api/runs",
         headers=headers,
         json={"workspace_id": "workspace_sales", "message": "First run."},
-    ).json()
+    )
     second = client.post(
         "/api/runs",
         headers=headers,

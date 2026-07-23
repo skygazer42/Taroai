@@ -61,6 +61,9 @@ def test_trigger_admin_api_creates_lists_disables_and_enables_trigger():
 
     created = client.post("/api/triggers", headers=headers, json=trigger_payload())
     listed = client.get("/api/triggers", headers=headers)
+    delete_enabled = client.delete(
+        f"/api/triggers/{created.json()['id']}", headers=headers
+    )
     disabled = client.post(
         f"/api/triggers/{created.json()['id']}/disable",
         headers=headers,
@@ -69,16 +72,23 @@ def test_trigger_admin_api_creates_lists_disables_and_enables_trigger():
         f"/api/triggers/{created.json()['id']}/enable",
         headers=headers,
     )
+    client.post(f"/api/triggers/{created.json()['id']}/disable", headers=headers)
+    deleted = client.delete(f"/api/triggers/{created.json()['id']}", headers=headers)
+    listed_after_delete = client.get("/api/triggers", headers=headers)
 
     assert created.status_code == 201
     assert created.json()["tenant_id"] == "tenant_acme"
     assert created.json()["created_by_user_id"] == account.id
     assert listed.status_code == 200
     assert [trigger["id"] for trigger in listed.json()] == [created.json()["id"]]
+    assert delete_enabled.status_code == 409
     assert disabled.status_code == 200
     assert disabled.json()["status"] == "disabled"
     assert enabled.status_code == 200
     assert enabled.json()["status"] == "enabled"
+    assert deleted.status_code == 200
+    assert deleted.json()["id"] == created.json()["id"]
+    assert listed_after_delete.json() == []
 
 
 def test_trigger_invoke_api_creates_accountable_run_with_audit_and_meter():

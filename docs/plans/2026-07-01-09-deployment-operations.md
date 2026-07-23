@@ -1,6 +1,5 @@
 # Deployment and Operations Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Build the cloud deployment and operations foundation for Taroai so the enterprise Agent Workspace can run reliably in a PoC cloud environment and later support private deployment.
 

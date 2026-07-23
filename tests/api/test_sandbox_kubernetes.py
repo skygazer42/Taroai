@@ -1,3 +1,4 @@
+import base64
 import json
 import subprocess
 from datetime import timedelta
@@ -26,6 +27,7 @@ class RecordingKubectlRunner:
         self.created_network_policy: dict | None = None
         self.deleted_pod_names: set[str] = set()
         self.deleted_network_policy_names: set[str] = set()
+        self.download_content = b"downloaded from pod"
 
     def __call__(self, command, **kwargs):
         self.calls.append(list(command))
@@ -93,7 +95,7 @@ class RecordingKubectlRunner:
             )
         if command[1] == "cp":
             if command[2].startswith("tenant-sandboxes/"):
-                Path(command[3]).write_text("downloaded from pod", encoding="utf-8")
+                Path(command[3]).write_bytes(self.download_content)
             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
         if command[1] == "get":
             items = [
@@ -387,6 +389,22 @@ def test_kubernetes_sandbox_creates_network_isolated_pod_and_executes_commands(
         session.id,
         "/workspace/input.txt",
     )
+    binary_content = b"\x89PNG\r\n\x1a\n\x00\xff"
+    binary_upload = adapter.upload_file(
+        SandboxFileWrite(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_sales",
+            run_id="run_1",
+            session_id=session.id,
+            path="/workspace/artifacts/image.png",
+            content_base64=base64.b64encode(binary_content).decode("ascii"),
+            content_type="image/png",
+        )
+    )
+    runner.download_content = binary_content
+    binary_download = adapter.download_file(
+        "tenant_acme", session.id, "/workspace/artifacts/image.png"
+    )
     snapshot = adapter.snapshot("tenant_acme", session.id)
     destroyed = adapter.destroy("tenant_acme", session.id)
 
@@ -483,6 +501,9 @@ def test_kubernetes_sandbox_creates_network_isolated_pod_and_executes_commands(
         "/workspace/input.txt",
     ]
     assert downloaded.content == "downloaded from pod"
+    assert binary_upload.content_bytes() == binary_content
+    assert binary_download.content is None
+    assert binary_download.content_bytes() == binary_content
     assert snapshot.uri == f"kubernetes://tenant-sandboxes/{session.metadata['pod_name']}/snapshots/{snapshot.id}"
     assert destroyed.status == SandboxSessionStatus.DESTROYED
     assert [

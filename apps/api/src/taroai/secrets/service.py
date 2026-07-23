@@ -1,9 +1,13 @@
 from datetime import datetime, timedelta
+import os
+from pathlib import Path
 import re
+import sqlite3
 from typing import Any
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
+from cryptography.fernet import Fernet, InvalidToken
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 from taroai.domain import new_id, utc_now
@@ -190,6 +194,242 @@ class InMemorySecretService(BaseModel):
         if secret.tenant_id != tenant_id:
             raise SecretAccessDeniedError("secret is not in tenant")
         return secret
+
+
+class LocalEncryptedSecretService(BaseModel):
+    """单机开发后端：密文和短期租约保存在 Compose 共享卷。"""
+
+    path: Path = Path("/data/taroai/secrets.db")
+    _cipher: Fernet = PrivateAttr()
+
+    def model_post_init(self, __context: Any) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._cipher = Fernet(self._load_or_create_key())
+            with self._connect() as connection:
+                connection.executescript(
+                    """
+                    PRAGMA journal_mode=WAL;
+                    CREATE TABLE IF NOT EXISTS local_secret_values (
+                        id TEXT PRIMARY KEY,
+                        tenant_id TEXT NOT NULL,
+                        payload TEXT NOT NULL,
+                        ciphertext BLOB NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS local_secret_leases (
+                        lease_token TEXT PRIMARY KEY,
+                        tenant_id TEXT NOT NULL,
+                        expires_at TEXT NOT NULL,
+                        payload TEXT NOT NULL
+                    );
+                    """
+                )
+            os.chmod(self.path, 0o600)
+        except (OSError, sqlite3.Error, ValueError) as error:
+            raise SecretStoreError("local secret backend initialization failed") from error
+
+    def create_secret(
+        self,
+        tenant_id: str,
+        workspace_id: str | None,
+        name: str,
+        value: str,
+        scope: SecretScope,
+        created_at: datetime | None = None,
+    ) -> SecretRef:
+        if scope.tenant_id != tenant_id:
+            raise SecretAccessDeniedError("secret scope tenant does not match")
+        if scope.workspace_id is not None and scope.workspace_id != workspace_id:
+            raise SecretAccessDeniedError("secret scope workspace does not match")
+        secret_id = new_id("secret")
+        secret = SecretRef(
+            id=secret_id,
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            name=name,
+            scope=scope,
+            backend="local",
+            external_name=secret_id,
+            created_at=created_at or utc_now(),
+        )
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO local_secret_values (id, tenant_id, payload, ciphertext)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    secret.id,
+                    tenant_id,
+                    secret.model_dump_json(),
+                    self._cipher.encrypt(value.encode("utf-8")),
+                ),
+            )
+        return secret
+
+    def register_secret_ref(self, secret: SecretRef) -> SecretRef:
+        if secret.backend != "local" or secret.external_name not in {None, secret.id}:
+            raise SecretStoreError("local secret reference is incomplete")
+        return self._get_secret(secret.tenant_id, secret.id)
+
+    def create_lease(
+        self,
+        tenant_id: str,
+        workspace_id: str | None,
+        secret_id: str,
+        tool_name: str,
+        actions: list[str],
+        ttl_seconds: int,
+        run_id: str | None = None,
+        step_id: str | None = None,
+        session_id: str | None = None,
+        now: datetime | None = None,
+    ) -> SecretLease:
+        secret = self._get_secret(tenant_id, secret_id)
+        if not secret.scope.allows(tenant_id, workspace_id, tool_name, actions):
+            raise SecretAccessDeniedError("secret scope does not allow this lease")
+        issued_at = now or utc_now()
+        lease = SecretLease(
+            id=new_id("lease"),
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            run_id=run_id,
+            step_id=step_id,
+            session_id=session_id,
+            secret_ref_id=secret.id,
+            tool_name=tool_name,
+            actions=actions,
+            lease_token=new_id("lease_token"),
+            issued_at=issued_at,
+            expires_at=issued_at + timedelta(seconds=ttl_seconds),
+        )
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO local_secret_leases (
+                    lease_token, tenant_id, expires_at, payload
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    lease.lease_token,
+                    tenant_id,
+                    lease.expires_at.isoformat(),
+                    lease.model_dump_json(),
+                ),
+            )
+        return lease
+
+    def resolve_lease_value(self, **kwargs) -> str:
+        return self.resolve_lease(**kwargs).value
+
+    def resolve_lease(
+        self,
+        tenant_id: str,
+        lease_token: str,
+        workspace_id: str | None = None,
+        run_id: str | None = None,
+        step_id: str | None = None,
+        session_id: str | None = None,
+        tool_name: str | None = None,
+        action: str | None = None,
+        require_bound_context: bool = False,
+        now: datetime | None = None,
+    ) -> SecretLeaseResolution:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT payload FROM local_secret_leases
+                WHERE tenant_id = ? AND lease_token = ?
+                """,
+                (tenant_id, lease_token),
+            ).fetchone()
+        lease = validate_secret_lease_resolution(
+            lease=SecretLease.model_validate_json(row["payload"]) if row else None,
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            run_id=run_id,
+            step_id=step_id,
+            session_id=session_id,
+            tool_name=tool_name,
+            action=action,
+            require_bound_context=require_bound_context,
+            now=now,
+        )
+        value = self._read_value(tenant_id, lease.secret_ref_id)
+        return build_secret_lease_resolution(lease, value, action)
+
+    def rotate_secret_value(
+        self,
+        tenant_id: str,
+        secret_id: str,
+        value: str,
+    ) -> SecretRef:
+        secret = self._get_secret(tenant_id, secret_id)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE local_secret_values SET ciphertext = ?
+                WHERE tenant_id = ? AND id = ?
+                """,
+                (self._cipher.encrypt(value.encode("utf-8")), tenant_id, secret_id),
+            )
+        return secret
+
+    def is_ready(self) -> bool:
+        try:
+            with self._connect() as connection:
+                connection.execute("SELECT 1 FROM local_secret_values LIMIT 1")
+            return True
+        except sqlite3.Error:
+            return False
+
+    def _get_secret(self, tenant_id: str, secret_id: str) -> SecretRef:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT payload FROM local_secret_values
+                WHERE tenant_id = ? AND id = ?
+                """,
+                (tenant_id, secret_id),
+            ).fetchone()
+        if row is None:
+            raise SecretNotFoundError(f"secret not found: {secret_id}")
+        return SecretRef.model_validate_json(row["payload"])
+
+    def _read_value(self, tenant_id: str, secret_id: str) -> str:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT ciphertext FROM local_secret_values
+                WHERE tenant_id = ? AND id = ?
+                """,
+                (tenant_id, secret_id),
+            ).fetchone()
+        if row is None:
+            raise SecretNotFoundError("secret value is not available")
+        try:
+            return self._cipher.decrypt(row["ciphertext"]).decode("utf-8")
+        except (InvalidToken, UnicodeDecodeError) as error:
+            raise SecretStoreError("local secret value cannot be decrypted") from error
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path, timeout=30)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    def _load_or_create_key(self) -> bytes:
+        key_path = Path(f"{self.path}.key")
+        try:
+            descriptor = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            with os.fdopen(descriptor, "wb") as key_file:
+                key_file.write(Fernet.generate_key())
+        if key_path.is_symlink() or not key_path.is_file():
+            raise SecretStoreError("local secret key file is invalid")
+        os.chmod(key_path, 0o600)
+        return key_path.read_bytes().strip()
 
 
 class AwsSecretsManagerSecretService(BaseModel):
@@ -380,6 +620,14 @@ class AwsSecretsManagerSecretService(BaseModel):
             raise SecretStoreError("secret backend write failed") from error
         return secret
 
+    def credentials_available(self) -> bool:
+        try:
+            client = self._client()
+        except BotoCoreError:
+            return False
+        signer = getattr(client, "_request_signer", None)
+        return signer is None or getattr(signer, "_credentials", None) is not None
+
     def _get_secret(self, tenant_id: str, secret_id: str) -> SecretRef:
         secret = self.secrets.get(secret_id)
         if secret is None:
@@ -423,7 +671,11 @@ class AwsSecretsManagerSecretService(BaseModel):
         return tags
 
 
-SecretService = InMemorySecretService | AwsSecretsManagerSecretService
+SecretService = (
+    InMemorySecretService
+    | LocalEncryptedSecretService
+    | AwsSecretsManagerSecretService
+)
 
 
 def validate_secret_lease_resolution(
@@ -489,4 +741,6 @@ def build_secret_service_from_settings(settings: Any) -> SecretService:
         return AwsSecretsManagerSecretService(
             config=AwsSecretsManagerConfig.from_settings(settings)
         )
+    if settings.secret_service_backend == "local":
+        return LocalEncryptedSecretService(path=settings.secret_service_local_path)
     return InMemorySecretService()

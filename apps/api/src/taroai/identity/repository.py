@@ -54,7 +54,12 @@ class SqlIdentityService(BaseModel):
                         self._dt(account.created_at),
                     ),
                 )
-            except sqlite3.IntegrityError as error:
+            except Exception as error:
+                if not (
+                    isinstance(error, sqlite3.IntegrityError)
+                    or getattr(error, "sqlstate", "") == "23505"
+                ):
+                    raise
                 raise ValueError(f"User already exists: {request.email}") from error
         self._record_audit_event(
             tenant_id=account.tenant_id,
@@ -139,6 +144,36 @@ class SqlIdentityService(BaseModel):
         if row is None:
             raise NotFoundError(f"User not found: {email}")
         return self._user_from_row(row)
+
+    def find_users_by_email(self, email: str) -> list[UserAccount]:
+        with self._connect() as connection:
+            tenant_ids = [
+                row["id"]
+                for row in connection.execute(
+                    "SELECT id FROM tenants ORDER BY id"
+                ).fetchall()
+            ]
+            rows = []
+            for tenant_id in tenant_ids:
+                row = connection.execute(
+                    "SELECT * FROM users WHERE tenant_id = ? AND lower(trim(email)) = lower(trim(?))",
+                    (tenant_id, normalize_email(email)),
+                ).fetchone()
+                if row is not None:
+                    rows.append(row)
+        return [self._user_from_row(row) for row in rows]
+
+    def list_users(self, tenant_id: str) -> list[UserAccount]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM users
+                WHERE tenant_id = ?
+                ORDER BY created_at, id
+                """,
+                (tenant_id,),
+            ).fetchall()
+        return [self._user_from_row(row) for row in rows]
 
     def get_user(self, tenant_id: str, user_id: str) -> UserAccount:
         with self._connect() as connection:

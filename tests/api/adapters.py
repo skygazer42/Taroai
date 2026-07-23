@@ -49,5 +49,6 @@ class DeterministicToolGateway(ToolGateway):
         state,
         step: PlanStep,
         granted_scopes: list[str] | None = None,
+        thread_id: str | None = None,
     ) -> ToolResult:
         return self.execute(step)

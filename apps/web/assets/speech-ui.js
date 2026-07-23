@@ -1,5 +1,5 @@
-import { chatApi } from "./chat-api.js";
-import { chatState } from "./chat-controller.js";
+import { chatApi } from "./chat-api.js?v=20260722-flow115";
+import { chatState } from "./chat-controller.js?v=20260722-flow115";
 
 function blobBase64(blob) {
   return new Promise((resolve, reject) => {
@@ -19,12 +19,25 @@ export class SpeechUI {
     this.startedAt = 0;
     this.timer = null;
     this.audio = null;
+    this.capabilityPromise = null;
   }
 
-  init() { window.taroaiSpeech = this; }
+  init() { window.taroaiSpeech = this; this.capabilities(); }
+
+  capabilities() {
+    if (!this.capabilityPromise) {
+      this.capabilityPromise = this.api.get("/api/speech/capabilities").catch(() => ({ reason: "Speech service is unavailable" }));
+    }
+    return this.capabilityPromise;
+  }
 
   async toggleRecording(control) {
     if (this.recorder?.state === "recording") { this.recorder.stop(); return; }
+    const capability = await this.capabilities();
+    if (!capability.transcription) {
+      window.taroaiChat?.network?.(`Voice input unavailable: ${capability.reason || "transcription is not configured"}`, "warning");
+      return;
+    }
     if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
       window.taroaiChat?.network?.("Voice recording is not supported by this browser", "warning");
       return;
@@ -70,7 +83,7 @@ export class SpeechUI {
     window.taroaiChat?.network?.("Transcribing voice…", "loading");
     try {
       const audio_base64 = await blobBase64(blob);
-      const result = await this.api.post("/api/speech/transcriptions", { audio_base64, media_type: blob.type, workspace_id: this.api.settings().workspaceId }, { scope: "speech-transcription" });
+      const result = await this.api.post("/api/speech/transcribe", { audio_base64, content_type: blob.type }, { scope: "speech-transcription" });
       const input = document.querySelector("#composer-input");
       const transcript = result.text || result.transcript || "";
       if (input && transcript) { input.value = `${input.value}${input.value ? " " : ""}${transcript}`; input.dispatchEvent(new Event("input", { bubbles: true })); input.focus(); }
@@ -79,8 +92,13 @@ export class SpeechUI {
   }
 
   async summarizeMessage(message) {
+    const capability = await this.capabilities();
+    if (!capability.summarization) {
+      window.taroaiChat?.network?.(`Summary unavailable: ${capability.reason || "summarization is not configured"}`, "warning");
+      return;
+    }
     try {
-      const result = await this.api.post(`/api/threads/${encodeURIComponent(chatState.currentThreadId)}/messages/${encodeURIComponent(message.id)}/summarize`, {}, { scope: "message-summarize" });
+      const result = await this.api.post("/api/speech/summarize", { text: message.content || message.text }, { scope: "message-summarize" });
       window.taroaiChat?.renderInlineNotice?.("Summary", result.summary || result.text || "Summary created.", "success");
     } catch (error) { window.taroaiChat?.network?.(`Summary failed: ${error.message}`, "error"); }
   }
@@ -89,19 +107,24 @@ export class SpeechUI {
     if (this.audio && !this.audio.paused) { this.audio.pause(); this.audio.currentTime = 0; control.textContent = "Read aloud"; return; }
     if (window.speechSynthesis?.speaking) { window.speechSynthesis.cancel(); control.textContent = "Read aloud"; return; }
     control.textContent = "Preparing audio…";
+    const capability = await this.capabilities();
+    if (!capability.text_to_speech) return this.speakInBrowser(message, control);
     try {
-      const result = await this.api.post("/api/speech/synthesis", { text: message.content || message.text, workspace_id: this.api.settings().workspaceId }, { scope: "speech-synthesis" });
-      const source = result.audio_url || result.url || (result.audio_base64 ? `data:${result.media_type || "audio/mpeg"};base64,${result.audio_base64}` : null);
+      const result = await this.api.post("/api/speech/synthesize", { text: message.content || message.text }, { scope: "speech-synthesis" });
+      const source = result.audio_url || result.url || (result.audio_base64 ? `data:${result.content_type || "audio/mpeg"};base64,${result.audio_base64}` : null);
       if (!source) throw new Error("Speech service returned no audio");
       this.audio = new Audio(source); control.textContent = "Stop audio";
       this.audio.addEventListener("ended", () => { control.textContent = "Read aloud"; });
       await this.audio.play();
-    } catch {
-      if (!window.speechSynthesis) { control.textContent = "Read aloud"; return; }
-      const utterance = new SpeechSynthesisUtterance(message.content || message.text || "");
-      utterance.onend = () => { control.textContent = "Read aloud"; };
-      control.textContent = "Stop audio"; window.speechSynthesis.speak(utterance);
-    }
+    } catch { this.speakInBrowser(message, control); }
+  }
+
+  speakInBrowser(message, control) {
+    if (!window.speechSynthesis) { control.textContent = "Read aloud"; return; }
+    const utterance = new SpeechSynthesisUtterance(message.content || message.text || "");
+    utterance.onend = () => { control.textContent = "Read aloud"; };
+    control.textContent = "Stop audio";
+    window.speechSynthesis.speak(utterance);
   }
 }
 

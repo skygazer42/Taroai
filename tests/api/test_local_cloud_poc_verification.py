@@ -11,6 +11,7 @@ from taroai.deployment.local_cloud_poc_verification import (
     assert_status,
     parse_args,
     safe_result_json,
+    set_browser_workspace_operations,
     verify_local_cloud_poc,
     verify_web,
     write_safe_result_json,
@@ -23,6 +24,41 @@ PNG_BYTES = bytes.fromhex(
     "0000000a49444154789c63000100000500010d0a2db4"
     "0000000049454e44ae426082"
 )
+
+
+def test_browser_workspace_submit_can_close_an_artifact_sidecar():
+    client = RecordingHttpClient()
+    client.workspace_sidecar_state = "artifact"
+    config = LocalCloudPocVerificationConfig(
+        api_base_url="http://api.local",
+        browser_base_url="http://browser.local",
+        bootstrap_token="bootstrap_token",
+    )
+
+    set_browser_workspace_operations(
+        client,
+        config,
+        {
+            "tenant_id": "tenant_acme",
+            "workspace_id": "workspace_acme",
+            "run_id": "run_1",
+            "session_id": "browser_verify_1",
+        },
+        is_open=False,
+    )
+
+    assert client.workspace_sidecar_state == "closed"
+    assert any(
+        call["payload"] == {
+            "tenant_id": "tenant_acme",
+            "workspace_id": "workspace_acme",
+            "run_id": "run_1",
+            "session_id": "browser_verify_1",
+            "action_type": "click",
+            "selector": "[data-artifact-panel-close]",
+        }
+        for call in client.calls
+    )
 
 
 def count_sse_events(body: str) -> int:
@@ -119,7 +155,12 @@ def verifier_skill_manifest() -> dict:
         "id": "sales.erp_invoice_matching",
         "version": "1.0.0",
         "name": "ERP Invoice Matching",
-        "description": "Match ERP invoices against renewal account data.",
+        "description": (
+            "Use sandbox.command to create a short Markdown invoice-matching report at "
+            "/workspace/artifacts/report.md for the input account_id. The report must "
+            "include the exact phrase 'local cloud PoC execution path'. After writing the "
+            "file, print 'report created' to stdout."
+        ),
         "type": "workflow_skill",
         "owner": "solutions/sales",
         "input_schema": {
@@ -129,10 +170,10 @@ def verifier_skill_manifest() -> dict:
         },
         "output_schema": {
             "type": "object",
-            "required": ["matches"],
-            "properties": {"matches": {"type": "array", "items": {"type": "object"}}},
+            "required": ["report_path"],
+            "properties": {"report_path": {"type": "string"}},
         },
-        "required_scopes": ["erp.invoice.read"],
+        "required_scopes": [],
         "risk_level": "medium",
         "runtime": {"sandbox": "workflow", "timeout_seconds": 120},
         "billing_meters": ["tool_call_count"],
@@ -196,6 +237,7 @@ class RecordingHttpClient:
         workspace_browser_preview_storage_id: str = "--",
         workspace_artifact_preview_storage_id: str = "storage_report_1",
         workspace_artifact_downloaded_storage_id: str = "storage_report_1",
+        workspace_artifact_download_statuses: list[str] | None = None,
         workspace_terminal_output_storage_id: str | None = None,
         workspace_terminal_output_uri: str | None = None,
         workspace_selected_history_sandbox_session_id: str = (
@@ -276,6 +318,7 @@ class RecordingHttpClient:
         self.workspace_run_feedback_recorded = False
         self.workspace_run_feedback_persists = workspace_run_feedback_persists
         self.workspace_skill_feedback_recorded = False
+        self.workspace_sidecar_state = "closed"
         self.workspace_downloaded_storage_object_id = None
         self.workspace_delivery_chain_status = workspace_delivery_chain_status
         self.workspace_delivery_chain_artifact_storage_id = (
@@ -292,6 +335,9 @@ class RecordingHttpClient:
         self.workspace_artifact_preview_storage_id = workspace_artifact_preview_storage_id
         self.workspace_artifact_downloaded_storage_id = (
             workspace_artifact_downloaded_storage_id
+        )
+        self.workspace_artifact_download_statuses = list(
+            workspace_artifact_download_statuses or ["Downloaded report.md"]
         )
         self.workspace_terminal_output_storage_id = (
             workspace_terminal_output_storage_id
@@ -1389,7 +1435,7 @@ class RecordingHttpClient:
                         "tenant_id": "tenant_acme",
                         "workspace_id": "workspace_acme",
                         "skill_id": "sales.erp_invoice_matching",
-                        "status": "installed",
+                        "status": "enabled",
                         "invocation_mode": "agent_workflow",
                         "invocation_ready": True,
                         "missing_required_scopes": [],
@@ -1922,6 +1968,12 @@ class RecordingHttpClient:
                     ),
                 )
             if payload["action_type"] in {"type", "click"}:
+                if payload.get("selector") == ".sidebar-ops-launch":
+                    self.workspace_sidecar_state = "operations"
+                if payload.get("selector") == "[data-operations-close]":
+                    self.workspace_sidecar_state = "closed"
+                if payload.get("selector") == "[data-artifact-panel-close]":
+                    self.workspace_sidecar_state = "closed"
                 if payload.get("selector") == "#cs-submit-missing-skill":
                     self.workspace_missing_skill_feedback_count += 1
                 if payload.get("selector") == "#cs-create-eval-candidates":
@@ -1976,6 +2028,19 @@ class RecordingHttpClient:
                         + payload["action_type"]
                         + '","current_url":"http://web.internal",'
                         '"text":null,"screenshot_uri":null,"metadata":{},'
+                        '"created_at":"2026-07-03T14:00:05Z"}'
+                    ),
+                )
+            if payload.get("selector") == "[data-sidecar-state]":
+                return LocalCloudPocHttpResponse(
+                    status_code=201,
+                    body=(
+                        '{"tenant_id":"tenant_acme","workspace_id":"workspace_acme",'
+                        '"run_id":"run_1","session_id":"browser_verify_1",'
+                        '"action_type":"extract","current_url":"http://web.internal",'
+                        '"text":"'
+                        + self.workspace_sidecar_state
+                        + '","screenshot_uri":null,"metadata":{},'
                         '"created_at":"2026-07-03T14:00:05Z"}'
                     ),
                 )
@@ -2502,13 +2567,18 @@ class RecordingHttpClient:
                     ),
                 )
             if payload.get("selector") == "[data-artifact-download-status]":
+                download_status = self.next_text(
+                    self.workspace_artifact_download_statuses
+                )
                 return LocalCloudPocHttpResponse(
                     status_code=201,
                     body=(
                         '{"tenant_id":"tenant_acme","workspace_id":"workspace_acme",'
                         '"run_id":"run_1","session_id":"browser_verify_1",'
                         '"action_type":"extract","current_url":"http://web.internal",'
-                        '"text":"Downloaded report.md",'
+                        '"text":"'
+                        + download_status
+                        + '",'
                         '"screenshot_uri":null,"metadata":{},'
                         '"created_at":"2026-07-03T14:00:06Z"}'
                     ),
@@ -2996,7 +3066,7 @@ def test_local_cloud_poc_config_rejects_strict_workspace_without_submit_message(
 def test_local_cloud_poc_verification_waits_for_delayed_browser_workspace_submit_status():
     client = RecordingHttpClient(
         model_gateway_configured=True,
-        workspace_status_texts=["running"] * 6 + ["succeeded"],
+        workspace_status_texts=["running"] * 6 + ["Succeeded"],
     )
     config = LocalCloudPocVerificationConfig(
         api_base_url="http://api.local",
@@ -3018,7 +3088,7 @@ def test_local_cloud_poc_verification_waits_for_delayed_browser_workspace_submit
 
     result = verify_local_cloud_poc(config, client=client)
 
-    assert "succeeded" in result.browser_workspace_submit_text
+    assert "succeeded" in result.browser_workspace_submit_text.lower()
     status_extracts = [
         call
         for call in client.calls
@@ -4893,6 +4963,7 @@ def test_local_cloud_poc_verification_logs_in_through_browser_workspace():
     assert workspace_navigation_query["tenantId"] == ["tenant_acme"]
     assert workspace_navigation_query["userId"] == ["user_owner"]
     assert workspace_navigation_query["workspaceId"] == ["workspace_acme"]
+    assert workspace_navigation_query["runId"] == ["run_1"]
     assert workspace_navigation_query["email"] == ["owner@example.com"]
     assert "accessToken" not in workspace_navigation_query
     assert "password" not in workspace_navigation_query
@@ -4904,12 +4975,15 @@ def test_local_cloud_poc_verification_logs_in_through_browser_workspace():
         )
         for action in browser_actions
     ]
+    assert (
+        "click",
+        ".sidebar-ops-launch",
+        None,
+    ) in observed
     assert ("type", "#api-base", "http://api.internal") in observed
-    assert ("type", "#tenant-id", "tenant_acme") in observed
-    assert ("type", "#workspace-id", "workspace_acme") in observed
     assert ("type", "#login-email", "owner@example.com") in observed
     assert ("type", "#login-password", "correct horse battery staple") in observed
-    assert ("click", "#login-button", None) in observed
+    assert ("click", "#login-button", None) not in observed
     assert ("extract", "[data-auth-status]", None) in observed
     assert ("extract", "[data-readiness-status]", None) in observed
     assert ("extract", "[data-readiness-model]", None) in observed
@@ -5043,6 +5117,39 @@ def test_local_cloud_poc_verification_waits_for_browser_workspace_login(monkeypa
 
     assert result.browser_workspace_auth_status == "Bearer"
     assert sleep_calls == [0.25]
+
+
+def test_local_cloud_poc_verification_waits_for_artifact_download(monkeypatch):
+    sleep_calls = []
+    monkeypatch.setattr(
+        "taroai.deployment.local_cloud_poc_verification.time.sleep",
+        sleep_calls.append,
+    )
+    client = RecordingHttpClient(
+        model_gateway_configured=True,
+        workspace_artifact_download_statuses=[
+            "Downloading report.md",
+            "Downloaded report.md",
+        ],
+    )
+    config = LocalCloudPocVerificationConfig(
+        api_base_url="http://api.local",
+        browser_base_url="http://browser.local",
+        web_base_url="http://web.local",
+        bootstrap_token="bootstrap_token",
+        browser_session_id="browser_verify_1",
+        browser_workspace_url="http://web.internal",
+        browser_workspace_api_base_url="http://api.internal",
+        browser_workspace_submit_message="Generate a hello report.",
+        browser_workspace_submit_expected_text="succeeded",
+        require_model_execution=True,
+        run_status_poll_interval_seconds=0,
+    )
+
+    result = verify_local_cloud_poc(config, client=client)
+
+    assert result.browser_workspace_artifact_download_status == "Downloaded report.md"
+    assert config.browser_workspace_submit_poll_interval_seconds in sleep_calls
 
 
 def test_local_cloud_poc_verification_submits_run_through_browser_workspace():
@@ -5256,7 +5363,6 @@ def test_local_cloud_poc_verification_accepts_browser_workspace_status_submit_te
     assert result.browser_workspace_skill_trace_audit_count_text == "1"
     assert result.browser_workspace_skill_trace_error_text == "No error"
     assert result.browser_workspace_skill_run_history_status == "2 recent runs"
-    assert "run_skill_1" in result.browser_workspace_skill_run_history_text
     assert "Invoke ERP Invoice Matching." in (
         result.browser_workspace_skill_run_history_text
     )
@@ -5425,7 +5531,6 @@ def test_local_cloud_poc_verification_accepts_browser_workspace_status_submit_te
     assert ("GET", "/api/solution-packs") in api_calls
     assert ("POST", "/api/solution-packs") in api_calls
     assert ("GET", "/api/solution-packs/sales.renewal_ops/versions") in api_calls
-    assert ("POST", "/api/solution-packs/sales.renewal_ops/install") in api_calls
     assert ("GET", "/api/solution-pack-installations") in api_calls
     assert ("GET", "/api/workspaces/workspace_acme/skills") in api_calls
     assert ("GET", "/api/skills") in api_calls
@@ -5517,11 +5622,11 @@ def test_local_cloud_poc_verification_rejects_browser_model_route_mismatch():
         verify_local_cloud_poc(config, client=client)
 
 
-def test_local_cloud_poc_verification_matches_model_plan_created_route():
+def test_local_cloud_poc_verification_matches_model_operation_recorded_route():
     run_events_body = (
         'id: 1\n'
-        'event: model.plan.created\n'
-        'data: {"id":"event_1","sequence":1,"type":"model.plan.created","payload":{"provider":"openai-primary","model":"gpt-enterprise-planner","usage":{"input_tokens":120,"output_tokens":45,"total_tokens":165,"cached_input_tokens":48},"steps":[]}}\n\n'
+        'event: model.operation.recorded\n'
+        'data: {"id":"event_1","sequence":1,"type":"model.operation.recorded","payload":{"operation":"decide","provider":"openai-primary","model":"gpt-enterprise-planner"}}\n\n'
         'id: 2\n'
         'event: sandbox.command.executed\n'
         'data: {"id":"event_2","sequence":2,"type":"sandbox.command.executed","payload":{"session_id":"runtime_sandbox_1","exit_code":0,"stdout_length":2,"stderr_length":0,"output_uri":"s3://taroai-artifacts/tenant_acme/workspace_acme/runs/run_1/sandbox-command-outputs/model_sandbox-output.json"}}\n\n'

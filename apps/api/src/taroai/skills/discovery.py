@@ -1,4 +1,4 @@
-from typing import Protocol
+from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -29,6 +29,8 @@ class SkillDiscoverySummary(BaseModel):
     description: str
     package_digest: str
     source_digest: str
+    input_schema: dict[str, Any]
+    allowed_tools: list[str] = Field(default_factory=list)
     required_scopes: list[str] = Field(default_factory=list)
     risk_level: str
 
@@ -76,6 +78,10 @@ class SkillDiscoveryService:
                 description=package.manifest.description,
                 package_digest=package.package_digest,
                 source_digest=package.provenance.source_digest,
+                input_schema=package.manifest.input_schema,
+                allowed_tools=_requirement_ids(
+                    package.taroai_config.get("spec", {}).get("tools", [])
+                ),
                 required_scopes=list(package.manifest.required_scopes),
                 risk_level=package.manifest.risk_level,
             )
@@ -99,7 +105,9 @@ class SkillDiscoveryService:
             skill_id,
         )
         if package.package_kind != SkillPackageKind.PACKAGE:
-            raise ValueError("legacy manifest skills cannot be loaded through discovery")
+            raise ValueError(
+                "legacy manifest skills cannot be loaded through discovery"
+            )
         if expected_version is not None and package.version != expected_version:
             raise ValueError("installed skill version changed before load")
         if (
@@ -123,3 +131,13 @@ class SkillDiscoveryService:
             skill_md=package.skill_md,
         )
 
+
+def _requirement_ids(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    return [
+        str(item.get("id") or item.get("name")) if isinstance(item, dict) else str(item)
+        for item in values
+        if (isinstance(item, str) and item)
+        or (isinstance(item, dict) and (item.get("id") or item.get("name")))
+    ]

@@ -48,7 +48,9 @@ class SqlLongTermMemoryService(BaseModel):
                     record.sensitivity_level,
                     record.confidence,
                     self._dt(record.created_at),
-                    self._dt(record.expires_at) if record.expires_at is not None else None,
+                    self._dt(record.expires_at)
+                    if record.expires_at is not None
+                    else None,
                     record.status.value,
                 ),
             )
@@ -60,8 +62,8 @@ class SqlLongTermMemoryService(BaseModel):
     def get(self, tenant_id: str, memory_id: str) -> MemoryRecord:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT * FROM memory_records WHERE id = ?",
-                (memory_id,),
+                "SELECT * FROM memory_records WHERE tenant_id = ? AND id = ?",
+                (tenant_id, memory_id),
             ).fetchone()
         if row is None:
             raise NotFoundError(f"Memory not found: {memory_id}")
@@ -105,6 +107,25 @@ class SqlLongTermMemoryService(BaseModel):
                 (tenant_id, scope_type.value, scope_id, self._dt(utc_now())),
             ).fetchall()
         return [self._from_row(row) for row in rows]
+
+    def forget(self, tenant_id: str, memory_id: str) -> MemoryRecord:
+        self.get(tenant_id, memory_id)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE memory_records
+                SET content = '', metadata = ?, status = ?, expires_at = ?
+                WHERE tenant_id = ? AND id = ?
+                """,
+                (
+                    self._json({}),
+                    MemoryStatus.EXPIRED.value,
+                    self._dt(utc_now()),
+                    tenant_id,
+                    memory_id,
+                ),
+            )
+        return self.get(tenant_id, memory_id)
 
     def delete_for_tenant(self, tenant_id: str) -> list[str]:
         with self._connect() as connection:
@@ -186,15 +207,19 @@ class SqlLongTermMemoryService(BaseModel):
     def _json(self, value: dict) -> str:
         return json.dumps(value, separators=(",", ":"))
 
-    def _loads(self, value: str | None) -> dict:
+    def _loads(self, value: dict | str | None) -> dict:
         if value is None:
             return {}
+        if isinstance(value, dict):
+            return value
         return json.loads(value)
 
     def _dt(self, value: datetime) -> str:
         return value.isoformat()
 
-    def _parse_dt(self, value: str) -> datetime:
+    def _parse_dt(self, value: datetime | str) -> datetime:
+        if isinstance(value, datetime):
+            return value
         return datetime.fromisoformat(value)
 
 
@@ -245,9 +270,13 @@ class SqlShortTermMemoryReviewStore(BaseModel):
                     self._dt(review.expires_at),
                     review.status.value,
                     review.approved_by_user_id,
-                    self._dt(review.approved_at) if review.approved_at is not None else None,
+                    self._dt(review.approved_at)
+                    if review.approved_at is not None
+                    else None,
                     review.rejected_by_user_id,
-                    self._dt(review.rejected_at) if review.rejected_at is not None else None,
+                    self._dt(review.rejected_at)
+                    if review.rejected_at is not None
+                    else None,
                     (
                         self._dt(review.activated_entry_expires_at)
                         if review.activated_entry_expires_at is not None
@@ -354,18 +383,22 @@ class SqlShortTermMemoryReviewStore(BaseModel):
     def _json(self, value: dict) -> str:
         return json.dumps(value, separators=(",", ":"))
 
-    def _loads(self, value: str | None) -> dict:
+    def _loads(self, value: dict | str | None) -> dict:
         if value is None:
             return {}
+        if isinstance(value, dict):
+            return value
         return json.loads(value)
 
     def _dt(self, value: datetime) -> str:
         return value.isoformat()
 
-    def _parse_dt(self, value: str) -> datetime:
+    def _parse_dt(self, value: datetime | str) -> datetime:
+        if isinstance(value, datetime):
+            return value
         return datetime.fromisoformat(value)
 
-    def _parse_optional_dt(self, value: str | None) -> datetime | None:
+    def _parse_optional_dt(self, value: datetime | str | None) -> datetime | None:
         if value is None:
             return None
         return self._parse_dt(value)

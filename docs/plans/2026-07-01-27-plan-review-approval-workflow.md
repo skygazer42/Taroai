@@ -1,6 +1,5 @@
 # Plan Review and Approval Workflow Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Define how the 01-26 plans are reviewed, revised, approved, frozen, and handed off into implementation without losing scope control.
 

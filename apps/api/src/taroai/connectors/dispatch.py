@@ -15,6 +15,8 @@ from taroai.secrets import (
     SecretAccessDeniedError,
     SecretLeaseExpiredError,
     SecretNotFoundError,
+    SecretRef,
+    SecretScope,
     SecretService,
 )
 
@@ -24,7 +26,7 @@ class ConnectorDispatchError(RuntimeError):
 
 
 class ConnectorCredentialExpiredError(ConnectorDispatchError):
-    """Signals that an OAuth connector must be re-authorized before retrying."""
+    """Signals that a connector credential must be replaced before retrying."""
 
     def __init__(self, connector_id: str) -> None:
         super().__init__("connector authorization has expired")
@@ -160,7 +162,72 @@ class ConnectorDispatchService(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     http_client: Any | None = None
+    mcp_client: Any | None = None
     secret_service: SecretService | None = None
+
+    def discover_mcp_capabilities(
+        self,
+        connector: ConnectorDefinition,
+    ) -> list[Any]:
+        from taroai.connectors.mcp import (
+            McpCredentialExpiredError,
+            McpConnectorError,
+            discover_mcp_capabilities,
+        )
+
+        try:
+            return discover_mcp_capabilities(
+                connector,
+                self.secret_service,
+                self.mcp_client,
+            )
+        except McpCredentialExpiredError as error:
+            raise ConnectorCredentialExpiredError(connector.id) from error
+        except McpConnectorError as error:
+            raise ConnectorDispatchError(str(error)) from error
+
+    def preflight(
+        self,
+        connector: ConnectorDefinition,
+        tool_input: dict[str, Any],
+        tool_name: str,
+    ) -> None:
+        """验证连接器及本次动作可执行，但不发出有副作用的请求。"""
+        if connector.type in {
+            ConnectorType.INTERNAL_API,
+            ConnectorType.SAAS,
+            ConnectorType.WEB,
+        }:
+            if "internal_api" not in connector.metadata:
+                # 兼容仅用于策略评估的匿名连接器；真实 SaaS/Web 连接器必须配置适配器。
+                if (
+                    connector.type in {ConnectorType.SAAS, ConnectorType.WEB}
+                    and connector.auth_mode == ConnectorAuthMode.NONE
+                ):
+                    return
+                raise ConnectorDispatchError("connector dispatch config is required")
+            config = self._internal_api_config(connector)
+            self._build_request(config, connector, tool_input, tool_name)
+            return
+        if connector.type == ConnectorType.DATABASE:
+            config = self._database_config(connector)
+            sql = tool_input.get("sql")
+            if not isinstance(sql, str):
+                raise ConnectorDispatchError("sql is required")
+            if not isinstance(tool_input.get("parameters", []), list):
+                raise ConnectorDispatchError("parameters must be an array")
+            self._validate_database_query(sql, config)
+            self._database_url(connector, config, tool_name)
+            return
+        if connector.type == ConnectorType.MCP_SERVER:
+            capability_name = tool_name.split(".", 2)[-1]
+            capabilities = self.discover_mcp_capabilities(connector)
+            if not any(item.name == capability_name for item in capabilities):
+                raise ConnectorDispatchError(
+                    f"MCP capability is not available: {capability_name}"
+                )
+            return
+        raise ConnectorDispatchError("connector type is not executable")
 
     def dispatch(
         self,
@@ -169,7 +236,11 @@ class ConnectorDispatchService(BaseModel):
         tool_name: str | None = None,
     ) -> ConnectorDispatchResult | None:
         resolved_tool_name = tool_name or f"connector.{connector.id}"
-        if connector.type == ConnectorType.INTERNAL_API:
+        if connector.type in {
+            ConnectorType.INTERNAL_API,
+            ConnectorType.SAAS,
+            ConnectorType.WEB,
+        } and "internal_api" in connector.metadata:
             config = self._internal_api_config(connector)
             request = self._build_request(
                 config=config,
@@ -189,6 +260,33 @@ class ConnectorDispatchService(BaseModel):
                 connector=connector,
                 tool_input=tool_input,
                 tool_name=resolved_tool_name,
+            )
+        if connector.type == ConnectorType.MCP_SERVER:
+            from taroai.connectors.mcp import (
+                McpConnectorError,
+                McpCredentialExpiredError,
+                call_mcp_tool,
+            )
+
+            parts = resolved_tool_name.split(".", 2)
+            if len(parts) != 3:
+                raise ConnectorDispatchError("MCP dispatch requires a capability tool name")
+            try:
+                output, response_size = call_mcp_tool(
+                    connector,
+                    parts[2],
+                    tool_input,
+                    self.secret_service,
+                    self.mcp_client,
+                )
+            except McpCredentialExpiredError as error:
+                raise ConnectorCredentialExpiredError(connector.id) from error
+            except McpConnectorError as error:
+                raise ConnectorDispatchError(str(error)) from error
+            return ConnectorDispatchResult(
+                output=output,
+                status_code=200,
+                response_size_bytes=response_size,
             )
         return None
 
@@ -286,6 +384,23 @@ class ConnectorDispatchService(BaseModel):
             raise ConnectorDispatchError("OAuth2 connector requires oauth2_bearer auth config")
 
         credential_ref = connector.credential_ref
+        if credential_ref.secret_backend and credential_ref.secret_external_name:
+            self.secret_service.register_secret_ref(
+                SecretRef(
+                    id=credential_ref.secret_ref_id,
+                    tenant_id=connector.tenant_id,
+                    workspace_id=connector.workspace_id,
+                    name=f"{connector.display_name} credential",
+                    scope=SecretScope(
+                        tenant_id=connector.tenant_id,
+                        workspace_id=connector.workspace_id,
+                        allowed_tool_names=[tool_name],
+                        actions=credential_ref.required_actions,
+                    ),
+                    backend=credential_ref.secret_backend,
+                    external_name=credential_ref.secret_external_name,
+                )
+            )
         try:
             lease = self.secret_service.create_lease(
                 tenant_id=connector.tenant_id,
@@ -300,9 +415,7 @@ class ConnectorDispatchService(BaseModel):
                 lease_token=lease.lease_token,
             )
         except (SecretLeaseExpiredError, SecretNotFoundError) as error:
-            if connector.auth_mode == ConnectorAuthMode.OAUTH2:
-                raise ConnectorCredentialExpiredError(connector.id) from error
-            raise ConnectorDispatchError("connector credential is not available") from error
+            raise ConnectorCredentialExpiredError(connector.id) from error
         except SecretAccessDeniedError as error:
             raise ConnectorDispatchError("connector credential is not available") from error
 
@@ -340,6 +453,10 @@ class ConnectorDispatchService(BaseModel):
         response_size = len(response.body)
         if response_size > max_response_bytes:
             raise ConnectorDispatchError("connector response exceeds max_response_bytes")
+        if response.status_code >= 400:
+            raise ConnectorDispatchError(
+                f"connector returned HTTP {response.status_code}"
+            )
         content_type = self._content_type(response.headers)
         return ConnectorDispatchResult(
             output={
@@ -427,11 +544,9 @@ class ConnectorDispatchService(BaseModel):
                 tenant_id=connector.tenant_id,
                 lease_token=lease.lease_token,
             )
-        except (
-            SecretAccessDeniedError,
-            SecretLeaseExpiredError,
-            SecretNotFoundError,
-        ) as error:
+        except (SecretLeaseExpiredError, SecretNotFoundError) as error:
+            raise ConnectorCredentialExpiredError(connector.id) from error
+        except SecretAccessDeniedError as error:
             raise ConnectorDispatchError("connector credential is not available") from error
 
     def _validate_database_query(

@@ -757,6 +757,10 @@ def test_sql_customer_feedback_service_persists_review_records_after_restart(
         tenant_id="tenant_acme",
         reviewed_by_user_id="user_cs_lead",
     )[0]
+    assert service.create_evaluation_candidates_for_low_rated_runs(
+        tenant_id="tenant_acme",
+        reviewed_by_user_id="user_cs_lead",
+    ) == []
     pack_candidate = service.create_solution_pack_improvement_candidates(
         tenant_id="tenant_acme",
         reviewed_by_user_id="user_solution_lead",

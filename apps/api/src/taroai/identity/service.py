@@ -111,6 +111,27 @@ class InMemoryIdentityService(BaseModel):
             raise NotFoundError(f"User not found: {email}")
         return self.get_user(tenant_id, user_id)
 
+    def find_users_by_email(self, email: str) -> list[UserAccount]:
+        normalized_email = normalize_email(email)
+        return sorted(
+            [
+                account.model_copy(deep=True)
+                for account in self.users.values()
+                if normalize_email(account.email) == normalized_email
+            ],
+            key=lambda account: (account.tenant_id, account.id),
+        )
+
+    def list_users(self, tenant_id: str) -> list[UserAccount]:
+        return sorted(
+            [
+                account.model_copy(deep=True)
+                for account in self.users.values()
+                if account.tenant_id == tenant_id
+            ],
+            key=lambda account: (account.created_at, account.id),
+        )
+
     def get_user(self, tenant_id: str, user_id: str) -> UserAccount:
         account = self.users.get(user_id)
         if account is None:

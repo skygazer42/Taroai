@@ -196,6 +196,7 @@ class ConnectorInvocationService(BaseModel):
     ) -> ToolPolicy:
         return ToolPolicy(
             tool_name=tool_name,
+            description=capability.description,
             required_scopes=capability.required_scopes,
             risk_level=ToolRiskLevel(capability.risk_level),
             approval_required=capability.approval_required,

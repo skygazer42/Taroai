@@ -1,7 +1,7 @@
 import re
 from typing import Protocol
-from urllib.parse import quote, urlparse
-from urllib.request import Request, urlopen
+from urllib.parse import quote, urljoin, urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -75,6 +75,46 @@ class GithubArchiveFetcher(Protocol):
     ) -> FetchedGithubArchive: ...
 
 
+def _assert_safe_github_url(url: str, policy: GithubFetchPolicy) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("GitHub archive URL must use HTTP or HTTPS")
+    if policy.require_https and parsed.scheme != "https":
+        raise ValueError("GitHub archive URL must use HTTPS")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("GitHub archive URL must not contain credentials")
+    if (parsed.hostname or "").lower() not in policy.allowed_hosts:
+        raise ValueError("GitHub archive URL uses an untrusted host")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("GitHub archive URL uses a forbidden port") from exc
+    if port not in {None, 443}:
+        raise ValueError("GitHub archive URL uses a forbidden port")
+
+
+class _GithubRedirectHandler(HTTPRedirectHandler):
+    def __init__(self, policy: GithubFetchPolicy):
+        self.policy = policy
+        self.redirect_count = 0
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target_url = urljoin(req.full_url, newurl)
+        _assert_safe_github_url(target_url, self.policy)
+        if self.redirect_count >= self.policy.max_redirects:
+            raise ValueError("GitHub archive exceeded the redirect limit")
+        redirected = super().redirect_request(
+            req,
+            fp,
+            code,
+            msg,
+            headers,
+            target_url,
+        )
+        self.redirect_count += 1
+        return redirected
+
+
 class HttpsGithubArchiveFetcher:
     """Fetches only GitHub codeload archives built from validated owner/repo/ref fields."""
 
@@ -87,17 +127,15 @@ class HttpsGithubArchiveFetcher:
             f"https://codeload.github.com/{quote(source.owner, safe='')}/"
             f"{quote(source.repository, safe='')}/zip/{quote(source.ref, safe='')}"
         )
+        _assert_safe_github_url(url, policy)
         request = Request(
             url,
             headers={"Accept": "application/zip", "User-Agent": "Taroai-Skill-Importer/1"},
         )
-        with urlopen(request, timeout=policy.timeout_seconds) as response:
+        opener = build_opener(_GithubRedirectHandler(policy))
+        with opener.open(request, timeout=policy.timeout_seconds) as response:
             final_url = response.geturl()
-            parsed = urlparse(final_url)
-            if policy.require_https and parsed.scheme != "https":
-                raise ValueError("GitHub archive redirected outside HTTPS")
-            if (parsed.hostname or "").lower() not in policy.allowed_hosts:
-                raise ValueError("GitHub archive redirected to an untrusted host")
+            _assert_safe_github_url(final_url, policy)
             content_length = response.headers.get("Content-Length")
             if content_length and int(content_length) > policy.max_response_bytes:
                 raise ValueError("GitHub archive exceeds the configured size limit")
@@ -281,15 +319,7 @@ class SkillPackageImportService:
             raise ValueError("GitHub fetch returned an empty archive")
         if len(fetched.archive_bytes) > self.github_policy.max_response_bytes:
             raise ValueError("GitHub fetch exceeded the response size policy")
-        parsed = urlparse(fetched.final_url)
-        if self.github_policy.require_https and parsed.scheme != "https":
-            raise ValueError("GitHub fetch final URL must use HTTPS")
-        if parsed.username is not None or parsed.password is not None:
-            raise ValueError("GitHub fetch final URL must not contain credentials")
-        if parsed.hostname not in self.github_policy.allowed_hosts:
-            raise ValueError("GitHub fetch redirected to a non-allowlisted host")
-        if parsed.port not in {None, 443}:
-            raise ValueError("GitHub fetch final URL uses a forbidden port")
+        _assert_safe_github_url(fetched.final_url, self.github_policy)
         if not fetched.resolved_ref or any(
             ord(character) < 32 for character in fetched.resolved_ref
         ):

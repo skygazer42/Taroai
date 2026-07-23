@@ -1,6 +1,5 @@
 # Knowledge, RAG, and Long-Term Memory Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Build the enterprise knowledge and long-term memory layer with ACL-aware document ingestion, retrieval, source citation, and reviewed memory writes.
 

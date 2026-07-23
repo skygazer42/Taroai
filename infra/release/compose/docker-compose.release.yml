@@ -2,15 +2,32 @@ name: taroai
 
 x-runtime-environment: &runtime-environment
   TAROAI_ENVIRONMENT: production
+  TAROAI_DEV_REQUEST_HEADERS_ENABLED: "false"
+  TAROAI_DEPLOYMENT_SECRET_MANAGER_TYPE: ${TAROAI_DEPLOYMENT_SECRET_MANAGER_TYPE:-aws_secrets_manager}
   TAROAI_DATABASE_URL: ${TAROAI_DATABASE_URL:?required}
   TAROAI_CONTROL_PLANE_STORE_BACKEND: sql
   TAROAI_IDENTITY_SERVICE_BACKEND: sql
   TAROAI_CONNECTOR_REGISTRY_BACKEND: sql
+  TAROAI_CUSTOMER_FEEDBACK_SERVICE_BACKEND: sql
   TAROAI_SKILL_REGISTRY_BACKEND: sql
+  TAROAI_AGENT_REGISTRY_BACKEND: sql
+  TAROAI_BROWSER_PROFILE_STORE_BACKEND: sql
+  TAROAI_AGENT_ENGINE_STORE_BACKEND: sql
+  TAROAI_CODING_WORKSPACE_STORE_BACKEND: sql
+  TAROAI_EVALUATION_REPOSITORY_BACKEND: sql
+  TAROAI_THREAD_SHARE_STORE_BACKEND: sql
+  TAROAI_SOLUTION_PACK_REGISTRY_BACKEND: sql
+  TAROAI_SSO_PROVIDER_REGISTRY_BACKEND: sql
+  TAROAI_SCIM_PROVISIONING_STORE_BACKEND: sql
   TAROAI_KNOWLEDGE_SERVICE_BACKEND: sql
   TAROAI_LONG_TERM_MEMORY_BACKEND: sql
   TAROAI_TRIGGER_STORE_BACKEND: sql
   TAROAI_STORAGE_CATALOG_BACKEND: sql
+  TAROAI_LIFECYCLE_POLICY_BACKEND: sql
+  TAROAI_RESTORE_DRILL_SCHEDULE_BACKEND: sql
+  TAROAI_MODEL_GATEWAY_POLICY_STORE_BACKEND: sql
+  TAROAI_MODEL_GATEWAY_PROVIDER_STORE_BACKEND: sql
+  TAROAI_MODEL_GATEWAY_PROVIDER_RATE_LIMIT_BACKEND: sql
   TAROAI_JOB_QUEUE_BACKEND: redis
   TAROAI_SHORT_TERM_MEMORY_BACKEND: redis
   TAROAI_REDIS_URL: ${TAROAI_REDIS_URL:?required}
@@ -22,16 +39,33 @@ x-runtime-environment: &runtime-environment
   TAROAI_ACCESS_TOKEN_SECRET: ${TAROAI_ACCESS_TOKEN_SECRET:?required}
   TAROAI_PASSWORD_HASH_SALT: ${TAROAI_PASSWORD_HASH_SALT:?required}
   TAROAI_TENANT_BOOTSTRAP_TOKEN: ${TAROAI_TENANT_BOOTSTRAP_TOKEN:?required}
-  TAROAI_SANDBOX_PROVIDER: http
-  TAROAI_SANDBOX_CONTROLLER_BASE_URL: http://sandbox-controller:8002
-  TAROAI_SANDBOX_CONTROLLER_API_KEY: ${TAROAI_SANDBOX_CONTROLLER_API_KEY:?required}
-  TAROAI_BROWSER_PROVIDER: playwright
-  TAROAI_BROWSER_CONTROLLER_BASE_URL: http://browser-controller:8001
-  TAROAI_BROWSER_CONTROLLER_API_KEY: ${TAROAI_BROWSER_CONTROLLER_API_KEY:?required}
+  TAROAI_SECRET_SERVICE_BACKEND: ${TAROAI_SECRET_SERVICE_BACKEND:-aws_secrets_manager}
+  TAROAI_SECRET_SERVICE_REGION: ${TAROAI_SECRET_SERVICE_REGION:-us-east-1}
+  TAROAI_SECRET_SERVICE_ENDPOINT_URL: ${TAROAI_SECRET_SERVICE_ENDPOINT_URL:-}
+  TAROAI_SECRET_SERVICE_NAME_PREFIX: ${TAROAI_SECRET_SERVICE_NAME_PREFIX:-taroai/production}
+  TAROAI_SECRET_SERVICE_KMS_KEY_ID: ${TAROAI_SECRET_SERVICE_KMS_KEY_ID:-}
+  TAROAI_SANDBOX_PROVIDER: ${TAROAI_SANDBOX_PROVIDER:-e2b}
+  TAROAI_E2B_API_KEY: ${TAROAI_E2B_API_KEY:-}
+  TAROAI_E2B_TEMPLATE: ${TAROAI_E2B_TEMPLATE:-}
+  TAROAI_E2B_REQUEST_TIMEOUT_SECONDS: ${TAROAI_E2B_REQUEST_TIMEOUT_SECONDS:-30}
+  TAROAI_E2B_MAX_SESSION_TTL_SECONDS: ${TAROAI_E2B_MAX_SESSION_TTL_SECONDS:-3600}
+  TAROAI_SANDBOX_CONTROLLER_BASE_URL: ${TAROAI_SANDBOX_CONTROLLER_BASE_URL:-}
+  TAROAI_SANDBOX_CONTROLLER_API_KEY: ${TAROAI_SANDBOX_CONTROLLER_API_KEY:-}
+  TAROAI_BROWSER_PROVIDER: ${TAROAI_BROWSER_PROVIDER:-disabled}
+  TAROAI_BROWSER_CONTROLLER_BASE_URL: ${TAROAI_BROWSER_CONTROLLER_BASE_URL:-}
+  TAROAI_BROWSER_CONTROLLER_API_KEY: ${TAROAI_BROWSER_CONTROLLER_API_KEY:-}
+  TAROAI_TAVILY_API_KEY: ${TAROAI_TAVILY_API_KEY:-}
   TAROAI_MODEL_GATEWAY_BASE_URL: ${TAROAI_MODEL_GATEWAY_BASE_URL:-https://api.openai.com/v1}
   TAROAI_MODEL_GATEWAY_API_KEY: ${TAROAI_MODEL_GATEWAY_API_KEY:-}
   TAROAI_MODEL_GATEWAY_API_KEY_SECRET_REF_ID: ${TAROAI_MODEL_GATEWAY_API_KEY_SECRET_REF_ID:-}
   TAROAI_MODEL_GATEWAY_MODEL: ${TAROAI_MODEL_GATEWAY_MODEL:-}
+  TAROAI_EMBEDDING_GATEWAY_ENABLED: ${TAROAI_EMBEDDING_GATEWAY_ENABLED:-false}
+  TAROAI_EMBEDDING_GATEWAY_BASE_URL: ${TAROAI_EMBEDDING_GATEWAY_BASE_URL:-https://api.openai.com/v1}
+  TAROAI_EMBEDDING_GATEWAY_API_KEY: ${TAROAI_EMBEDDING_GATEWAY_API_KEY:-}
+  TAROAI_EMBEDDING_GATEWAY_API_KEY_SECRET_REF_ID: ${TAROAI_EMBEDDING_GATEWAY_API_KEY_SECRET_REF_ID:-}
+  TAROAI_EMBEDDING_GATEWAY_MODEL: ${TAROAI_EMBEDDING_GATEWAY_MODEL:-}
+  TAROAI_EMBEDDING_GATEWAY_DIMENSIONS: ${TAROAI_EMBEDDING_GATEWAY_DIMENSIONS:-}
+  TAROAI_EMBEDDING_GATEWAY_TIMEOUT_SECONDS: ${TAROAI_EMBEDDING_GATEWAY_TIMEOUT_SECONDS:-30}
   TAROAI_RUN_EXECUTION_DISPATCH_MODE: queue
   TAROAI_RUN_MIGRATIONS: "false"
 
@@ -72,10 +106,6 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
-      sandbox-controller:
-        condition: service_healthy
-      browser-controller:
-        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"]
       interval: 10s
@@ -85,9 +115,11 @@ services:
     cap_drop: ["ALL"]
     networks: [control]
 
-  worker:
+  worker: &worker-service
     image: ${TAROAI_API_IMAGE:?required}
     restart: unless-stopped
+    deploy:
+      replicas: 2
     read_only: true
     tmpfs:
       - /tmp:size=256m,noexec,nosuid
@@ -99,6 +131,7 @@ services:
       - taroai.workers.runner
       - --worker-kind
       - agent
+      - --loop-forever
       - --poll-interval-seconds
       - "1"
     depends_on:
@@ -110,11 +143,40 @@ services:
     cap_drop: ["ALL"]
     networks: [control]
 
+  trigger-due-worker:
+    <<: *worker-service
+    deploy:
+      replicas: 1
+    command:
+      - python
+      - -m
+      - taroai.workers.runner
+      - --worker-kind
+      - trigger_due
+      - --loop-forever
+      - --poll-interval-seconds
+      - "1"
+
+  trigger-scheduler:
+    <<: *worker-service
+    deploy:
+      replicas: 1
+    command:
+      - python
+      - -m
+      - taroai.workers.runner
+      - --worker-kind
+      - trigger_scheduler
+      - --loop-forever
+      - --poll-interval-seconds
+      - "15"
+
   sandbox-controller:
-    image: ${TAROAI_SANDBOX_IMAGE:?required}
+    profiles: ["self-hosted-sandbox"]
+    image: ${TAROAI_SANDBOX_IMAGE:-taroai-sandbox-controller:not-enabled}
     restart: unless-stopped
     environment:
-      TAROAI_SANDBOX_CONTROLLER_API_KEY: ${TAROAI_SANDBOX_CONTROLLER_API_KEY:?required}
+      TAROAI_SANDBOX_CONTROLLER_API_KEY: ${TAROAI_SANDBOX_CONTROLLER_API_KEY:-}
       TAROAI_SANDBOX_CONTROLLER_PROVIDER: ${TAROAI_SANDBOX_CONTROLLER_PROVIDER:-docker}
       TAROAI_SANDBOX_CONTROLLER_MAX_SESSIONS: ${TAROAI_SANDBOX_CONTROLLER_MAX_SESSIONS:-50}
       TAROAI_SANDBOX_CONTROLLER_DOCKER_READ_ONLY_ROOTFS: "true"
@@ -132,13 +194,14 @@ services:
     networks: [control]
 
   browser-controller:
-    image: ${TAROAI_BROWSER_IMAGE:?required}
+    profiles: ["browser"]
+    image: ${TAROAI_BROWSER_IMAGE:-taroai-browser-controller:not-enabled}
     restart: unless-stopped
     read_only: true
     tmpfs:
       - /tmp:size=512m,noexec,nosuid
     environment:
-      TAROAI_BROWSER_CONTROLLER_API_KEY: ${TAROAI_BROWSER_CONTROLLER_API_KEY:?required}
+      TAROAI_BROWSER_CONTROLLER_API_KEY: ${TAROAI_BROWSER_CONTROLLER_API_KEY:-}
       TAROAI_BROWSER_CONTROLLER_MAX_SESSIONS: ${TAROAI_BROWSER_CONTROLLER_MAX_SESSIONS:-50}
       TAROAI_BROWSER_CONTROLLER_NAVIGATION_ALLOWED_HOSTS: ${TAROAI_BROWSER_CONTROLLER_NAVIGATION_ALLOWED_HOSTS:-[]}
     healthcheck:

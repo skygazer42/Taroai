@@ -1,6 +1,5 @@
 # Enterprise Connectors Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Build the connector layer that lets approved agents and skills reach enterprise SaaS, databases, files, internal APIs, and MCP servers through governed credentials, permissions, sync jobs, and audit logs.
 

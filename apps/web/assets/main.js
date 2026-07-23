@@ -1,22 +1,28 @@
-import { createChatController } from "./chat-controller.js";
-import { createSkillsUI } from "./skills-ui.js";
-import { createAgentsUI } from "./agents-ui.js";
-import { createArtifactsUI } from "./artifacts-ui.js";
-import { createSpeechUI } from "./speech-ui.js";
-import { createAgentBrainUI } from "./brain-ui.js";
-import { createFilesUI } from "./files-ui.js";
-import { createEvaluationsUI } from "./evaluations-ui.js";
+import { createChatController } from "./chat-controller.js?v=20260722-flow115";
+import { createSkillsUI } from "./skills-ui.js?v=20260722-flow115";
+import { createAgentsUI } from "./agents-ui.js?v=20260722-flow115";
+import { createArtifactsUI } from "./artifacts-ui.js?v=20260722-flow115";
+import { createSpeechUI } from "./speech-ui.js?v=20260722-flow115";
+import { createAgentBrainUI } from "./brain-ui.js?v=20260722-flow115";
+import { createFilesUI } from "./files-ui.js?v=20260722-flow115";
+import { createEvaluationsUI } from "./evaluations-ui.js?v=20260722-flow115";
+import { createWorkspaceUI } from "./workspace-ui.js?v=20260722-flow115";
 
 window.__taroaiThreadChat = true;
 
 const state = {
   currentRunId: null,
+  chatRunId: null,
   lastSequence: 0,
   events: [],
   eventStreamIntegrityIssues: [],
   artifacts: [],
   storageObjects: [],
   workspaceFiles: [],
+  homepageAgents: [],
+  storeItems: [],
+  notifications: [],
+  unreadNotificationCount: 0,
   runHistory: [],
   runTrace: null,
   runtimeState: null,
@@ -28,6 +34,7 @@ const state = {
   browserPreviewObjectUrl: null,
   browserPreviewStorageObjectId: null,
   pollTimer: null,
+  notificationTimer: null,
   pollingInFlight: false,
   pollIntervalMs: 1500,
   runStatus: "idle",
@@ -38,7 +45,6 @@ const state = {
   workspaceSkills: [],
   selectedSkillId: null,
   selectedSolutionPackDraftId: null,
-  selectedModel: localStorage.getItem("taroai.selectedModel") || "Claude Sonnet 5",
   selectedAttachments: [],
   filesDialogSelection: new Set(),
   activePopover: null,
@@ -46,20 +52,29 @@ const state = {
   artifactPanelOpen: false,
   operationsOpen: false,
   sidebarCollapsed: localStorage.getItem("taroai.sidebarCollapsed") === "true",
+  mobileNavOpen: false,
   appRoute: "chat",
   activeWorkbenchView: localStorage.getItem("taroai.activeWorkbenchView") || "run",
-  apiBase: localStorage.getItem("taroai.apiBase") || "http://localhost:8000",
+  apiBase: localStorage.getItem("taroai.apiBase") || window.location.origin,
   tenantId: localStorage.getItem("taroai.tenantId") || "tenant_acme",
   userId: localStorage.getItem("taroai.userId") || "user_luke",
   workspaceId: localStorage.getItem("taroai.workspaceId") || "workspace_sales",
   tenantSlug: localStorage.getItem("taroai.tenantSlug") || "acme",
   ownerDisplayName: localStorage.getItem("taroai.ownerDisplayName") || "Owner",
   agentId: localStorage.getItem("taroai.agentId") || "agent_workspace",
-  authEmail: localStorage.getItem("taroai.authEmail") || "owner@example.com",
-  accessToken: sessionStorage.getItem("taroai.accessToken") || "",
+  authEmail: localStorage.getItem("taroai.authEmail") || "",
+  authDisplayName: "",
+  accessToken: sessionStorage.getItem("taroai.accessToken") || localStorage.getItem("taroai.accessToken") || "",
+  authMode: "login",
+  invitationToken: "",
+  invitationTenantId: "",
 };
 
 applyUrlConfiguration();
+const invitationParams = new URLSearchParams(window.location.search);
+state.invitationToken = invitationParams.get("invite") || "";
+state.invitationTenantId = invitationParams.get("tenantId") || invitationParams.get("tenant_id") || state.tenantId;
+if (state.invitationToken) state.authMode = "invite";
 
 const ACTIVE_RUN_STATUSES = [
   "created",
@@ -67,7 +82,6 @@ const ACTIVE_RUN_STATUSES = [
   "classifying",
   "retrieving_context",
   "planning",
-  "awaiting_policy",
   "running",
   "awaiting_approval",
   "retrying",
@@ -89,22 +103,15 @@ const ROUTE_DEFINITIONS = {
   },
   discover: {
     eyebrow: "Explore",
-    title: "Discover agents",
-    description: "Start with a focused workflow, then adapt it in Chat.",
-    cards: [
-      { title: "Case Study Writer", description: "Turn customer interviews into a publishable case study.", meta: "Gmail · Docs", action: "agent:Case Study Writer", actionLabel: "Run agent" },
-      { title: "Product Description Writer", description: "Create consistent product copy from structured inputs.", meta: "Gmail · Sheets", action: "agent:Product Description Writer", actionLabel: "Run agent" },
-      { title: "Cash Flow Forecaster", description: "Build and explain a rolling cash-flow view.", meta: "Sheets · Finance", action: "agent:Cash Flow Forecaster", actionLabel: "Run agent" },
-    ],
+    title: "Discover",
+    description: "Reusable agents and skills available in the current workspace.",
+    cards: [],
   },
   feed: {
     eyebrow: "Workspace activity",
     title: "Feed",
-    description: "Recent shared activity will appear here when the team feed API is connected.",
-    cards: [
-      { title: "No shared activity yet", description: "Start a governed run and its evidence will remain available in Operations.", meta: "Local workspace", action: "chat", actionLabel: "Start a run" },
-      { title: "Run evidence", description: "Inspect timelines, terminal output, approvals, and artifacts already supported by Taroai.", meta: "Operations", action: "operations", actionLabel: "Open Operations" },
-    ],
+    description: "Recent runs from the current workspace.",
+    cards: [],
   },
   agents: {
     eyebrow: "Reusable work",
@@ -132,10 +139,7 @@ const ROUTE_DEFINITIONS = {
     eyebrow: "Organize work",
     title: "Workspaces",
     description: "Keep runs, files, skills, and evidence within a tenant-scoped workspace.",
-    cards: [
-      { title: "workspace_sales", description: "The active workspace configured for this local session.", meta: "Current workspace", action: "operations", actionLabel: "Open workspace" },
-      { title: "Plan a workspace", description: "Use Chat to define a new workspace structure without pretending it already exists.", meta: "Guided setup", action: "prompt:Plan a new workspace for my team.", actionLabel: "Plan in Chat" },
-    ],
+    cards: [],
   },
   files: {
     eyebrow: "Workspace drive",
@@ -155,19 +159,27 @@ const ROUTE_DEFINITIONS = {
       { title: "Knowledge and memory", description: "Ask Chat to retrieve and organize workspace context.", meta: "Context", action: "prompt:Review the knowledge and memory available in this workspace.", actionLabel: "Ask Chat" },
     ],
   },
-  rewards: {
-    eyebrow: "Taroai",
-    title: "Rewards",
-    description: "Referral rewards are not connected in this local build.",
-    cards: [
-      { title: "Local preview", description: "No referral data is sent or generated from this page.", meta: "No external side effects", action: "chat", actionLabel: "Back to Chat" },
-    ],
-  },
 };
 
 const elements = {
   shell: document.querySelector("[data-app='taroai-workspace']"),
+  mainContent: document.querySelector("#main-content"),
+  sidebar: document.querySelector("#app-sidebar"),
   sidebarCollapse: document.querySelector("[data-sidebar-collapse]"),
+  mobileNavToggle: document.querySelector("[data-mobile-nav-toggle]"),
+  accountAvatar: document.querySelector("[data-account-avatar]"),
+  accountName: document.querySelector("[data-account-name]"),
+  accountMeta: document.querySelector("[data-account-meta]"),
+  authDialog: document.querySelector("#auth-dialog"),
+  authDialogTitle: document.querySelector("#auth-dialog-title"),
+  authSubtitle: document.querySelector("[data-auth-subtitle]"),
+  authEmailField: document.querySelector("[data-auth-email-field]"),
+  authDialogClose: document.querySelector("[data-auth-dialog-close]"),
+  authForm: document.querySelector("[data-auth-form]"),
+  authSwitch: document.querySelector("[data-auth-switch]"),
+  authSwitchPrompt: document.querySelector("[data-auth-switch-prompt]"),
+  authModeToggle: document.querySelector("[data-auth-mode-toggle]"),
+  developerOnly: document.querySelectorAll("[data-developer-only]"),
   newChat: document.querySelector("[data-new-chat]"),
   routeLinks: document.querySelectorAll("[data-app-route]"),
   routeSurface: document.querySelector("[data-testid='product-route']"),
@@ -178,16 +190,15 @@ const elements = {
   routeSearchShell: document.querySelector("[data-route-search-shell]"),
   routeSearch: document.querySelector("[data-route-search]"),
   routeSearchResults: document.querySelector("[data-route-search-results]"),
-  agentRunButtons: document.querySelectorAll("[data-agent-prompt]"),
-  agentCarouselNext: document.querySelector("[data-agent-carousel-next]"),
   agentCardRail: document.querySelector(".agent-card-rail"),
-  createAgent: document.querySelector("[data-create-agent]"),
-  createAgentPrompt: document.querySelector("[data-create-agent-prompt]"),
+  agentRailNext: document.querySelector("[data-agent-rail-next]"),
+  heroGreeting: document.querySelector("[data-hero-greeting]"),
+  planPill: document.querySelector("[data-plan-pill]"),
+  agentUpdates: document.querySelector("[data-agent-updates]"),
+  agentUpdatesLabel: document.querySelector("[data-agent-updates-label]"),
   exploreAgents: document.querySelector("[data-explore-agents]"),
   modelSelectorButton: document.querySelector("#model-selector-button"),
   modelSelectorMenu: document.querySelector("#model-selector-menu"),
-  selectedModel: document.querySelector("[data-selected-model]"),
-  modelOptions: document.querySelectorAll("[data-model-option]"),
   composerAddButton: document.querySelector("#composer-add-button"),
   composerAddMenu: document.querySelector("#composer-add-menu"),
   addCommands: document.querySelectorAll("[data-add-command]"),
@@ -204,6 +215,7 @@ const elements = {
   artifactPanelClose: document.querySelector("[data-artifact-panel-close]"),
   operationsOpeners: document.querySelectorAll("[data-open-operations]"),
   operationsClose: document.querySelector("[data-operations-close]"),
+  sidecarState: document.querySelector("[data-sidecar-state]"),
   workbenchViews: document.querySelectorAll("[data-workbench-view]"),
   workbenchViewToggles: document.querySelectorAll("[data-workbench-view-toggle]"),
   apiBase: document.querySelector("#api-base"),
@@ -214,6 +226,10 @@ const elements = {
   ownerDisplayName: document.querySelector("#owner-display-name"),
   loginEmail: document.querySelector("#login-email"),
   loginPassword: document.querySelector("#login-password"),
+  signupNameField: document.querySelector("[data-register-only]"),
+  signupName: document.querySelector("#signup-name"),
+  rememberLogin: document.querySelector("#remember-login"),
+  passwordToggle: document.querySelector("[data-password-toggle]"),
   bootstrapToken: document.querySelector("#bootstrap-token"),
   bootstrapLoginButton: document.querySelector("#bootstrap-login-button"),
   bootstrapStatus: document.querySelector("[data-bootstrap-status]"),
@@ -390,6 +406,7 @@ function applyUrlConfiguration() {
     state[key] = value;
     localStorage.setItem(storageKey, value);
   }
+  state.currentRunId = normalizedUrlConfigValue("runId", urlParams.get("runId")) || state.currentRunId;
 
   const hadUrlSecret =
     urlParams.has("accessToken") ||
@@ -420,6 +437,9 @@ function normalizedUrlConfigValue(param, rawValue) {
 }
 
 function initializeControls() {
+  if (new URLSearchParams(window.location.search).get("dev") === "1") {
+    elements.developerOnly.forEach((element) => { element.hidden = false; });
+  }
   elements.apiBase.value = state.apiBase;
   elements.tenantId.value = state.tenantId;
   elements.userId.value = state.userId;
@@ -427,7 +447,6 @@ function initializeControls() {
   elements.tenantSlug.value = state.tenantSlug;
   elements.ownerDisplayName.value = state.ownerDisplayName;
   elements.loginEmail.value = state.authEmail;
-  setSelectedModel(state.selectedModel);
   renderAttachmentChips();
   setActivePopover(null);
   setArtifactPanelOpen(false);
@@ -448,11 +467,8 @@ function initializeControls() {
   renderCustomerSuccess();
   renderSolutionPacks();
   renderWorkspaceSkills();
+  renderHomepageAgents();
   loadReadiness();
-  loadCustomerSuccess();
-  loadSolutionPacks();
-  loadWorkspaceSkills();
-  // Durable Thread history is owned by chat-controller.js.
 }
 
 function switchWorkbenchView(viewName) {
@@ -478,7 +494,7 @@ function setChatState(chatState) {
 }
 
 function routeFromHash() {
-  const routeName = window.location.hash.replace(/^#/, "").trim().toLowerCase();
+  const routeName = window.location.hash.replace(/^#/, "").trim().toLowerCase().split("/")[0];
   return Object.hasOwn(ROUTE_DEFINITIONS, routeName) ? routeName : "chat";
 }
 
@@ -508,7 +524,7 @@ function renderAppRoute(routeName, updateHash = false) {
     elements.routeTitle.textContent = definition.title;
     elements.routeDescription.textContent = definition.description;
     elements.routeSearchShell.hidden = activeRoute !== "search";
-    renderRouteCards(definition.cards || []);
+    renderRouteCards(routeCards(activeRoute, definition));
     if (activeRoute === "search") {
       renderRouteSearchResults(elements.routeSearch.value);
       window.requestAnimationFrame(() => elements.routeSearch.focus());
@@ -518,6 +534,72 @@ function renderAppRoute(routeName, updateHash = false) {
   if (updateHash && window.location.hash !== `#${activeRoute}`) {
     window.location.hash = activeRoute;
   }
+}
+
+function refreshRouteData(routeName) {
+  if (!state.accessToken) return;
+  if (["feed", "search"].includes(routeName)) loadRunHistory();
+  if (routeName === "feed") loadNotifications();
+  if (routeName === "discover") {
+    loadHomepageAgents();
+    loadWorkspaceSkills();
+    loadStoreItems();
+  }
+}
+
+function routeCards(routeName, definition) {
+  if (routeName === "discover") {
+    const published = state.homepageAgents.filter((agent) => agent.status === "published");
+    const agents = published.length
+      ? published.map((agent) => ({
+          title: agent.name || "Untitled agent",
+          description: agent.description || "Reusable workspace agent",
+          meta: agent.status || `v${agent.latest_version || agent.version || 1}`,
+          action: `agent:${agent.id || agent.agent_id}`,
+          actionLabel: "Open",
+        }))
+      : [{ title: "No published agents", description: "Publish an agent before sharing it from Discover.", meta: "Workspace", action: "route:agents", actionLabel: "Open Agents" }];
+    return [...agents, {
+      title: "Built-in Store",
+      description: state.storeItems.length
+        ? "Install verified Taroai capabilities into this workspace."
+        : "Browse verified capabilities bundled with this deployment.",
+      meta: `${state.storeItems.length} available`,
+      action: "route:skills",
+      actionLabel: "Open Store",
+    }, {
+      title: "Skills",
+      description: state.workspaceSkills.length
+        ? "Inspect, enable, or try the skills installed in this workspace."
+        : "Install a reusable skill from GitHub or a ZIP package.",
+      meta: `${state.workspaceSkills.length} installed`,
+      action: "route:skills",
+      actionLabel: "Browse skills",
+    }];
+  }
+  if (routeName === "feed") {
+    const notifications = state.notifications.slice(0, 12).map((notification) => ({
+      title: notification.title || "Agent update",
+      description: `${notification.body || "Your agent has an update."} · ${shortDateTime(notification.created_at)}`,
+      meta: notification.read_at ? "Agent" : "New · Agent",
+      action: `notification:${notification.id}`,
+      actionLabel: "Open",
+    }));
+    const runs = state.runHistory.slice(0, Math.max(0, 12 - notifications.length)).map((run) => ({
+      title: run.message || run.id,
+      description: `${run.status || "created"} · ${shortDateTime(run.created_at)}`,
+      meta: "Run",
+      action: `run:${run.id}`,
+      actionLabel: "Open",
+    }));
+    return notifications.length || runs.length
+      ? [...notifications, ...runs]
+      : [{ title: "No activity yet", description: "Start a chat or schedule an agent to create the first workspace update.", meta: "Workspace", action: "chat", actionLabel: "Start a chat" }];
+  }
+  if (routeName === "workspaces") {
+    return [{ title: state.workspaceId, description: "The workspace connected to this session.", meta: "Current workspace", action: "operations", actionLabel: "Open" }];
+  }
+  return definition.cards || [];
 }
 
 function renderRouteCards(cards) {
@@ -593,8 +675,187 @@ function prefillChatMessage(message) {
   elements.input.focus();
 }
 
-function prefillAgentRun(agentName) {
-  prefillChatMessage(`Run the "${agentName}" agent`);
+function formatAgentStat(value) {
+  const count = Number(value);
+  if (!Number.isFinite(count) || count <= 0) return "";
+  if (count >= 1000) return `${(count / 1000).toFixed(1)}k`;
+  return String(count);
+}
+
+function renderAgentUpdatesPill() {
+  if (!elements.agentUpdates) return;
+  const count = state.unreadNotificationCount;
+  const show = Boolean(state.accessToken) && count > 0;
+  elements.agentUpdates.hidden = !show;
+  if (show && elements.agentUpdatesLabel) {
+    elements.agentUpdatesLabel.textContent = `${count} unread update${count === 1 ? "" : "s"} from your agents`;
+  }
+}
+
+async function loadNotifications() {
+  if (!state.accessToken) return;
+  try {
+    const [list, unread] = await Promise.all([
+      apiFetch("/api/notifications?limit=20"),
+      apiFetch("/api/notifications/unread-count"),
+    ]);
+    state.notifications = list.items || [];
+    state.unreadNotificationCount = Number(unread.count) || 0;
+    renderAgentUpdatesPill();
+    if (state.appRoute === "feed") renderAppRoute("feed", false);
+  } catch {
+    // Notifications should not block chat when an older API is still rolling out.
+  }
+}
+
+async function markNotificationsRead() {
+  if (!state.accessToken || !state.unreadNotificationCount) return;
+  try {
+    await apiFetch("/api/notifications/read-all", { method: "POST" });
+    const readAt = new Date().toISOString();
+    state.notifications = state.notifications.map((notification) => ({
+      ...notification,
+      read_at: notification.read_at || readAt,
+    }));
+    state.unreadNotificationCount = 0;
+    renderAgentUpdatesPill();
+    if (state.appRoute === "feed") renderAppRoute("feed", false);
+  } catch {
+    // Keep the unread badge so the user can retry by reopening Feed.
+  }
+}
+
+async function openNotification(notificationId) {
+  const notification = state.notifications.find((item) => item.id === notificationId);
+  if (!notification) return;
+  if (!notification.read_at) {
+    try {
+      const updated = await apiFetch(`/api/notifications/${encodeURIComponent(notificationId)}/read`, {
+        method: "POST",
+      });
+      Object.assign(notification, updated);
+      state.unreadNotificationCount = Math.max(0, state.unreadNotificationCount - 1);
+      renderAgentUpdatesPill();
+    } catch {
+      // The related run remains useful if the optional read receipt cannot be saved.
+    }
+  }
+  if (notification.run_id) {
+    renderAppRoute("chat", true);
+    selectRunFromHistory(notification.run_id);
+  } else {
+    renderAppRoute("agents", true);
+  }
+}
+
+function startNotificationPolling() {
+  if (state.notificationTimer) return;
+  state.notificationTimer = window.setInterval(() => {
+    if (document.visibilityState === "visible") loadNotifications();
+  }, 30_000);
+}
+
+function stopNotificationPolling() {
+  if (!state.notificationTimer) return;
+  window.clearInterval(state.notificationTimer);
+  state.notificationTimer = null;
+}
+
+function syncAgentRailNext() {
+  if (!elements.agentRailNext || !elements.agentCardRail) return;
+  const rail = elements.agentCardRail;
+  elements.agentRailNext.hidden = rail.scrollWidth <= rail.clientWidth + 8;
+}
+
+function renderHomepageAgents(error = "") {
+  elements.agentCardRail.replaceChildren();
+  if (!state.accessToken || error || !state.homepageAgents.length) {
+    const signedOut = !state.accessToken;
+    elements.agentCardRail.innerHTML = `<article class="agent-card homepage-agent-empty"><header><span class="agent-card-art" aria-hidden="true">A</span><h3>${signedOut ? "Sign in to view agents" : error || "No agents yet"}</h3></header><p>${signedOut ? "Your workspace agents will appear here." : error || "Create one from a successful conversation."}</p><footer><button type="button" ${signedOut ? "data-auth-dialog-open" : "data-open-agent-library"}>${signedOut ? "Sign in" : "Open Agents"}</button></footer></article>`;
+    renderAgentUpdatesPill();
+    syncAgentRailNext();
+    return;
+  }
+  for (const agent of state.homepageAgents.slice(0, 8)) {
+    const card = document.createElement("article");
+    card.className = "agent-card";
+    const header = document.createElement("header");
+    const mark = document.createElement("span");
+    mark.className = "agent-card-art";
+    mark.setAttribute("aria-hidden", "true");
+    mark.textContent = (agent.name || "A").slice(0, 1).toUpperCase();
+    const title = document.createElement("h3");
+    title.textContent = agent.name || "Untitled agent";
+    header.append(mark, title);
+    card.append(header);
+    const connectorNames = (agent.connectors || agent.integrations || agent.skill_bindings || [])
+      .map((item) => (typeof item === "string" ? item : item.name || item.skill_id || item.id || ""))
+      .filter(Boolean)
+      .slice(0, 3);
+    if (connectorNames.length) {
+      const connectors = document.createElement("div");
+      connectors.className = "agent-connectors";
+      for (const name of connectorNames) {
+        const chip = document.createElement("span");
+        chip.textContent = name;
+        connectors.append(chip);
+      }
+      card.append(connectors);
+    }
+    const description = document.createElement("p");
+    description.textContent = agent.description || "Reusable workspace agent";
+    const footer = document.createElement("footer");
+    const open = document.createElement("button");
+    open.type = "button";
+    open.dataset.openAgentLibrary = agent.id || agent.agent_id || "";
+    open.textContent = "Run agent";
+    footer.append(open);
+    const runs = formatAgentStat(agent.run_count ?? agent.usage_count ?? agent.total_runs);
+    const likes = formatAgentStat(agent.likes ?? agent.upvotes);
+    if (runs) {
+      const stat = document.createElement("span");
+      stat.className = "agent-stat";
+      stat.textContent = `∿ ${runs}`;
+      footer.append(stat);
+    }
+    if (likes) {
+      const stat = document.createElement("span");
+      stat.className = "agent-stat";
+      stat.textContent = `♡ ${likes}`;
+      footer.append(stat);
+    }
+    if (!runs && !likes) {
+      const status = document.createElement("span");
+      status.textContent = agent.status || `v${agent.latest_version || agent.version || 1}`;
+      footer.append(status);
+    }
+    card.append(description, footer);
+    elements.agentCardRail.append(card);
+  }
+  renderAgentUpdatesPill();
+  syncAgentRailNext();
+}
+
+async function loadHomepageAgents() {
+  try {
+    const payload = await apiFetch(`/api/agents?workspace_id=${encodeURIComponent(state.workspaceId)}`);
+    state.homepageAgents = Array.isArray(payload) ? payload : payload.agents || payload.items || [];
+    renderHomepageAgents();
+    if (state.appRoute === "discover") renderAppRoute("discover", false);
+  } catch {
+    state.homepageAgents = [];
+    renderHomepageAgents("Agents unavailable");
+  }
+}
+
+async function loadStoreItems() {
+  try {
+    const payload = await apiFetch("/api/store/items?kind=solution_pack");
+    state.storeItems = payload.items || [];
+    if (state.appRoute === "discover") renderAppRoute("discover", false);
+  } catch {
+    state.storeItems = [];
+  }
 }
 
 function handleRouteAction(action) {
@@ -623,7 +884,7 @@ function handleRouteAction(action) {
     return;
   }
   if (action.startsWith("agent:")) {
-    prefillAgentRun(action.slice("agent:".length));
+    window.location.hash = `agents/${encodeURIComponent(action.slice("agent:".length))}`;
     return;
   }
   if (action.startsWith("prompt:")) {
@@ -633,6 +894,10 @@ function handleRouteAction(action) {
   if (action.startsWith("run:")) {
     renderAppRoute("chat", true);
     selectRunFromHistory(action.slice("run:".length));
+    return;
+  }
+  if (action.startsWith("notification:")) {
+    void openNotification(action.slice("notification:".length));
   }
 }
 
@@ -644,6 +909,20 @@ function setSidebarCollapsed(collapsed) {
     state.sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar",
   );
   localStorage.setItem("taroai.sidebarCollapsed", String(state.sidebarCollapsed));
+}
+
+function setMobileNavOpen(open) {
+  state.mobileNavOpen = Boolean(open);
+  elements.shell.classList.toggle("is-mobile-nav-open", state.mobileNavOpen);
+  elements.mainContent?.toggleAttribute("inert", state.mobileNavOpen);
+  elements.mobileNavToggle?.setAttribute("aria-expanded", String(state.mobileNavOpen));
+  elements.mobileNavToggle?.setAttribute("aria-label", state.mobileNavOpen ? "Close navigation" : "Open navigation");
+  if (state.mobileNavOpen) {
+    elements.sidebarCollapse?.setAttribute("aria-label", "Close navigation");
+    window.requestAnimationFrame(() => elements.newChat?.focus());
+  } else {
+    elements.sidebarCollapse?.setAttribute("aria-label", state.sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar");
+  }
 }
 
 function setActivePopover(popoverName, trigger = null) {
@@ -679,21 +958,6 @@ function closeActivePopover(returnFocus = false) {
   }
 }
 
-function setSelectedModel(modelName) {
-  const available = Array.from(elements.modelOptions).map(
-    (button) => button.dataset.modelOption,
-  );
-  const selectedModel = available.includes(modelName) ? modelName : available[0];
-  state.selectedModel = selectedModel;
-  elements.selectedModel.textContent = selectedModel;
-  elements.modelOptions.forEach((button) => {
-    const isSelected = button.dataset.modelOption === selectedModel;
-    button.classList.toggle("is-selected", isSelected);
-    button.setAttribute("aria-checked", String(isSelected));
-  });
-  localStorage.setItem("taroai.selectedModel", selectedModel);
-}
-
 function setArtifactPanelOpen(open) {
   state.artifactPanelOpen = Boolean(open);
   if (state.artifactPanelOpen) {
@@ -701,7 +965,9 @@ function setArtifactPanelOpen(open) {
   }
   elements.sidecar.classList.toggle("is-artifact-open", state.artifactPanelOpen);
   elements.sidecar.classList.toggle("is-operations-open", state.operationsOpen);
+  elements.sidecarState.textContent = state.artifactPanelOpen ? "artifact" : "closed";
   if (!state.artifactPanelOpen) {
+    window.taroaiArtifacts?.close?.();
     elements.sidecar.classList.remove("is-chat-sidecar-open");
   }
 }
@@ -711,9 +977,17 @@ function setOperationsOpen(open) {
   if (state.operationsOpen) {
     state.artifactPanelOpen = false;
     elements.sidecar.classList.remove("is-chat-sidecar-open");
+    if (state.accessToken) {
+      const loads = [loadRunHistory()];
+      if (!state.customerSuccess) {
+        loads.push(loadCustomerSuccess(), loadSolutionPacks(), loadWorkspaceSkills());
+      }
+      Promise.allSettled(loads).then(syncOperationsRun);
+    }
   }
   elements.sidecar.classList.toggle("is-operations-open", state.operationsOpen);
   elements.sidecar.classList.toggle("is-artifact-open", state.artifactPanelOpen);
+  elements.sidecarState.textContent = state.operationsOpen ? "operations" : "closed";
 }
 
 function renderAttachmentChips() {
@@ -788,6 +1062,13 @@ function updateFilesSelectionStatus() {
     : "No files selected";
   elements.filesConfirm.disabled = count === 0;
   elements.filesConfirm.closest(".files-dialog-footer").hidden = count === 0;
+}
+
+function openAuthDialog() {
+  window.taroaiChat?.closeModelMenu();
+  renderAuth();
+  if (!elements.authDialog.open) elements.authDialog.showModal();
+  if (!state.accessToken) (elements.loginEmail.value ? elements.loginPassword : elements.loginEmail).focus();
 }
 
 async function openFilesDialog() {
@@ -902,6 +1183,7 @@ function requestHeaders() {
     "Content-Type": "application/json",
     "X-Tenant-ID": state.tenantId,
     "X-User-ID": state.userId,
+    "X-Workspace-ID": state.workspaceId,
   };
   if (state.accessToken) {
     const bearerPrefix = "Bearer ";
@@ -924,7 +1206,10 @@ async function apiFetch(path, options = {}) {
   if (!response.ok) {
     handleAuthExpired(response.status);
     const detail = body.detail || body.message || response.statusText;
-    throw new Error(`${response.status} ${detail}`);
+    const error = new Error(`${response.status} ${detail}`);
+    error.status = response.status;
+    error.body = body;
+    throw error;
   }
   return body;
 }
@@ -984,7 +1269,7 @@ function resetConversation() {
 function setStatus(status) {
   state.runStatus = status;
   elements.status.textContent = status;
-  elements.status.className = "status-pill";
+  elements.status.className = "visually-hidden";
   if (ACTIVE_RUN_STATUSES.includes(status)) {
     elements.status.classList.add("running");
   }
@@ -1008,8 +1293,56 @@ function syncComposerState() {
 
 function renderAuth(status) {
   const hasToken = Boolean(state.accessToken);
-  elements.authStatus.textContent = status || (hasToken ? "Bearer" : "No token");
-  elements.logoutButton.disabled = !hasToken;
+  const registering = !hasToken && state.authMode === "register";
+  const acceptingInvitation = !hasToken && state.authMode === "invite";
+  const email = elements.loginEmail.value.trim() || state.authEmail;
+  elements.authStatus.textContent = status || (hasToken ? "Signed in" : "");
+  elements.accountName.textContent = hasToken ? email : "Sign in";
+  elements.accountMeta.textContent = hasToken ? "Workspace" : "Connect your workspace";
+  elements.accountAvatar.textContent = hasToken ? email.slice(0, 1).toUpperCase() : "→";
+  if (elements.planPill) elements.planPill.hidden = !hasToken;
+  if (elements.heroGreeting) {
+    const firstName = hasToken
+      ? state.authDisplayName.trim().split(/\s+/)[0] || email.split("@")[0].split(/[._-]/)[0]
+      : "";
+    const greetingName = /^\d+$/.test(firstName) ? "" : firstName;
+    elements.heroGreeting.textContent = greetingName ? `How can I help, ${greetingName}?` : "How can I help?";
+  }
+  elements.loginButton.hidden = hasToken;
+  elements.loginButton.textContent = acceptingInvitation ? "Join workspace" : registering ? "Sign up" : "Login";
+  elements.logoutButton.hidden = !hasToken;
+  elements.authDialogTitle.textContent = acceptingInvitation ? "Join this workspace" : registering ? "Create your account" : "Welcome";
+  elements.authSubtitle.textContent = acceptingInvitation
+    ? "Choose your display name and password to accept the invitation."
+    : registering
+    ? "Create a local workspace to get started."
+    : "Please enter your details to login.";
+  elements.signupNameField.hidden = !(registering || acceptingInvitation);
+  elements.signupName.required = registering || acceptingInvitation;
+  elements.authEmailField.hidden = acceptingInvitation;
+  elements.loginEmail.required = !acceptingInvitation;
+  elements.loginPassword.autocomplete = registering || acceptingInvitation ? "new-password" : "current-password";
+  elements.authSwitch.hidden = hasToken || acceptingInvitation;
+  elements.authSwitchPrompt.textContent = registering
+    ? "Already have an account?"
+    : "Don't have an account?";
+  elements.authModeToggle.textContent = registering ? "Login" : "Register";
+  elements.authDialogClose.hidden = !hasToken;
+  elements.loginEmail.disabled = hasToken || acceptingInvitation;
+  elements.loginPassword.disabled = hasToken;
+  elements.rememberLogin.disabled = hasToken || acceptingInvitation;
+  elements.rememberLogin.closest("label").hidden = acceptingInvitation;
+  elements.passwordToggle.disabled = hasToken;
+  syncLoginButton();
+}
+
+function syncLoginButton() {
+  const acceptingInvitation = !state.accessToken && state.authMode === "invite";
+  elements.loginButton.disabled =
+    Boolean(state.accessToken) ||
+    (!acceptingInvitation && !elements.loginEmail.value.trim()) ||
+    !elements.loginPassword.value ||
+    ((state.authMode === "register" || acceptingInvitation) && !elements.signupName.value.trim());
 }
 
 function renderBootstrap(status = "Not bootstrapped") {
@@ -1017,17 +1350,41 @@ function renderBootstrap(status = "Not bootstrapped") {
 }
 
 function handleAuthExpired(status) {
-  if ((status === 401 || status === 403) && state.accessToken) {
+  if (status === 401 && state.accessToken) {
     stopRunPolling();
+    stopNotificationPolling();
     state.accessToken = "";
     sessionStorage.removeItem("taroai.accessToken");
+    localStorage.removeItem("taroai.accessToken");
     clearAuthenticatedWorkspaceState("Authentication expired.");
-    renderAuth("Auth required");
+    renderAuth("Session expired");
     appendMessage("agent", "Authentication expired. Please sign in again.");
+    window.dispatchEvent(new CustomEvent("taroai:auth-changed", { detail: { authenticated: false } }));
+    openAuthDialog();
     return true;
   }
   return false;
 }
+
+window.addEventListener("taroai:auth-expired", () => handleAuthExpired(401));
+window.addEventListener("taroai:agents-changed", () => loadHomepageAgents());
+window.addEventListener("taroai:workspace-changed", (event) => {
+  const workspaceId = event.detail?.workspaceId;
+  if (!workspaceId) return;
+  state.workspaceId = workspaceId;
+  elements.workspaceId.value = workspaceId;
+  localStorage.setItem("taroai.workspaceId", workspaceId);
+  state.homepageAgents = [];
+  state.storeItems = [];
+  state.runHistory = [];
+  state.workspaceSkills = [];
+  loadHomepageAgents();
+  loadNotifications();
+});
+window.addEventListener("taroai:chat-context-changed", (event) => {
+  state.chatRunId = event.detail?.runId || null;
+  if (state.operationsOpen) syncOperationsRun();
+});
 
 async function loadReadiness() {
   renderReadiness({ status: "checking" });
@@ -1036,6 +1393,11 @@ async function loadReadiness() {
     state.readiness = readiness;
     renderReadiness(readiness);
   } catch (error) {
+    if (error.status === 503 && error.body?.ready === false) {
+      state.readiness = error.body;
+      renderReadiness(error.body);
+      return;
+    }
     state.readiness = null;
     renderReadiness(null, error);
   }
@@ -1067,7 +1429,9 @@ function renderReadiness(readiness = state.readiness, error = null) {
   elements.readinessModel.textContent = describeModelReadiness(modelGateway);
   elements.readinessSandbox.textContent = describeSandboxReadiness(sandbox);
   elements.readinessStatus.textContent =
-    modelGateway.configured && sandbox.configured ? "Preflight ready" : "Preflight needs config";
+    readiness.ready && modelGateway.configured && sandbox.configured
+      ? "Preflight ready"
+      : "Preflight needs config";
 }
 
 function renderRunControls() {
@@ -1157,10 +1521,14 @@ function planExecutionLoopStage(runtime, plannedSteps, completedSteps) {
   return executionLoopStageLabel("Waiting", "waiting");
 }
 
-function latestPlanCreatedEvent() {
+function latestModelRouteEvent() {
   return [...state.events].reverse().find((event) => {
     return (
-      (event.type === "plan.created" || event.type === "model.plan.created") &&
+      [
+        "plan.created",
+        "model.plan.created",
+        "model.operation.recorded",
+      ].includes(event.type) &&
       event.payload
     );
   });
@@ -1170,7 +1538,7 @@ function modelRouteLabel() {
   if (!state.currentRunId) {
     return "No model route";
   }
-  const event = latestPlanCreatedEvent();
+  const event = latestModelRouteEvent();
   if (!event) {
     return "Model route pending";
   }
@@ -1768,8 +2136,8 @@ async function bootstrapTenant() {
       localStorage.setItem("taroai.workspaceId", state.workspaceId);
     }
     elements.bootstrapToken.value = "";
-    renderBootstrap("Tenant ready");
     await login();
+    renderBootstrap("Tenant ready");
   } catch (error) {
     elements.bootstrapToken.value = "";
     renderBootstrap("Bootstrap failed");
@@ -1777,27 +2145,50 @@ async function bootstrapTenant() {
   }
 }
 
-async function login() {
+async function syncStoredSession() {
+  if (!state.accessToken) return false;
+  const session = await apiFetch("/api/auth/session");
+  if (!session.authenticated) {
+    handleAuthExpired(401);
+    return false;
+  }
+  elements.tenantId.value = session.tenant_id;
+  elements.userId.value = session.user_id;
+  if (session.workspace_id) elements.workspaceId.value = session.workspace_id;
+  if (session.email) elements.loginEmail.value = session.email;
+  state.authDisplayName = session.display_name || "";
+  syncSettings();
+  renderAuth("Signed in");
+  return true;
+}
+
+async function login(tenantId = null) {
   syncSettings();
   const email = elements.loginEmail.value.trim();
   const password = elements.loginPassword.value;
   if (!email || !password) {
-    renderAuth("Missing");
+    renderAuth("Enter email and password");
     return;
   }
-  renderAuth("Signing in");
+  renderAuth("Signing in…");
   try {
     const result = await apiFetch("/api/auth/login", {
       method: "POST",
       body: JSON.stringify({
-        tenant_id: state.tenantId,
+        ...(tenantId ? { tenant_id: tenantId } : {}),
         email,
         password,
+        remember_me: elements.rememberLogin.checked,
       }),
     });
     state.accessToken = result.access_token || "";
     if (state.accessToken) {
+      sessionStorage.removeItem("taroai.accessToken");
+      localStorage.removeItem("taroai.accessToken");
       sessionStorage.setItem("taroai.accessToken", state.accessToken);
+      if (elements.rememberLogin.checked) {
+        localStorage.setItem("taroai.accessToken", state.accessToken);
+      }
     }
     if (result.tenant_id) {
       state.tenantId = result.tenant_id;
@@ -1809,20 +2200,122 @@ async function login() {
       elements.userId.value = result.user_id;
       localStorage.setItem("taroai.userId", state.userId);
     }
+    state.authDisplayName = result.display_name || "";
+    if (result.workspace_id) {
+      state.workspaceId = result.workspace_id;
+      elements.workspaceId.value = result.workspace_id;
+      localStorage.setItem("taroai.workspaceId", state.workspaceId);
+    }
     elements.loginPassword.value = "";
-    renderAuth("Bearer");
+    state.authMode = "login";
+    renderAuth("Signed in");
     await loadReadiness();
-    await loadCustomerSuccess();
-    await loadSolutionPacks();
-    await loadWorkspaceSkills();
-    await loadRunHistory();
+    await Promise.all([loadHomepageAgents(), loadNotifications()]);
+    startNotificationPolling();
+    if (state.currentRunId) {
+      await refreshRun();
+    }
     window.dispatchEvent(new CustomEvent("taroai:auth-changed", { detail: { authenticated: true } }));
+    if (routeFromHash() !== "chat") window.dispatchEvent(new Event("hashchange"));
+    if (elements.authDialog.open) elements.authDialog.close();
   } catch (error) {
     state.accessToken = "";
     sessionStorage.removeItem("taroai.accessToken");
+    localStorage.removeItem("taroai.accessToken");
     clearAuthenticatedWorkspaceState("Authentication failed.");
-    renderAuth("Auth failed");
-    appendMessage("agent", error.message);
+    const invalidCredentials = error.status === 401;
+    renderAuth(
+      invalidCredentials
+        ? "Email or password is incorrect."
+        : "Sign-in is unavailable. Try again.",
+    );
+    elements.loginEmail.toggleAttribute("aria-invalid", invalidCredentials);
+    elements.loginPassword.toggleAttribute("aria-invalid", invalidCredentials);
+    elements.loginPassword.value = "";
+    syncLoginButton();
+    elements.loginPassword.focus();
+  }
+}
+
+async function registerAccount() {
+  const displayName = elements.signupName.value.trim();
+  const email = elements.loginEmail.value.trim();
+  const password = elements.loginPassword.value;
+  if (!displayName || !email || password.length < 8) {
+    renderAuth("Enter your name, email, and a password of at least 8 characters.");
+    return;
+  }
+  renderAuth("Creating account…");
+  try {
+    const result = await apiFetch("/api/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ display_name: displayName, email, password }),
+    });
+    await login(result.tenant_id);
+  } catch (error) {
+    renderAuth(
+      error.status === 403
+        ? "Account creation is unavailable."
+        : "Could not create the account. Check your details and try again.",
+    );
+    elements.signupName.setAttribute("aria-invalid", "true");
+    elements.loginEmail.setAttribute("aria-invalid", "true");
+    elements.loginPassword.setAttribute("aria-invalid", "true");
+    elements.loginPassword.value = "";
+    syncLoginButton();
+    elements.loginPassword.focus();
+  }
+}
+
+async function acceptInvitation() {
+  const displayName = elements.signupName.value.trim();
+  const password = elements.loginPassword.value;
+  if (!state.invitationToken || !state.invitationTenantId || !displayName || password.length < 8) {
+    renderAuth("Enter your name and a password of at least 8 characters.");
+    return;
+  }
+  renderAuth("Joining workspace…");
+  try {
+    const result = await apiFetch("/api/tenant-invitations/accept", {
+      method: "POST",
+      body: JSON.stringify({
+        tenant_id: state.invitationTenantId,
+        token: state.invitationToken,
+        display_name: displayName,
+        password,
+      }),
+    });
+    state.accessToken = result.access_token || "";
+    sessionStorage.setItem("taroai.accessToken", state.accessToken);
+    state.tenantId = result.tenant_id;
+    state.userId = result.user_id;
+    state.workspaceId = result.workspace_id;
+    state.authDisplayName = result.display_name || displayName;
+    elements.tenantId.value = state.tenantId;
+    elements.userId.value = state.userId;
+    elements.workspaceId.value = state.workspaceId;
+    if (result.email) elements.loginEmail.value = result.email;
+    localStorage.setItem("taroai.tenantId", state.tenantId);
+    localStorage.setItem("taroai.userId", state.userId);
+    localStorage.setItem("taroai.workspaceId", state.workspaceId);
+    state.invitationToken = "";
+    state.invitationTenantId = "";
+    state.authMode = "login";
+    elements.loginPassword.value = "";
+    const url = new URL(window.location.href);
+    url.searchParams.delete("invite");
+    url.searchParams.delete("tenant_id");
+    url.searchParams.delete("tenantId");
+    window.history.replaceState({}, document.title, `${url.pathname}${url.search}${url.hash}`);
+    renderAuth("Signed in");
+    await Promise.all([loadReadiness(), loadHomepageAgents(), loadNotifications()]);
+    startNotificationPolling();
+    window.dispatchEvent(new CustomEvent("taroai:auth-changed", { detail: { authenticated: true } }));
+    if (elements.authDialog.open) elements.authDialog.close();
+  } catch (error) {
+    elements.loginPassword.value = "";
+    renderAuth(error.status === 409 || error.status === 400 ? "This invitation is no longer valid." : "Could not join the workspace. Try again.");
+    syncLoginButton();
   }
 }
 
@@ -1834,11 +2327,15 @@ async function logout() {
     await apiFetch(`/api/auth/logout`, { method: "POST" });
   } finally {
     stopRunPolling();
+    stopNotificationPolling();
     state.accessToken = "";
+    state.authMode = "login";
     sessionStorage.removeItem("taroai.accessToken");
+    localStorage.removeItem("taroai.accessToken");
     clearAuthenticatedWorkspaceState();
     renderAuth();
     window.dispatchEvent(new CustomEvent("taroai:auth-changed", { detail: { authenticated: false } }));
+    openAuthDialog();
   }
 }
 
@@ -1862,11 +2359,16 @@ function clearAuthenticatedWorkspaceState(terminalMessage = "Signed out.") {
   state.selectedSolutionPackId = null;
   state.workspaceSkills = [];
   state.selectedSkillId = null;
+  state.homepageAgents = [];
+  state.notifications = [];
+  state.unreadNotificationCount = 0;
   state.runStatus = "idle";
   clearBrowserPreview();
   renderCustomerSuccess();
   renderSolutionPacks();
   renderWorkspaceSkills();
+  renderHomepageAgents();
+  renderAgentUpdatesPill();
   renderRunHistory();
   renderBrowser();
   renderArtifacts();
@@ -1954,6 +2456,7 @@ async function loadWorkspaceSkills() {
       state.selectedSkillId = readySkill ? readySkill.skill_id : null;
     }
     renderWorkspaceSkills();
+    if (state.appRoute === "discover") renderAppRoute("discover", false);
   } catch (error) {
     state.workspaceSkills = [];
     state.selectedSkillId = null;
@@ -1962,9 +2465,6 @@ async function loadWorkspaceSkills() {
 }
 
 async function loadRunHistory() {
-  if (window.__taroaiThreadChat) {
-    return window.taroaiChat?.loadThreads?.();
-  }
   renderRunHistory({ status: "loading" });
   try {
     const result = await apiFetch(
@@ -1972,6 +2472,7 @@ async function loadRunHistory() {
     );
     state.runHistory = result.items || [];
     renderRunHistory();
+    if (state.appRoute === "feed") renderAppRoute("feed", false);
   } catch (error) {
     state.runHistory = [];
     renderRunHistory(null, error);
@@ -2192,7 +2693,7 @@ function renderConversationForRun(run) {
   elements.conversation.append(actions);
 }
 
-async function selectRunFromHistory(runId) {
+async function selectRunFromHistory(runId, showConversation = true) {
   const run = state.runHistory.find((item) => item.id === runId);
   if (!run) {
     return;
@@ -2207,7 +2708,8 @@ async function selectRunFromHistory(runId) {
   state.storageObjects = [];
   state.runTrace = null;
   state.runtimeState = null;
-  renderConversationForRun(run);
+  state.previewedRunIds.delete(run.id);
+  if (showConversation) renderConversationForRun(run);
   setStatus(run.status || "created");
   renderTimeline();
   renderRunTrace();
@@ -2221,9 +2723,45 @@ async function selectRunFromHistory(runId) {
   renderTerminal("Loading selected run...");
   renderRunHistory();
   await refreshRun();
-  renderConversationForRun({ ...run, status: state.runStatus });
+  if (showConversation) renderConversationForRun({ ...run, status: state.runStatus });
   if (ACTIVE_RUN_STATUSES.includes(state.runStatus)) {
     startRunPolling();
+  }
+}
+
+async function syncOperationsRun() {
+  if (!state.operationsOpen) return;
+  if (!state.chatRunId) {
+    stopRunPolling();
+    state.currentRunId = null;
+    state.selectedRunHistoryId = null;
+    state.lastSequence = 0;
+    state.events = [];
+    state.eventStreamIntegrityIssues = [];
+    state.artifacts = [];
+    state.storageObjects = [];
+    state.runTrace = null;
+    state.runtimeState = null;
+    setStatus("idle");
+    renderTimeline();
+    renderRunTrace();
+    renderRuntimeState();
+    renderBrowser();
+    renderArtifacts();
+    renderApproval();
+    renderTerminal("No run selected.");
+    renderRunHistory();
+    return;
+  }
+  if (state.chatRunId === state.currentRunId) return;
+  try {
+    if (!state.runHistory.some((run) => run.id === state.chatRunId)) {
+      const run = await apiFetch(`/api/runs/${encodeURIComponent(state.chatRunId)}`);
+      state.runHistory = [run, ...state.runHistory.filter((item) => item.id !== run.id)];
+    }
+    await selectRunFromHistory(state.chatRunId, false);
+  } catch (error) {
+    renderTerminal(error.message);
   }
 }
 
@@ -2338,10 +2876,17 @@ async function invokeSelectedWorkspaceSkill() {
       state.eventStreamIntegrityIssues = [];
       state.artifacts = [];
       state.storageObjects = [];
+      state.runTrace = null;
+      state.runtimeState = null;
+      clearArtifactPreview();
+      clearArtifactDownloadStatus();
+      renderRunTrace();
+      renderRuntimeState();
       setStatus(result.status || result.output?.status || "running");
-      elements.skillInvokeStatus.textContent = `Run ${state.currentRunId}`;
+      elements.skillInvokeStatus.textContent = "Loading run";
       switchWorkbenchView("run");
       await refreshRun();
+      elements.skillInvokeStatus.textContent = `Run ${state.currentRunId}`;
       loadRunHistory();
       if (ACTIVE_RUN_STATUSES.includes(state.runStatus)) {
         startRunPolling();
@@ -2524,7 +3069,7 @@ async function createCustomerSuccessSolutionPackCandidates() {
 function selectedEvaluationCandidate(data = state.customerSuccess) {
   const candidates = data ? data.evaluationCandidates || [] : [];
   return (
-    candidates.find((candidate) => candidate.status === "pending_review") ||
+    candidates.findLast((candidate) => candidate.status === "pending_review") ||
     candidates[0] ||
     null
   );
@@ -2641,10 +3186,10 @@ async function reviewSelectedSolutionPackCandidate(status) {
         body: JSON.stringify(solutionPackCandidateReviewPayload(status)),
       }
     );
-    if (updated.publication_draft_id) {
-      state.selectedSolutionPackDraftId = updated.publication_draft_id;
-    }
     await loadCustomerSuccess();
+    if (updated.publication_draft_id) {
+      selectSolutionPackDraft(updated.publication_draft_id);
+    }
     const draftLabel = updated.publication_draft_id
       ? `, draft ${updated.publication_draft_id}`
       : "";
@@ -2772,27 +3317,24 @@ async function saveSelectedSolutionPackDraft() {
   if (!draft) {
     return;
   }
-  renderSolutionPackDrafts(state.customerSuccess, "Saving draft");
+  const proposedSkillManifest = parseDraftSkillManifest();
+  if (proposedSkillManifest === false) {
+    return;
+  }
+  const proposedPackVersion = elements.customerSuccessDraftPackVersion.value.trim();
+  const payload = {
+    requested_skill_name: elements.customerSuccessDraftSkill.value.trim(),
+    proposed_change_summary: elements.customerSuccessDraftSummary.value.trim(),
+    ...(proposedPackVersion ? { proposed_pack_version: proposedPackVersion } : {}),
+    ...(proposedSkillManifest ? manifestPayloadForDraft(proposedSkillManifest) : {}),
+  };
+  elements.customerSuccessDraftStatus.textContent = "Saving draft";
   try {
-    const proposedSkillManifest = parseDraftSkillManifest();
-    if (proposedSkillManifest === false) {
-      return;
-    }
-    const proposedPackVersion = elements.customerSuccessDraftPackVersion.value.trim();
     const updated = await apiFetch(
       `/api/customer-success/solution-pack-drafts/${draft.id}`,
       {
         method: "PATCH",
-        body: JSON.stringify({
-          requested_skill_name: elements.customerSuccessDraftSkill.value.trim(),
-          proposed_change_summary: elements.customerSuccessDraftSummary.value.trim(),
-          ...(proposedPackVersion
-            ? { proposed_pack_version: proposedPackVersion }
-            : {}),
-          ...(proposedSkillManifest
-            ? manifestPayloadForDraft(proposedSkillManifest)
-            : {}),
-        }),
+        body: JSON.stringify(payload),
       }
     );
     replaceSolutionPackDraft(updated);
@@ -3013,13 +3555,12 @@ async function refreshRun() {
     return;
   }
   await loadRunStatus();
-  await loadEvents();
   await loadArtifacts();
   await loadStorageObjects();
-  await loadRunTrace();
   await loadRuntimeState();
+  await announceRunDelivery();
+  await loadEvents();
   renderTimeline();
-  renderRunTrace();
   renderRuntimeState();
   renderBrowser();
   renderArtifacts();
@@ -3028,9 +3569,11 @@ async function refreshRun() {
   renderApproval();
   renderTerminalFromEvents();
   renderDeliveryChain();
-  await announceRunDelivery();
+  await loadRunTrace();
+  renderRunTrace();
   if (isRunTerminalStatus(state.runStatus)) {
     stopRunPolling();
+    loadNotifications();
   }
 }
 
@@ -3576,13 +4119,16 @@ function renderTerminalFromEvents() {
 }
 
 function storageObjectForTerminalOutputUri(outputUri) {
-  if (!outputUri) {
-    return null;
-  }
-  return state.storageObjects.find((storageObject) => {
-    const uri = `s3://${storageObject.bucket}/${storageObject.key}`;
-    return storageObject.purpose === "sandbox-command-outputs" && uri === outputUri;
+  const outputs = state.storageObjects.filter((storageObject) => {
+    return storageObject.purpose === "sandbox-command-outputs";
   });
+  if (!outputUri) {
+    return outputs.at(-1) || null;
+  }
+  return outputs.find((storageObject) => {
+    const uri = `s3://${storageObject.bucket}/${storageObject.key}`;
+    return uri === outputUri;
+  }) || null;
 }
 
 function renderTerminalOutputStorageObject(storageObject) {
@@ -4076,6 +4622,12 @@ elements.routeLinks.forEach((link) => {
 });
 
 window.addEventListener("hashchange", () => {
+  const routeName = routeFromHash();
+  renderAppRoute(routeName, false);
+  refreshRouteData(routeName);
+});
+
+window.addEventListener("taroai:route-changed", () => {
   renderAppRoute(routeFromHash(), false);
 });
 
@@ -4090,41 +4642,29 @@ elements.routeSurface.addEventListener("click", (event) => {
   }
 });
 
-elements.agentRunButtons.forEach((button) => {
-  button.addEventListener("click", () => {
-    prefillAgentRun(button.dataset.agentName || "selected");
+elements.agentCardRail.addEventListener("click", (event) => {
+  const button = event.target?.closest?.("[data-open-agent-library]");
+  if (!button) return;
+  const agentId = button.dataset.openAgentLibrary;
+  if (agentId) window.location.hash = `agents/${encodeURIComponent(agentId)}`;
+  else renderAppRoute("agents", true);
+});
+
+if (elements.agentRailNext) {
+  elements.agentRailNext.addEventListener("click", () => {
+    elements.agentCardRail.scrollBy({ left: 344, behavior: "smooth" });
   });
-});
+}
 
-elements.agentCarouselNext.addEventListener("click", () => {
-  const firstCard = elements.agentCardRail.firstElementChild;
-  if (firstCard) {
-    elements.agentCardRail.append(firstCard);
-  }
-});
-
-elements.createAgent.addEventListener("click", () => {
-  renderAppRoute("agents", true);
-});
-
-elements.createAgentPrompt.addEventListener("click", () => {
-  renderAppRoute("agents", true);
-});
+if (elements.agentUpdates) {
+  elements.agentUpdates.addEventListener("click", () => {
+    renderAppRoute("feed", true);
+    markNotificationsRead();
+  });
+}
 
 elements.exploreAgents.addEventListener("click", () => {
-  renderAppRoute("discover", true);
-});
-
-elements.modelSelectorButton.addEventListener("click", () => {
-  const next = state.activePopover === "model" ? null : "model";
-  setActivePopover(next, elements.modelSelectorButton);
-});
-
-elements.modelOptions.forEach((button) => {
-  button.addEventListener("click", () => {
-    setSelectedModel(button.dataset.modelOption);
-    closeActivePopover(true);
-  });
+  renderAppRoute("agents", true);
 });
 
 elements.composerAddButton.addEventListener("click", () => {
@@ -4188,9 +4728,60 @@ elements.operationsOpeners.forEach((button) => {
 });
 elements.operationsClose.addEventListener("click", () => setOperationsOpen(false));
 elements.sidebarCollapse.addEventListener("click", () => {
-  setSidebarCollapsed(!state.sidebarCollapsed);
+  if (window.matchMedia("(max-width: 720px)").matches) {
+    setMobileNavOpen(false);
+    elements.mobileNavToggle?.focus();
+  } else {
+    setSidebarCollapsed(!state.sidebarCollapsed);
+  }
+});
+elements.mobileNavToggle?.addEventListener("click", () => setMobileNavOpen(!state.mobileNavOpen));
+window.matchMedia("(max-width: 720px)").addEventListener("change", (event) => {
+  if (!event.matches && state.mobileNavOpen) setMobileNavOpen(false);
 });
 elements.newChat.addEventListener("click", () => startNewChat());
+
+document.addEventListener("click", (event) => {
+  if (!state.mobileNavOpen || event.target?.closest?.("[data-mobile-nav-toggle]")) return;
+  const insideSidebar = event.target?.closest?.("#app-sidebar");
+  const navigated = event.target?.closest?.("[data-thread-id], [data-app-route]");
+  if (!insideSidebar || navigated) {
+    setMobileNavOpen(false);
+    window.requestAnimationFrame(() => elements.mobileNavToggle?.focus());
+  }
+}, true);
+
+document.addEventListener("click", (event) => {
+  if (event.target?.closest?.("[data-auth-dialog-open]")) openAuthDialog();
+});
+elements.authForm.addEventListener("input", () => {
+  elements.signupName.removeAttribute("aria-invalid");
+  elements.loginEmail.removeAttribute("aria-invalid");
+  elements.loginPassword.removeAttribute("aria-invalid");
+  if (!state.accessToken) elements.authStatus.textContent = "";
+  syncLoginButton();
+});
+elements.authDialogClose.addEventListener("click", () => elements.authDialog.close());
+elements.passwordToggle.addEventListener("click", () => {
+  const visible = elements.loginPassword.type === "text";
+  elements.loginPassword.type = visible ? "password" : "text";
+  elements.passwordToggle.setAttribute("aria-label", visible ? "Show password" : "Hide password");
+});
+elements.authModeToggle.addEventListener("click", () => {
+  state.authMode = state.authMode === "register" ? "login" : "register";
+  elements.signupName.removeAttribute("aria-invalid");
+  elements.loginEmail.removeAttribute("aria-invalid");
+  elements.loginPassword.removeAttribute("aria-invalid");
+  elements.loginPassword.value = "";
+  renderAuth();
+  (state.authMode === "register" ? elements.signupName : elements.loginEmail).focus();
+});
+elements.authForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (state.authMode === "invite") return acceptInvitation();
+  if (state.authMode === "register") registerAccount();
+  else login();
+});
 
 document.addEventListener("click", (event) => {
   if (!state.activePopover) {
@@ -4211,6 +4802,11 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && state.activePopover) {
     event.preventDefault();
     closeActivePopover(true);
+  }
+  if (event.key === "Escape" && state.mobileNavOpen) {
+    event.preventDefault();
+    setMobileNavOpen(false);
+    elements.mobileNavToggle?.focus();
   }
 });
 
@@ -4340,7 +4936,6 @@ elements.runFeedbackNegative.addEventListener("click", () => {
 elements.approve.addEventListener("click", () => approveRun());
 elements.reject.addEventListener("click", () => rejectRun());
 elements.bootstrapLoginButton.addEventListener("click", () => bootstrapTenant());
-elements.loginButton.addEventListener("click", () => login());
 elements.logoutButton.addEventListener("click", () => logout());
 elements.artifacts.addEventListener("click", (event) => {
   const target = event.target;
@@ -4367,13 +4962,26 @@ elements.browserScreenshot.addEventListener("click", (event) => {
   downloadBrowserCapture(storageObjectId);
 });
 
-initializeControls();
-fitComposer();
-createChatController();
-createSkillsUI();
-createAgentsUI();
-createArtifactsUI();
-createSpeechUI();
-createAgentBrainUI();
-createFilesUI();
-createEvaluationsUI();
+async function startApp() {
+  initializeControls();
+  fitComposer();
+  await syncStoredSession();
+  createChatController();
+  createSkillsUI();
+  createAgentsUI();
+  createArtifactsUI();
+  createSpeechUI();
+  createAgentBrainUI();
+  createFilesUI();
+  createEvaluationsUI();
+  createWorkspaceUI();
+  if (state.accessToken) {
+    await Promise.all([loadHomepageAgents(), loadNotifications()]);
+    startNotificationPolling();
+    refreshRouteData(state.appRoute);
+  } else {
+    openAuthDialog();
+  }
+}
+
+startApp();

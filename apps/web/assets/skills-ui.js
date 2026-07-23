@@ -1,10 +1,14 @@
-import { chatApi } from "./chat-api.js";
-import { chatState } from "./chat-controller.js";
+import { chatApi } from "./chat-api.js?v=20260722-flow115";
+import { chatState } from "./chat-controller.js?v=20260722-flow115";
 
 function items(value, ...keys) {
   if (Array.isArray(value)) return value;
   for (const key of keys) if (Array.isArray(value?.[key])) return value[key];
   return Array.isArray(value?.items) ? value.items : [];
+}
+
+function packageVersion(record) {
+  return record?.package?.version || record?.package?.manifest?.version || null;
 }
 
 function fileBase64(file) {
@@ -52,6 +56,7 @@ export class SkillsUI {
     this.mode = "rendered";
     this.filter = "all";
     this.search = "";
+    this.installedSkillIds = new Set();
     this.boundRoute = () => this.route();
   }
 
@@ -104,13 +109,17 @@ export class SkillsUI {
   async load() {
     try {
       const workspace = encodeURIComponent(this.api.settings().workspaceId);
-      const [installed, catalog] = await Promise.allSettled([
+      const [installed, catalog, store] = await Promise.allSettled([
         this.api.get(`/api/workspaces/${workspace}/skills`),
         this.api.get(`/api/skills?workspace_id=${workspace}`),
+        this.api.get("/api/store/items?kind=solution_pack"),
       ]);
+      const installedItems = installed.status === "fulfilled" ? items(installed.value, "skills", "installations") : [];
+      this.installedSkillIds = new Set(installedItems.map((item) => item.skill_id || item.id).filter(Boolean));
       const all = [
-        ...(installed.status === "fulfilled" ? items(installed.value, "skills", "installations").map((item) => ({ ...item, __installed: true })) : []),
+        ...installedItems.map((item) => ({ ...item, __installed: true })),
         ...(catalog.status === "fulfilled" ? items(catalog.value, "skills", "catalog").map((item) => ({ ...item, __catalog: true })) : []),
+        ...(store.status === "fulfilled" ? items(store.value).map((item) => ({ ...item, __store: true, origin: "builtin" })) : []),
       ];
       const byId = new Map();
       for (const raw of all) {
@@ -183,12 +192,22 @@ export class SkillsUI {
     this.renderList();
     this.renderDetail(true);
     if (!this.selected) return;
+    if (this.selected.__store) {
+      try {
+        const detail = await this.api.get(`/api/store/items/${encodeURIComponent(id)}`);
+        this.selected = { ...this.selected, ...detail, __store: true, origin: "builtin" };
+      } catch (error) {
+        this.toast(error.message, "error");
+      }
+      this.renderDetail();
+      return;
+    }
     let version = this.selected.installed_version || this.selected.version || this.selected.manifest?.version || null;
     try {
       const packages = items(await this.api.get(`/api/skills/${encodeURIComponent(id)}/packages`), "packages");
       this.packages = packages;
-      this.packageRecord = packages.find((item) => item.package?.version === version) || packages[packages.length - 1] || null;
-      version = this.packageRecord?.package?.version || version;
+      this.packageRecord = packages.find((item) => packageVersion(item) === version) || packages[packages.length - 1] || null;
+      version = packageVersion(this.packageRecord) || version;
       if (!version) throw new Error("No package version is available");
       const payload = await this.api.get(`/api/skills/${encodeURIComponent(id)}/packages/${encodeURIComponent(version)}/files`);
       this.files = items(payload, "files", "entries");
@@ -207,7 +226,7 @@ export class SkillsUI {
 
   async loadFile(path) {
     if (!this.selected || !path) return;
-    const version = this.packageRecord?.package?.version || this.selected.installed_version || this.selected.manifest?.version;
+    const version = packageVersion(this.packageRecord) || this.selected.installed_version || this.selected.manifest?.version;
     if (!version) return;
     const payload = await this.api.get(`/api/skills/${encodeURIComponent(this.selected.id)}/packages/${encodeURIComponent(version)}/files/${path.split("/").map(encodeURIComponent).join("/")}`);
     const existing = this.files.find((file) => (file.path || file.name) === path);
@@ -224,9 +243,13 @@ export class SkillsUI {
       return;
     }
     const skill = this.selected;
+    if (skill.__store) {
+      this.renderStoreDetail(detail, loading);
+      return;
+    }
     const installed = Boolean(skill.installed);
     const enabled = installed && skill.enabled !== false && skill.status !== "disabled";
-    const version = this.packageRecord?.package?.version || skill.installed_version || skill.version || skill.manifest?.version || "1.0.0";
+    const version = packageVersion(this.packageRecord) || skill.installed_version || skill.version || skill.manifest?.version || "1.0.0";
     const packageStatus = this.packageRecord?.status || skill.status || "draft";
     const latestEvaluation = this.evaluations[this.evaluations.length - 1] || null;
     const canInstall = packageStatus === "published";
@@ -243,13 +266,46 @@ export class SkillsUI {
         <aside class="skill-file-tree" data-skill-files>${loading ? "<span>Loading package…</span>" : ""}</aside>
         <div class="skill-source-panel"><header><strong data-skill-file-title>SKILL.md</strong><div><button data-skill-source-mode="rendered" class="is-active">Rendered</button><button data-skill-source-mode="raw">Raw</button></div></header><div data-skill-source></div></div>
       </section>
-      <section data-skill-view-panel="versions" hidden><div class="skill-version-actions"><button data-skill-upgrade ${installed ? "" : "disabled"}>Upgrade</button><button data-skill-rollback ${installed ? "" : "disabled"}>Rollback</button></div><div class="skill-version-workbench"><aside data-skill-version-list></aside><article><form data-skill-version-compare><label><span>Compare from</span><select name="from_version"></select></label><label><span>To</span><select name="to_version"></select></label><button type="submit">Compare versions</button></form><div data-skill-version-diff><div class="route-note">Select two package versions to inspect file, permission, dependency, and source changes.</div></div></article></div></section>
       <section data-skill-view-panel="evaluation" hidden><div class="evaluation-summary"><strong>${latestEvaluation?.status || "Evaluation not run"}</strong><p>${latestEvaluation ? `Score ${latestEvaluation.score ?? "—"} · ${latestEvaluation.id}` : "Run the package evaluation suite before promotion."}</p><button data-skill-evaluate>Run evaluation</button>${packageStatus === "draft" ? `<button data-skill-publish ${latestEvaluation?.passed ? "" : "disabled"}>Publish evaluated version</button>` : ""}</div></section>`;
     detail.querySelector("h2").textContent = skill.name;
     detail.querySelector(".capability-detail-header p").textContent = skill.description || "Reusable execution guidance for this workspace.";
     if (!loading) {
       this.renderFiles();
       this.renderVersions();
+    }
+  }
+
+  renderStoreDetail(detail, loading = false) {
+    const item = this.selected;
+    const packages = item.packages || [];
+    const installed = packages.length > 0 && packages.every((pkg) => this.installedSkillIds.has(pkg.skill_id));
+    detail.innerHTML = `
+      <header class="capability-detail-header">
+        <div><span class="capability-glyph large">S</span><div><small>Built-in · ${item.publisher || "Taroai"}</small><h2></h2><p></p></div></div>
+        <div><button type="button" class="primary" data-skill-install ${installed || loading ? "disabled" : ""}>${installed ? "Installed" : loading ? "Loading…" : "Install pack"}</button></div>
+      </header>
+      <div class="skill-evidence-strip">
+        <div><small>Version</small><strong>v${item.version || "1.0.0"}</strong></div><div><small>Skills</small><strong>${item.skill_count ?? packages.length}</strong></div><div><small>Risk</small><strong>${item.risk_level || "low"}</strong></div><div><small>License</small><strong>${item.license || "—"}</strong></div>
+      </div>
+      <section class="store-pack-detail">
+        <div class="route-note"><strong>Verified built-in package</strong><p>Installed from immutable Taroai resources with an exact package digest. No external credentials are required.</p></div>
+        <div class="store-package-list" data-store-package-list></div>
+      </section>`;
+    detail.querySelector("h2").textContent = item.name;
+    detail.querySelector(".capability-detail-header p").textContent = item.description || "Reusable built-in workspace capability.";
+    const list = detail.querySelector("[data-store-package-list]");
+    for (const pkg of packages) {
+      const row = document.createElement("article");
+      const copy = document.createElement("div");
+      const title = document.createElement("strong");
+      title.textContent = pkg.skill_id;
+      const meta = document.createElement("small");
+      meta.textContent = `v${pkg.version} · ${pkg.risk_level || "low"} risk`;
+      copy.append(title, meta);
+      const status = document.createElement("span");
+      status.textContent = this.installedSkillIds.has(pkg.skill_id) ? "Installed" : "Included";
+      row.append(copy, status);
+      list.append(row);
     }
   }
 
@@ -260,29 +316,31 @@ export class SkillsUI {
     list.replaceChildren();
     for (const record of this.packages) {
       const pkg = record.package || {};
+      const version = packageVersion(record);
       const card = document.createElement("button");
       card.type = "button";
-      card.dataset.skillVersionOpen = pkg.version;
+      card.dataset.skillVersionOpen = version;
       card.className = "skill-version-card";
-      card.classList.toggle("is-active", pkg.version === this.packageRecord?.package?.version);
+      card.classList.toggle("is-active", version === packageVersion(this.packageRecord));
       card.innerHTML = `<span><strong></strong><small></small></span><em></em>`;
-      card.querySelector("strong").textContent = `v${pkg.version}`;
+      card.querySelector("strong").textContent = `v${version}`;
       card.querySelector("small").textContent = `${pkg.files?.length || 0} files · ${(pkg.package_digest || "").slice(0, 10)}`;
       card.querySelector("em").textContent = record.status || "draft";
       list.append(card);
     }
     for (const select of form.querySelectorAll("select")) select.replaceChildren();
     for (const record of this.packages) {
+      const version = packageVersion(record);
       for (const select of form.querySelectorAll("select")) {
         const option = document.createElement("option");
-        option.value = record.package.version;
-        option.textContent = `v${record.package.version} · ${record.status}`;
+        option.value = version;
+        option.textContent = `v${version} · ${record.status}`;
         select.append(option);
       }
     }
-    const current = this.packageRecord?.package?.version;
-    form.elements.to_version.value = current || this.packages.at(-1)?.package?.version || "";
-    form.elements.from_version.value = this.packages.find((item) => item.package.version !== form.elements.to_version.value)?.package?.version || form.elements.to_version.value;
+    const current = packageVersion(this.packageRecord);
+    form.elements.to_version.value = current || packageVersion(this.packages.at(-1)) || "";
+    form.elements.from_version.value = packageVersion(this.packages.find((item) => packageVersion(item) !== form.elements.to_version.value)) || form.elements.to_version.value;
     form.addEventListener("submit", (event) => { event.preventDefault(); this.compareVersions(new FormData(form)); });
     if (this.versionDiff) this.renderVersionDiff();
   }
@@ -417,11 +475,24 @@ export class SkillsUI {
   }
 
   async install() {
-    if (!this.selected || !this.packageRecord) return;
+    if (!this.selected) return;
+    if (this.selected.__store) {
+      try {
+        await this.api.post(
+          `/api/store/items/${encodeURIComponent(this.selected.id)}/install`,
+          { workspace_id: this.api.settings().workspaceId, expected_digest: this.selected.digest },
+          { scope: "store-install" },
+        );
+        this.toast("Built-in pack installed", "success");
+        await this.load();
+      } catch (error) { this.toast(error.message, "error"); }
+      return;
+    }
+    if (!this.packageRecord) return;
     const workspace = encodeURIComponent(this.api.settings().workspaceId);
     const pkg = this.packageRecord.package;
     try {
-      await this.api.post(`/api/workspaces/${workspace}/skills/${encodeURIComponent(this.selected.id)}/install`, { version: pkg.version, package_digest: pkg.package_digest }, { scope: "skill-install" });
+      await this.api.post(`/api/workspaces/${workspace}/skills/${encodeURIComponent(this.selected.id)}/install`, { version: packageVersion(this.packageRecord), package_digest: pkg.package_digest }, { scope: "skill-install" });
       this.toast("Skill installed in this workspace", "success");
       await this.load();
     } catch (error) { this.toast(error.message, "error"); }
@@ -429,7 +500,7 @@ export class SkillsUI {
 
   async evaluate() {
     if (!this.selected || !this.packageRecord) return;
-    const version = this.packageRecord.package.version;
+    const version = packageVersion(this.packageRecord);
     try {
       const result = await this.api.post(`/api/skills/${encodeURIComponent(this.selected.id)}/packages/${encodeURIComponent(version)}/evaluate`, { workspace_id: this.api.settings().workspaceId }, { scope: "skill-evaluate" });
       this.evaluations.push(result);
@@ -443,7 +514,7 @@ export class SkillsUI {
     if (!this.selected || !this.packageRecord) return;
     const evaluation = [...this.evaluations].reverse().find((item) => item.passed);
     if (!evaluation) return this.toast("A passing evaluation is required before publish", "error");
-    const version = this.packageRecord.package.version;
+    const version = packageVersion(this.packageRecord);
     try {
       this.packageRecord = await this.api.post(`/api/skills/${encodeURIComponent(this.selected.id)}/packages/${encodeURIComponent(version)}/publish`, { evaluation_run_id: evaluation.id }, { scope: "skill-publish" });
       this.toast("Skill version published", "success");
@@ -455,9 +526,9 @@ export class SkillsUI {
     if (!this.selected || !this.selected.installed_version) return;
     try {
       const packages = items(await this.api.get(`/api/skills/${encodeURIComponent(this.selected.id)}/packages`), "packages")
-        .filter((item) => item.status === "published" && item.package?.version !== this.selected.installed_version);
+        .filter((item) => item.status === "published" && packageVersion(item) !== this.selected.installed_version);
       if (!packages.length) throw new Error("No other published version is available");
-      const suggested = packages[packages.length - 1].package.version;
+      const suggested = packageVersion(packages[packages.length - 1]);
       const target = window.prompt(`${operation === "upgrade" ? "Upgrade" : "Rollback"} to version`, suggested);
       if (!target) return;
       await this.api.post(`/api/workspaces/${encodeURIComponent(this.api.settings().workspaceId)}/skills/${encodeURIComponent(this.selected.id)}/${operation}`, { target_version: target, expected_package_digest: this.selected.package_digest || null }, { scope: `skill-${operation}` });
@@ -468,7 +539,7 @@ export class SkillsUI {
 
   async openVersion(version) {
     if (!this.selected) return;
-    const record = this.packages.find((item) => item.package?.version === version);
+    const record = this.packages.find((item) => packageVersion(item) === version);
     if (!record) return;
     this.packageRecord = record;
     this.versionDiff = null;

@@ -14,6 +14,7 @@ from taroai.knowledge.models import (
 from taroai.knowledge.ingestion import chunk_text_content
 from taroai.knowledge.service import InMemoryKnowledgeService
 from taroai.knowledge.repository import SqlKnowledgeService
+from taroai.knowledge.retrieval import cosine_similarity, retrieval_terms, term_relevance
 
 __all__ = [
     "DocumentChunk",
@@ -29,5 +30,8 @@ __all__ = [
     "KnowledgeTenantDeletionResult",
     "RetrievalRequest",
     "RetrievalResult",
+    "cosine_similarity",
+    "retrieval_terms",
     "SqlKnowledgeService",
+    "term_relevance",
 ]

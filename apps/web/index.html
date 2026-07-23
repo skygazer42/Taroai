@@ -8,13 +8,15 @@
       content="Taroai workspace for governed agent runs, approvals, terminal output, and artifacts."
     />
     <title>Taroai Workspace</title>
-    <link rel="stylesheet" href="./assets/styles.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2316181a'/%3E%3Ctext x='32' y='43' text-anchor='middle' font-size='36' fill='white'%3ET%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="./assets/styles.css?v=20260722-flow115" />
   </head>
   <body>
     <div class="workspace-shell" data-app="taroai-workspace" data-chat-state="empty">
       <a class="skip-link" href="#main-content">Skip to main content</a>
 
       <aside
+        id="app-sidebar"
         class="app-sidebar"
         data-testid="app-sidebar"
         aria-label="Main navigation"
@@ -46,8 +48,8 @@
           <a class="sidebar-item" href="#discover" data-app-route="discover"><span class="nav-icon" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"></circle><path d="m14.5 9.5-1.6 3.4-3.4 1.6 1.6-3.4z"></path></svg></span><span>Discover</span></a>
           <a class="sidebar-item" href="#feed" data-app-route="feed"><span class="nav-icon" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24"><rect x="5" y="4" width="14" height="16" rx="2"></rect><path d="M8 8h8M8 12h8M8 16h5"></path></svg></span><span>Feed</span></a>
           <a class="sidebar-item" href="#agents" data-app-route="agents"><span class="nav-icon" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="7"></circle><path d="M12 8v8M8 12h8"></path></svg></span><span>Agents</span></a>
-          <a class="sidebar-item" href="#skills" data-app-route="skills"><span class="nav-icon" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24"><path d="M7 5h10v4H7zM5 11h14v8H5z"></path><path d="M9 15h6"></path></svg></span><span>Skills</span></a>
-          <a class="sidebar-item" href="#evaluations" data-app-route="evaluations"><span class="nav-icon" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24"><path d="M5 12l4 4L19 6"></path><path d="M5 20h14"></path></svg></span><span>Evaluations</span></a>
+          <a class="sidebar-item" href="#skills" data-app-route="skills" hidden><span class="nav-icon" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24"><path d="M7 5h10v4H7zM5 11h14v8H5z"></path><path d="M9 15h6"></path></svg></span><span>Skills</span></a>
+          <a class="sidebar-item" href="#evaluations" data-app-route="evaluations" hidden><span class="nav-icon" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24"><path d="M5 12l4 4L19 6"></path><path d="M5 20h14"></path></svg></span><span>Evaluations</span></a>
           <a class="sidebar-item" href="#workspaces" data-app-route="workspaces"><span class="nav-icon" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24"><path d="m13 3-7 10h6l-1 8 7-11h-6z"></path></svg></span><span>Workspaces</span></a>
           <a class="sidebar-item" href="#files" data-app-route="files"><span class="nav-icon" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24"><path d="M4 9h16l-1.5 9h-13zM7 9l1.5-3h7L17 9"></path></svg></span><span>Files</span></a>
           <button class="sidebar-item" type="button" data-app-route="brain">
@@ -57,37 +59,42 @@
           </button>
         </nav>
 
-        <section class="sidebar-recents thread-recents" data-testid="run-history" aria-label="Chat threads">
+        <section class="sidebar-recents thread-recents" data-testid="thread-history" aria-label="Chat threads">
           <div class="sidebar-section-heading">
-            <h2>Threads</h2>
-            <button class="icon-button" data-run-history-refresh data-thread-refresh type="button" title="Refresh threads" aria-label="Refresh threads">↻</button>
+            <h2>Recents</h2>
+            <button class="icon-button" data-thread-refresh type="button" title="Refresh threads" aria-label="Refresh threads">↻</button>
           </div>
-          <label class="thread-search" aria-label="Search threads">
+          <label class="thread-search" aria-label="Search threads" hidden>
             <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5"></circle><path d="m15 15 4 4"></path></svg>
             <input type="search" data-thread-search placeholder="Search threads" autocomplete="off" />
           </label>
-          <div class="run-history-status visually-hidden" data-run-history-status>No runs loaded</div>
-          <ul class="run-history-list thread-list" data-run-history-list data-thread-list><li>No threads yet.</li></ul>
+          <div class="visually-hidden" data-thread-status>No threads loaded</div>
+          <ul class="run-history-list thread-list" data-thread-list><li>No threads yet.</li></ul>
         </section>
 
         <footer class="sidebar-footer">
-          <button class="sidebar-rewards" type="button" data-app-route="rewards">
-            <span class="reward-icon" aria-hidden="true">♧</span>
-            <span><strong>Rewards</strong><small>Refer friends, earn credits</small></span>
-            <span aria-hidden="true">›</span>
-          </button>
           <div class="sidebar-account-row">
-            <button class="sidebar-account" type="button" aria-label="User menu">
-              <span class="account-avatar" aria-hidden="true">O</span>
-              <span><strong>owner@example.com</strong><small>Free</small></span>
+            <button class="sidebar-account" type="button" aria-label="Account" aria-haspopup="dialog" data-auth-dialog-open>
+              <span class="account-avatar" data-account-avatar aria-hidden="true">→</span>
+              <span><strong data-account-name>Sign in</strong><small data-account-meta>Connect your workspace</small></span>
             </button>
-            <button class="icon-button sidebar-ops-launch" type="button" aria-label="Open Operations" data-open-operations>⌘</button>
+            <button class="icon-button sidebar-ops-launch" type="button" aria-label="Open developer operations" data-open-operations data-developer-only hidden>⌘</button>
           </div>
         </footer>
       </aside>
 
       <main id="main-content" class="chat-column" data-testid="chat-column" aria-label="Agent chat">
         <header class="chat-topbar">
+          <button
+            class="topbar-action mobile-nav-toggle"
+            type="button"
+            data-mobile-nav-toggle
+            aria-label="Open navigation"
+            aria-controls="app-sidebar"
+            aria-expanded="false"
+          >
+            <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M5 12h14M5 17h14"></path></svg>
+          </button>
           <div class="model-selector">
             <button
               id="model-selector-button"
@@ -98,78 +105,29 @@
               aria-expanded="false"
             >
               <span class="model-spark" aria-hidden="true">✹</span>
-              <span data-selected-model>Claude Sonnet 5</span>
+              <span data-selected-model>Choose model</span>
               <span aria-hidden="true">⌄</span>
             </button>
             <div id="model-selector-menu" class="composer-popover model-menu" role="menu" aria-label="Choose a model" hidden>
-              <p class="menu-group-label">Anthropic</p>
-              <button class="model-option" type="button" role="menuitem" disabled aria-disabled="true">
-                <span class="model-mark" aria-hidden="true">✹</span>
-                <span><strong>Claude Fable 5</strong><small>Requires paid plan</small></span>
-                <span aria-hidden="true">ⓘ</span>
-              </button>
-              <button class="model-option is-selected" type="button" role="menuitemradio" aria-checked="true" data-model-option="Claude Sonnet 5">
-                <span class="model-mark" aria-hidden="true">✹</span>
-                <span><strong>Claude Sonnet 5 <em>NEW</em></strong><small>Everyday coding, agents, and professional work.</small></span>
-                <span class="effort-chip">Low ›</span><span aria-hidden="true">✓</span>
-              </button>
-              <button class="model-option" type="button" role="menuitem" disabled aria-disabled="true">
-                <span class="model-mark" aria-hidden="true">✹</span>
-                <span><strong>Claude Opus 4.8</strong><small>Requires paid plan</small></span>
-                <span aria-hidden="true">ⓘ</span>
-              </button>
-              <button class="model-option" type="button" role="menuitemradio" aria-checked="false" data-model-option="Claude Haiku 4.5">
-                <span class="model-mark" aria-hidden="true">✹</span>
-                <span><strong>Claude Haiku 4.5</strong><small>Quick replies and light tasks.</small></span>
-                <span class="effort-chip">Low ›</span>
-              </button>
-              <button class="model-version-row" type="button" role="menuitem"><span aria-hidden="true">›</span> Older versions</button>
-              <div class="menu-separator"></div>
-              <p class="menu-group-label">Google</p>
-              <button class="model-option" type="button" role="menuitemradio" aria-checked="false" data-model-option="Gemini 3.1 Pro">
-                <span class="model-mark" aria-hidden="true">✦</span>
-                <span><strong>Gemini 3.1 Pro</strong><small>Big-picture reasoning over long documents.</small></span><span aria-hidden="true">ⓘ</span>
-              </button>
-              <button class="model-option" type="button" role="menuitemradio" aria-checked="false" data-model-option="Gemini 3.5 Flash">
-                <span class="model-mark" aria-hidden="true">✦</span>
-                <span><strong>Gemini 3.5 Flash <em>NEW</em></strong><small>Fast, high-volume agentic work.</small></span><span aria-hidden="true">ⓘ</span>
-              </button>
-              <div class="menu-separator"></div>
-              <p class="menu-group-label">OpenAI</p>
-              <button class="model-option" type="button" role="menuitemradio" aria-checked="false" data-model-option="GPT-5.6 Sol">
-                <span class="model-mark" aria-hidden="true">◉</span>
-                <span><strong>GPT-5.6 Sol <em>NEW</em></strong><small>Rigorous coding and step-by-step reasoning.</small></span>
-                <span class="effort-chip">Low ›</span>
-              </button>
-              <button class="model-option" type="button" role="menuitemradio" aria-checked="false" data-model-option="GPT-5.6 Terra">
-                <span class="model-mark" aria-hidden="true">◉</span>
-                <span><strong>GPT-5.6 Terra <em>NEW</em></strong><small>Rigorous coding and step-by-step reasoning.</small></span>
-                <span class="effort-chip">Low ›</span>
-              </button>
-              <button class="model-option" type="button" role="menuitemradio" aria-checked="false" data-model-option="GPT-5.6 Luna"><span class="model-mark" aria-hidden="true">◉</span><span><strong>GPT-5.6 Luna <em>NEW</em></strong><small>Rigorous coding and step-by-step reasoning.</small></span><span class="effort-chip">Low ›</span></button>
-              <button class="model-option" type="button" role="menuitemradio" aria-checked="false" data-model-option="GPT-5.5"><span class="model-mark" aria-hidden="true">◉</span><span><strong>GPT-5.5 <em>NEW</em></strong><small>Balanced reasoning and throughput.</small></span><span class="effort-chip">Low ›</span></button>
-              <div class="menu-separator"></div>
-              <p class="menu-group-label">Sakana</p>
-              <button class="model-option" type="button" role="menuitem" disabled aria-disabled="true"><span class="model-mark" aria-hidden="true">S</span><span><strong>Fugu Ultra</strong><small>Requires paid plan</small></span><span aria-hidden="true">ⓘ</span></button>
-              <div class="menu-separator"></div>
-              <p class="menu-group-label">Z.AI</p>
+              <p class="model-menu-empty">Sign in to load available models.</p>
             </div>
           </div>
 
           <div class="chat-topbar-actions">
-            <span class="status-pill thread-presence" data-status-pill data-thread-presence>Ready</span>
-            <button class="topbar-action" type="button" data-open-queue aria-expanded="false">Queue <span data-queue-count>0</span></button>
-            <button class="topbar-action" type="button" data-open-artifacts>Artifacts</button>
-            <button class="topbar-action" type="button" data-open-code>Code</button>
-            <button class="topbar-pill" type="button" data-open-operations>Operations</button>
-            <button class="topbar-action" type="button" data-open-files-dialog>Files</button>
-            <button class="topbar-action" type="button" data-thread-share>Share</button>
-            <button class="topbar-action thread-more" type="button" data-thread-more aria-label="Thread actions" aria-expanded="false">•••</button>
-            <div class="thread-actions-menu" data-thread-actions-menu hidden>
-              <button type="button" data-thread-rename>Rename</button>
-              <button type="button" data-thread-pin>Pin thread</button>
-              <button type="button" data-thread-archive>Archive</button>
-              <button type="button" data-thread-delete>Delete</button>
+            <span class="visually-hidden" data-status-pill data-thread-presence aria-live="polite">Ready</span>
+            <button class="topbar-pill" type="button" data-open-operations data-developer-only hidden>Operations</button>
+            <button class="topbar-action thread-more" type="button" data-thread-more aria-label="Thread actions" aria-haspopup="menu" aria-controls="thread-actions-menu" aria-expanded="false">•••</button>
+            <div id="thread-actions-menu" class="thread-actions-menu" data-thread-actions-menu role="menu" hidden>
+              <button type="button" role="menuitem" data-thread-share>Share</button>
+              <button type="button" role="menuitem" data-thread-create-agent>Create agent</button>
+              <button type="button" role="menuitem" data-open-artifacts>Artifacts</button>
+              <button type="button" role="menuitem" data-open-code>Code</button>
+              <button type="button" role="menuitem" data-open-queue>Queue <span data-queue-count>0</span></button>
+              <div class="menu-separator" role="separator"></div>
+              <button type="button" role="menuitem" data-thread-rename>Rename</button>
+              <button type="button" role="menuitem" data-thread-pin>Pin thread</button>
+              <button type="button" role="menuitem" data-thread-archive>Archive</button>
+              <button type="button" role="menuitem" data-thread-delete>Delete</button>
             </div>
           </div>
         </header>
@@ -190,7 +148,13 @@
         </section>
 
         <div class="chat-scroll-region">
-          <section class="chat-empty-state" data-testid="chat-empty-state"><h1>How can I help, luke?</h1></section>
+          <section class="chat-empty-state" data-testid="chat-empty-state">
+            <h1 data-hero-greeting>How can I help?</h1>
+            <button class="agent-updates-pill" type="button" data-agent-updates hidden>
+              <span class="agent-updates-art" aria-hidden="true">✹</span>
+              <span data-agent-updates-label>Updates from your agents</span>
+            </button>
+          </section>
           <div class="conversation" data-testid="conversation-log" data-thread-conversation aria-live="polite">
             <article class="message message-agent"><p>Start a governed run. I will stream timeline events, terminal output, approvals, and artifacts from the Taroai backend.</p></article>
             <div class="quick-row" aria-label="Suggested follow-ups">
@@ -206,7 +170,7 @@
             <div class="composer-resource-row" data-resource-chips aria-live="polite"></div>
             <div class="composer-upload-row" data-upload-list aria-live="polite"></div>
             <div class="composer-row">
-              <textarea id="composer-input" rows="1" placeholder="Ask anything... Type @ to mention skills or connectors, or / for commands" aria-label="Message"></textarea>
+              <textarea id="composer-input" rows="1" placeholder="Ask anything..." aria-label="Message"></textarea>
               <div class="mention-menu" data-mention-menu role="listbox" aria-label="Mention a workspace resource" hidden>
                 <div class="mention-menu-header"><span>Reference</span><small>Skills, connectors, agents, knowledge</small></div>
                 <div data-mention-results></div>
@@ -217,52 +181,47 @@
                 <button id="composer-add-button" class="composer-icon-button" type="button" aria-label="Add files, create media, and more" aria-haspopup="menu" aria-controls="composer-add-menu" aria-expanded="false"><span aria-hidden="true">+</span></button>
                 <input id="composer-file-input" type="file" multiple hidden />
                 <div data-attachment-chips class="attachment-chips" aria-live="polite"></div>
-                <button class="delivery-mode-button" type="button" data-delivery-mode value="queue" aria-label="Send behavior">Queue automatic</button>
               </div>
               <div class="composer-action-group">
                 <button class="composer-icon-button" type="button" aria-label="Voice input" data-voice-input title="Start voice input">
                   <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="12" rx="3"></rect><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3"></path></svg>
                 </button>
-                <button class="stop-button" type="button" data-thread-stop hidden aria-label="Stop agent"><span aria-hidden="true"></span> Stop</button>
+                <button class="stop-button" type="button" data-thread-stop hidden aria-label="Stop response"><span aria-hidden="true"></span> Stop</button>
                 <button id="send-button" class="send-button" type="button" aria-label="Send message" disabled>
                   <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M6.5 10.5 12 5l5.5 5.5"></path></svg>
                 </button>
               </div>
+              <span class="visually-hidden">Press Enter to send, Shift+Enter for a new line.</span>
+              <span class="visually-hidden" data-chat-network-state role="status" aria-live="polite">Ready</span>
             </div>
             <div id="composer-add-menu" class="composer-popover add-menu" role="menu" aria-label="Add content" hidden>
               <button type="button" role="menuitem" data-add-command="files"><span aria-hidden="true">⌕</span>Add files or photos</button>
               <button type="button" role="menuitem" data-add-command="drive"><span aria-hidden="true">△</span>Add from Google Drive</button>
-              <div class="menu-separator"></div>
-              <button type="button" role="menuitem" data-add-command="image"><span aria-hidden="true">▧</span>Create image</button>
-              <button type="button" role="menuitem" data-add-command="video"><span aria-hidden="true">▥</span>Create video</button>
-              <button type="button" role="menuitem" data-add-command="voice"><span aria-hidden="true">≋</span>Create voice</button>
-              <div class="menu-separator"></div>
+              <div class="menu-separator" data-media-create-separator hidden></div>
+              <button type="button" role="menuitem" data-add-command="image" hidden><span aria-hidden="true">▧</span>Create image</button>
+              <button type="button" role="menuitem" data-add-command="video" hidden><span aria-hidden="true">▥</span>Create video</button>
+              <button type="button" role="menuitem" data-add-command="voice" hidden><span aria-hidden="true">≋</span>Create voice</button>
+              <div class="menu-separator" data-workflow-create-separator></div>
               <button type="button" role="menuitem" data-add-command="connectors"><span aria-hidden="true">⌁</span>Add connectors</button>
-              <button type="button" role="menuitem" data-add-command="browser"><span aria-hidden="true">◎</span>Browser use <span aria-hidden="true">›</span></button>
+              <button type="button" role="menuitem" data-add-command="browser" aria-haspopup="menu" aria-controls="composer-browser-menu" aria-expanded="false" hidden><span aria-hidden="true">◎</span>Browser use <span aria-hidden="true">›</span></button>
+              <div id="composer-browser-menu" class="composer-popover browser-profile-menu" role="menu" aria-label="Browser profile" hidden></div>
               <div class="menu-separator"></div>
+              <button type="button" role="menuitem" data-add-command="agent"><span aria-hidden="true">✦</span>Agent mode</button>
               <button type="button" role="menuitem" data-add-command="workflow"><span aria-hidden="true">⌘</span>Run a workflow</button>
               <button type="button" role="menuitem" data-add-command="slides"><span aria-hidden="true">▱</span>Create slide deck</button>
             </div>
           </div>
-          <div class="composer-hint">
-            <span class="visually-hidden">Press Enter to send, Shift+Enter for a new line.</span>
-            <span class="composer-network-state" data-chat-network-state>Ready</span>
-            <button type="button" class="create-agent-prompt" data-create-agent-prompt><span aria-hidden="true">⌘</span><span>Go beyond prompts — create an agent and build systems</span></button>
-            <button type="button" class="create-agent-button" data-create-agent><span class="sparkle-icon" aria-hidden="true">✣</span> Create an agent</button>
-          </div>
         </div>
 
-        <section class="popular-agents" aria-label="Homepage agents">
+        <section class="popular-agents" aria-label="Workspace agents">
           <header class="popular-agents-header">
-            <div><h2><span aria-hidden="true">↳</span> Popular agents</h2><p>Ready-made AI workflows — run instantly or schedule to save time on repeat work.</p></div>
+            <div><h2><span aria-hidden="true">↳</span> Workspace agents</h2><p>Reusable workflows connected to this workspace.</p></div>
             <button type="button" data-explore-agents>Explore <span aria-hidden="true">→</span></button>
           </header>
-          <div class="agent-card-rail">
-            <article class="agent-card"><header><span class="agent-card-art" aria-hidden="true">⌁</span><h3>Case Study Writer</h3></header><div class="agent-connectors"><span>Gmail</span><span>Docs</span></div><p>Transforms a customer interview or win report into a polished, SEO-optimized case study.</p><footer><button type="button" data-agent-prompt data-agent-name="Case Study Writer">Run agent</button><span>⌁ 2.0k</span><span>♡ 1.5k</span></footer></article>
-            <article class="agent-card"><header><span class="agent-card-art" aria-hidden="true">◇</span><h3>Product Description Writer</h3></header><div class="agent-connectors"><span>Gmail</span><span>Sheets</span></div><p>Writes SEO-optimized product descriptions for any SKU in your brand voice.</p><footer><button type="button" data-agent-prompt data-agent-name="Product Description Writer">Run agent</button><span>⌁ 1.9k</span><span>♡ 514</span></footer></article>
-            <article class="agent-card"><header><span class="agent-card-art" aria-hidden="true">◫</span><h3>Cash Flow Forecaster</h3></header><div class="agent-connectors"><span>Gmail</span><span>Sheets</span></div><p>Builds a rolling 13-week cash flow forecast from your actuals and commitments.</p><footer><button type="button" data-agent-prompt data-agent-name="Cash Flow Forecaster">Run agent</button><span>⌁ 1.8k</span><span>♡ 1.4k</span></footer></article>
+          <div class="agent-card-rail" data-homepage-agents aria-live="polite">
+            <article class="agent-card homepage-agent-empty"><header><span class="agent-card-art" aria-hidden="true">A</span><h3>Sign in to view agents</h3></header><p>Your workspace agents will appear here.</p><footer><button type="button" data-auth-dialog-open>Sign in</button></footer></article>
           </div>
-          <button class="agent-card-next" type="button" aria-label="Show next agents" data-agent-carousel-next>›</button>
+          <button class="agent-card-next" type="button" data-agent-rail-next aria-label="Scroll to more agents" hidden>›</button>
         </section>
       </main>
 
@@ -272,6 +231,7 @@
         aria-labelledby="artifact-panel-title"
         data-workspace-sidecar
       >
+        <output class="visually-hidden" data-sidecar-state>closed</output>
         <header class="artifact-panel-header">
           <div>
             <span class="panel-kicker">Output</span>
@@ -369,67 +329,6 @@
         </div>
 
         <div class="workbench-view is-active" data-workbench-view="run">
-        <section class="runtime-config" aria-label="Connection">
-          <label>
-            <span>API</span>
-            <input id="api-base" value="http://localhost:8000" autocomplete="off" />
-          </label>
-          <label>
-            <span>Tenant</span>
-            <input id="tenant-id" value="tenant_acme" autocomplete="off" />
-          </label>
-          <label>
-            <span>User</span>
-            <input id="user-id" value="user_luke" autocomplete="off" />
-          </label>
-          <label>
-            <span>Workspace</span>
-            <input id="workspace-id" value="workspace_sales" autocomplete="off" />
-          </label>
-          <label>
-            <span>Slug</span>
-            <input id="tenant-slug" value="acme" autocomplete="off" />
-          </label>
-          <label>
-            <span>Owner</span>
-            <input id="owner-display-name" value="Owner" autocomplete="name" />
-          </label>
-          <label>
-            <span>Email</span>
-            <input id="login-email" value="owner@example.com" autocomplete="username" />
-          </label>
-          <label>
-            <span>Password</span>
-            <input
-              id="login-password"
-              type="password"
-              placeholder="Password"
-              autocomplete="current-password"
-            />
-          </label>
-          <label>
-            <span>Bootstrap</span>
-            <input
-              id="bootstrap-token"
-              type="password"
-              placeholder="Bootstrap token"
-              autocomplete="off"
-            />
-          </label>
-          <div class="auth-actions">
-            <button id="bootstrap-login-button" type="button">Bootstrap</button>
-            <button id="login-button" type="button">Login</button>
-            <button id="logout-button" type="button" disabled>Logout</button>
-            <span data-bootstrap-status>Not bootstrapped</span>
-            <span data-auth-status>No token</span>
-          </div>
-          <div class="readiness-strip" aria-label="Runtime preflight">
-            <span data-readiness-status>Preflight unchecked</span>
-            <span data-readiness-model>Model unchecked</span>
-            <span data-readiness-sandbox>Sandbox unchecked</span>
-          </div>
-        </section>
-
         <section class="panel run-controls" data-testid="run-controls" aria-label="Run controls">
           <div class="panel-header">
             <h2>Run Control</h2>
@@ -568,6 +467,14 @@
         </div>
 
         <div class="workbench-view is-active" data-workbench-view="run">
+        <section class="panel run-history" data-testid="run-history" aria-label="Recent runs">
+          <div class="panel-header">
+            <h2>Recent Runs</h2>
+            <button class="icon-button" data-run-history-refresh type="button" title="Refresh runs" aria-label="Refresh runs">↻</button>
+          </div>
+          <span class="run-history-status" data-run-history-status>No runs loaded</span>
+          <ul class="run-history-list" data-run-history-list><li>No runs.</li></ul>
+        </section>
         <section class="panel" data-testid="run-timeline" aria-label="Run timeline">
           <div class="panel-header">
             <h2>Timeline</h2>
@@ -984,6 +891,69 @@
       </aside>
     </div>
 
+    <dialog id="auth-dialog" class="chat-dialog auth-dialog" aria-labelledby="auth-dialog-title">
+      <div class="auth-dialog-shell">
+        <div class="auth-wordmark" aria-label="Taroai">TAROAI</div>
+        <form class="chat-dialog-card auth-dialog-card" data-auth-form>
+          <button class="auth-close" type="button" aria-label="Close" data-auth-dialog-close hidden>×</button>
+          <header class="auth-welcome">
+            <h2 id="auth-dialog-title">Welcome</h2>
+            <p data-auth-subtitle>Please enter your details to login.</p>
+          </header>
+          <label data-register-only hidden>
+            <span>Name</span>
+            <input id="signup-name" type="text" placeholder="Your name" autocomplete="name" maxlength="120" />
+          </label>
+          <label data-auth-email-field>
+            <span>Email</span>
+            <input id="login-email" type="email" placeholder="username@email.com" autocomplete="username" required />
+          </label>
+          <label>
+            <span>Password</span>
+            <span class="auth-password-field">
+              <input id="login-password" type="password" placeholder="••••••••••••••••••••" autocomplete="current-password" required />
+              <button type="button" aria-label="Show password" data-password-toggle>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12s3.5-5 9.5-5 9.5 5 9.5 5-3.5 5-9.5 5-9.5-5-9.5-5Z"></path><circle cx="12" cy="12" r="2.5"></circle></svg>
+              </button>
+            </span>
+          </label>
+          <label class="auth-remember">
+            <input id="remember-login" type="checkbox" checked />
+            <span>Remember me</span>
+          </label>
+          <span class="auth-status" data-auth-status aria-live="polite"></span>
+          <button id="login-button" class="primary auth-submit" type="submit" disabled>Login</button>
+          <button id="logout-button" class="auth-submit" type="button" hidden>Sign out</button>
+          <p class="auth-switch" data-auth-switch>
+            <span data-auth-switch-prompt>Don't have an account?</span>
+            <button type="button" data-auth-mode-toggle>Register</button>
+          </p>
+        </form>
+        <form class="local-setup-form" data-developer-only hidden>
+          <details class="local-setup">
+            <summary>Local setup</summary>
+            <div class="runtime-config" aria-label="Local connection settings">
+              <label><span>API</span><input id="api-base" value="" autocomplete="off" /></label>
+              <label><span>Tenant</span><input id="tenant-id" value="tenant_acme" autocomplete="off" /></label>
+              <label><span>User</span><input id="user-id" value="user_luke" autocomplete="off" /></label>
+              <label><span>Workspace</span><input id="workspace-id" value="workspace_sales" autocomplete="off" /></label>
+              <label><span>Slug</span><input id="tenant-slug" value="acme" autocomplete="off" /></label>
+              <label><span>Owner</span><input id="owner-display-name" value="Owner" autocomplete="name" /></label>
+              <label class="local-setup-bootstrap"><span>Bootstrap token</span><input id="bootstrap-token" type="password" placeholder="Bootstrap token" autocomplete="off" /></label>
+              <button id="bootstrap-login-button" type="button">Create local workspace</button>
+              <span data-bootstrap-status>Not configured</span>
+              <div class="readiness-strip" aria-label="Runtime preflight">
+                <span data-readiness-status>Preflight unchecked</span>
+                <span data-readiness-model>Model unchecked</span>
+                <span data-readiness-sandbox>Sandbox unchecked</span>
+              </div>
+            </div>
+          </details>
+        </form>
+        <p class="auth-legal">By continuing, you agree to your workspace access policy.</p>
+      </div>
+    </dialog>
+
     <dialog id="files-dialog" class="files-dialog" aria-labelledby="files-dialog-title">
       <form method="dialog" class="files-dialog-shell">
         <header class="files-dialog-header">
@@ -1023,6 +993,6 @@
       </form>
     </dialog>
 
-    <script src="./assets/main.js" type="module"></script>
+    <script src="./assets/main.js?v=20260722-flow115" type="module"></script>
   </body>
 </html>

@@ -2,6 +2,7 @@ from pathlib import Path
 
 import yaml
 
+from taroai.config import DURABLE_DEPLOYMENT_BACKENDS
 from taroai.workers.runner import parse_worker_process_args
 
 
@@ -52,6 +53,67 @@ def test_worker_runner_cli_parses_agent_and_cleanup_worker_modes():
     assert restore_drill_execution_config.worker_kind == "restore_drill_execution"
     assert restore_drill_evidence_config.worker_kind == "restore_drill_evidence"
     assert restore_drill_scheduler_config.worker_kind == "restore_drill_scheduler"
+
+
+def test_compose_runs_the_agent_and_trigger_workers_continuously():
+    assert "TAROAI_RUN_EXECUTION_DISPATCH_MODE=queue" in Path(
+        ".env.example"
+    ).read_text()
+    deployments = {
+        "infra/docker-compose.yml": {
+            "agent-worker": "agent",
+            "trigger-due-worker": "trigger_due",
+            "trigger-scheduler": "trigger_scheduler",
+        },
+        "infra/release/compose/docker-compose.release.yml": {
+            "worker": "agent",
+            "trigger-due-worker": "trigger_due",
+            "trigger-scheduler": "trigger_scheduler",
+        },
+    }
+
+    for path, expected_workers in deployments.items():
+        services = load_yaml_documents(path)[0]["services"]
+        agent_service = "agent-worker" if path == "infra/docker-compose.yml" else "worker"
+        assert services[agent_service]["deploy"]["replicas"] == 2
+        for service_name, worker_kind in expected_workers.items():
+            command = services[service_name]["command"]
+            assert command[command.index("--worker-kind") + 1] == worker_kind
+            assert "--loop-forever" in command
+            assert services[service_name]["restart"] == "unless-stopped"
+            assert services[service_name]["environment"]["TAROAI_RUN_MIGRATIONS"] == "false"
+            if worker_kind != "agent":
+                assert services[service_name]["deploy"]["replicas"] == 1
+
+
+def test_local_compose_loads_runtime_overrides_last():
+    services = load_yaml_documents("infra/docker-compose.yml")[0]["services"]
+
+    for service_name in ("api", "agent-worker"):
+        env_files = services[service_name]["env_file"]
+        assert env_files[-1] == {"path": "../.env.runtime", "required": False}
+
+def test_release_compose_uses_cloud_tools_without_local_controllers_by_default():
+    compose = load_yaml_documents(
+        "infra/release/compose/docker-compose.release.yml"
+    )[0]
+    environment = compose["x-runtime-environment"]
+    services = compose["services"]
+
+    assert environment["TAROAI_SANDBOX_PROVIDER"] == "${TAROAI_SANDBOX_PROVIDER:-e2b}"
+    assert environment["TAROAI_BROWSER_PROVIDER"] == "${TAROAI_BROWSER_PROVIDER:-disabled}"
+    assert environment["TAROAI_SECRET_SERVICE_BACKEND"] == (
+        "${TAROAI_SECRET_SERVICE_BACKEND:-aws_secrets_manager}"
+    )
+    assert environment["TAROAI_DEV_REQUEST_HEADERS_ENABLED"] == "false"
+    for setting_name, backend in DURABLE_DEPLOYMENT_BACKENDS.items():
+        assert environment[f"TAROAI_{setting_name.upper()}"] == backend
+
+    api_dependencies = services["api"]["depends_on"]
+    assert "sandbox-controller" not in api_dependencies
+    assert "browser-controller" not in api_dependencies
+    assert services["sandbox-controller"]["profiles"] == ["self-hosted-sandbox"]
+    assert services["browser-controller"]["profiles"] == ["browser"]
 
 
 def test_kubernetes_worker_manifest_runs_workers_independently():

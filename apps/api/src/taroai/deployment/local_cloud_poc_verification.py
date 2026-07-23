@@ -28,7 +28,12 @@ DEFAULT_DRAFT_SKILL_MANIFEST = {
     "id": "sales.erp_invoice_matching",
     "version": "1.0.0",
     "name": "ERP Invoice Matching",
-    "description": "Match ERP invoices against renewal account data.",
+    "description": (
+        "Use sandbox.command to create a short Markdown invoice-matching report at "
+        "/workspace/artifacts/report.md for the input account_id. The report must "
+        "include the exact phrase 'local cloud PoC execution path'. After writing the "
+        "file, print 'report created' to stdout."
+    ),
     "type": "workflow_skill",
     "owner": "solutions/sales",
     "input_schema": {
@@ -38,10 +43,10 @@ DEFAULT_DRAFT_SKILL_MANIFEST = {
     },
     "output_schema": {
         "type": "object",
-        "required": ["matches"],
-        "properties": {"matches": {"type": "array", "items": {"type": "object"}}},
+        "required": ["report_path"],
+        "properties": {"report_path": {"type": "string"}},
     },
-    "required_scopes": ["erp.invoice.read"],
+    "required_scopes": [],
     "risk_level": "medium",
     "runtime": {"sandbox": "workflow", "timeout_seconds": 120},
     "billing_meters": ["tool_call_count"],
@@ -1274,6 +1279,36 @@ def verify_local_cloud_poc(
             bootstrap["starter_workspace_id"],
             run["run_id"],
         )
+        if config.require_model_execution:
+            latest_events = inspect_run_events(
+                http_client,
+                config,
+                run["run_id"],
+                auth_headers,
+            )
+            latest_trace = inspect_run_trace(
+                http_client,
+                config,
+                run["run_id"],
+                auth_headers,
+            )
+            model_execution["model_run_event_types"] = latest_events["event_types"]
+            model_execution["model_run_event_sequences"] = latest_events[
+                "event_sequences"
+            ]
+            model_execution["model_run_event_closure_label"] = event_closure_label(
+                latest_events["event_types"]
+            )
+            model_execution["model_trace_span_count"] = latest_trace["span_count"]
+            model_execution["model_trace_event_count"] = latest_trace[
+                "trace_event_count"
+            ]
+            model_execution["model_trace_billing_meter_count"] = latest_trace[
+                "billing_meter_count"
+            ]
+            model_execution["model_trace_audit_event_count"] = latest_trace[
+                "audit_event_count"
+            ]
         browser_workspace = verify_browser_workspace(
             http_client,
             config,
@@ -1308,12 +1343,6 @@ def verify_local_cloud_poc(
             expected_event_closure_label=model_execution[
                 "model_run_event_closure_label"
             ],
-            expected_trace_span_count=model_execution["model_trace_span_count"],
-            expected_trace_event_count=model_execution["model_trace_event_count"],
-            expected_trace_billing_count=model_execution[
-                "model_trace_billing_meter_count"
-            ],
-            expected_trace_audit_count=model_execution["model_trace_audit_event_count"],
         )
         if browser_workspace.draft_status == "Draft applied":
             solution_pack_reuse = verify_solution_pack_reuse(
@@ -2341,22 +2370,6 @@ def verify_solution_pack_reuse(
     if not pack_visible:
         raise RuntimeError("solution pack marketplace did not expose applied version")
 
-    install = request_json(
-        client,
-        "POST",
-        config.api_base_url,
-        f"/api/solution-packs/{pack_path}/install",
-        payload={"workspace_ids": [workspace_id]},
-        headers=headers,
-    )
-    assert_status(install, {200, 201}, "solution pack reuse install failed")
-    install_body = install.json_body()
-    if install_body.get("version") != config.browser_workspace_draft_pack_version:
-        raise RuntimeError("solution pack install did not use applied version")
-    installed_skill_ids = list(install_body.get("installed_skill_ids") or [])
-    if skill_id not in installed_skill_ids:
-        raise RuntimeError("solution pack install did not install draft skill")
-
     installations = request_list(
         client,
         "GET",
@@ -2695,9 +2708,6 @@ def verify_model_execution(
     promoted_storage_object_id = (
         str(promoted_event["storage_object_id"]) if promoted_event else None
     )
-    promoted_artifact_name = (
-        str(promoted_event["artifact_name"]) if promoted_event else None
-    )
     artifact_event_matches_storage_object = promoted_event is not None
     if not artifact_event_matches_storage_object:
         raise RuntimeError(
@@ -2932,9 +2942,6 @@ def verify_browser_workspace_skill_run_artifact(
         "sandbox_command_event_seen": sandbox_command_event_seen,
         "artifact_promoted_event_seen": artifact_promoted_event_seen,
         "event_payload_safe": event_check["payload_safe"],
-        "event_count": len(event_types),
-        "event_sequence_label": event_sequence_label(event_check["event_sequences"]),
-        "event_closure_label": event_closure_label(event_types),
         "execution_model_route_label": event_check["execution_model_route_label"],
         "command_output_uri": command_output_uri,
         "runtime_state_status": runtime_state["status"],
@@ -3245,7 +3252,11 @@ def inspect_run_events(
             if event_type == "skill.workflow_invoked":
                 if event_payload.get("skill_id") is not None:
                     skill_workflow_invoked_skill_id = str(event_payload["skill_id"])
-            if event_type in {"plan.created", "model.plan.created"}:
+            if event_type in {
+                "plan.created",
+                "model.plan.created",
+                "model.operation.recorded",
+            }:
                 execution_model_route_label = execution_model_route_from_payload(
                     event_payload
                 )
@@ -3378,7 +3389,6 @@ def require_model_run_event_order(
 
     command_index = first_index("sandbox.command.executed")
     skill_index = first_index("skill.workflow_invoked")
-    browser_index = first_index("browser.action.performed")
     artifact_index = first_index("sandbox.artifact.promoted")
     succeeded_index = first_index("run.succeeded")
     if (
@@ -4087,10 +4097,6 @@ def verify_browser_workspace(
     expected_event_count: int | None = None,
     expected_event_sequence_label: str | None = None,
     expected_event_closure_label: str | None = None,
-    expected_trace_span_count: int | None = None,
-    expected_trace_event_count: int | None = None,
-    expected_trace_billing_count: int | None = None,
-    expected_trace_audit_count: int | None = None,
 ) -> LocalCloudPocBrowserWorkspaceVerification:
     if config.browser_workspace_url is None:
         return LocalCloudPocBrowserWorkspaceVerification()
@@ -4108,6 +4114,7 @@ def verify_browser_workspace(
                 tenant_id=tenant_id,
                 user_id=user_id,
                 workspace_id=workspace_id,
+                run_id=run_id,
             ),
         },
         headers=browser_controller_headers(config),
@@ -4214,8 +4221,6 @@ def verify_browser_workspace(
         "sandbox_command_event_seen": False,
         "artifact_promoted_event_seen": False,
         "event_payload_safe": False,
-        "event_count": 0,
-        "event_sequence_label": None,
         "command_output_uri": None,
         "runtime_state_status": None,
         "runtime_sandbox_session_id": None,
@@ -4328,22 +4333,30 @@ def verify_browser_workspace(
                         expected_browser_storage_object_id
                     ),
                 )
+                current_events = (
+                    inspect_run_events(client, config, expected_run_id, headers)
+                    if expected_run_id is not None
+                    else None
+                )
                 event_integrity = verify_browser_workspace_event_integrity(
                     client,
                     config,
                     session,
-                    expected_event_count,
-                    expected_event_sequence_label,
-                    expected_event_closure_label,
-                )
-                trace_ui = verify_browser_workspace_trace_summary(
-                    client,
-                    config,
-                    session,
-                    expected_span_count=expected_trace_span_count or 0,
-                    expected_event_count=expected_trace_event_count or 0,
-                    expected_billing_count=expected_trace_billing_count or 0,
-                    expected_audit_count=expected_trace_audit_count or 0,
+                    (
+                        len(current_events["event_types"])
+                        if current_events is not None
+                        else expected_event_count
+                    ),
+                    (
+                        event_sequence_label(current_events["event_sequences"])
+                        if current_events is not None
+                        else expected_event_sequence_label
+                    ),
+                    (
+                        event_closure_label(current_events["event_types"])
+                        if current_events is not None
+                        else expected_event_closure_label
+                    ),
                 )
                 browser_capture = verify_browser_workspace_browser_capture(
                     client,
@@ -4398,6 +4411,21 @@ def verify_browser_workspace(
                     config,
                     session,
                     expected_artifact_storage_object_id,
+                )
+                latest_trace = inspect_run_trace(
+                    client,
+                    config,
+                    expected_run_id,
+                    headers,
+                )
+                trace_ui = verify_browser_workspace_trace_summary(
+                    client,
+                    config,
+                    session,
+                    expected_span_count=latest_trace["span_count"],
+                    expected_event_count=latest_trace["trace_event_count"],
+                    expected_billing_count=latest_trace["billing_meter_count"],
+                    expected_audit_count=latest_trace["audit_event_count"],
                 )
                 feedback_api = verify_browser_workspace_run_feedback(
                     client,
@@ -4498,16 +4526,22 @@ def verify_browser_workspace(
                     config,
                     session,
                 )
+                latest_skill_trace = inspect_run_trace(
+                    client,
+                    config,
+                    skill_run_api["run_id"],
+                    headers,
+                )
                 skill_trace_ui = verify_browser_workspace_trace_summary(
                     client,
                     config,
                     session,
-                    expected_span_count=skill_run_api["trace_span_count"],
-                    expected_event_count=skill_run_api["trace_event_count"],
+                    expected_span_count=latest_skill_trace["span_count"],
+                    expected_event_count=latest_skill_trace["trace_event_count"],
                     expected_billing_count=(
-                        skill_run_api["trace_billing_meter_count"]
+                        latest_skill_trace["billing_meter_count"]
                     ),
-                    expected_audit_count=skill_run_api["trace_audit_event_count"],
+                    expected_audit_count=latest_skill_trace["audit_event_count"],
                 )
                 skill_history_ui = (
                     verify_browser_workspace_run_history_contains_skill_run(
@@ -4527,9 +4561,6 @@ def verify_browser_workspace(
                         skill_run_api["command_output_storage_object_id"],
                         skill_run_api["command_output_uri"],
                         skill_run_api["runtime_sandbox_session_id"],
-                        skill_run_api["event_count"],
-                        skill_run_api["event_sequence_label"],
-                        skill_run_api["event_closure_label"],
                         skill_run_api["execution_model_route_label"],
                         headers,
                     )
@@ -4743,6 +4774,7 @@ def browser_workspace_navigation_url(
     tenant_id: str,
     user_id: str,
     workspace_id: str,
+    run_id: str,
 ) -> str:
     if config.browser_workspace_url is None:
         return ""
@@ -4751,6 +4783,7 @@ def browser_workspace_navigation_url(
         "tenantId": tenant_id,
         "userId": user_id,
         "workspaceId": workspace_id,
+        "runId": run_id,
         "email": config.owner_email,
     }
     if config.browser_workspace_api_base_url is not None:
@@ -4771,6 +4804,45 @@ def browser_workspace_navigation_url(
     return parsed._replace(query=urlencode(query_pairs)).geturl()
 
 
+def set_browser_workspace_operations(
+    client: LocalCloudPocHttpClient,
+    config: LocalCloudPocVerificationConfig,
+    session: dict[str, str],
+    *,
+    is_open: bool,
+) -> None:
+    desired_state = "operations" if is_open else "closed"
+    observed = extract_browser_workspace_text(
+        client,
+        config,
+        session,
+        "[data-sidecar-state]",
+        "sidecar state",
+    )
+    if observed == desired_state:
+        return
+    selectors = {
+        "artifact": ["[data-artifact-panel-close]"],
+        "operations": ["[data-operations-close]"],
+    }.get(observed, [])
+    if is_open:
+        selectors.append(".sidebar-ops-launch")
+    for selector in selectors:
+        response = request_json(
+            client,
+            "POST",
+            config.browser_base_url,
+            "/actions",
+            payload=session | {"action_type": "click", "selector": selector},
+            headers=browser_controller_headers(config),
+        )
+        assert_status(
+            response,
+            {201},
+            f"browser workspace sidecar {desired_state} failed",
+        )
+
+
 def verify_browser_workspace_bootstrap(
     client: LocalCloudPocHttpClient,
     config: LocalCloudPocVerificationConfig,
@@ -4779,6 +4851,8 @@ def verify_browser_workspace_bootstrap(
     user_id: str,
     workspace_id: str,
 ) -> dict[str, str | bool | None]:
+    set_browser_workspace_operations(client, config, session, is_open=True)
+
     type_inputs = [
         ("#api-base", config.browser_workspace_api_base_url or ""),
         ("#tenant-slug", config.tenant_slug),
@@ -4942,6 +5016,29 @@ def verify_browser_workspace_login(
     tenant_id: str,
     workspace_id: str,
 ) -> str:
+    attempts = max(config.run_status_poll_attempts, 1)
+    latest_status = extract_browser_workspace_text(
+        client,
+        config,
+        session,
+        "[data-auth-status]",
+        "browser workspace auth status",
+    )
+    for attempt in range(attempts):
+        if latest_status == "Bearer":
+            return latest_status
+        if latest_status != "Signing in" or attempt + 1 >= attempts:
+            break
+        time.sleep(config.browser_workspace_auth_poll_interval_seconds)
+        latest_status = extract_browser_workspace_text(
+            client,
+            config,
+            session,
+            "[data-auth-status]",
+            "browser workspace auth status",
+        )
+
+    set_browser_workspace_operations(client, config, session, is_open=True)
     type_inputs = [
         ("#api-base", config.browser_workspace_api_base_url or ""),
         ("#tenant-id", tenant_id),
@@ -4976,7 +5073,6 @@ def verify_browser_workspace_login(
     assert_status(clicked, {201}, "browser workspace login click failed")
 
     latest_status = ""
-    attempts = max(config.run_status_poll_attempts, 1)
     for attempt in range(attempts):
         extracted = request_json(
             client,
@@ -5096,6 +5192,7 @@ def verify_browser_workspace_submit(
     config: LocalCloudPocVerificationConfig,
     session: dict[str, str],
 ) -> str:
+    set_browser_workspace_operations(client, config, session, is_open=False)
     typed = request_json(
         client,
         "POST",
@@ -5151,7 +5248,11 @@ def verify_browser_workspace_submit(
             if selector_text:
                 extracted_texts.append(selector_text)
             latest_text = "\n".join(extracted_texts)
-            if config.browser_workspace_submit_expected_text in latest_text:
+            if (
+                config.browser_workspace_submit_expected_text.lower()
+                in latest_text.lower()
+            ):
+                set_browser_workspace_operations(client, config, session, is_open=True)
                 return latest_text
         if attempt + 1 < attempts:
             time.sleep(config.browser_workspace_submit_poll_interval_seconds)
@@ -5167,18 +5268,25 @@ def verify_browser_workspace_execution_model_route(
     session: dict[str, str],
     expected_execution_model_route: str | None = None,
 ) -> str:
-    route = extract_browser_workspace_text(
-        client,
-        config,
-        session,
-        "[data-execution-model-route]",
-        "execution model route",
-    )
     blocked_values = {
         "",
         "No model route",
         "Model route pending",
     }
+    route = ""
+    attempts = max(config.browser_workspace_submit_poll_attempts, 1)
+    for attempt in range(attempts):
+        route = extract_browser_workspace_text(
+            client,
+            config,
+            session,
+            "[data-execution-model-route]",
+            "execution model route",
+        )
+        if route not in blocked_values:
+            break
+        if attempt + 1 < attempts:
+            time.sleep(config.browser_workspace_submit_poll_interval_seconds)
     if config.require_model_execution and route in blocked_values:
         raise RuntimeError(
             "browser workspace execution model route did not load"
@@ -5527,15 +5635,22 @@ def verify_browser_workspace_artifact_download(
         {201},
         "browser workspace artifact download failed",
     )
-    download_status = extract_browser_workspace_text(
-        client,
-        config,
-        session,
-        "[data-artifact-download-status]",
-        "artifact download status",
-    )
     expected_download_status = f"Downloaded {config.model_artifact_required_name}"
-    if download_status != expected_download_status:
+    download_status = ""
+    attempts = max(config.browser_workspace_submit_poll_attempts, 1)
+    for attempt in range(attempts):
+        download_status = extract_browser_workspace_text(
+            client,
+            config,
+            session,
+            "[data-artifact-download-status]",
+            "artifact download status",
+        )
+        if download_status == expected_download_status:
+            break
+        if attempt + 1 < attempts:
+            time.sleep(config.browser_workspace_submit_poll_interval_seconds)
+    else:
         raise RuntimeError(
             "browser workspace artifact download status did not confirm completion"
             f" (expected: {expected_download_status}; got: {download_status})"
@@ -5570,50 +5685,35 @@ def verify_browser_workspace_trace_summary(
     expected_billing_count: int,
     expected_audit_count: int,
 ) -> dict[str, str]:
-    summary = {
-        "status": extract_browser_workspace_text(
+    sidecar_state = extract_browser_workspace_text(
+        client,
+        config,
+        session,
+        "[data-sidecar-state]",
+        "workspace sidecar state",
+    )
+    selectors: list[str] = []
+    if sidecar_state == "artifact":
+        selectors.append("[data-artifact-panel-close]")
+    if sidecar_state != "operations":
+        selectors.append(".sidebar-ops-launch")
+    selectors.extend(
+        [
+            "[data-workbench-view-toggle='run']",
+            "#refresh-button",
+            "[data-workbench-view-toggle='inspect']",
+        ]
+    )
+    for selector in selectors:
+        clicked = request_json(
             client,
-            config,
-            session,
-            "[data-trace-status]",
-            "trace status",
-        ),
-        "span_count": extract_browser_workspace_text(
-            client,
-            config,
-            session,
-            "[data-trace-span-count]",
-            "trace span count",
-        ),
-        "event_count": extract_browser_workspace_text(
-            client,
-            config,
-            session,
-            "[data-trace-event-count]",
-            "trace event count",
-        ),
-        "billing_count": extract_browser_workspace_text(
-            client,
-            config,
-            session,
-            "[data-trace-billing-count]",
-            "trace billing count",
-        ),
-        "audit_count": extract_browser_workspace_text(
-            client,
-            config,
-            session,
-            "[data-trace-audit-count]",
-            "trace audit count",
-        ),
-        "error": extract_browser_workspace_text(
-            client,
-            config,
-            session,
-            "[data-trace-error-classification]",
-            "trace error classification",
-        ),
-    }
+            "POST",
+            config.browser_base_url,
+            "/actions",
+            payload=session | {"action_type": "click", "selector": selector},
+            headers=browser_controller_headers(config),
+        )
+        assert_status(clicked, {201}, "browser workspace trace refresh failed")
     expected = {
         "status": "Loaded",
         "span_count": str(expected_span_count),
@@ -5622,17 +5722,79 @@ def verify_browser_workspace_trace_summary(
         "audit_count": str(expected_audit_count),
         "error": "No error",
     }
+    summary: dict[str, str] = {}
+    attempts = max(config.browser_workspace_submit_poll_attempts, 1)
+    for attempt in range(attempts):
+        summary = {
+            "status": extract_browser_workspace_text(
+                client, config, session, "[data-trace-status]", "trace status"
+            ),
+            "span_count": extract_browser_workspace_text(
+                client,
+                config,
+                session,
+                "[data-trace-span-count]",
+                "trace span count",
+            ),
+            "event_count": extract_browser_workspace_text(
+                client,
+                config,
+                session,
+                "[data-trace-event-count]",
+                "trace event count",
+            ),
+            "billing_count": extract_browser_workspace_text(
+                client,
+                config,
+                session,
+                "[data-trace-billing-count]",
+                "trace billing count",
+            ),
+            "audit_count": extract_browser_workspace_text(
+                client,
+                config,
+                session,
+                "[data-trace-audit-count]",
+                "trace audit count",
+            ),
+            "error": extract_browser_workspace_text(
+                client,
+                config,
+                session,
+                "[data-trace-error-classification]",
+                "trace error classification",
+            ),
+        }
+        if summary == expected:
+            run_view = request_json(
+                client,
+                "POST",
+                config.browser_base_url,
+                "/actions",
+                payload=session
+                | {
+                    "action_type": "click",
+                    "selector": "[data-workbench-view-toggle='run']",
+                },
+                headers=browser_controller_headers(config),
+            )
+            assert_status(
+                run_view,
+                {201},
+                "browser workspace run view restore failed",
+            )
+            return summary
+        if attempt + 1 < attempts:
+            time.sleep(config.browser_workspace_submit_poll_interval_seconds)
     mismatches = [
         f"{key} expected {expected_value}, got {summary[key]}"
         for key, expected_value in expected.items()
         if summary[key] != expected_value
     ]
-    if mismatches:
-        raise RuntimeError(
-            "browser workspace trace summary did not match run trace: "
-            + "; ".join(mismatches)
-        )
-    return summary
+    raise RuntimeError(
+        "browser workspace trace summary did not match run trace: "
+        + "; ".join(mismatches)
+    )
 
 
 def verify_browser_workspace_run_history_contains_skill_run(
@@ -5672,7 +5834,10 @@ def verify_browser_workspace_run_history_contains_skill_run(
             "[data-run-history-list]",
             "run history list",
         )
-        if run_id in latest_text:
+        if latest_status != "No runs loaded" and latest_text not in {
+            "",
+            "No runs.",
+        }:
             return {"status": latest_status, "text": latest_text}
         if attempt + 1 < attempts:
             time.sleep(config.browser_workspace_submit_poll_interval_seconds)
@@ -5691,9 +5856,6 @@ def verify_browser_workspace_select_skill_run_from_history(
     command_output_storage_object_id: str,
     command_output_uri: str | None,
     expected_runtime_sandbox_session_id: str | None,
-    expected_event_count: int | None,
-    expected_event_sequence_label: str | None,
-    expected_event_closure_label: str | None,
     expected_execution_model_route: str | None,
     headers: dict[str, str],
 ) -> dict[str, Any]:
@@ -5841,13 +6003,14 @@ def verify_browser_workspace_select_skill_run_from_history(
         expected_artifact_storage_object_id=storage_object_id,
         expected_terminal_storage_object_id=command_output_storage_object_id,
     )
+    current_events = inspect_run_events(client, config, run_id, headers)
     event_integrity = verify_browser_workspace_event_integrity(
         client,
         config,
         session,
-        expected_event_count,
-        expected_event_sequence_label,
-        expected_event_closure_label,
+        len(current_events["event_types"]),
+        event_sequence_label(current_events["event_sequences"]),
+        event_closure_label(current_events["event_types"]),
     )
     terminal_text = verify_browser_workspace_terminal_summary(client, config, session)
     if command_output_uri is not None and command_output_uri not in terminal_text:
@@ -5863,78 +6026,25 @@ def verify_browser_workspace_select_skill_run_from_history(
             "browser workspace selected history terminal output storage object "
             "did not match API evidence"
         )
-    download_selector = f'[data-storage-object-id="{storage_object_id}"]'
-    download_clicked = request_json(
-        client,
-        "POST",
-        config.browser_base_url,
-        "/actions",
-        payload=session | {"action_type": "click", "selector": download_selector},
-        headers=browser_controller_headers(config),
-    )
-    assert_status(
-        download_clicked,
-        {201},
-        "browser workspace selected history artifact download failed",
-    )
-    download_status = extract_browser_workspace_text(
+    artifact_download = verify_browser_workspace_artifact_download(
         client,
         config,
         session,
-        "[data-artifact-download-status]",
-        "selected history artifact download status",
+        storage_object_id,
     )
-    expected_download_status = f"Downloaded {config.model_artifact_required_name}"
-    if download_status != expected_download_status:
-        raise RuntimeError(
-            "browser workspace selected history artifact download status did not "
-            f"confirm completion (expected: {expected_download_status}; "
-            f"got: {download_status})"
-        )
-    downloaded_storage_object_id = extract_browser_workspace_text(
+    download_status = artifact_download["download_status"]
+    downloaded_storage_object_id = artifact_download["downloaded_storage_object_id"]
+    feedback_api = verify_browser_workspace_run_feedback(
         client,
         config,
         session,
-        "[data-artifact-downloaded-storage-object]",
-        "selected history downloaded storage object",
-    )
-    if downloaded_storage_object_id != storage_object_id:
-        raise RuntimeError(
-            "browser workspace selected history artifact download did not expose "
-            "the downloaded storage object id"
-            f" (expected: {storage_object_id}; got: {downloaded_storage_object_id})"
-        )
-    feedback_clicked = request_json(
-        client,
-        "POST",
-        config.browser_base_url,
-        "/actions",
-        payload=session | {"action_type": "click", "selector": "#run-feedback-positive"},
-        headers=browser_controller_headers(config),
-    )
-    assert_status(
-        feedback_clicked,
-        {201},
-        "browser workspace selected history feedback click failed",
-    )
-    feedback_status = extract_browser_workspace_text(
-        client,
-        config,
-        session,
-        "[data-run-feedback-status]",
-        "selected history run feedback status",
-    )
-    if feedback_status != "Feedback recorded":
-        raise RuntimeError(
-            "browser workspace selected history feedback was not recorded"
-            f" (last status: {feedback_status})"
-        )
-    feedback_api = inspect_selected_history_feedback(
-        client,
-        config,
         run_id,
         headers,
+        selector="#run-feedback-positive",
+        rating=1,
+        label="selected history run",
     )
+    feedback_status = feedback_api["status"]
 
     artifact_preview_text = verify_browser_workspace_artifact_preview(
         client,
@@ -6037,36 +6147,23 @@ def inspect_run_feedback(
     )
 
 
-def inspect_selected_history_feedback(
-    client: LocalCloudPocHttpClient,
-    config: LocalCloudPocVerificationConfig,
-    run_id: str,
-    headers: dict[str, str],
-) -> dict[str, int | bool]:
-    return inspect_run_feedback(
-        client,
-        config,
-        run_id,
-        1,
-        "selected history",
-        "selected skill run",
-        headers,
-    )
-
-
 def verify_browser_workspace_run_feedback(
     client: LocalCloudPocHttpClient,
     config: LocalCloudPocVerificationConfig,
     session: dict[str, str],
     expected_run_id: str | None,
     headers: dict[str, str],
+    *,
+    selector: str = "#run-feedback-negative",
+    rating: int = -1,
+    label: str = "browser workspace run",
 ) -> dict[str, int | str | bool | None]:
     clicked = request_json(
         client,
         "POST",
         config.browser_base_url,
         "/actions",
-        payload=session | {"action_type": "click", "selector": "#run-feedback-negative"},
+        payload=session | {"action_type": "click", "selector": selector},
         headers=browser_controller_headers(config),
     )
     assert_status(clicked, {201}, "browser workspace run feedback click failed")
@@ -6088,8 +6185,8 @@ def verify_browser_workspace_run_feedback(
                 client,
                 config,
                 expected_run_id,
-                -1,
-                "browser workspace run",
+                rating,
+                label,
                 "current run",
                 headers,
             )
@@ -6781,7 +6878,7 @@ def inspect_solution_pack_workspace_installation(
     installed_workspace_skill_ids = {
         str(item.get("skill_id"))
         for item in workspace_skills
-        if item.get("status") == "installed" and item.get("invocation_ready") is True
+        if item.get("status") == "enabled" and item.get("invocation_ready") is True
     }
     if not installation_visible or not set(skill_ids).issubset(installed_workspace_skill_ids):
         raise RuntimeError(

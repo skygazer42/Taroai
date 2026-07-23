@@ -1,6 +1,5 @@
 # Enterprise Tenant Onboarding Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Build the customer onboarding path that turns a signed enterprise account into a usable tenant with workspaces, users, roles, starter skills, knowledge spaces, quotas, and operational checks.
 

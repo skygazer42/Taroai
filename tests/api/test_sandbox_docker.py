@@ -1,3 +1,4 @@
+import base64
 import subprocess
 import stat
 from pathlib import Path
@@ -100,6 +101,21 @@ def test_docker_sandbox_runs_container_with_disabled_network_and_workspace_mount
         session.id,
         "/workspace/input.txt",
     )
+    binary_content = b"\x89PNG\r\n\x1a\n\x00\xff"
+    binary_upload = adapter.upload_file(
+        SandboxFileWrite(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_sales",
+            run_id="run_1",
+            session_id=session.id,
+            path="/workspace/image.png",
+            content_base64=base64.b64encode(binary_content).decode("ascii"),
+            content_type="image/png",
+        )
+    )
+    binary_download = adapter.download_file(
+        "tenant_acme", session.id, "/workspace/image.png"
+    )
     run_call = runner.calls[0]
     workspace_host_path = next(
         Path(item.rsplit(":/workspace", 1)[0])
@@ -137,6 +153,9 @@ def test_docker_sandbox_runs_container_with_disabled_network_and_workspace_mount
     assert result.stdout == "hello\n"
     assert [file.path for file in files] == ["/workspace/input.txt"]
     assert downloaded.content == "hello"
+    assert binary_upload.content_bytes() == binary_content
+    assert binary_download.content is None
+    assert binary_download.content_bytes() == binary_content
     assert "--workdir" in exec_call
     assert "/workspace" in exec_call
     assert "TAROAI_SANDBOX_WORKSPACE=/workspace" in exec_call

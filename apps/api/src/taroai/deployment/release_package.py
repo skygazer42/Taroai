@@ -962,6 +962,7 @@ def required_archive_entries(manifest_path: str, schema_path: str) -> list[str]:
         "infra/config/cloud.env.example",
         "infra/config/deepseek.env.example",
         "infra/config/private.env.example",
+        "infra/config/zhipu.env.example",
         "infra/docker-compose.yml",
         "infra/k8s/api.yaml",
         "infra/k8s/sandbox-runtime-policy.yaml",

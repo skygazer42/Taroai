@@ -1,3 +1,4 @@
+import hmac
 import json
 from datetime import datetime, timedelta, timezone
 from threading import RLock
@@ -18,11 +19,13 @@ from taroai.domain import (
     ChatThreadCreate,
     ChatThreadStatus,
     IdempotencyRecord,
+    Notification,
     Run,
     RunCreate,
     RunEvent,
     RunStatus,
     new_id,
+    notification_for_agent_run_status,
     utc_now,
 )
 from taroai.errors import (
@@ -32,6 +35,8 @@ from taroai.errors import (
     TenantAccessError,
 )
 from taroai.licensing.models import LicenseValidationResult
+from taroai.secrets import SecretCaptureRequest
+from taroai.workflow import WorkflowRun, WorkflowSpec, WorkflowTask
 
 if TYPE_CHECKING:
     from taroai.agent.models import (
@@ -105,17 +110,179 @@ class InMemoryControlPlaneStore(BaseModel):
     billing_meters: dict[str, list[BillingMeterEvent]] = Field(default_factory=dict)
     audit_events: dict[str, list[AuditEvent]] = Field(default_factory=dict)
     approval_requests: dict[str, list[ApprovalRequest]] = Field(default_factory=dict)
+    workflows: dict[str, WorkflowRun] = Field(default_factory=dict)
+    workflow_tasks: dict[str, WorkflowTask] = Field(default_factory=dict)
+    secret_capture_requests: dict[str, SecretCaptureRequest] = Field(default_factory=dict)
     runtime_states: dict[str, RunStateSnapshot] = Field(default_factory=dict)
     idempotency_records: dict[str, IdempotencyRecord] = Field(default_factory=dict)
     license_validations: dict[str, LicenseValidationResult] = Field(default_factory=dict)
     chat_threads: dict[str, ChatThread] = Field(default_factory=dict)
     chat_messages: dict[str, ChatMessage] = Field(default_factory=dict)
+    notifications: dict[str, Notification] = Field(default_factory=dict)
     agent_cycles: dict[str, Any] = Field(default_factory=dict)
     agent_actions: dict[str, Any] = Field(default_factory=dict)
     agent_checkpoints: dict[str, list[Any]] = Field(default_factory=dict)
     workspace_tenants: dict[str, str] = Field(default_factory=dict)
+    workspace_names: dict[str, str] = Field(default_factory=dict)
+    tenant_names: dict[str, str] = Field(default_factory=dict)
+    tenant_invitations: dict[str, Any] = Field(default_factory=dict)
     user_tenants: dict[str, str] = Field(default_factory=dict)
     _repository_lock: RLock = PrivateAttr(default_factory=RLock)
+
+    def register_workspace(
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        user_id: str,
+        workspace_name: str | None = None,
+    ) -> None:
+        with self._repository_lock:
+            self._validate_context_ownership(tenant_id, workspace_id, user_id)
+            self._register_context(tenant_id, workspace_id, user_id)
+            self.tenant_names.setdefault(tenant_id, tenant_id)
+            self.workspace_names.setdefault(workspace_id, workspace_name or workspace_id)
+
+    def list_workspace_ids(self, tenant_id: str) -> list[str]:
+        with self._repository_lock:
+            return [
+                workspace_id
+                for workspace_id, owner_tenant_id in self.workspace_tenants.items()
+                if owner_tenant_id == tenant_id
+            ]
+
+    def get_tenant(self, tenant_id: str):
+        from taroai.tenancy import TenantInfo
+
+        with self._repository_lock:
+            if tenant_id not in self.tenant_names and tenant_id not in self.workspace_tenants.values():
+                raise NotFoundError(f"Tenant not found: {tenant_id}")
+            return TenantInfo(id=tenant_id, name=self.tenant_names.get(tenant_id, tenant_id))
+
+    def rename_tenant(self, tenant_id: str, name: str):
+        from taroai.tenancy import TenantInfo
+
+        with self._repository_lock:
+            self.get_tenant(tenant_id)
+            self.tenant_names[tenant_id] = name
+            return TenantInfo(id=tenant_id, name=name)
+
+    def list_workspaces(self, tenant_id: str):
+        from taroai.tenancy import WorkspaceInfo
+
+        with self._repository_lock:
+            return [
+                WorkspaceInfo(
+                    id=workspace_id,
+                    tenant_id=tenant_id,
+                    name=self.workspace_names.get(workspace_id, workspace_id),
+                )
+                for workspace_id in self.list_workspace_ids(tenant_id)
+            ]
+
+    def create_workspace(
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        user_id: str,
+        name: str,
+    ):
+        from taroai.tenancy import WorkspaceInfo
+
+        with self._repository_lock:
+            if workspace_id in self.workspace_tenants:
+                raise ValueError(f"Workspace already exists: {workspace_id}")
+            self.register_workspace(tenant_id, workspace_id, user_id, name)
+            return WorkspaceInfo(id=workspace_id, tenant_id=tenant_id, name=name)
+
+    def rename_workspace(
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        name: str,
+    ):
+        from taroai.tenancy import WorkspaceInfo
+
+        with self._repository_lock:
+            if self.workspace_tenants.get(workspace_id) != tenant_id:
+                raise NotFoundError(f"Workspace not found: {workspace_id}")
+            self.workspace_names[workspace_id] = name
+            return WorkspaceInfo(id=workspace_id, tenant_id=tenant_id, name=name)
+
+    def create_tenant_invitation(
+        self,
+        invitation: Any,
+    ):
+        with self._repository_lock:
+            self.get_tenant(invitation.tenant_id)
+            self.tenant_invitations[invitation.id] = invitation.model_copy(deep=True)
+            return invitation.model_copy(deep=True)
+
+    def list_tenant_invitations(self, tenant_id: str):
+        with self._repository_lock:
+            return sorted(
+                [
+                    item.model_copy(deep=True)
+                    for item in self.tenant_invitations.values()
+                    if item.tenant_id == tenant_id
+                ],
+                key=lambda item: (item.created_at, item.id),
+                reverse=True,
+            )
+
+    def get_tenant_invitation(
+        self,
+        tenant_id: str,
+        invitation_id: str,
+    ):
+        with self._repository_lock:
+            invitation = self.tenant_invitations.get(invitation_id)
+            if invitation is None or invitation.tenant_id != tenant_id:
+                raise NotFoundError(f"Tenant invitation not found: {invitation_id}")
+            return invitation.model_copy(deep=True)
+
+    def get_tenant_invitation_by_token_hash(
+        self,
+        tenant_id: str,
+        token_hash: str,
+    ):
+        with self._repository_lock:
+            for invitation in self.tenant_invitations.values():
+                if invitation.tenant_id == tenant_id and hmac.compare_digest(
+                    invitation.token_hash,
+                    token_hash,
+                ):
+                    return invitation.model_copy(deep=True)
+            raise NotFoundError("Tenant invitation not found")
+
+    def revoke_tenant_invitation(
+        self,
+        tenant_id: str,
+        invitation_id: str,
+        revoked_at: datetime,
+    ):
+        with self._repository_lock:
+            invitation = self.get_tenant_invitation(tenant_id, invitation_id)
+            if invitation.public(revoked_at).status != "pending":
+                raise ValueError("Tenant invitation is no longer pending")
+            invitation.revoked_at = revoked_at
+            self.tenant_invitations[invitation.id] = invitation
+            return invitation.model_copy(deep=True)
+
+    def accept_tenant_invitation(
+        self,
+        tenant_id: str,
+        invitation_id: str,
+        accepted_by_user_id: str,
+        accepted_at: datetime,
+    ):
+        with self._repository_lock:
+            invitation = self.get_tenant_invitation(tenant_id, invitation_id)
+            if invitation.public(accepted_at).status != "pending":
+                raise ValueError("Tenant invitation is no longer pending")
+            invitation.accepted_at = accepted_at
+            invitation.accepted_by_user_id = accepted_by_user_id
+            self.tenant_invitations[invitation.id] = invitation
+            return invitation.model_copy(deep=True)
 
     def create_run(self, tenant_id: str, user_id: str, payload: RunCreate) -> Run:
         with self._repository_lock:
@@ -319,6 +486,7 @@ class InMemoryControlPlaneStore(BaseModel):
                 created_by_user_id=user_id,
                 role=payload.role,
                 content=payload.content,
+                execution_content=payload.execution_content,
                 kind=payload.kind,
                 dispatch_status=payload.dispatch_status,
                 delivery_status=payload.delivery_status,
@@ -363,6 +531,7 @@ class InMemoryControlPlaneStore(BaseModel):
     ) -> ChatMessage:
         allowed_fields = {
             "content",
+            "execution_content",
             "kind",
             "dispatch_status",
             "delivery_status",
@@ -757,6 +926,29 @@ class InMemoryControlPlaneStore(BaseModel):
             )
             self.agent_actions[action_id] = renewed.model_copy(deep=True)
             return renewed.model_copy(deep=True)
+
+    def cancel_agent_action(
+        self,
+        tenant_id: str,
+        action_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> "AgentAction":
+        with self._repository_lock:
+            action = self.get_agent_action(tenant_id, action_id)
+            if action.status not in {"pending", "running", "uncertain"}:
+                return action
+            cancelled = action.model_copy(
+                update={
+                    "status": "cancelled",
+                    "lease_owner_id": None,
+                    "lease_expires_at": None,
+                    "completed_at": self._lease_time(now or utc_now()),
+                },
+                deep=True,
+            )
+            self.agent_actions[action_id] = cancelled.model_copy(deep=True)
+            return cancelled
 
     def recover_expired_agent_actions(
         self,
@@ -1186,7 +1378,69 @@ class InMemoryControlPlaneStore(BaseModel):
                 "run.status_changed",
                 {"status": status.value},
             )
+        is_workflow_task = bool(
+            run.trigger_message_id
+            and self.get_chat_message(tenant_id, run.trigger_message_id).kind
+            == "workflow_task"
+        )
+        if run.status != status and not is_workflow_task:
+            notification = notification_for_agent_run_status(updated_run, status)
+            if notification is not None:
+                self.notifications[notification.id] = notification
         return updated_run
+
+    def list_notifications(
+        self, tenant_id: str, user_id: str, limit: int = 50
+    ) -> list[Notification]:
+        with self._repository_lock:
+            return sorted(
+                (
+                    item.model_copy(deep=True)
+                    for item in self.notifications.values()
+                    if item.tenant_id == tenant_id and item.user_id == user_id
+                ),
+                key=lambda item: (item.created_at, item.id),
+                reverse=True,
+            )[:limit]
+
+    def count_unread_notifications(self, tenant_id: str, user_id: str) -> int:
+        with self._repository_lock:
+            return sum(
+                item.tenant_id == tenant_id
+                and item.user_id == user_id
+                and item.read_at is None
+                for item in self.notifications.values()
+            )
+
+    def mark_notification_read(
+        self, tenant_id: str, user_id: str, notification_id: str
+    ) -> Notification:
+        with self._repository_lock:
+            item = self.notifications.get(notification_id)
+            if (
+                item is None
+                or item.tenant_id != tenant_id
+                or item.user_id != user_id
+            ):
+                raise NotFoundError(f"Notification not found: {notification_id}")
+            if item.read_at is None:
+                item = item.model_copy(update={"read_at": utc_now()})
+                self.notifications[item.id] = item
+            return item.model_copy(deep=True)
+
+    def mark_all_notifications_read(self, tenant_id: str, user_id: str) -> int:
+        with self._repository_lock:
+            now = utc_now()
+            unread = [
+                item
+                for item in self.notifications.values()
+                if item.tenant_id == tenant_id
+                and item.user_id == user_id
+                and item.read_at is None
+            ]
+            for item in unread:
+                self.notifications[item.id] = item.model_copy(update={"read_at": now})
+            return len(unread)
 
     def cancel_run(
         self,
@@ -1299,6 +1553,12 @@ class InMemoryControlPlaneStore(BaseModel):
         run_id: str,
         step_id: str,
         reason: str,
+        *,
+        kind: str = "action",
+        subject_type: str | None = None,
+        subject_id: str | None = None,
+        preview_payload: dict[str, Any] | None = None,
+        validation_payload: dict[str, Any] | None = None,
     ) -> ApprovalRequest:
         run = self.get_run(tenant_id, run_id)
         approval = ApprovalRequest(
@@ -1309,6 +1569,11 @@ class InMemoryControlPlaneStore(BaseModel):
             step_id=step_id,
             reason=reason,
             status=ApprovalStatus.PENDING,
+            kind=kind,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            preview_payload=preview_payload or {},
+            validation_payload=validation_payload or {},
             requested_by_user_id=run.user_id,
             created_at=utc_now(),
         )
@@ -1316,7 +1581,17 @@ class InMemoryControlPlaneStore(BaseModel):
         self._append_run_event(
             run,
             "approval.requested",
-            {"approval_id": approval.id, "step_id": step_id, "reason": reason},
+            {
+                "approval_id": approval.id,
+                "step_id": step_id,
+                "reason": reason,
+                "kind": approval.kind,
+                "subject_type": approval.subject_type,
+                "subject_id": approval.subject_id,
+                "preview": approval.preview_payload,
+                "validation": approval.validation_payload,
+                "execution_status": approval.execution_status,
+            },
         )
         return approval
 
@@ -1437,6 +1712,215 @@ class InMemoryControlPlaneStore(BaseModel):
     def list_approval_requests(self, tenant_id: str, run_id: str) -> list[ApprovalRequest]:
         self.get_run(tenant_id, run_id)
         return list(self.approval_requests.get(run_id, []))
+
+    def update_approval_execution(
+        self,
+        tenant_id: str,
+        run_id: str,
+        approval_id: str,
+        execution_status: str,
+        error: str | None = None,
+    ) -> ApprovalRequest:
+        run = self.get_run(tenant_id, run_id)
+        approvals = self.approval_requests.get(run_id, [])
+        for index, approval in enumerate(approvals):
+            if approval.id != approval_id:
+                continue
+            updated = approval.model_copy(
+                update={"execution_status": execution_status, "error": error}
+            )
+            approvals[index] = updated
+            self._append_run_event(
+                run,
+                "approval.execution_updated",
+                {
+                    "approval_id": approval_id,
+                    "execution_status": execution_status,
+                    "error": error,
+                },
+            )
+            return updated
+        raise NotFoundError(f"Approval request not found: {approval_id}")
+
+    def create_workflow(self, run: Run, spec: WorkflowSpec) -> WorkflowRun:
+        with self._repository_lock:
+            existing = self.get_workflow_for_parent_run(run.tenant_id, run.id)
+            if existing is not None:
+                return existing
+            now = utc_now()
+            workflow = WorkflowRun(
+                id=new_id("workflow"),
+                tenant_id=run.tenant_id,
+                workspace_id=run.workspace_id,
+                parent_run_id=run.id,
+                parent_thread_id=run.thread_id,
+                user_id=run.user_id,
+                status="awaiting_approval",
+                spec=spec,
+                created_at=now,
+                updated_at=now,
+            )
+            self.workflows[workflow.id] = workflow.model_copy(deep=True)
+            for phase in spec.phases:
+                for task_spec in phase.tasks:
+                    task = WorkflowTask(
+                        id=new_id("workflow_task"),
+                        tenant_id=run.tenant_id,
+                        workspace_id=run.workspace_id,
+                        workflow_id=workflow.id,
+                        task_id=task_spec.id,
+                        phase_id=phase.id,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    self.workflow_tasks[task.id] = task
+            return workflow
+
+    def get_workflow(self, tenant_id: str, workflow_id: str) -> WorkflowRun:
+        workflow = self.workflows.get(workflow_id)
+        if workflow is None or workflow.tenant_id != tenant_id:
+            raise NotFoundError(f"Workflow not found: {workflow_id}")
+        return workflow.model_copy(deep=True)
+
+    def get_workflow_for_parent_run(
+        self, tenant_id: str, run_id: str
+    ) -> WorkflowRun | None:
+        return next(
+            (
+                workflow.model_copy(deep=True)
+                for workflow in self.workflows.values()
+                if workflow.tenant_id == tenant_id
+                and workflow.parent_run_id == run_id
+            ),
+            None,
+        )
+
+    def update_workflow(
+        self, tenant_id: str, workflow_id: str, **changes: Any
+    ) -> WorkflowRun:
+        with self._repository_lock:
+            workflow = self.get_workflow(tenant_id, workflow_id)
+            updated = workflow.model_copy(
+                update={**changes, "updated_at": utc_now()}, deep=True
+            )
+            self.workflows[workflow_id] = updated
+            return updated.model_copy(deep=True)
+
+    def list_workflow_tasks(
+        self, tenant_id: str, workflow_id: str
+    ) -> list[WorkflowTask]:
+        self.get_workflow(tenant_id, workflow_id)
+        return sorted(
+            [
+                task.model_copy(deep=True)
+                for task in self.workflow_tasks.values()
+                if task.tenant_id == tenant_id and task.workflow_id == workflow_id
+            ],
+            key=lambda task: (task.created_at, task.id),
+        )
+
+    def get_workflow_task_for_child_run(
+        self, tenant_id: str, run_id: str
+    ) -> WorkflowTask | None:
+        return next(
+            (
+                task.model_copy(deep=True)
+                for task in self.workflow_tasks.values()
+                if task.tenant_id == tenant_id and task.child_run_id == run_id
+            ),
+            None,
+        )
+
+    def update_workflow_task(
+        self, tenant_id: str, task_record_id: str, **changes: Any
+    ) -> WorkflowTask:
+        with self._repository_lock:
+            task = self.workflow_tasks.get(task_record_id)
+            if task is None or task.tenant_id != tenant_id:
+                raise NotFoundError(f"Workflow task not found: {task_record_id}")
+            updated = task.model_copy(
+                update={**changes, "updated_at": utc_now()}, deep=True
+            )
+            self.workflow_tasks[task_record_id] = updated
+            return updated.model_copy(deep=True)
+
+    def create_secret_capture_request(
+        self,
+        run: Run,
+        *,
+        name: str,
+        tool_name: str | None = None,
+        connector_id: str | None = None,
+        action_id: str | None = None,
+        actions: list[str] | None = None,
+    ) -> SecretCaptureRequest:
+        existing = next(
+            (
+                item
+                for item in self.secret_capture_requests.values()
+                if item.tenant_id == run.tenant_id
+                and item.run_id == run.id
+                and item.name == name
+                and item.status == "pending"
+            ),
+            None,
+        )
+        if existing is not None:
+            return existing.model_copy(deep=True)
+        capture = SecretCaptureRequest(
+            id=new_id("secret_capture"),
+            tenant_id=run.tenant_id,
+            workspace_id=run.workspace_id,
+            run_id=run.id,
+            name=name,
+            tool_name=tool_name,
+            connector_id=connector_id,
+            action_id=action_id,
+            actions=actions or [],
+        )
+        self.secret_capture_requests[capture.id] = capture
+        self._append_run_event(
+            run,
+            "secret_capture.requested",
+            {
+                "requestId": capture.id,
+                "name": capture.name,
+                "toolName": capture.tool_name,
+                "connectorId": capture.connector_id,
+                "actions": capture.actions,
+            },
+        )
+        return capture
+
+    def get_secret_capture_request(
+        self, tenant_id: str, request_id: str
+    ) -> SecretCaptureRequest:
+        capture = self.secret_capture_requests.get(request_id)
+        if capture is None or capture.tenant_id != tenant_id:
+            raise NotFoundError(f"Secret capture request not found: {request_id}")
+        return capture.model_copy(deep=True)
+
+    def resolve_secret_capture_request(
+        self, tenant_id: str, request_id: str, secret_ref_id: str
+    ) -> SecretCaptureRequest:
+        capture = self.get_secret_capture_request(tenant_id, request_id)
+        if capture.status != "pending":
+            raise ValueError("secret capture request is no longer pending")
+        resolved = capture.model_copy(
+            update={
+                "status": "resolved",
+                "secret_ref_id": secret_ref_id,
+                "resolved_at": utc_now(),
+            }
+        )
+        self.secret_capture_requests[request_id] = resolved
+        run = self.get_run(tenant_id, capture.run_id)
+        self._append_run_event(
+            run,
+            "secret_capture.resolved",
+            {"requestId": request_id, "secretRefId": secret_ref_id},
+        )
+        return resolved
 
     def save_runtime_state(self, state: Any) -> RunStateSnapshot:
         self.get_run(state.tenant_id, state.run_id)

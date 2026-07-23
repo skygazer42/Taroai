@@ -22,6 +22,11 @@ function apiError(response, body) {
   return error;
 }
 
+function notifyAuthExpired(status) {
+  if (status !== 401) return;
+  window.dispatchEvent(new CustomEvent("taroai:auth-expired"));
+}
+
 function fileAsBase64(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -61,7 +66,7 @@ export class ChatApi {
   }
 
   settings() {
-    const apiBase = readValue("#api-base", "taroai.apiBase", "http://127.0.0.1:8000").replace(/\/+$/, "");
+    const apiBase = readValue("#api-base", "taroai.apiBase", window.location.origin).replace(/\/+$/, "");
     return {
       apiBase,
       tenantId: readValue("#tenant-id", "taroai.tenantId", "tenant_acme"),
@@ -77,6 +82,7 @@ export class ChatApi {
       ...(includeJson ? JSON_HEADERS : {}),
       "X-Tenant-ID": settings.tenantId,
       "X-User-ID": settings.userId,
+      "X-Workspace-ID": settings.workspaceId,
       ...extra,
     };
     if (settings.accessToken) headers.Authorization = `Bearer ${settings.accessToken}`;
@@ -97,7 +103,10 @@ export class ChatApi {
     });
     const text = await response.text();
     const body = responseBody(text);
-    if (!response.ok) throw apiError(response, body);
+    if (!response.ok) {
+      notifyAuthExpired(response.status);
+      throw apiError(response, body);
+    }
     return body;
   }
 
@@ -151,6 +160,7 @@ export class ChatApi {
     });
     if (!response.ok) {
       const body = responseBody(await response.text());
+      notifyAuthExpired(response.status);
       throw apiError(response, body);
     }
     return response.blob();
@@ -192,6 +202,7 @@ export class ChatApi {
     });
     if (!response.ok) {
       const body = responseBody(await response.text());
+      notifyAuthExpired(response.status);
       throw apiError(response, body);
     }
     if (!response.body) throw new Error("This browser cannot read the event stream");
@@ -200,6 +211,7 @@ export class ChatApi {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
+    let framesSinceYield = 0;
     try {
       while (true) {
         const { value, done } = await reader.read();
@@ -210,7 +222,14 @@ export class ChatApi {
           const frame = buffer.slice(0, boundary);
           const separatorLength = buffer.slice(boundary).startsWith("\r\n\r\n") ? 4 : 2;
           buffer = buffer.slice(boundary + separatorLength);
-          if (frame.trim()) options.onEvent?.(parseSseFrame(frame));
+          if (frame.trim()) {
+            options.onEvent?.(parseSseFrame(frame));
+            framesSinceYield += 1;
+            if (framesSinceYield === 24) {
+              framesSinceYield = 0;
+              await new Promise((resolve) => setTimeout(resolve, 0));
+            }
+          }
           boundary = buffer.search(/\r?\n\r?\n/);
         }
       }

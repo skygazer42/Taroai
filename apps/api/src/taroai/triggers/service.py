@@ -47,6 +47,9 @@ class TriggerStore(BaseModel):
     ) -> TriggerDefinition:
         raise NotImplementedError
 
+    def delete(self, tenant_id: str, trigger_id: str) -> TriggerDefinition:
+        raise NotImplementedError
+
 
 class InMemoryTriggerStore(TriggerStore):
     triggers: dict[str, TriggerDefinition] = Field(default_factory=dict)
@@ -101,6 +104,11 @@ class InMemoryTriggerStore(TriggerStore):
         self.triggers[trigger_id] = updated
         return updated
 
+    def delete(self, tenant_id: str, trigger_id: str) -> TriggerDefinition:
+        trigger = self.get(tenant_id, trigger_id)
+        del self.triggers[trigger_id]
+        return trigger
+
 
 class TriggerService(BaseModel):
     store: TriggerStore = Field(default_factory=InMemoryTriggerStore)
@@ -126,6 +134,12 @@ class TriggerService(BaseModel):
 
     def disable_trigger(self, tenant_id: str, trigger_id: str) -> TriggerDefinition:
         return self.store.update_status(tenant_id, trigger_id, TriggerStatus.DISABLED)
+
+    def delete_trigger(self, tenant_id: str, trigger_id: str) -> TriggerDefinition:
+        trigger = self.store.get(tenant_id, trigger_id)
+        if trigger.status != TriggerStatus.DISABLED:
+            raise ValueError("Disable the trigger before deleting it")
+        return self.store.delete(tenant_id, trigger_id)
 
     def update_next_run_at(
         self,

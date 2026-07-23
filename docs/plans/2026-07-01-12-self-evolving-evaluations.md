@@ -1,6 +1,5 @@
 # Self-Evolving and Evaluations Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Build a controlled self-improvement pipeline where failed or low-rated runs produce reviewed improvement candidates for prompts, skills, workflows, retrieval, and policy, without allowing agents to mutate production behavior directly.
 

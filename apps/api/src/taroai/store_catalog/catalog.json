@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "items": [
+    {
+      "id": "taroai.data-signal-starter",
+      "version": "1.0.0",
+      "name": "Data Signal Starter",
+      "description": "Turn an attached CSV into a concise, evidence-backed data quality and signal brief.",
+      "category": "data",
+      "publisher": "Taroai",
+      "industry": "general",
+      "use_cases": ["csv_analysis", "data_quality", "exploratory_summary"],
+      "skills": ["items/csv-signal-brief"],
+      "success_metrics": ["grounded_findings", "reported_data_quality_issues"],
+      "rollout_checklist": ["attach_a_csv", "review_sensitive_columns"]
+    }
+  ]
+}

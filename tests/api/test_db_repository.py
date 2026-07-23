@@ -72,6 +72,12 @@ def test_migration_runner_applies_pending_schema_and_records_versions(tmp_path: 
         "037_agent_engines.sql",
         "038_coding_workspaces.sql",
         "039_evaluation_runtime.sql",
+        "040_unique_run_event_sequence.sql",
+            "041_chat_message_execution_content.sql",
+            "042_workflow_agent_approvals.sql",
+            "043_owner_connector_invoke_permission.sql",
+            "044_notifications.sql",
+            "045_tenant_invitations.sql",
     ]
     runner = MigrationRunner(
         config=DatabaseConfig(url=f"sqlite:///{database_path}"),
@@ -208,6 +214,12 @@ def test_chat_loop_migration_adds_state_payload_to_existing_runtime_states(
         "037_agent_engines.sql",
         "038_coding_workspaces.sql",
         "039_evaluation_runtime.sql",
+        "040_unique_run_event_sequence.sql",
+            "041_chat_message_execution_content.sql",
+            "042_workflow_agent_approvals.sql",
+            "043_owner_connector_invoke_permission.sql",
+            "044_notifications.sql",
+            "045_tenant_invitations.sql",
     ]
     assert "state_payload" in columns
     assert state_payload == "{}"
@@ -611,13 +623,49 @@ def test_sql_repository_get_run_uses_tenant_scoped_lookup(monkeypatch):
     assert executed_sql == ["SELECT * FROM runs WHERE tenant_id = ? AND id = ?"]
 
 
+def test_sql_repository_get_runtime_state_uses_tenant_scoped_lookup(monkeypatch):
+    executed: list[tuple[str, tuple]] = []
+
+    class Result:
+        def fetchone(self):
+            return None
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, error_type, error, traceback):
+            return None
+
+        def execute(self, sql, params):
+            executed.append((" ".join(sql.split()), tuple(params)))
+            return Result()
+
+    monkeypatch.setattr("taroai.db.repository.connect_database", lambda _config: Connection())
+    monkeypatch.setattr(SqlControlPlaneRepository, "get_run", lambda *_args: None)
+    repository = SqlControlPlaneRepository(config=DatabaseConfig(url="postgresql://example"))
+
+    with pytest.raises(NotFoundError, match="Runtime state not found"):
+        repository.get_runtime_state("tenant_acme", "run_1")
+
+    assert executed == [
+        (
+            "SELECT * FROM runtime_states WHERE tenant_id = ? AND run_id = ?",
+            ("tenant_acme", "run_1"),
+        )
+    ]
+
+
 def test_sql_repository_append_run_event_sequence_lookup_is_tenant_scoped():
     executed: list[tuple[str, tuple]] = []
     now = datetime(2026, 7, 4, 0, 20, tzinfo=timezone.utc)
 
     class SelectResult:
+        def __init__(self, row):
+            self.row = row
+
         def fetchone(self):
-            return {"next_sequence": 7}
+            return self.row
 
     class InsertResult:
         def fetchone(self):
@@ -625,9 +673,12 @@ def test_sql_repository_append_run_event_sequence_lookup_is_tenant_scoped():
 
     class Connection:
         def execute(self, sql, params):
-            executed.append((" ".join(sql.split()), tuple(params)))
-            if sql.strip().upper().startswith("SELECT"):
-                return SelectResult()
+            normalized = " ".join(sql.split())
+            executed.append((normalized, tuple(params)))
+            if "FOR UPDATE" in normalized:
+                return SelectResult({"id": "run_1"})
+            if "MAX(sequence)" in normalized:
+                return SelectResult({"next_sequence": 7})
             return InsertResult()
 
     repository = SqlControlPlaneRepository(config=DatabaseConfig(url="postgresql://example"))
@@ -649,6 +700,10 @@ def test_sql_repository_append_run_event_sequence_lookup_is_tenant_scoped():
 
     assert event.sequence == 7
     assert executed[0] == (
+        "SELECT id FROM runs WHERE tenant_id = ? AND id = ? FOR UPDATE",
+        ("tenant_acme", "run_1"),
+    )
+    assert executed[1] == (
         "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence "
         "FROM run_events WHERE tenant_id = ? AND run_id = ?",
         ("tenant_acme", "run_1"),

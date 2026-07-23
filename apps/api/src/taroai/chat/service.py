@@ -5,8 +5,9 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from threading import Lock, RLock
 from typing import Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from taroai.api.idempotency import (
     IdempotencyConflictError,
@@ -25,6 +26,7 @@ from taroai.domain import (
     ResourceReference,
     Run,
     RunCreate,
+    RunMode,
     IdempotencyRecord,
     utc_now,
 )
@@ -40,6 +42,16 @@ from taroai.model_gateway import (
 from taroai.store import NotFoundError, TenantAccessError
 
 
+_MESSAGE_KIND_BY_RUN_MODE = {
+    RunMode.CHAT: "text",
+    RunMode.AUTONOMOUS: "agent",
+    RunMode.WORKFLOW: "workflow",
+}
+_RUN_MODE_BY_MESSAGE_KIND = {
+    kind: mode for mode, kind in _MESSAGE_KIND_BY_RUN_MODE.items()
+}
+
+
 class ChatThreadApiCreate(BaseModel):
     workspace_id: str = Field(min_length=1)
     title: str = ""
@@ -53,6 +65,7 @@ class ChatThreadApiCreate(BaseModel):
 class ChatThreadPatch(BaseModel):
     title: str | None = None
     pinned: bool | None = None
+    status: Literal["active", "archived"] | None = None
     provider_id: str | None = None
     model_id: str | None = None
     reasoning_effort: ReasoningEffort | None = None
@@ -62,11 +75,27 @@ class ChatThreadPatch(BaseModel):
 
 class ChatMessageSubmit(BaseModel):
     content: str = Field(min_length=1)
+    display_content: str | None = Field(default=None, min_length=1)
+    timezone: str | None = Field(default=None, min_length=1, max_length=128)
+    skill_ids: list[str] = Field(default_factory=list)
     delivery_mode: Literal["auto", "queue", "manual", "steer"] = "auto"
+    mode: RunMode = RunMode.CHAT
     attachments: list[str] = Field(default_factory=list)
     resource_refs: list[ResourceReference] = Field(default_factory=list)
 
     model_config = ConfigDict(extra="forbid")
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        try:
+            ZoneInfo(value)
+        except (ValueError, ZoneInfoNotFoundError) as error:
+            raise ValueError(f"unknown timezone: {value}") from error
+        return value
 
 
 class ChatMessageEdit(BaseModel):
@@ -165,11 +194,14 @@ class ChatService:
         self,
         tenant_id: str,
         workspace_id: str | None = None,
+        *,
+        include_archived: bool = False,
     ) -> list[ChatThread]:
         return [
             thread
             for thread in self.store.list_chat_threads(tenant_id, workspace_id)
             if thread.status != ChatThreadStatus.DELETED
+            and (include_archived or thread.status != ChatThreadStatus.ARCHIVED)
         ]
 
     def update_thread(
@@ -231,6 +263,8 @@ class ChatService:
         }:
             raise ValueError("Only queued or pending steering messages can be edited")
         changes = payload.model_dump(exclude_unset=True)
+        if "content" in changes:
+            changes["execution_content"] = changes["content"]
         return self.store.update_chat_message(tenant_id, message_id, **changes)
 
     def delete_message(
@@ -328,8 +362,9 @@ class ChatService:
                     message.created_by_user_id or thread.created_by_user_id,
                     RunCreate(
                         workspace_id=thread.workspace_id,
-                        message=message.content,
+                        message=message.execution_content or message.content,
                         attachments=message.attachments,
+                        mode=_RUN_MODE_BY_MESSAGE_KIND.get(message.kind, RunMode.CHAT),
                         thread_id=thread.id,
                         trigger_message_id=message.id,
                         provider_id=selection.provider_id,
@@ -365,6 +400,21 @@ class ChatService:
             thread = self.get_thread(tenant_id, thread_id)
             if thread.status != ChatThreadStatus.ACTIVE:
                 raise ValueError("messages cannot be posted to an archived thread")
+            if payload.timezone is not None:
+                local_datetime = utc_now().astimezone(
+                    ZoneInfo(payload.timezone)
+                ).isoformat()
+                payload = payload.model_copy(
+                    update={
+                        "display_content": payload.display_content or payload.content,
+                        "content": (
+                            "[Platform context: "
+                            f"user_timezone={payload.timezone}; "
+                            f"current_local_datetime={local_datetime}]\n\n"
+                            f"{payload.content}"
+                        ),
+                    }
+                )
             selection = self.resolve_selection(
                 tenant_id=tenant_id,
                 workspace_id=thread.workspace_id,
@@ -454,6 +504,20 @@ class ChatService:
     ) -> list[ModelCatalogEntry]:
         entries: dict[tuple[str, str], ModelCatalogEntry] = {}
         registry = self._provider_registry_resolver()
+        policy = self._model_policy_resolver()
+        default_request = self._selection_request(
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            provider_id=None,
+            model_id=None,
+            reasoning_effort=None,
+        )
+        default_model = policy.resolve_model(default_request)
+        provider_order = {
+            provider.id: index
+            for index, provider in enumerate(registry.candidates(default_request))
+        }
         for provider in registry.providers:
             for model_id in provider.catalog_model_ids():
                 request = self._selection_request(
@@ -467,7 +531,7 @@ class ChatService:
                 if not provider.matches(request):
                     continue
                 try:
-                    self._model_policy_resolver().assert_request_allowed(request)
+                    policy.assert_request_allowed(request)
                 except ModelPolicyDeniedError:
                     continue
                 entries[(provider.id, model_id)] = ModelCatalogEntry(
@@ -475,8 +539,20 @@ class ChatService:
                     model_id=model_id,
                     display_name=f"{provider.display_name or provider.id} / {model_id}",
                     reasoning_efforts=provider.reasoning_efforts,
+                    default_reasoning_effort=provider.default_reasoning_effort,
+                    configured=bool(
+                        provider.api_key or provider.api_key_secret_ref_id
+                    ),
                 )
-        return [entries[key] for key in sorted(entries)]
+        return sorted(
+            entries.values(),
+            key=lambda entry: (
+                entry.model_id != default_model,
+                provider_order.get(entry.provider_id, len(provider_order)),
+                entry.provider_id,
+                entry.model_id,
+            ),
+        )
 
     def resolve_selection(
         self,
@@ -572,8 +648,13 @@ class ChatService:
             thread.id,
             user_id,
             ChatMessageCreate(
-                content=payload.content,
-                kind="manual_queue" if payload.delivery_mode == "manual" else "text",
+                content=payload.display_content or payload.content,
+                execution_content=payload.content,
+                kind=(
+                    "manual_queue"
+                    if payload.delivery_mode == "manual"
+                    else _MESSAGE_KIND_BY_RUN_MODE[payload.mode]
+                ),
                 dispatch_status=dispatch_status,
                 attachments=payload.attachments,
                 resource_refs=payload.resource_refs,
@@ -594,7 +675,9 @@ class ChatService:
             thread.id,
             user_id,
             ChatMessageCreate(
-                content=payload.content,
+                content=payload.display_content or payload.content,
+                execution_content=payload.content,
+                kind=_MESSAGE_KIND_BY_RUN_MODE[payload.mode],
                 dispatch_status=ChatMessageDispatchStatus.INFLIGHT,
                 attachments=payload.attachments,
                 resource_refs=payload.resource_refs,
@@ -606,8 +689,9 @@ class ChatService:
                 user_id,
                 RunCreate(
                     workspace_id=thread.workspace_id,
-                    message=message.content,
+                    message=payload.content,
                     attachments=message.attachments,
+                    mode=payload.mode,
                     thread_id=thread.id,
                     trigger_message_id=message.id,
                     provider_id=selection.provider_id,
@@ -631,7 +715,11 @@ class ChatService:
                 tenant_id,
                 message.id,
                 dispatch_status=fallback_status,
-                kind="manual_queue" if payload.delivery_mode == "manual" else "text",
+                kind=(
+                    "manual_queue"
+                    if payload.delivery_mode == "manual"
+                    else _MESSAGE_KIND_BY_RUN_MODE[payload.mode]
+                ),
             )
         return self._dispatch_response(message, run, run_started=run_started)
 

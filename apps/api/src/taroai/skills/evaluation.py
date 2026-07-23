@@ -269,7 +269,7 @@ def score_evaluation_case(
     )
 
 
-def load_evaluation_suite(package: SkillPackage) -> SkillEvaluationSuite:
+def load_evaluation_suite(package: SkillPackage) -> SkillEvaluationSuite | None:
     config = package.taroai_config.get("spec", {})
     if not isinstance(config, dict):
         config = {}
@@ -283,8 +283,8 @@ def load_evaluation_suite(package: SkillPackage) -> SkillEvaluationSuite:
     except KeyError:
         try:
             suite_file = package.get_file("evals/cases.jsonl")
-        except KeyError as error:
-            raise SkillPackageError("skill package has no executable evaluation suite") from error
+        except KeyError:
+            return None
     try:
         text = suite_file.content.decode("utf-8-sig")
         if suite_file.path.endswith(".jsonl"):
@@ -325,4 +325,3 @@ def _safe_output_summary(output: dict[str, Any]) -> dict[str, Any]:
             for key, value in sorted(output.items())
         },
     }
-

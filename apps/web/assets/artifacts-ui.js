@@ -1,7 +1,7 @@
-import { chatApi } from "./chat-api.js";
+import { chatApi } from "./chat-api.js?v=20260722-flow115";
 
 function contentOf(artifact) {
-  return artifact.content ?? artifact.text ?? artifact.markdown ?? artifact.source ?? artifact.data ?? "";
+  return artifact.content ?? artifact.text ?? artifact.markdown ?? artifact.source ?? artifact.srcdoc ?? artifact.data ?? "";
 }
 
 function kindOf(artifact) {
@@ -22,7 +22,9 @@ export class ArtifactsUI {
     this.mode = "preview";
     this.source = null;
     this.diff = null;
+    this.previewUrl = null;
     this.objectUrls = [];
+    this.openToken = 0;
   }
 
   init() {
@@ -30,10 +32,26 @@ export class ArtifactsUI {
   }
 
   async open(artifact) {
+    const openToken = ++this.openToken;
     this.revokeUrls();
+    if (artifact.id && !contentOf(artifact) && !artifact.download_url) {
+      try {
+        const preview = await this.api.get(`/api/artifacts/${encodeURIComponent(artifact.id)}/preview`);
+        artifact = { ...artifact, ...preview };
+      } catch { /* Source and download remain available when preview is unsupported. */ }
+    }
+    if (openToken !== this.openToken) return;
     this.artifact = artifact;
     this.source = null;
     this.diff = null;
+    if (artifact.id && ["image", "pdf"].includes(kindOf(artifact))) {
+      try {
+        const blob = await this.api.blob(`/api/artifacts/${encodeURIComponent(artifact.id)}/download`);
+        if (openToken !== this.openToken) return;
+        this.previewUrl = URL.createObjectURL(blob);
+        this.objectUrls.push(this.previewUrl);
+      } catch { /* The preview shows an explicit unavailable state below. */ }
+    }
     const stage = document.querySelector("[data-artifact-stage]");
     if (!stage) return;
     stage.hidden = false;
@@ -143,7 +161,8 @@ export class ArtifactsUI {
   }
 
   renderPdf(stage) {
-    const source = this.artifact.preview_url || this.artifact.download_url || this.artifact.url;
+    const source = this.previewUrl || (!this.artifact.id && (this.artifact.preview_url || this.artifact.download_url || this.artifact.url));
+    if (!source) return this.renderBinaryUnavailable(stage);
     const frame = document.createElement("iframe");
     frame.className = "artifact-preview-frame";
     frame.title = this.artifact.name || "PDF preview";
@@ -154,11 +173,20 @@ export class ArtifactsUI {
   }
 
   renderImage(stage) {
+    const source = this.previewUrl || (!this.artifact.id && (this.artifact.preview_url || this.artifact.download_url || this.artifact.url)) || String(contentOf(this.artifact));
+    if (!source) return this.renderBinaryUnavailable(stage);
     const image = document.createElement("img");
     image.className = "artifact-image-preview";
     image.alt = this.artifact.name || "Artifact preview";
-    image.src = this.artifact.preview_url || this.artifact.download_url || this.artifact.url || String(contentOf(this.artifact));
+    image.src = source;
     stage.append(image);
+  }
+
+  renderBinaryUnavailable(stage) {
+    const note = document.createElement("p");
+    note.className = "route-note";
+    note.textContent = "Preview unavailable. Try Download again.";
+    stage.append(note);
   }
 
   renderDashboard(stage) {
@@ -211,14 +239,24 @@ export class ArtifactsUI {
   }
 
   async download() {
-    const direct = this.artifact.download_url || this.artifact.url;
-    if (direct) { window.open(direct, "_blank", "noopener"); return; }
     if (this.artifact.id) {
       try {
         const blob = await this.api.blob(`/api/artifacts/${encodeURIComponent(this.artifact.id)}/download`);
         const url = URL.createObjectURL(blob); this.objectUrls.push(url); const link = document.createElement("a"); link.href = url; link.download = this.artifact.filename || this.artifact.name || "artifact"; link.click(); return;
-      } catch { /* Inline artifacts fall back to client-side content below. */ }
+      } catch (error) {
+        const stage = document.querySelector("[data-rich-artifact-stage]");
+        if (stage) {
+          stage.replaceChildren();
+          const note = document.createElement("p");
+          note.className = "route-note";
+          note.textContent = `Download failed. ${error.message}`;
+          stage.append(note);
+        }
+        return;
+      }
     }
+    const direct = this.artifact.download_url || this.artifact.url;
+    if (direct && !this.artifact.id) { window.open(direct, "_blank", "noopener"); return; }
     const content = contentOf(this.artifact); const blob = new Blob([typeof content === "string" ? content : JSON.stringify(content, null, 2)], { type: this.artifact.media_type || "text/plain" });
     const url = URL.createObjectURL(blob); this.objectUrls.push(url); const link = document.createElement("a"); link.href = url; link.download = this.artifact.filename || this.artifact.name || "artifact.txt"; link.click();
   }
@@ -251,7 +289,21 @@ export class ArtifactsUI {
     dialog.showModal();
   }
 
-  revokeUrls() { this.objectUrls.forEach((url) => URL.revokeObjectURL(url)); this.objectUrls = []; }
+  close() {
+    this.openToken += 1;
+    this.revokeUrls();
+    this.artifact = null;
+    this.source = null;
+    this.diff = null;
+    const stage = document.querySelector("[data-artifact-stage]");
+    if (stage) { stage.replaceChildren(); stage.hidden = true; }
+  }
+
+  revokeUrls() {
+    this.objectUrls.forEach((url) => URL.revokeObjectURL(url));
+    this.objectUrls = [];
+    this.previewUrl = null;
+  }
 }
 
 let singleton;

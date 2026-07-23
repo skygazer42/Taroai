@@ -1,6 +1,9 @@
 from pydantic import BaseModel, Field
 
+from taroai.domain import utc_now
+
 from taroai.connectors.models import (
+    ConnectorCredentialRef,
     ConnectorDefinition,
     ConnectorDefinitionCreate,
     ConnectorSyncStateUpdate,
@@ -76,6 +79,28 @@ class InMemoryConnectorRegistry(BaseModel):
     ) -> ConnectorDefinition:
         connector = self.get_connector(tenant_id, connector_id)
         updated = connector.apply_status(status)
+        self.connectors[connector_id] = updated
+        return updated.model_copy(deep=True)
+
+    def update_connector_credential(
+        self,
+        tenant_id: str,
+        connector_id: str,
+        credential_ref: ConnectorCredentialRef,
+    ) -> ConnectorDefinition:
+        connector = self.get_connector(tenant_id, connector_id)
+        if credential_ref.tenant_id != tenant_id or credential_ref.workspace_id not in {
+            None,
+            connector.workspace_id,
+        }:
+            raise ConnectorAccessDeniedError("connector credential is not in workspace")
+        updated = connector.model_copy(
+            update={
+                "credential_ref": credential_ref,
+                "status": ConnectorStatus.ENABLED,
+                "updated_at": utc_now(),
+            }
+        )
         self.connectors[connector_id] = updated
         return updated.model_copy(deep=True)
 

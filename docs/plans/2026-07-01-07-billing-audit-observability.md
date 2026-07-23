@@ -1,6 +1,5 @@
 # Billing, Audit, and Observability Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Make cost, audit, and traces first-class platform primitives so every run, model call, tool call, sandbox action, memory write, and artifact operation can be inspected and billed.
 

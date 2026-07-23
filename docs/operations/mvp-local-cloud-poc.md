@@ -10,13 +10,17 @@ This runbook starts the local cloud PoC with the static Workspace UI, API contai
 cp .env.example .env
 ```
 
-Compose loads `.env.example` first and then overlays `.env` when it exists.
+Compose loads `.env.example`, then overlays `.env`, and finally overlays the
+optional `.env.runtime`. Use `.env.runtime` for temporary provider changes that
+must survive container recreation without rewriting the main local config.
 
-Do not commit or package `.env`. The repository ships only `.env.example`; `.env` is a local operator override and can change provider behavior such as the local PoC sandbox setting.
+Do not commit or package `.env` or `.env.runtime`. Both are ignored local
+operator files; the repository ships only non-secret templates.
 
-The API service also passes `TAROAI_MODEL_GATEWAY_*` values from the host shell
-through `infra/docker-compose.yml`, so strict model execution can be configured
-without writing provider credentials into `.env`.
+For the current Zhipu profile, copy `infra/config/zhipu.env.example` to
+`.env.runtime`, fill the key locally, and recreate the API and workers. Model and
+Embedding settings intentionally come only from these service env files so an
+empty Compose interpolation cannot erase a configured credential.
 
 The API and `minio-init` services also pass object-storage bucket and region
 settings from the host shell. Keep `TAROAI_OBJECT_STORAGE_BUCKET` and
@@ -74,10 +78,10 @@ The local PoC API uses PostgreSQL by default through `TAROAI_DATABASE_URL=postgr
 
 The local cloud PoC template uses SQL-backed control-plane/catalog services, Redis-backed short-term memory and job queues, and MinIO-backed object storage. The Pydantic Settings profile gate rejects the in-memory backend defaults whenever `TAROAI_ENVIRONMENT` is `production` or `prod`, even in managed-cloud mode, so production operators must keep the durable SQL/Redis backend settings enabled before startup.
 
-Production environments also reject `TAROAI_DEPLOYMENT_SECRET_MANAGER_TYPE=local`
-and `TAROAI_SECRET_SERVICE_BACKEND=memory`. Use the local secret-manager and
-in-process secret service defaults only for local validation; production and
-customer-operated deployments must use an approved external secret backend.
+Production environments reject `TAROAI_DEPLOYMENT_SECRET_MANAGER_TYPE=local`
+and both `memory` and `local` secret-service backends. Compose uses the encrypted,
+shared-volume `local` backend so API and workers can resume Secret Capture; production
+and customer-operated deployments must use an approved external secret backend.
 
 The local cloud PoC template enables `TAROAI_SANDBOX_PROVIDER=local_process`. Sandbox sessions execute commands inside per-session workspaces under `TAROAI_SANDBOX_ROOT_DIR` in the API container. Its capability response intentionally declares no network isolation, filesystem isolation, or resource limits; it only proves local workspace lifecycle and destroy behavior. `/readyz` exposes those direct-adapter capability flags for local providers, and the local PoC verifier records them in its result JSON, so the workspace preflight and release evidence can distinguish PoC execution from hardened sandbox isolation. Operators can explicitly switch to `TAROAI_SANDBOX_PROVIDER=docker` where a Docker daemon is available; that provider starts disabled-network containers with the session workspace mounted at `/workspace`, memory/CPU/pids limits, non-root `--user`, read-only rootfs, dropped capabilities, security options, and tmpfs mounts configured through `TAROAI_SANDBOX_DOCKER_*` settings. Direct in-process sandbox capacity is configured through `TAROAI_SANDBOX_MAX_SESSIONS`, `TAROAI_SANDBOX_MAX_SESSIONS_PER_TENANT`, and `TAROAI_SANDBOX_MAX_SESSIONS_PER_RUN`; controller deployments use the `TAROAI_SANDBOX_CONTROLLER_*` capacity settings below. Sandbox command environment keys must be valid POSIX-style names, and platform-managed keys such as `TAROAI_SANDBOX_WORKSPACE` stay authoritative across local, Docker, and Kubernetes providers. This is useful for local validation; shared enterprise deployments still need Kubernetes, E2B, or microVM-backed isolation before granting broad command execution to employees. The Pydantic Settings profile gate rejects `local_process`, `docker`, and `disabled` sandbox providers for BYOC, VPC, private, and air-gapped deployment modes, and also rejects them whenever `TAROAI_ENVIRONMENT` is `production` or `prod`; those deployment contexts must use `TAROAI_SANDBOX_PROVIDER=k8s` or `TAROAI_SANDBOX_PROVIDER=e2b`, configure `TAROAI_SANDBOX_CONTROLLER_BASE_URL`, configure `TAROAI_SANDBOX_CONTROLLER_API_KEY` in the runtime secret, and route sandbox lifecycle, command, file, snapshot, destroy, `GET /sessions`, and `GET /capabilities` calls through the HTTP sandbox controller contract. Air-gapped mode still requires an internal provider.
 
@@ -222,7 +226,7 @@ The local cloud PoC template also enables `TAROAI_BROWSER_PROVIDER=playwright` a
 ## Start
 
 ```bash
-docker compose -f infra/docker-compose.yml up --build
+docker compose --env-file .env -f infra/docker-compose.yml up --build
 ```
 
 If default host ports are already occupied, override only the host mappings without changing service-internal URLs:
@@ -235,7 +239,7 @@ POSTGRES_PORT=55432 \
 REDIS_PORT=56379 \
 MINIO_API_PORT=59000 \
 MINIO_CONSOLE_PORT=59001 \
-docker compose -p taroai-live-e2e -f infra/docker-compose.yml up --build
+docker compose --env-file .env -p taroai-live-e2e -f infra/docker-compose.yml up --build
 ```
 
 When using these alternate host ports, open `http://localhost:3300` and set the workspace API Base field to `http://localhost:8800`.
@@ -395,7 +399,7 @@ For a shared local stack, prefer injecting the controller key through the shell:
 read -rsp "TAROAI_BROWSER_CONTROLLER_API_KEY: " TAROAI_BROWSER_CONTROLLER_API_KEY
 export TAROAI_BROWSER_CONTROLLER_API_KEY
 echo
-docker compose -f infra/docker-compose.yml up --build
+docker compose --env-file .env -f infra/docker-compose.yml up --build
 ```
 
 Sandbox workspace root:
@@ -876,7 +880,7 @@ The API entrypoint runs migrations when `TAROAI_RUN_MIGRATIONS=true`. For an
 operator-style dry run, generate a migration plan first:
 
 ```bash
-docker compose -f infra/docker-compose.yml run --rm api \
+docker compose --env-file .env -f infra/docker-compose.yml run --rm api \
   sh -lc 'python -m taroai.db.migration_cli \
     --database-url "$TAROAI_DATABASE_URL" \
     --migrations-path /app/migrations'
@@ -885,7 +889,7 @@ docker compose -f infra/docker-compose.yml run --rm api \
 Apply migrations explicitly after reviewing the plan:
 
 ```bash
-docker compose -f infra/docker-compose.yml run --rm api \
+docker compose --env-file .env -f infra/docker-compose.yml run --rm api \
   sh -lc 'python -m taroai.db.migration_cli \
     --database-url "$TAROAI_DATABASE_URL" \
     --migrations-path /app/migrations \
@@ -988,11 +992,11 @@ For object storage, use the API storage endpoints after login:
 ## Shutdown
 
 ```bash
-docker compose -f infra/docker-compose.yml down
+docker compose --env-file .env -f infra/docker-compose.yml down
 ```
 
 To remove local volumes:
 
 ```bash
-docker compose -f infra/docker-compose.yml down -v
+docker compose --env-file .env -f infra/docker-compose.yml down -v
 ```

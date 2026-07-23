@@ -108,6 +108,7 @@ class ChatThread(BaseModel):
 class ChatMessageCreate(BaseModel):
     role: ChatMessageRole = ChatMessageRole.USER
     content: str = Field(min_length=1)
+    execution_content: str | None = Field(default=None, min_length=1)
     kind: str = "text"
     dispatch_status: ChatMessageDispatchStatus = ChatMessageDispatchStatus.READY
     delivery_status: ChatMessageDeliveryStatus = ChatMessageDeliveryStatus.PENDING
@@ -124,6 +125,7 @@ class ChatMessage(BaseModel):
     created_by_user_id: str | None = None
     role: ChatMessageRole
     content: str
+    execution_content: str | None = None
     kind: str = "text"
     dispatch_status: ChatMessageDispatchStatus
     delivery_status: ChatMessageDeliveryStatus
@@ -165,6 +167,58 @@ class Run(BaseModel):
     model_id: str | None = None
     reasoning_effort: str | None = None
     resource_refs: list[ResourceReference] = Field(default_factory=list)
+
+
+class Notification(BaseModel):
+    id: str
+    tenant_id: str
+    user_id: str
+    type: str
+    title: str
+    body: str
+    run_id: str | None = None
+    thread_id: str | None = None
+    created_at: datetime
+    read_at: datetime | None = None
+
+
+_AGENT_RUN_NOTIFICATION_COPY = {
+    RunStatus.SUCCEEDED: (
+        "agent.run.succeeded",
+        "Agent run completed",
+        "The background run completed successfully.",
+    ),
+    RunStatus.FAILED: (
+        "agent.run.failed",
+        "Agent run failed",
+        "The background run could not be completed.",
+    ),
+    RunStatus.AWAITING_APPROVAL: (
+        "agent.run.awaiting_approval",
+        "Agent run needs approval",
+        "Review the pending action to continue this run.",
+    ),
+}
+
+
+def notification_for_agent_run_status(
+    run: Run, status: RunStatus
+) -> Notification | None:
+    copy = _AGENT_RUN_NOTIFICATION_COPY.get(status)
+    if run.agent_id is None or copy is None:
+        return None
+    notification_type, title, body = copy
+    return Notification(
+        id=new_id("notification"),
+        tenant_id=run.tenant_id,
+        user_id=run.user_id,
+        type=notification_type,
+        title=title,
+        body=body,
+        run_id=run.id,
+        thread_id=run.thread_id,
+        created_at=utc_now(),
+    )
 
 
 class RunEvent(BaseModel):
@@ -269,6 +323,29 @@ class ApprovalRequest(BaseModel):
     step_id: str
     reason: str
     status: ApprovalStatus
+    kind: Literal[
+        "action",
+        "tool_action",
+        "connector",
+        "connector_action",
+        "workflow",
+        "guardrail",
+        "memory",
+        "agent_write",
+    ] = "action"
+    subject_type: str | None = None
+    subject_id: str | None = None
+    preview_payload: dict[str, Any] = Field(default_factory=dict)
+    validation_payload: dict[str, Any] = Field(default_factory=dict)
+    execution_status: Literal[
+        "not_started",
+        "applying",
+        "blocked_by_validation",
+        "apply_failed",
+        "superseded",
+        "applied",
+    ] = "not_started"
+    error: str | None = None
     requested_by_user_id: str | None = None
     resolved_by_user_id: str | None = None
     created_at: datetime

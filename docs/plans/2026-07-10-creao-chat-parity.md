@@ -1,6 +1,5 @@
 # CREAO Chat Parity Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Reproduce the logged-in CREAO `/chat` shell and core interaction states in Taroai while preserving all existing governed-run functionality and honestly representing unsupported backend capabilities.
 
@@ -140,9 +139,7 @@ Expected: all interaction and viewport checks pass.
 
 ### Task 6: Visual-verdict iteration
 
-**Files:**
-- Update: `.omx/state/taroai-creao-chat/web-clone-verdicts.json`
-- Update: `.omx/state/taroai-creao-chat/ralph-progress.json`
+Visual verdicts are temporary test evidence and are not stored in the repository.
 
 **Step 1: Capture the local empty state**
 

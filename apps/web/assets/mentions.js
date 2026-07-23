@@ -7,7 +7,7 @@ function asArray(value) {
 }
 
 function candidateType(candidate, fallback) {
-  const raw = candidate.type || candidate.kind || candidate.resource_type || fallback || "resource";
+  const raw = fallback || candidate.type || candidate.kind || candidate.resource_type || "resource";
   return String(raw).replace(/_binding$/, "").replace(/_base$/, "").toLowerCase();
 }
 
@@ -24,6 +24,7 @@ function normalizeOne(candidate, fallbackType) {
     name: candidate.name || candidate.display_name || candidate.title || String(id),
     description: candidate.description || candidate.summary || candidate.status || "",
     enabled: candidate.enabled !== false && candidate.status !== "disabled",
+    is_default: Boolean(candidate.is_default),
     icon: { skill: "S", connector: "C", agent: "A", knowledge: "K", file: "F", browser_profile: "B", repository: "R" }[type] || "@",
   };
 }

@@ -294,15 +294,14 @@ class KubernetesSandboxAdapter(SandboxAdapter):
             raise SandboxExecutionError(
                 f"kubernetes sandbox provider failed to upload file: {message}"
             )
-        return SandboxFileRef(
+        return SandboxFileRef.from_bytes(
+            content_bytes,
             tenant_id=file_write.tenant_id,
             workspace_id=file_write.workspace_id,
             run_id=file_write.run_id,
             session_id=file_write.session_id,
             path=display_path,
             content_type=file_write.content_type,
-            size_bytes=len(content_bytes),
-            content=file_write.content if file_write.content_base64 is None else None,
         )
 
     def download_file(
@@ -333,16 +332,15 @@ class KubernetesSandboxAdapter(SandboxAdapter):
             raise NotFoundError(f"Sandbox file not found: {path}. {message}".strip())
         if not local_path.exists() or not local_path.is_file():
             raise NotFoundError(f"Sandbox file not found: {path}")
-        content = local_path.read_text(encoding="utf-8")
-        return SandboxFileRef(
+        content = local_path.read_bytes()
+        return SandboxFileRef.from_bytes(
+            content,
             tenant_id=session.tenant_id,
             workspace_id=session.workspace_id,
             run_id=session.run_id,
             session_id=session.id,
             path=display_path,
             content_type=self._content_type(display_path),
-            size_bytes=len(content.encode("utf-8")),
-            content=content,
         )
 
     def list_files(self, tenant_id: str, session_id: str) -> list[SandboxFileRef]:

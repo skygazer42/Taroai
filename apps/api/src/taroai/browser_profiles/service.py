@@ -218,23 +218,22 @@ class BrowserProfileService:
     ) -> dict[str, Any] | None:
         if profile is None or profile.secret_ref_id is None:
             return None
-        if profile.secret_ref_id not in self.secret_service.secrets:
-            self.secret_service.register_secret_ref(
-                SecretRef(
-                    id=profile.secret_ref_id,
+        self.secret_service.register_secret_ref(
+            SecretRef(
+                id=profile.secret_ref_id,
+                tenant_id=profile.tenant_id,
+                workspace_id=profile.workspace_id,
+                name=f"Browser profile state: {profile.name}",
+                scope=SecretScope(
                     tenant_id=profile.tenant_id,
                     workspace_id=profile.workspace_id,
-                    name=f"Browser profile state: {profile.name}",
-                    scope=SecretScope(
-                        tenant_id=profile.tenant_id,
-                        workspace_id=profile.workspace_id,
-                        allowed_tool_names=["browser.profile"],
-                        actions=["read", "write"],
-                    ),
-                    backend=profile.secret_backend or "memory",
-                    external_name=profile.secret_external_name,
-                )
+                    allowed_tool_names=["browser.profile"],
+                    actions=["read", "write"],
+                ),
+                backend=profile.secret_backend or "memory",
+                external_name=profile.secret_external_name,
             )
+        )
         lease = self.secret_service.create_lease(
             tenant_id=profile.tenant_id,
             workspace_id=profile.workspace_id,

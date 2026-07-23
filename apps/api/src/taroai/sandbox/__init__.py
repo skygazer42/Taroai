@@ -50,6 +50,14 @@ def register_browser_tool_handlers(*args, **kwargs):
     return register(*args, **kwargs)
 
 
+def __getattr__(name: str):
+    if name == "E2BSandboxAdapter":
+        from taroai.sandbox.e2b import E2BSandboxAdapter
+
+        return E2BSandboxAdapter
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 __all__ = [
     "BrowserAction",
     "BrowserActionRequest",
@@ -60,6 +68,7 @@ __all__ = [
     "BrowserProviderUnavailableError",
     "BrowserSession",
     "DockerSandboxAdapter",
+    "E2BSandboxAdapter",
     "HttpBrowserController",
     "HttpSandboxAdapter",
     "KubernetesSandboxAdapter",

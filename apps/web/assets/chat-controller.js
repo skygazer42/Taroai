@@ -1,27 +1,39 @@
-import { chatApi } from "./chat-api.js";
+import { chatApi } from "./chat-api.js?v=20260722-flow115";
 import {
   filterMentionCandidates,
   insertMention,
   mentionQuery,
   normalizeCapabilities,
   resourceReference,
-} from "./mentions.js";
+} from "./mentions.js?v=20260722-flow115";
 
 export const chatState = {
   currentThreadId: null,
   currentRunId: null,
+  currentRunMode: "chat",
   lastThreadSequence: 0,
   threads: [],
   messages: [],
   queue: [],
   events: [],
   artifacts: [],
+  commandOutputs: new Map(),
   codingWorkspace: null,
   activeCodingChange: null,
   modelCatalog: [],
   selectedModel: null,
   capabilities: [],
+  creationCapabilities: {
+    image: false,
+    video: false,
+    voice: false,
+    browser: false,
+    workflow: false,
+    slides: false,
+  },
   resourceRefs: [],
+  browserProfile: null,
+  createIntent: null,
   uploads: [],
   thread: null,
   running: false,
@@ -34,22 +46,56 @@ export const chatState = {
   share: null,
   suggestions: [],
   promotingManual: false,
+  thoughtOpen: false,
+  inputRequest: null,
+  inputAnswers: {},
+  inputExtra: "",
+  feedbackByMessage: new Map(),
+  enteringMessageId: null,
+  inputRequestEntering: false,
+  suggestionsEntering: false,
 };
 
 const ACTIVE_RUN_STATES = new Set([
   "created",
   "queued",
+  "classifying",
+  "retrieving_context",
   "planning",
   "running",
-  "executing",
-  "repairing",
-  "replanning",
-  "verifying",
-  "waiting_for_approval",
-  "waiting_for_user",
+  "awaiting_approval",
+  "retrying",
 ]);
 
-const TERMINAL_EVENT_WORDS = ["completed", "succeeded", "failed", "cancelled", "stopped"];
+const TERMINAL_EVENT_WORDS = ["completed", "succeeded", "failed", "cancelled", "stopped", "timed_out"];
+
+const CREATE_INTENTS = {
+  agent: {
+    label: "Agent",
+    chipLabel: "Mode",
+    prefix: "The user explicitly chose Agent mode. Use the available tools when needed and complete the task end to end.\n\n",
+  },
+  image: {
+    label: "Image",
+    prefix: "The user explicitly chose image generation in the composer. Use your image generation tool to fulfill this request.\n\n",
+  },
+  video: {
+    label: "Video",
+    prefix: "The user explicitly chose video generation in the composer. Use your video generation tool to fulfill this request.\n\n",
+  },
+  voice: {
+    label: "Voice",
+    prefix: "The user explicitly chose voice generation in the composer. Use your text-to-speech tool to fulfill this request.\n\n",
+  },
+  workflow: {
+    label: "Workflow",
+    prefix: "The user explicitly chose a multi-step workflow in the composer. Plan clear phases, inputs, parallel work where useful, and verification before producing the final result.\n\n",
+  },
+  slides: {
+    label: "Slide deck",
+    prefix: "The user explicitly chose slide deck creation in the composer. Create a polished slide deck artifact that fulfills this request.\n\n",
+  },
+};
 
 function query(selector, root = document) {
   return root.querySelector(selector);
@@ -69,6 +115,11 @@ function arrayFrom(payload, ...keys) {
   return [];
 }
 
+function isDisplayableArtifact(artifact) {
+  if (artifact.name !== "agent-result.md") return true;
+  return Boolean(artifact.storage_object_id || Object.keys(artifact.preview_payload || {}).length);
+}
+
 function text(value, fallback = "") {
   if (value === null || value === undefined) return fallback;
   if (typeof value === "string") return value;
@@ -79,44 +130,120 @@ function text(value, fallback = "") {
   }
 }
 
+function safeCommandStream(value, limit = 8000) {
+  if (typeof value !== "string") return "";
+  if (value.length <= limit) return value;
+  const half = Math.floor(limit / 2);
+  return `${value.slice(0, half)}\n… output truncated …\n${value.slice(-half)}`;
+}
+
 function setText(element, value) {
   if (element) element.textContent = value;
 }
 
-function safeTime(value) {
-  const date = value ? new Date(value) : null;
-  if (!date || Number.isNaN(date.valueOf())) return "";
-  return new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" }).format(date);
-}
-
 function threadIdFromHash() {
   const match = window.location.hash.match(/^#chat\/([^/?#]+)/i);
-  return match ? decodeURIComponent(match[1]) : null;
+  return match
+    ? decodeURIComponent(match[1])
+    : new URLSearchParams(window.location.search).get("threadId");
 }
 
 function updateThreadHash(threadId, replace = false) {
-  const hash = threadId ? `#chat/${encodeURIComponent(threadId)}` : "#chat";
-  if (window.location.hash === hash) return;
-  if (replace) history.replaceState({}, "", hash);
-  else history.pushState({}, "", hash);
+  const url = new URL(window.location.href);
+  url.searchParams.delete("threadId");
+  url.hash = threadId ? `#chat/${encodeURIComponent(threadId)}` : "#chat";
+  if (url.href === window.location.href) return;
+  if (replace) history.replaceState({}, "", url);
+  else history.pushState({}, "", url);
+  window.dispatchEvent(new CustomEvent("taroai:route-changed"));
+}
+
+function publishChatContext() {
+  window.dispatchEvent(new CustomEvent("taroai:chat-context-changed", {
+    detail: {
+      threadId: chatState.currentThreadId,
+      runId: chatState.currentRunId,
+    },
+  }));
 }
 
 function modelKey(model) {
   return `${model.provider_id || model.provider || "provider"}:${model.model_id || model.id || model.name}`;
 }
 
+const PROVIDER_LABELS = {
+  anthropic: "Anthropic",
+  openai: "OpenAI",
+  google: "Google",
+  gemini: "Google",
+  meta: "Meta",
+  deepseek: "DeepSeek",
+  zai: "Z.AI",
+  "z-ai": "Z.AI",
+  minimax: "MiniMax",
+  moonshot: "Moonshot AI",
+  mistral: "Mistral",
+  xai: "xAI",
+  sakana: "Sakana",
+};
+
+const PROVIDER_GLYPHS = {
+  anthropic: "✳",
+  openai: "⬡",
+  google: "✦",
+  gemini: "✦",
+  meta: "∞",
+  deepseek: "◗",
+  zai: "◇",
+  minimax: "✶",
+  moonshot: "☾",
+  xai: "✕",
+  sakana: "≋",
+};
+
+const MODEL_PRESENTATION = {
+  "claude-sonnet-5": { name: "Claude Sonnet 5", description: "Everyday coding, agents, and professional work at scale.", isNew: true },
+  "claude-opus-4-8": { name: "Claude Opus 4.8", description: "Deep reasoning for the hardest problems." },
+  "claude-haiku-4-5": { name: "Claude Haiku 4.5", description: "Quick replies and light tasks." },
+  "gpt-5.6": { name: "GPT-5.6", description: "Rigorous coding and step-by-step reasoning.", isNew: true },
+  "gpt-5.5": { name: "GPT-5.5", description: "Rigorous coding and step-by-step reasoning." },
+  "deepseek-v4-flash": { name: "DeepSeek V4 Flash", description: "Fast, high-volume agentic work at low cost.", isNew: true },
+  "glm-4.7": { name: "GLM 4.7", description: "Agentic reasoning, coding, and tool use.", isNew: true },
+  "glm-4.5-flash": { name: "GLM 4.5 Flash", description: "Fast everyday chat and tool use.", isNew: true },
+  "glm-5.2": { name: "GLM 5.2", description: "Long agentic coding on a budget.", isNew: true },
+  "glm-5": { name: "GLM 5", description: "Reliable general assistant work." },
+  "minimax-m2.1": { name: "MiniMax M2.1", description: "Fast multimodal agents at a low price.", isNew: true },
+  "kimi-k2.5": { name: "Kimi K2.5", description: "Agentic reasoning with a huge context window.", isNew: true },
+  "grok-4.1": { name: "Grok 4.1", description: "Frontier reasoning with real-time knowledge." },
+  "grok-4.1-fast": { name: "Grok 4.1 Fast", description: "Snappy responses for everyday tasks.", isNew: true },
+  "grok-4.5": { name: "Grok 4.5", description: "Cost-efficient development and agent work.", isNew: true },
+};
+
+function providerLabel(providerId) {
+  const key = String(providerId || "").toLowerCase();
+  return PROVIDER_LABELS[key] || `${key.slice(0, 1).toUpperCase()}${key.slice(1)}` || "Models";
+}
+
+function providerGlyph(providerId) {
+  return PROVIDER_GLYPHS[String(providerId || "").toLowerCase()] || "✹";
+}
+
 function normalizedModel(model, providerFallback = "") {
   const providerId = model.provider_id || model.provider || providerFallback || "default";
   const modelId = model.model_id || model.id || model.slug || model.name;
-  const efforts = model.reasoning_efforts || model.efforts || model.supported_efforts || ["none"];
+  const efforts = model.reasoning_efforts || model.efforts || model.supported_efforts || [];
+  const reasoningEfforts = Array.isArray(efforts) ? efforts : [];
+  const presentation = MODEL_PRESENTATION[modelId] || null;
   return {
     ...model,
     provider_id: providerId,
     model_id: modelId,
-    display_name: model.display_name || model.label || model.name || modelId,
-    description: model.description || model.summary || "Available for this workspace",
-    reasoning_efforts: Array.isArray(efforts) && efforts.length ? efforts : ["none"],
-    reasoning_effort: model.reasoning_effort || model.default_reasoning_effort || efforts?.[0] || "none",
+    display_name: presentation?.name || model.display_name || model.label || model.name || modelId,
+    description: presentation?.description || model.description || model.summary || "Available for this workspace",
+    is_new: Boolean(presentation?.isNew || model.is_new),
+    configured: model.configured !== false,
+    reasoning_efforts: reasoningEfforts,
+    reasoning_effort: model.reasoning_effort || model.default_reasoning_effort || reasoningEfforts[0] || null,
     enabled: model.enabled !== false && model.allowed !== false,
   };
 }
@@ -126,7 +253,8 @@ function currentWorkspaceId() {
 }
 
 function eventType(event) {
-  return String(event.type || event.event_type || event.name || event.event || "event").toLowerCase();
+  const type = String(event.type || event.event_type || event.name || event.event || "event").toLowerCase();
+  return type === "workflow_completed" ? "workflow.completed" : type;
 }
 
 function eventPayload(event) {
@@ -145,8 +273,178 @@ function messageContent(message) {
   return message.content || message.message || message.text || "";
 }
 
+function visibleMessageContent(message) {
+  const content = String(messageContent(message));
+  if (isAssistant(message)) return content;
+  const intent = Object.values(CREATE_INTENTS).find((item) => content.startsWith(item.prefix));
+  return intent ? content.slice(intent.prefix.length) : content;
+}
+
+function appendInlineText(parent, value) {
+  const source = String(value);
+  const pattern = /(\*\*([^*\n]+)\*\*|`([^`\n]+)`|\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)|(https?:\/\/[^\s<>()\[\]]*[^\s<>()\[\].,!?;:'"。，！？；：]))/g;
+  let cursor = 0;
+  for (const match of source.matchAll(pattern)) {
+    if (match.index > cursor) parent.append(source.slice(cursor, match.index));
+    if (match[2]) {
+      const strong = document.createElement("strong");
+      strong.textContent = match[2];
+      parent.append(strong);
+    } else if (match[3]) {
+      const code = document.createElement("code");
+      code.textContent = match[3];
+      parent.append(code);
+    } else {
+      const link = document.createElement("a");
+      link.href = match[5] || match[6];
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.textContent = match[4] || match[6];
+      parent.append(link);
+    }
+    cursor = match.index + match[0].length;
+  }
+  if (cursor < source.length) parent.append(source.slice(cursor));
+}
+
+function appendCodeBlock(parent, source, language = "") {
+  const block = document.createElement("section");
+  block.className = "message-code";
+  const header = document.createElement("header");
+  const label = document.createElement("span");
+  label.textContent = language || "code";
+  const copy = document.createElement("button");
+  copy.type = "button";
+  copy.textContent = "Copy";
+  copy.setAttribute("aria-label", "Copy code");
+  copy.addEventListener("click", async () => {
+    await navigator.clipboard?.writeText(source);
+    copy.textContent = "Copied";
+    window.setTimeout(() => { copy.textContent = "Copy"; }, 1200);
+  });
+  header.append(label, copy);
+  const pre = document.createElement("pre");
+  const code = document.createElement("code");
+  if (language) code.className = `language-${language.replace(/[^a-z0-9_-]/gi, "")}`;
+  code.textContent = source;
+  pre.append(code);
+  block.append(header, pre);
+  parent.append(block);
+}
+
+function tableCells(line) {
+  return line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim());
+}
+
+function isTableDivider(line) {
+  const cells = tableCells(line);
+  return cells.length > 1 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+}
+
+function appendMarkdown(parent, value) {
+  const lines = String(value).replaceAll("\r\n", "\n").split("\n");
+  for (let index = 0; index < lines.length;) {
+    const line = lines[index];
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+    const fence = line.match(/^```([\w.+-]*)\s*$/);
+    if (fence) {
+      const code = [];
+      index += 1;
+      while (index < lines.length && !/^```\s*$/.test(lines[index])) code.push(lines[index++]);
+      if (index < lines.length) index += 1;
+      appendCodeBlock(parent, code.join("\n"), fence[1]);
+      continue;
+    }
+    const heading = line.match(/^(#{1,4})\s+(.+)$/);
+    if (heading) {
+      const element = document.createElement(heading[1].length < 3 ? "h2" : "h3");
+      appendInlineText(element, heading[2]);
+      parent.append(element);
+      index += 1;
+      continue;
+    }
+    if (index + 1 < lines.length && line.includes("|") && isTableDivider(lines[index + 1])) {
+      const wrapper = document.createElement("div");
+      wrapper.className = "message-table-wrap";
+      const table = document.createElement("table");
+      const head = document.createElement("thead");
+      const headRow = document.createElement("tr");
+      for (const cell of tableCells(line)) {
+        const th = document.createElement("th");
+        appendInlineText(th, cell);
+        headRow.append(th);
+      }
+      head.append(headRow);
+      table.append(head);
+      index += 2;
+      const body = document.createElement("tbody");
+      while (index < lines.length && lines[index].includes("|") && lines[index].trim()) {
+        const row = document.createElement("tr");
+        for (const cell of tableCells(lines[index])) {
+          const td = document.createElement("td");
+          appendInlineText(td, cell);
+          row.append(td);
+        }
+        body.append(row);
+        index += 1;
+      }
+      table.append(body);
+      wrapper.append(table);
+      parent.append(wrapper);
+      continue;
+    }
+    const listMatch = line.match(/^\s*(?:([-*])|(\d+)\.)\s+(.+)$/);
+    if (listMatch) {
+      const ordered = Boolean(listMatch[2]);
+      const list = document.createElement(ordered ? "ol" : "ul");
+      if (ordered) list.start = Number(listMatch[2]);
+      while (index < lines.length) {
+        const itemMatch = lines[index].match(/^\s*(?:([-*])|(\d+)\.)\s+(.+)$/);
+        if (!itemMatch || Boolean(itemMatch[2]) !== ordered) break;
+        const item = document.createElement("li");
+        appendInlineText(item, itemMatch[3]);
+        list.append(item);
+        index += 1;
+      }
+      parent.append(list);
+      continue;
+    }
+    const paragraph = document.createElement("p");
+    appendInlineText(paragraph, line);
+    index += 1;
+    while (index < lines.length && lines[index].trim() && !/^```/.test(lines[index]) && !/^(#{1,4})\s+/.test(lines[index])) {
+      if (lines[index].match(/^\s*(?:[-*]|\d+\.)\s+/)) break;
+      paragraph.append(document.createElement("br"));
+      appendInlineText(paragraph, lines[index]);
+      index += 1;
+    }
+    parent.append(paragraph);
+  }
+}
+
 function isAssistant(message) {
   return ["assistant", "agent", "system"].includes(String(message.role || message.kind || "").toLowerCase());
+}
+
+function assistantResponseReady() {
+  const message = chatState.messages.at(-1);
+  return isAssistant(message || {}) && dispatchStatus(message) === "completed";
+}
+
+function runSubject() {
+  if (chatState.currentRunMode === "chat") return "Response";
+  if (chatState.currentRunMode === "workflow") return "Workflow";
+  return "Agent";
+}
+
+function workingStatus(live = false) {
+  const message = chatState.currentRunMode === "chat"
+    ? "Response is streaming"
+    : `${runSubject()} is working`;
+  return live ? `Live · ${message.toLowerCase()}` : message;
 }
 
 function escapeFilename(value) {
@@ -180,13 +478,13 @@ export class ChatController {
     this.boundWindowMessage = (event) => this.onWindowMessage(event);
     this.boundDragOver = (event) => this.onDragOver(event);
     this.boundDrop = (event) => this.onDrop(event);
+    this.conversationFrame = null;
   }
 
   captureRefs() {
     this.refs = {
       shell: query("[data-app='taroai-workspace']"),
       conversation: query("[data-thread-conversation]"),
-      chatScroll: query(".chat-scroll-region"),
       emptyState: query("[data-testid='chat-empty-state']"),
       input: query("#composer-input"),
       send: query("#send-button"),
@@ -194,6 +492,7 @@ export class ChatController {
       newChat: query("[data-new-chat]"),
       threadList: query("[data-thread-list]"),
       threadSearch: query("[data-thread-search]"),
+      threadStatus: query("[data-thread-status]"),
       threadPresence: query("[data-thread-presence]"),
       modelButton: query("#model-selector-button"),
       modelMenu: query("#model-selector-menu"),
@@ -204,12 +503,12 @@ export class ChatController {
       resourceChips: query("[data-resource-chips]"),
       mentionMenu: query("[data-mention-menu]"),
       mentionResults: query("[data-mention-results]"),
-      deliveryMode: query("[data-delivery-mode]"),
       networkState: query("[data-chat-network-state]"),
       queueCount: query("[data-queue-count]"),
       sidecarQueueCount: query("[data-sidecar-queue-count]"),
       queue: query("[data-message-queue]"),
       sidecar: query("[data-workspace-sidecar]"),
+      sidecarState: query("[data-sidecar-state]"),
       chatSidecar: query("[data-chat-sidecar]"),
       artifactEmpty: query("[data-thread-artifacts-empty]"),
       sidecarTitle: query("#artifact-panel-title"),
@@ -231,7 +530,7 @@ export class ChatController {
       actionsMenu: query("[data-thread-actions-menu]"),
       moreButton: query("[data-thread-more]"),
       shareButton: query("[data-thread-share]"),
-      createAgentButtons: queryAll("[data-create-agent], [data-create-agent-prompt], [data-thread-create-agent]"),
+      createAgentButtons: queryAll("[data-thread-create-agent]"),
     };
   }
 
@@ -251,8 +550,13 @@ export class ChatController {
     this.refs.dropzone?.addEventListener("dragleave", () => this.refs.dropzone?.classList.remove("is-dragging"));
     this.restoreDraft();
     this.renderAll();
-    await Promise.allSettled([this.loadModelCatalog(), this.loadThreads(), this.loadCapabilities()]);
-    await this.restoreFromHash();
+    if (this.api.settings().accessToken) {
+      await Promise.allSettled([this.loadModelCatalog(), this.loadThreads(), this.loadCapabilities()]);
+      await this.restoreFromHash();
+    } else {
+      this.renderThreadListNotice("Sign in to load threads", "Your conversations will appear here.");
+      this.network("Sign in to continue", "idle");
+    }
   }
 
   stopOwnedEvent(event) {
@@ -264,14 +568,16 @@ export class ChatController {
   ownedTarget(target) {
     return target?.closest?.(
       "[data-new-chat], #send-button, #model-selector-button, [data-chat-model], [data-model-effort], " +
-        "[data-run-history-refresh], [data-thread-id], [data-thread-action], #composer-add-button, [data-add-command], " +
+        "[data-run-history-refresh], [data-thread-refresh], [data-thread-id], #composer-add-button, [data-add-command], " +
         "[data-open-queue], [data-open-artifacts], [data-open-code], [data-sidecar-tab], [data-queue-action], [data-queue-dispatch], " +
         "[data-thread-stop], [data-thread-share], [data-thread-more], [data-thread-rename], [data-thread-pin], " +
         "[data-thread-archive], [data-thread-delete], [data-remove-upload], [data-remove-resource], [data-mention-id], " +
-        "[data-delivery-mode], [data-voice-input], [data-thread-create-agent], [data-create-agent], " +
-        "[data-create-agent-prompt], [data-thread-artifact], [data-artifact-copy], [data-artifact-download], " +
-        "[data-coding-tab], [data-coding-change], [data-coding-action], " +
-        "[data-message-copy], [data-message-retry], [data-message-speak], [data-message-summarize], [data-suggestion]",
+        "[data-remove-create-intent], [data-remove-browser-profile], [data-browser-profile-id], [data-browser-profile-none], " +
+        "[data-browser-profile-create-default], [data-browser-profile-new], [data-voice-input], " +
+        "[data-thread-create-agent], [data-thread-artifact], [data-artifact-copy], [data-artifact-download], " +
+        "[data-coding-tab], [data-coding-change], [data-coding-action], [data-thought-toggle], " +
+        "[data-message-copy], [data-message-retry], [data-message-speak], [data-message-summarize], " +
+        "[data-message-feedback], [data-message-more], [data-input-option], [data-input-submit], [data-suggestion]",
     );
   }
 
@@ -286,13 +592,22 @@ export class ChatController {
     this.stopOwnedEvent(event);
 
     if (control.matches("[data-new-chat]")) return this.startNewChat();
+    if (control.matches("[data-thought-toggle]")) {
+      chatState.thoughtOpen = !chatState.thoughtOpen;
+      const card = control.closest(".chat-thought");
+      card?.classList.toggle("is-open", chatState.thoughtOpen);
+      control.setAttribute("aria-expanded", String(chatState.thoughtOpen));
+      const detail = query(".chat-thought-detail", card);
+      if (detail) detail.hidden = !chatState.thoughtOpen;
+      return;
+    }
     if (control.matches("#send-button")) return this.sendThreadMessage();
     if (control.matches("#model-selector-button")) return this.toggleModelMenu();
     if (control.matches("[data-chat-model]")) return this.selectModel(control.dataset.chatModel);
     if (control.matches("[data-model-effort]")) return this.selectModelEffort(control.dataset.modelEffort, control.dataset.modelKey);
     if (control.matches("[data-run-history-refresh]")) return this.loadThreads();
+    if (control.matches("[data-thread-refresh]")) return this.loadThreads();
     if (control.matches("[data-thread-id]")) return this.loadThread(control.dataset.threadId, true);
-    if (control.matches("[data-thread-action]")) return this.handleThreadItemAction(control);
     if (control.matches("#composer-add-button")) return this.toggleAddMenu();
     if (control.matches("[data-add-command]")) return this.handleAddCommand(control.dataset.addCommand);
     if (control.matches("[data-open-queue]")) return this.openSidecar("queue");
@@ -310,10 +625,15 @@ export class ChatController {
     if (control.matches("[data-thread-delete]")) return this.deleteCurrentThread();
     if (control.matches("[data-remove-upload]")) return this.removeUpload(control.dataset.removeUpload);
     if (control.matches("[data-remove-resource]")) return this.removeResource(control.dataset.removeResource);
+    if (control.matches("[data-remove-create-intent]")) return this.selectCreateIntent(null);
+    if (control.matches("[data-remove-browser-profile]")) return this.selectBrowserProfile(null);
+    if (control.matches("[data-browser-profile-id]")) return this.selectBrowserProfile(control.dataset.browserProfileId);
+    if (control.matches("[data-browser-profile-none]")) return this.selectBrowserProfile(null);
+    if (control.matches("[data-browser-profile-create-default]")) return this.createBrowserProfile("default", true);
+    if (control.matches("[data-browser-profile-new]")) return this.showBrowserProfileForm();
     if (control.matches("[data-mention-id]")) return this.chooseMention(control.dataset.mentionId);
-    if (control.matches("[data-delivery-mode]")) return this.toggleDeliveryMode();
     if (control.matches("[data-voice-input]")) return this.startVoiceInput(control);
-    if (control.matches("[data-thread-create-agent], [data-create-agent], [data-create-agent-prompt]")) return this.openCreateAgentDialog();
+    if (control.matches("[data-thread-create-agent]")) return this.openCreateAgentDialog();
     if (control.matches("[data-thread-artifact]")) return this.openArtifact(control.dataset.threadArtifact);
     if (control.matches("[data-artifact-copy]")) return this.copyArtifact();
     if (control.matches("[data-artifact-download]")) return this.downloadArtifact();
@@ -324,10 +644,23 @@ export class ChatController {
     if (control.matches("[data-message-retry]")) return this.retryMessage(control.dataset.messageRetry);
     if (control.matches("[data-message-speak]")) return this.speakMessage(control.dataset.messageSpeak, control);
     if (control.matches("[data-message-summarize]")) return this.summarizeMessage(control.dataset.messageSummarize);
+    if (control.matches("[data-message-feedback]")) return this.submitMessageFeedback(control);
+    if (control.matches("[data-message-more]")) return this.toggleMessageMenu(control);
+    if (control.matches("[data-input-option]")) return this.selectInputOption(control);
+    if (control.matches("[data-input-submit]")) return this.submitInputRequest();
     if (control.matches("[data-suggestion]")) return this.applySuggestion(control.dataset.suggestion);
   }
 
   onInput(event) {
+    if (event.target?.matches?.("[data-input-text]")) {
+      chatState.inputAnswers[event.target.dataset.inputText] = event.target.value;
+      this.updateInputSubmitState();
+      return;
+    }
+    if (event.target?.matches?.("[data-input-extra]")) {
+      chatState.inputExtra = event.target.value;
+      return;
+    }
     if (event.target === this.refs.threadSearch) {
       this.renderThreads();
       return;
@@ -340,9 +673,21 @@ export class ChatController {
 
   onKeydown(event) {
     if (event.key === "Escape") {
+      const addMenu = query("#composer-add-menu");
+      const returnFocus = !this.refs.actionsMenu?.hidden
+        ? this.refs.moreButton
+        : !this.refs.modelMenu?.hidden
+          ? this.refs.modelButton
+          : !addMenu?.hidden
+            ? query("#composer-add-button")
+            : null;
       this.closeModelMenu();
       this.closeAddMenu();
       this.closeThreadMenu();
+      if (returnFocus) {
+        event.preventDefault();
+        requestAnimationFrame(() => returnFocus.focus());
+      }
     }
     if (event.target !== this.refs.input) return;
     if (!this.refs.mentionMenu?.hidden) {
@@ -393,11 +738,13 @@ export class ChatController {
   async onAuthChanged(event) {
     if (!event.detail?.authenticated) {
       chatState.threads = [];
+      await Promise.allSettled([this.loadModelCatalog(), this.loadCapabilities()]);
       this.startNewChat();
       this.renderThreadListNotice("Sign in to load threads", "Your local draft is still available.");
       return;
     }
     await Promise.allSettled([this.loadThreads(), this.loadModelCatalog(), this.loadCapabilities()]);
+    this.network("Ready", "idle");
     const threadId = threadIdFromHash();
     if (threadId) await this.loadThread(threadId, false);
   }
@@ -418,18 +765,28 @@ export class ChatController {
   }
 
   async loadThreads() {
+    if (!this.api.settings().accessToken) {
+      chatState.threads = [];
+      this.renderThreadListNotice("Sign in to load threads", "Your conversations will appear here.");
+      return;
+    }
     const queryString = new URLSearchParams({ workspace_id: currentWorkspaceId(), include_archived: "false" });
     try {
       const payload = await this.api.get(`/api/threads?${queryString}`);
       chatState.threads = arrayFrom(payload, "threads", "data");
       this.renderThreads();
     } catch (error) {
+      if (!this.api.settings().accessToken) {
+        this.renderThreadListNotice("Sign in to load threads", "Your conversations will appear here.");
+        return;
+      }
       this.renderThreadListNotice("Threads are unavailable", error.message);
     }
   }
 
   renderThreadListNotice(title, detail = "") {
     if (!this.refs.threadList) return;
+    setText(this.refs.threadStatus, title);
     this.refs.threadList.replaceChildren();
     const item = document.createElement("li");
     item.className = "thread-list-notice";
@@ -448,6 +805,7 @@ export class ChatController {
       .filter((thread) => !["archived", "deleted"].includes(String(thread.status || "").toLowerCase()))
       .filter((thread) => !search || `${thread.title || ""} ${thread.last_message || ""}`.toLowerCase().includes(search))
       .sort((a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)) || String(b.updated_at || "").localeCompare(String(a.updated_at || "")));
+    setText(this.refs.threadStatus, `${threads.length} ${search ? "matching " : ""}thread${threads.length === 1 ? "" : "s"}`);
     this.refs.threadList.replaceChildren();
     if (!threads.length) {
       const empty = document.createElement("li");
@@ -456,7 +814,7 @@ export class ChatController {
       this.refs.threadList.append(empty);
       return;
     }
-    for (const thread of threads) {
+    for (const thread of (search ? threads : threads.slice(0, 30))) {
       const item = document.createElement("li");
       item.className = "thread-list-item";
       item.classList.toggle("is-active", thread.id === chatState.currentThreadId);
@@ -465,24 +823,18 @@ export class ChatController {
       button.dataset.threadId = thread.id;
       const title = document.createElement("strong");
       title.textContent = `${thread.pinned ? "• " : ""}${thread.title || "Untitled thread"}`;
-      const meta = document.createElement("small");
-      meta.textContent = thread.running || ACTIVE_RUN_STATES.has(String(thread.run_status || "").toLowerCase())
-        ? "Working…"
-        : safeTime(thread.updated_at || thread.created_at) || "Ready";
-      button.append(title, meta);
-      const actions = document.createElement("div");
-      actions.className = "thread-item-actions";
-      for (const [action, label] of [["rename", "Rename"], ["archive", "Archive"], ["delete", "Delete"]]) {
-        const actionButton = document.createElement("button");
-        actionButton.type = "button";
-        actionButton.dataset.threadAction = action;
-        actionButton.dataset.threadActionId = thread.id;
-        actionButton.title = label;
-        actionButton.setAttribute("aria-label", `${label} ${thread.title || "thread"}`);
-        actionButton.textContent = action === "rename" ? "✎" : action === "archive" ? "□" : "×";
-        actions.append(actionButton);
+      button.append(title);
+      const runStatus = String(thread.run_status || "").toLowerCase();
+      if (thread.running || ACTIVE_RUN_STATES.has(runStatus)) {
+        const meta = document.createElement("small");
+        meta.textContent = runStatus === "awaiting_approval"
+          ? "Approval needed"
+          : runStatus === "retrying"
+            ? "Retrying…"
+            : "Working…";
+        button.append(meta);
       }
-      item.append(button, actions);
+      item.append(button);
       this.refs.threadList.append(item);
     }
   }
@@ -496,12 +848,19 @@ export class ChatController {
       model_id: model?.model_id || null,
       reasoning_effort: model?.reasoning_effort || null,
     };
-    const created = await this.api.post("/api/threads", body, { scope: "thread-create" });
+    let created;
+    try {
+      created = await this.api.post("/api/threads", body, { scope: "thread-create" });
+    } catch (error) {
+      if (error.body?.code === "model_policy_denied") await this.loadModelCatalog();
+      throw error;
+    }
     const thread = created.thread || created;
     chatState.currentThreadId = thread.id;
     chatState.thread = thread;
     chatState.threads = [thread, ...chatState.threads.filter((item) => item.id !== thread.id)];
     updateThreadHash(thread.id, true);
+    publishChatContext();
     this.renderThreads();
     this.renderDetails();
     return thread;
@@ -509,29 +868,78 @@ export class ChatController {
 
   async loadThread(threadId, updateHash = false) {
     if (!threadId) return this.startNewChat();
+    this.closeArtifactSidecar();
     this.abortStream();
     chatState.loading = true;
     chatState.currentThreadId = threadId;
     chatState.messages = [];
     chatState.events = [];
+    chatState.commandOutputs = new Map();
     chatState.queue = [];
+    chatState.suggestions = [];
+    chatState.inputRequest = null;
+    chatState.inputAnswers = {};
+    chatState.inputExtra = "";
+    chatState.thoughtOpen = false;
     this.network("Opening thread…", "loading");
     this.renderConversation();
     try {
-      const [payload, messagesPayload] = await Promise.all([
-        this.api.get(`/api/threads/${encodeURIComponent(threadId)}`),
-        this.api.get(`/api/threads/${encodeURIComponent(threadId)}/messages`),
-      ]);
+      const payload = await this.api.get(`/api/threads/${encodeURIComponent(threadId)}/bootstrap?event_limit=500`);
       const thread = payload.thread || payload;
+      const activeRun = payload.active_run || null;
       if (thread.id && thread.id !== threadId) chatState.currentThreadId = thread.id;
       chatState.thread = thread;
-      chatState.currentRunId = thread.current_run_id || thread.active_run_id || payload.current_run_id || null;
-      chatState.messages = arrayFrom(messagesPayload, "messages", "chat_messages");
+      chatState.currentRunId = thread.current_run_id || thread.active_run_id || activeRun?.id || null;
+      chatState.messages = await this.hydrateMessageAttachments(
+        arrayFrom(payload, "messages", "chat_messages"),
+      );
+      const latestUserMessage = [...chatState.messages].reverse().find((message) => !isAssistant(message));
+      chatState.currentRunMode = activeRun?.mode
+        || (latestUserMessage?.kind === "agent" ? "autonomous" : latestUserMessage?.kind === "workflow" ? "workflow" : "chat");
       const hydratedEvents = arrayFrom(payload, "events", "timeline");
       const cachedEvents = this.restoreEventCache(threadId);
       chatState.events = hydratedEvents.length ? hydratedEvents : cachedEvents;
+      await this.loadCommandOutputs(chatState.events);
       const latestEvent = chatState.events.at(-1);
       chatState.currentRunId = chatState.currentRunId || latestEvent?.run_id || null;
+      const currentRunEvents = chatState.currentRunId
+        ? chatState.events.filter((event) => (event.run_id || eventPayload(event).run_id) === chatState.currentRunId)
+        : chatState.events;
+      const completedAssistantEvent = [...currentRunEvents]
+        .reverse()
+        .find((event) => eventType(event) === "assistant.message.completed");
+      const completedAssistant = eventPayload(completedAssistantEvent || {});
+      const completedAssistantId = completedAssistant.message_id
+        || (completedAssistantEvent ? `assistant:${chatState.currentRunId || threadId}` : null);
+      if (
+        completedAssistantId
+        && completedAssistant.content
+        && !chatState.messages.some((message) => message.id === completedAssistantId)
+      ) {
+        chatState.messages.push({
+          id: completedAssistantId,
+          role: "assistant",
+          content: completedAssistant.content,
+          dispatch_status: "completed",
+          delivery_status: "delivered",
+          created_at: completedAssistantEvent.created_at || new Date().toISOString(),
+        });
+      }
+      const completedLoop = [...currentRunEvents].reverse().find((event) => eventType(event) === "agent.loop.completed");
+      const terminalEvent = [...currentRunEvents].reverse().find((event) => {
+        const type = eventType(event);
+        return type === "agent.loop.completed"
+          || (type === "run.status_changed" && TERMINAL_EVENT_WORDS.includes(String(eventPayload(event).status || "").toLowerCase()))
+          || (type.startsWith("run.") && TERMINAL_EVENT_WORDS.some((word) => type.includes(word)));
+      });
+      const completedOutcome = String(eventPayload(completedLoop || {}).outcome || "").toLowerCase();
+      const terminalOutcome = completedLoop
+        ? (completedOutcome === "complete" ? "succeeded" : completedOutcome)
+        : eventType(terminalEvent || {}) === "run.status_changed"
+          ? String(eventPayload(terminalEvent).status || "").toLowerCase()
+          : terminalEvent
+            ? eventType(terminalEvent).split(".").at(-1) || null
+            : null;
       chatState.queue = arrayFrom(payload, "queue", "queued_messages").length
         ? arrayFrom(payload, "queue", "queued_messages")
         : chatState.messages.filter((message) => ["queued", "steering", "ready"].includes(dispatchStatus(message)));
@@ -541,12 +949,25 @@ export class ChatController {
       chatState.codingWorkspace = null;
       chatState.activeCodingChange = null;
       chatState.running =
-        Boolean(thread.running) ||
-        ACTIVE_RUN_STATES.has(String(thread.run_status || thread.current_run_status || "").toLowerCase()) ||
-        chatState.messages.some((message) => dispatchStatus(message) === "inflight");
+        !terminalOutcome && (
+          Boolean(thread.running) ||
+          ACTIVE_RUN_STATES.has(String(activeRun?.status || "").toLowerCase()) ||
+          ACTIVE_RUN_STATES.has(String(thread.run_status || thread.current_run_status || "").toLowerCase()) ||
+          chatState.messages.some((message) => dispatchStatus(message) === "inflight")
+        );
+      const waitingEvent = [...currentRunEvents]
+        .reverse()
+        .find((event) => eventType(event) === "agent.waiting_for_user");
+      if (String(activeRun?.status || "").toLowerCase() === "waiting_for_user" && waitingEvent) {
+        chatState.running = false;
+        chatState.suggestions = arrayFrom(eventPayload(waitingEvent), "options").map(String).filter(Boolean);
+        this.setInputRequest(eventPayload(waitingEvent));
+      }
       if (chatState.running && chatState.currentRunId) {
-        const streamedText = chatState.events
-          .filter((event) => event.run_id === chatState.currentRunId && eventType(event) === "assistant.delta")
+        const streamEvents = chatState.events.filter((event) => event.run_id === chatState.currentRunId);
+        const streamedText = streamEvents
+          .slice(streamEvents.findLastIndex((event) => eventType(event) === "assistant.stream.reset") + 1)
+          .filter((event) => eventType(event) === "assistant.delta")
           .map((event) => eventPayload(event).delta || "")
           .join("");
         if (streamedText) {
@@ -565,52 +986,124 @@ export class ChatController {
       const hydratedSequence = chatState.events.reduce((highest, item) => Math.max(highest, eventSequence(item)), 0);
       chatState.lastThreadSequence = Math.max(restoredSequence, hydratedSequence);
       const threadModel = this.findModel(thread.provider_id, thread.model_id);
-      if (threadModel) {
-        chatState.selectedModel = { ...threadModel, reasoning_effort: thread.reasoning_effort || threadModel.reasoning_effort };
+      if (thread.provider_id && thread.model_id) {
+        chatState.selectedModel = threadModel
+          ? { ...threadModel, reasoning_effort: thread.reasoning_effort || threadModel.reasoning_effort }
+          : null;
+        this.renderModelMenu();
+        this.renderModelButton();
       }
       chatState.threads = [thread, ...chatState.threads.filter((item) => item.id !== thread.id)];
       if (updateHash) updateThreadHash(thread.id);
+      publishChatContext();
       this.restoreDraft();
       this.renderAll();
+      if (completedLoop) this.persistPendingAgent(completedOutcome || "complete");
       await this.loadCodingWorkspace();
       await this.maybePromoteManualMessage();
-      this.network(chatState.running ? "Agent is working" : "Thread ready", chatState.running ? "active" : "idle");
+      if (
+        !chatState.running
+        && eventType(latestEvent || {}) !== "agent.waiting_for_user"
+        && (!terminalOutcome || terminalOutcome === "succeeded")
+      ) this.loadSuggestions();
+      this.network(chatState.running ? workingStatus() : "Thread ready", chatState.running ? "active" : "idle");
       this.startEventStream();
     } catch (error) {
-      this.network(error.status === 404 ? "Thread not found" : "Could not open thread", "error");
+      if (error.status === 404) {
+        chatState.loading = false;
+        this.startNewChat();
+        this.refs.shell.dataset.chatState = "thread";
+        if (this.refs.emptyState) this.refs.emptyState.hidden = true;
+        this.refs.conversation.replaceChildren();
+        this.renderInlineNotice(
+          "Thread unavailable",
+          "It may have been deleted, archived, or belong to another workspace.",
+          "warning",
+        );
+        this.network("Thread unavailable", "warning");
+        return;
+      }
+      this.network("Could not open thread", "error");
       this.renderInlineNotice("Thread unavailable", error.message, "failure");
     } finally {
       chatState.loading = false;
     }
   }
 
+  async hydrateMessageAttachments(messages) {
+    const unresolved = new Set(
+      messages.flatMap((message) => arrayFrom(message.attachments || [], "items"))
+        .filter((attachment) => typeof attachment === "string" || !attachment.filename)
+        .map((attachment) => typeof attachment === "string" ? attachment : attachment.id || attachment.storage_object_id)
+        .filter(Boolean),
+    );
+    if (!unresolved.size) return messages;
+    try {
+      const payload = await this.api.get(
+        `/api/workspaces/${encodeURIComponent(currentWorkspaceId())}/files?include_run_files=true`,
+      );
+      const files = new Map(
+        arrayFrom(payload, "items", "files")
+          .map((file) => [file.id || file.storage_object_id, file]),
+      );
+      return messages.map((message) => ({
+        ...message,
+        attachments: arrayFrom(message.attachments || [], "items").map((attachment) => {
+          const id = typeof attachment === "string" ? attachment : attachment.id || attachment.storage_object_id;
+          const file = files.get(id);
+          return file ? { id, filename: file.filename || file.logical_path || id } : attachment;
+        }),
+      }));
+    } catch {
+      return messages;
+    }
+  }
+
   async restoreFromHash() {
+    if (!this.api.settings().accessToken) return;
     const threadId = threadIdFromHash();
     if (threadId && threadId !== chatState.currentThreadId) return this.loadThread(threadId, false);
     if (!threadId && chatState.currentThreadId) this.startNewChat(false);
   }
 
   startNewChat(updateHash = true) {
+    this.closeArtifactSidecar();
     this.abortStream();
+    const selectedModelKey = modelKey(chatState.selectedModel || {});
+    chatState.selectedModel =
+      chatState.modelCatalog.find((model) => modelKey(model) === selectedModelKey) ||
+      chatState.modelCatalog.find((model) => model.configured !== false) ||
+      null;
     chatState.currentThreadId = null;
     chatState.currentRunId = null;
+    chatState.currentRunMode = "chat";
     chatState.thread = null;
     chatState.messages = [];
     chatState.queue = [];
     chatState.events = [];
     chatState.artifacts = [];
+    chatState.commandOutputs = new Map();
     chatState.codingWorkspace = null;
     chatState.activeCodingChange = null;
     chatState.resourceRefs = [];
+    chatState.createIntent = null;
     chatState.uploads = [];
     chatState.running = false;
     chatState.suggestions = [];
+    chatState.inputRequest = null;
+    chatState.inputAnswers = {};
+    chatState.inputExtra = "";
+    chatState.thoughtOpen = false;
+    chatState.browserProfile = null;
     chatState.lastThreadSequence = 0;
+    publishChatContext();
     if (updateHash) updateThreadHash(null);
     this.refs.input.value = localStorage.getItem("taroai.threadDraft.new") || "";
     this.network("Ready", "idle");
     this.closeThreadMenu();
     this.closeModelMenu();
+    this.renderModelMenu();
+    this.renderModelButton();
     this.renderAll();
     this.refs.input?.focus();
   }
@@ -623,29 +1116,6 @@ export class ChatController {
     this.renderThreads();
     this.renderDetails();
     return thread;
-  }
-
-  async handleThreadItemAction(control) {
-    const threadId = control.dataset.threadActionId;
-    const action = control.dataset.threadAction;
-    const thread = chatState.threads.find((item) => item.id === threadId);
-    if (!thread) return;
-    if (action === "rename") {
-      const title = window.prompt("Rename thread", thread.title || "Untitled thread")?.trim();
-      if (title) await this.updateThread(threadId, { title });
-    }
-    if (action === "archive") {
-      await this.archiveThread(threadId);
-      if (threadId === chatState.currentThreadId) this.startNewChat();
-      else this.renderThreads();
-    }
-    if (action === "delete") {
-      if (!window.confirm(`Delete “${thread.title || "Untitled thread"}”?`)) return;
-      await this.api.delete(`/api/threads/${encodeURIComponent(threadId)}`, { scope: "thread-delete" });
-      chatState.threads = chatState.threads.filter((item) => item.id !== threadId);
-      if (threadId === chatState.currentThreadId) this.startNewChat();
-      else this.renderThreads();
-    }
   }
 
   async renameCurrentThread() {
@@ -669,18 +1139,7 @@ export class ChatController {
   }
 
   async archiveThread(threadId) {
-    try {
-      return await this.updateThread(threadId, { status: "archived" });
-    } catch (error) {
-      if (![400, 404, 405, 422].includes(error.status)) throw error;
-      chatState.threads = chatState.threads.map((thread) =>
-        thread.id === threadId ? { ...thread, status: "archived" } : thread,
-      );
-      if (chatState.currentThreadId === threadId) chatState.thread = { ...chatState.thread, status: "archived" };
-      this.network("Archived in this view; server archive support is not ready", "warning");
-      this.renderThreads();
-      return chatState.thread;
-    }
+    return this.updateThread(threadId, { status: "archived" });
   }
 
   async deleteCurrentThread() {
@@ -698,6 +1157,7 @@ export class ChatController {
     const open = this.refs.actionsMenu.hidden;
     this.refs.actionsMenu.hidden = !open;
     this.refs.moreButton?.setAttribute("aria-expanded", String(open));
+    if (open) requestAnimationFrame(() => query('[role="menuitem"]:not(:disabled)', this.refs.actionsMenu)?.focus());
   }
 
   closeThreadMenu() {
@@ -706,9 +1166,16 @@ export class ChatController {
   }
 
   async loadModelCatalog() {
+    if (!this.api.settings().accessToken) {
+      chatState.modelCatalog = [];
+      chatState.selectedModel = null;
+      this.renderModelMenu();
+      this.renderModelButton();
+      return;
+    }
     const queryString = new URLSearchParams({ workspace_id: currentWorkspaceId() });
     try {
-      const payload = await this.api.get(`/api/model-catalog?${queryString}`);
+      const payload = await this.api.get(`/api/model-catalog?${queryString}`, { cache: "no-store" });
       let models = arrayFrom(payload, "models", "items");
       if (!models.length && Array.isArray(payload.providers)) {
         models = payload.providers.flatMap((provider) =>
@@ -723,23 +1190,26 @@ export class ChatController {
         );
       }
       chatState.modelCatalog = models.map((model) => normalizedModel(model)).filter((model) => model.enabled && model.model_id);
-    } catch (error) {
-      const existing = queryAll("[data-model-option]").map((button) =>
-        normalizedModel({
-          provider_id: button.closest(".model-menu")?.dataset.provider || "configured",
-          model_id: button.dataset.modelOption,
-          display_name: button.dataset.modelOption,
-          description: query("small", button)?.textContent || "Configured model",
-        }),
-      );
-      chatState.modelCatalog = existing;
-      this.network("Using saved model catalog", "warning");
+    } catch {
+      chatState.modelCatalog = [];
+      const signedIn = Boolean(this.api.settings().accessToken);
+      this.network(signedIn ? "Models unavailable" : "Sign in to continue", signedIn ? "warning" : "idle");
     }
     const stored = localStorage.getItem("taroai.chatModel");
-    const fallback = chatState.modelCatalog[0] || null;
-    chatState.selectedModel = chatState.selectedModel || chatState.modelCatalog.find((model) => modelKey(model) === stored) || fallback;
+    const selectable = chatState.modelCatalog.filter((model) => model.configured !== false);
+    const fallback = selectable[0] || null;
+    const selectedKey = chatState.selectedModel ? modelKey(chatState.selectedModel) : null;
+    const threadKey = chatState.currentThreadId && chatState.thread?.provider_id && chatState.thread?.model_id
+      ? modelKey(chatState.thread)
+      : null;
+    chatState.selectedModel = threadKey
+      ? selectable.find((model) => modelKey(model) === threadKey) || null
+      : selectable.find((model) => modelKey(model) === selectedKey) ||
+        selectable.find((model) => modelKey(model) === stored) ||
+        fallback;
     this.renderModelMenu();
     this.renderModelButton();
+    this.syncComposer();
   }
 
   findModel(providerId, modelId) {
@@ -750,48 +1220,108 @@ export class ChatController {
     if (!this.refs.modelMenu) return;
     this.refs.modelMenu.replaceChildren();
     if (!chatState.modelCatalog.length) {
+      const signedIn = Boolean(this.api.settings().accessToken);
       const empty = document.createElement("p");
       empty.className = "model-menu-empty";
-      empty.textContent = "No models are available for this workspace.";
+      empty.textContent = signedIn ? "No models available for this workspace." : "Sign in to load models.";
       this.refs.modelMenu.append(empty);
+      if (!signedIn) {
+        const signIn = document.createElement("button");
+        signIn.type = "button";
+        signIn.className = "model-menu-sign-in";
+        signIn.dataset.authDialogOpen = "";
+        signIn.setAttribute("role", "menuitem");
+        signIn.textContent = "Sign in";
+        this.refs.modelMenu.append(signIn);
+      }
       return;
     }
-    const groups = new Map();
+    const selectedKey = modelKey(chatState.selectedModel || {});
+    const visibleModels = new Map();
     for (const model of chatState.modelCatalog) {
+      if (!visibleModels.has(model.model_id) || modelKey(model) === selectedKey) {
+        visibleModels.set(model.model_id, model);
+      }
+    }
+    const groups = new Map();
+    for (const model of visibleModels.values()) {
       if (!groups.has(model.provider_id)) groups.set(model.provider_id, []);
       groups.get(model.provider_id).push(model);
     }
+    let firstGroup = true;
     for (const [provider, models] of groups) {
       const label = document.createElement("p");
       label.className = "menu-group-label";
-      label.textContent = provider;
+      label.classList.toggle("menu-group-follow", !firstGroup);
+      label.textContent = providerLabel(provider);
       this.refs.modelMenu.append(label);
+      firstGroup = false;
       for (const model of models) {
+        const selected = modelKey(model) === modelKey(chatState.selectedModel || {});
+        const locked = model.configured === false;
         const row = document.createElement("div");
         row.className = "model-option chat-model-option";
-        row.classList.toggle("is-selected", modelKey(model) === modelKey(chatState.selectedModel || {}));
+        row.classList.toggle("is-selected", selected);
+        row.classList.toggle("is-locked", locked);
         const button = document.createElement("button");
         button.type = "button";
         button.className = "chat-model-main";
+        button.setAttribute("role", "menuitem");
         button.dataset.chatModel = modelKey(model);
+        if (locked) button.disabled = true;
         const mark = document.createElement("span");
         mark.className = "model-mark";
-        mark.textContent = provider.slice(0, 1).toUpperCase();
+        mark.textContent = providerGlyph(model.provider_id);
         const copy = document.createElement("span");
+        const nameRow = document.createElement("span");
+        nameRow.className = "model-name-row";
         const strong = document.createElement("strong");
         strong.textContent = model.display_name;
+        nameRow.append(strong);
+        if (locked) {
+          const lock = document.createElement("span");
+          lock.className = "model-lock";
+          lock.setAttribute("aria-label", "Locked");
+          lock.textContent = "🔒";
+          nameRow.append(lock);
+        } else if (model.is_new || (Array.isArray(model.tags) && model.tags.includes("new"))) {
+          const badge = document.createElement("span");
+          badge.className = "model-new-badge";
+          badge.textContent = "NEW";
+          nameRow.append(badge);
+        }
+        const info = document.createElement("span");
+        info.className = "model-info";
+        info.title = model.description;
+        info.setAttribute("aria-hidden", "true");
+        info.textContent = "ⓘ";
+        nameRow.append(info);
         const small = document.createElement("small");
-        small.textContent = model.description;
-        copy.append(strong, small);
+        small.textContent = locked ? "Requires paid plan" : model.description;
+        copy.append(nameRow, small);
         button.append(mark, copy);
-        const effort = document.createElement("button");
-        effort.type = "button";
-        effort.className = "effort-chip";
-        effort.dataset.modelEffort = model.reasoning_effort || model.reasoning_efforts[0];
-        effort.dataset.modelKey = modelKey(model);
-        effort.textContent = `${model.reasoning_effort || model.reasoning_efforts[0]} ›`;
-        effort.title = "Cycle reasoning effort";
-        row.append(button, effort);
+        row.append(button);
+        if (model.reasoning_efforts.length) {
+          if (!locked) {
+            const currentEffort =
+              (selected ? chatState.selectedModel?.reasoning_effort : model.reasoning_effort) ||
+              model.reasoning_efforts[0];
+            const effort = document.createElement("button");
+            effort.type = "button";
+            effort.className = "effort-chip";
+            effort.setAttribute("role", "menuitem");
+            effort.dataset.modelEffort = currentEffort;
+            effort.dataset.modelKey = modelKey(model);
+            effort.textContent = `${currentEffort} ›`;
+            effort.title = "Cycle reasoning effort";
+            row.append(effort);
+          }
+        }
+        const check = document.createElement("span");
+        check.className = "model-check";
+        check.setAttribute("aria-hidden", "true");
+        check.textContent = selected ? "✓" : "";
+        row.append(check);
         this.refs.modelMenu.append(row);
       }
     }
@@ -800,10 +1330,12 @@ export class ChatController {
   renderModelButton() {
     if (!chatState.selectedModel) {
       setText(this.refs.selectedModel, "Choose model");
+      setText(this.refs.detailModel, "");
       return;
     }
-    setText(this.refs.selectedModel, `${chatState.selectedModel.display_name} · ${chatState.selectedModel.reasoning_effort}`);
-    setText(this.refs.detailModel, `${chatState.selectedModel.provider_id} / ${chatState.selectedModel.model_id} / ${chatState.selectedModel.reasoning_effort}`);
+    const effort = chatState.selectedModel.reasoning_effort;
+    setText(this.refs.selectedModel, chatState.selectedModel.display_name);
+    setText(this.refs.detailModel, [chatState.selectedModel.provider_id, chatState.selectedModel.model_id, effort].filter(Boolean).join(" / "));
   }
 
   toggleModelMenu() {
@@ -813,6 +1345,7 @@ export class ChatController {
     const open = this.refs.modelMenu.hidden;
     this.refs.modelMenu.hidden = !open;
     this.refs.modelButton?.setAttribute("aria-expanded", String(open));
+    if (open) requestAnimationFrame(() => query('[role="menuitem"]:not(:disabled)', this.refs.modelMenu)?.focus());
   }
 
   closeModelMenu() {
@@ -829,45 +1362,41 @@ export class ChatController {
     const open = menu.hidden;
     menu.hidden = !open;
     button?.setAttribute("aria-expanded", String(open));
+    if (open) requestAnimationFrame(() => query('[role="menuitem"]:not(:disabled)', menu)?.focus());
   }
 
   closeAddMenu() {
     const menu = query("#composer-add-menu");
     if (menu) menu.hidden = true;
+    const browserMenu = query("#composer-browser-menu");
+    if (browserMenu) browserMenu.hidden = true;
+    query('[data-add-command="browser"]')?.setAttribute("aria-expanded", "false");
     query("#composer-add-button")?.setAttribute("aria-expanded", "false");
   }
 
   handleAddCommand(command) {
+    if (command === "browser") return this.toggleBrowserProfileMenu();
     this.closeAddMenu();
+    if (command === "agent") return this.openAgentBuilderDialog();
     if (command === "files") {
       this.refs.fileInput?.click();
       return;
     }
-    const commandText = {
-      drive: "@Google-Drive ",
-      image: "/image ",
-      video: "/video ",
-      voice: "/voice ",
-      connectors: "@",
-      browser: "/browser ",
-      workflow: "/workflow ",
-      slides: "/slides ",
-    }[command];
-    if (!commandText) return;
-    this.refs.input.value = commandText;
-    this.syncComposer();
-    this.updateMentionMenu();
-    this.refs.input.focus();
+    if (command === "drive" || command === "connectors") return this.openComposerResourceDialog(command);
+    if (CREATE_INTENTS[command] && chatState.creationCapabilities[command] === true) {
+      this.selectCreateIntent(command);
+    }
   }
 
   async selectModel(key) {
     const model = chatState.modelCatalog.find((item) => modelKey(item) === key);
-    if (!model) return;
+    if (!model || model.configured === false) return;
     chatState.selectedModel = { ...model };
     localStorage.setItem("taroai.chatModel", key);
     this.closeModelMenu();
     this.renderModelMenu();
     this.renderModelButton();
+    this.syncComposer();
     if (chatState.currentThreadId) {
       try {
         await this.updateThread(chatState.currentThreadId, {
@@ -884,7 +1413,7 @@ export class ChatController {
 
   async selectModelEffort(currentEffort, key) {
     const model = chatState.modelCatalog.find((item) => modelKey(item) === key);
-    if (!model) return;
+    if (!model?.reasoning_efforts.length) return;
     const currentIndex = Math.max(0, model.reasoning_efforts.indexOf(currentEffort));
     model.reasoning_effort = model.reasoning_efforts[(currentIndex + 1) % model.reasoning_efforts.length];
     chatState.selectedModel = { ...model };
@@ -900,12 +1429,41 @@ export class ChatController {
   }
 
   async loadCapabilities() {
+    if (!this.api.settings().accessToken) {
+      chatState.capabilities = [];
+      chatState.creationCapabilities = {};
+      this.renderCreationCapabilities();
+      return;
+    }
     try {
       const payload = await this.api.get(`/api/workspaces/${encodeURIComponent(currentWorkspaceId())}/capabilities`);
       chatState.capabilities = normalizeCapabilities(payload);
+      chatState.creationCapabilities = payload.composer_creation || {};
+      const profiles = chatState.capabilities.filter((item) => item.type === "browser_profile" && item.enabled);
+      chatState.browserProfile = profiles.find((item) => item.id === chatState.browserProfile?.id) || null;
     } catch {
       chatState.capabilities = [];
+      chatState.creationCapabilities = {};
+      chatState.browserProfile = null;
     }
+    this.renderCreationCapabilities();
+    this.renderResourceChips();
+  }
+
+  renderCreationCapabilities() {
+    const capabilities = chatState.creationCapabilities;
+    for (const intent of Object.keys(CREATE_INTENTS)) {
+      const control = query(`[data-add-command="${intent}"]`);
+      if (control) control.hidden = intent !== "agent" && capabilities[intent] !== true;
+    }
+    const browser = query('[data-add-command="browser"]');
+    if (browser) browser.hidden = capabilities.browser !== true;
+    const mediaAvailable = ["image", "video", "voice"].some((intent) => capabilities[intent] === true);
+    const workflowAvailable = ["workflow", "slides"].some((intent) => capabilities[intent] === true);
+    const mediaSeparator = query("[data-media-create-separator]");
+    const workflowSeparator = query("[data-workflow-create-separator]");
+    if (mediaSeparator) mediaSeparator.hidden = !mediaAvailable;
+    if (workflowSeparator) workflowSeparator.hidden = !workflowAvailable;
   }
 
   updateMentionMenu() {
@@ -967,19 +1525,160 @@ export class ChatController {
     this.renderResourceChips();
   }
 
+  selectCreateIntent(intent) {
+    chatState.createIntent = intent && CREATE_INTENTS[intent] ? intent : null;
+    this.closeAddMenu();
+    this.renderResourceChips();
+    this.syncComposer();
+    this.refs.input?.focus();
+  }
+
+  selectBrowserProfile(profileId) {
+    const profile = chatState.capabilities.find((item) => item.type === "browser_profile" && item.id === profileId) || null;
+    chatState.browserProfile = profile;
+    this.closeAddMenu();
+    this.renderResourceChips();
+    this.refs.input?.focus();
+  }
+
+  toggleBrowserProfileMenu() {
+    const menu = query("#composer-browser-menu");
+    if (!menu) return;
+    const open = menu.hidden;
+    this.renderBrowserProfileMenu();
+    menu.hidden = !open;
+    query('[data-add-command="browser"]')?.setAttribute("aria-expanded", String(open));
+  }
+
+  renderBrowserProfileMenu() {
+    const menu = query("#composer-browser-menu");
+    if (!menu) return;
+    const profiles = chatState.capabilities.filter((item) => item.type === "browser_profile" && item.enabled);
+    const profileButtons = profiles.map((profile) => `
+      <button type="button" role="menuitemradio" aria-checked="${profile.id === chatState.browserProfile?.id}" data-browser-profile-id="${escapeHtml(profile.id)}">
+        <span aria-hidden="true">◎</span><span>${escapeHtml(profile.name)}</span><span aria-hidden="true">${profile.id === chatState.browserProfile?.id ? "✓" : ""}</span>
+      </button>`).join("");
+    menu.innerHTML = profiles.length ? `
+      ${profiles.length > 1 ? `<button type="button" role="menuitemradio" aria-checked="${!chatState.browserProfile}" data-browser-profile-none><span aria-hidden="true">◎</span><span>No profile</span><span>${chatState.browserProfile ? "" : "✓"}</span></button>` : ""}
+      ${profileButtons}
+      <div class="menu-separator"></div>
+      <button type="button" role="menuitem" data-browser-profile-new><span aria-hidden="true">+</span><span>Create profile</span></button>
+      <form class="browser-profile-inline-form" data-browser-profile-form hidden>
+        <input name="name" maxlength="120" placeholder="Profile name..." aria-label="Profile name" required />
+        <button type="submit" aria-label="Create profile">✓</button>
+      </form>` : `
+      <button type="button" role="menuitem" data-browser-profile-create-default><span aria-hidden="true">+</span><span>Create default profile</span></button>`;
+    query("[data-browser-profile-form]", menu)?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      this.createBrowserProfile(new FormData(event.currentTarget).get("name"));
+    });
+  }
+
+  showBrowserProfileForm() {
+    const menu = query("#composer-browser-menu");
+    const form = query("[data-browser-profile-form]", menu);
+    if (!form) return;
+    query("[data-browser-profile-new]", menu).hidden = true;
+    form.hidden = false;
+    form.elements.name.focus();
+  }
+
+  async createBrowserProfile(rawName, isDefault = false) {
+    const name = String(rawName || "").trim();
+    if (!name) return;
+    try {
+      const profile = await this.api.post("/api/browser/profiles", {
+        workspace_id: currentWorkspaceId(),
+        name,
+        is_default: isDefault,
+      }, { scope: "browser-profile-create" });
+      await this.loadCapabilities();
+      this.selectBrowserProfile(profile.id);
+      this.network(`Browser profile “${name}” created`, "success");
+    } catch (error) {
+      this.network(`Browser profile failed: ${error.message}`, "error");
+    }
+  }
+
+  openComposerResourceDialog(command) {
+    const drive = command === "drive";
+    const resources = chatState.capabilities.filter((item) => {
+      if (item.type !== "connector" || !item.enabled) return false;
+      return !drive || `${item.id} ${item.name} ${item.description}`.toLowerCase().includes("google drive");
+    });
+    const dialog = document.createElement("dialog");
+    dialog.className = "chat-dialog composer-resource-dialog";
+    const title = drive ? "Import from Google Drive" : "Add connectors";
+    const empty = drive ? "Connect Google Drive to import files directly from your Drive." : "No connected connectors available.";
+    dialog.innerHTML = `
+      <div class="chat-dialog-card">
+        <header><div><small>Workspace resources</small><h2>${title}</h2></div><button type="button" data-close aria-label="Close">×</button></header>
+        <p>${drive ? "Choose a connected Google Drive account to use in this chat." : "Choose a connected service to reference in your message."}</p>
+        <div class="composer-resource-options">
+          ${resources.length ? resources.map((item) => `
+            <button type="button" class="agent-builder-resource" data-composer-resource="${escapeHtml(item.id)}">
+              <span aria-hidden="true">${escapeHtml(item.icon)}</span><span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.description || "Connected integration")}</small></span>
+            </button>`).join("") : `<p class="agent-builder-empty">${empty}</p>`}
+        </div>
+        <footer><button type="button" data-close>Cancel</button><button type="button" class="primary" data-manage-connectors>Manage connectors</button></footer>
+      </div>`;
+    document.body.append(dialog);
+    dialog.addEventListener("click", (event) => {
+      if (event.target.closest("[data-close]")) return dialog.close();
+      if (event.target.closest("[data-manage-connectors]")) {
+        dialog.close();
+        window.location.hash = "brain/connectors";
+        return;
+      }
+      const button = event.target.closest("[data-composer-resource]");
+      const resource = button && resources.find((item) => item.id === button.dataset.composerResource);
+      if (!resource) return;
+      if (!chatState.resourceRefs.some((item) => item.type === resource.type && item.id === resource.id)) {
+        chatState.resourceRefs.push({ ...resourceReference(resource), name: resource.name });
+      }
+      const mention = `@${resource.name.replace(/\s+/g, "-")}`;
+      const suffix = drive ? " Find and attach a file from Google Drive: " : " ";
+      this.refs.input.value = `${this.refs.input.value.trimEnd()}${this.refs.input.value.trim() ? " " : ""}${mention}${suffix}`;
+      dialog.close();
+      this.renderResourceChips();
+      this.saveDraft();
+      this.syncComposer();
+      this.refs.input.focus();
+    });
+    dialog.addEventListener("close", () => dialog.remove());
+    dialog.showModal();
+  }
+
   renderResourceChips() {
     if (!this.refs.resourceChips) return;
     this.refs.resourceChips.replaceChildren();
-    for (const resource of chatState.resourceRefs) {
+    if (chatState.createIntent) {
+      const intent = CREATE_INTENTS[chatState.createIntent];
+      const chip = document.createElement("span");
+      chip.className = "resource-chip create-intent-chip";
+      chip.innerHTML = `<small>${escapeHtml(intent.chipLabel || "Create")}</small><strong>${escapeHtml(intent.label)}</strong>`;
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.dataset.removeCreateIntent = "";
+      remove.setAttribute("aria-label", `Remove ${intent.label} intent`);
+      remove.textContent = "×";
+      chip.append(remove);
+      this.refs.resourceChips.append(chip);
+    }
+    const resources = chatState.browserProfile
+      ? [{ ...resourceReference(chatState.browserProfile), name: chatState.browserProfile.name, persistentBrowserProfile: true }, ...chatState.resourceRefs]
+      : chatState.resourceRefs;
+    for (const resource of resources.filter((item, index, items) => items.findIndex((candidate) => candidate.type === item.type && candidate.id === item.id) === index)) {
       const chip = document.createElement("span");
       chip.className = `resource-chip resource-chip-${resource.type}`;
       const kind = document.createElement("small");
-      kind.textContent = resource.type;
+      kind.textContent = resource.type === "browser_profile" ? "browser" : resource.type;
       const name = document.createElement("strong");
       name.textContent = `@${resource.name || resource.id}`;
       const remove = document.createElement("button");
       remove.type = "button";
-      remove.dataset.removeResource = `${resource.type}:${resource.id}`;
+      if (resource.persistentBrowserProfile) remove.dataset.removeBrowserProfile = "";
+      else remove.dataset.removeResource = `${resource.type}:${resource.id}`;
       remove.setAttribute("aria-label", `Remove ${resource.name || resource.id}`);
       remove.textContent = "×";
       chip.append(kind, name, remove);
@@ -1044,16 +1743,6 @@ export class ChatController {
     }
   }
 
-  toggleDeliveryMode() {
-    if (!this.refs.deliveryMode) return;
-    const current = this.refs.deliveryMode.value || "queue";
-    const next = current === "queue" ? "manual" : current === "manual" ? "steer" : "queue";
-    this.refs.deliveryMode.value = next;
-    this.refs.deliveryMode.textContent = next === "queue" ? "Queue automatic" : next === "manual" ? "Queue for review" : "Steer now";
-    this.refs.deliveryMode.classList.toggle("is-steer", next === "steer");
-    this.refs.deliveryMode.classList.toggle("is-manual", next === "manual");
-  }
-
   saveDraft() {
     const key = chatState.currentThreadId || "new";
     localStorage.setItem(`taroai.threadDraft.${key}`, this.refs.input?.value || "");
@@ -1077,51 +1766,80 @@ export class ChatController {
     this.refs.input.style.height = "auto";
     this.refs.input.style.height = `${Math.min(this.refs.input.scrollHeight, 180)}px`;
     const uploadPending = chatState.uploads.some((upload) => !["Ready", "Failed"].includes(upload.status));
-    this.refs.send.disabled = uploadPending || (!this.refs.input.value.trim() && !chatState.uploads.some((upload) => upload.status === "Ready"));
-    if (this.refs.stop) this.refs.stop.hidden = !chatState.running;
+    this.refs.send.disabled = !chatState.selectedModel || uploadPending || (!this.refs.input.value.trim() && !chatState.uploads.some((upload) => upload.status === "Ready"));
+    if (this.refs.stop) this.refs.stop.hidden = !chatState.running || assistantResponseReady();
     this.refs.send.hidden = chatState.running && !this.refs.input.value.trim();
-    if (this.refs.deliveryMode) this.refs.deliveryMode.hidden = !chatState.running;
   }
 
-  async sendThreadMessage(contentOverride = null, deliveryOverride = null) {
+  async sendThreadMessage(contentOverride = null, deliveryOverride = null, modeOverride = null) {
+    if (chatState.uploads.some((upload) => !["Ready", "Failed"].includes(upload.status))) {
+      this.network("Wait for files to finish uploading and scanning", "warning");
+      return null;
+    }
     const content = (contentOverride ?? this.refs.input?.value ?? "").trim();
-    const attachments = chatState.uploads.filter((upload) => upload.status === "Ready").map((upload) => upload.id || upload.storage_object_id);
-    if (!content && !attachments.length) return;
-    const submittedContent = content || "Review the attached files.";
-    if (!chatState.currentThreadId) {
+    const readyUploads = chatState.uploads.filter((upload) => upload.status === "Ready");
+    const attachments = readyUploads.map((upload) => upload.id || upload.storage_object_id);
+    const displayAttachments = readyUploads.map((upload) => ({
+      id: upload.id || upload.storage_object_id,
+      filename: upload.filename || upload.name,
+    }));
+    if (!content && !attachments.length) return null;
+    const displayContent = content || "Review the attached files.";
+    const createIntent = chatState.createIntent;
+    const submittedContent = createIntent && createIntent !== "workflow" ? `${CREATE_INTENTS[createIntent].prefix}${displayContent}` : displayContent;
+    const composerResources = chatState.browserProfile
+      ? [{ ...resourceReference(chatState.browserProfile), name: chatState.browserProfile.name }, ...chatState.resourceRefs]
+      : chatState.resourceRefs;
+    const resourceRefs = composerResources.filter((item, index, items) => items.findIndex((candidate) => candidate.type === item.type && candidate.id === item.id) === index);
+    const runMode = modeOverride || (createIntent === "workflow" ? "workflow" : createIntent ? "autonomous" : "chat");
+    const startedWithoutThread = !chatState.currentThreadId;
+    if (startedWithoutThread) {
       try {
         await this.createThread();
       } catch (error) {
         this.network(`Could not create thread: ${error.message}`, "error");
-        return;
+        return null;
       }
     }
-    const deliveryMode = deliveryOverride || (chatState.running ? this.refs.deliveryMode?.value || "queue" : "auto");
+    const deliveryMode = deliveryOverride || (chatState.running ? "queue" : "auto");
+    if (!chatState.running && deliveryMode === "auto") chatState.currentRunMode = runMode;
     const optimisticId = `client:${Date.now()}`;
     const optimistic = {
       id: optimisticId,
       role: "user",
-      content: submittedContent,
+      content: displayContent,
       dispatch_status: deliveryMode === "auto" ? "sending" : deliveryMode === "steer" ? "steering" : deliveryMode === "manual" ? "ready" : "queued",
-      kind: deliveryMode === "manual" ? "manual_queue" : "text",
+      kind: deliveryMode === "manual" ? "manual_queue" : runMode === "autonomous" ? "agent" : runMode === "workflow" ? "workflow" : "text",
       created_at: new Date().toISOString(),
-      attachments,
-      resource_refs: chatState.resourceRefs,
+      attachments: displayAttachments,
+      resource_refs: resourceRefs,
       optimistic: true,
     };
+    chatState.suggestions = [];
+    chatState.inputRequest = null;
+    chatState.inputAnswers = {};
+    chatState.inputExtra = "";
+    chatState.thoughtOpen = false;
     chatState.messages.push(optimistic);
+    if (startedWithoutThread) localStorage.removeItem("taroai.threadDraft.new");
     this.clearDraft();
     chatState.resourceRefs = [];
+    chatState.browserProfile = null;
+    chatState.createIntent = null;
     chatState.uploads = [];
     this.renderAll();
-    this.network(deliveryMode === "auto" ? "Starting agent…" : deliveryMode === "steer" ? "Steering requested" : deliveryMode === "manual" ? "Queued for review after this turn" : "Message queued automatically", "loading");
+    this.network(deliveryMode === "auto" ? (runMode === "chat" ? "Thinking…" : "Starting agent…") : deliveryMode === "steer" ? "Steering requested" : deliveryMode === "manual" ? "Queued for review after this turn" : "Message queued automatically", "loading");
     try {
       const result = await this.api.post(
         `/api/threads/${encodeURIComponent(chatState.currentThreadId)}/messages`,
         {
           content: submittedContent,
+          display_content: displayContent,
+          skill_ids: optimistic.resource_refs.filter(({ type }) => type === "skill").map(({ id }) => id),
           delivery_mode: deliveryMode,
-          resource_refs: optimistic.resource_refs.map(({ type, id, version }) => ({ type, id, version: version ?? null })),
+          mode: runMode,
+          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+          resource_refs: optimistic.resource_refs.filter(({ type }) => type !== "skill").map(({ type, id, version }) => ({ type, id, version: version ?? null })),
           attachments,
         },
         { scope: "thread-message" },
@@ -1132,18 +1850,24 @@ export class ChatController {
         ...message,
         id: message.id || result.message_id || optimisticId,
         dispatch_status: message.dispatch_status || result.dispatch_status || optimistic.dispatch_status,
+        attachments: arrayFrom(message.attachments || attachments, "items").map((attachment) => {
+          const id = typeof attachment === "string" ? attachment : attachment.id || attachment.storage_object_id;
+          return displayAttachments.find((item) => item.id === id) || attachment;
+        }),
         optimistic: false,
       };
       chatState.messages = chatState.messages.map((item) => (item.id === optimisticId ? persistedMessage : item));
       chatState.currentRunId = result.run_id || result.current_run_id || chatState.currentRunId;
+      publishChatContext();
       const status = dispatchStatus(persistedMessage);
-      if (["queued", "steering", "ready"].includes(status)) {
+      if (["queued", "ready"].includes(status)) {
         chatState.queue = [persistedMessage, ...chatState.queue.filter((item) => item.id !== persistedMessage.id)];
       } else {
+        chatState.currentRunMode = runMode;
         chatState.running = true;
       }
       if (!chatState.thread?.title || chatState.thread.title === "New thread") {
-        const suggestedTitle = submittedContent.replace(/\s+/g, " ").slice(0, 72).trim();
+        const suggestedTitle = displayContent.replace(/\s+/g, " ").slice(0, 72).trim();
         if (suggestedTitle) {
           try {
             await this.updateThread(chatState.currentThreadId, { title: suggestedTitle });
@@ -1152,13 +1876,16 @@ export class ChatController {
           }
         }
       }
-      this.updateThreadPreview(submittedContent);
+      this.updateThreadPreview(displayContent);
       this.renderAll();
       this.startEventStream();
+      return result;
     } catch (error) {
+      if (error.body?.code === "model_policy_denied") await this.loadModelCatalog();
       chatState.messages = chatState.messages.map((item) => (item.id === optimisticId ? { ...item, dispatch_status: "failed", error: error.message } : item));
       this.network(`Message failed: ${error.message}`, "error");
       this.renderConversation();
+      return null;
     }
   }
 
@@ -1196,26 +1923,16 @@ export class ChatController {
   async steerQueuedMessage(messageId) {
     const queued = chatState.queue.find((item) => item.id === messageId);
     if (!queued) return;
-    let result;
-    try {
-      result = await this.api.post(
-        `/api/threads/${encodeURIComponent(chatState.currentThreadId)}/messages/${encodeURIComponent(messageId)}/steer`,
-        {},
-        { scope: "queue-steer" },
-      );
-    } catch (error) {
-      if (![404, 405].includes(error.status)) throw error;
-      result = await this.api.post(
-        `/api/threads/${encodeURIComponent(chatState.currentThreadId)}/steer`,
-        {
-          content: messageContent(queued),
-          attachments: queued.attachments || [],
-          resource_refs: queued.resource_refs || [],
-        },
-        { scope: "queue-steer-fallback" },
-      );
-      await this.deleteQueuedMessage(messageId);
-    }
+    const result = await this.api.post(
+      `/api/threads/${encodeURIComponent(chatState.currentThreadId)}/steer`,
+      {
+        content: messageContent(queued),
+        attachments: queued.attachments || [],
+        resource_refs: queued.resource_refs || [],
+      },
+      { scope: "queue-steer" },
+    );
+    await this.deleteQueuedMessage(messageId);
     const status = result.dispatch_status || result.message?.dispatch_status || "steering";
     const nextMessageId = result.message_id || result.message?.id || messageId;
     const replacement = { ...queued, ...result.message, id: nextMessageId, dispatch_status: status };
@@ -1296,22 +2013,15 @@ export class ChatController {
   async dispatchQueue() {
     if (!chatState.currentThreadId || !chatState.queue.length) return;
     try {
-      let result;
-      try {
-        result = await this.api.post(
-          `/api/threads/${encodeURIComponent(chatState.currentThreadId)}/queue/dispatch`,
-          {},
-          { scope: "queue-dispatch" },
-        );
-      } catch (error) {
-        if (![404, 405].includes(error.status)) throw error;
-        result = await this.api.post(
-          `/api/threads/${encodeURIComponent(chatState.currentThreadId)}/continue`,
-          {},
-          { scope: "queue-continue-fallback" },
-        );
-      }
+      const nextMessage = chatState.queue[0];
+      chatState.currentRunMode = nextMessage?.kind === "agent" ? "autonomous" : nextMessage?.kind === "workflow" ? "workflow" : "chat";
+      const result = await this.api.post(
+        `/api/threads/${encodeURIComponent(chatState.currentThreadId)}/continue`,
+        {},
+        { scope: "queue-dispatch" },
+      );
       chatState.currentRunId = result.run_id || chatState.currentRunId;
+      publishChatContext();
       chatState.running = true;
       this.network("Queued message started", "active");
       await this.loadThread(chatState.currentThreadId, false);
@@ -1372,19 +2082,16 @@ export class ChatController {
   async stopThread() {
     if (!chatState.currentThreadId) return;
     if (this.refs.stop) this.refs.stop.disabled = true;
+    this.network(`Stopping ${runSubject().toLowerCase()}…`, "active");
     try {
-      try {
-        await this.api.post(`/api/threads/${encodeURIComponent(chatState.currentThreadId)}/stop`, {}, { scope: "thread-stop" });
-      } catch (error) {
-        if (![404, 405].includes(error.status) || !chatState.currentRunId) throw error;
-        await this.api.post(
-          `/api/runs/${encodeURIComponent(chatState.currentRunId)}/cancel`,
-          { reason_code: "user_requested" },
-          { scope: "thread-run-cancel-fallback" },
-        );
-      }
+      if (!chatState.currentRunId) throw new Error("No active run to stop");
+      await this.api.post(
+        `/api/runs/${encodeURIComponent(chatState.currentRunId)}/cancel`,
+        { reason_code: "user_requested" },
+        { scope: "thread-stop" },
+      );
       chatState.running = false;
-      this.network("Agent stopped", "warning");
+      this.network(`${runSubject()} stopped`, "warning");
       this.renderAll();
     } catch (error) {
       this.network(`Stop failed: ${error.message}`, "error");
@@ -1423,7 +2130,7 @@ export class ChatController {
   }
 
   startEventStream() {
-    if (!chatState.currentThreadId || chatState.streamAbort) return;
+    if (!chatState.currentThreadId || !chatState.running || chatState.streamAbort) return;
     const controller = new AbortController();
     chatState.streamAbort = controller;
     const threadId = chatState.currentThreadId;
@@ -1433,22 +2140,22 @@ export class ChatController {
         signal: controller.signal,
         onStatus: (status) => {
           if (threadId !== chatState.currentThreadId) return;
-          setText(this.refs.detailStream, status === "connected" ? "Live" : "Reconnecting");
+          setText(this.refs.detailStream, status === "connected" ? "Live" : chatState.running ? "Reconnecting" : "Complete");
           if (status === "connected") {
             chatState.reconnectAttempt = 0;
-            this.network(chatState.running ? "Live · agent is working" : "Live", chatState.running ? "active" : "success");
+            this.network(chatState.running ? workingStatus(true) : "Live", chatState.running ? "active" : "success");
           }
         },
         onEvent: (frame) => this.applyStreamEvent(frame),
       })
       .catch((error) => {
-        if (controller.signal.aborted || threadId !== chatState.currentThreadId) return;
+        if (controller.signal.aborted || threadId !== chatState.currentThreadId || !chatState.running) return;
         this.network(`Connection interrupted · retrying`, "warning");
         this.renderReconnectCard(error.message);
       })
       .finally(() => {
         if (chatState.streamAbort === controller) chatState.streamAbort = null;
-        if (!controller.signal.aborted && threadId === chatState.currentThreadId) {
+        if (!controller.signal.aborted && threadId === chatState.currentThreadId && chatState.running) {
           chatState.reconnectAttempt += 1;
           const delay = Math.min(30000, 1000 * 2 ** Math.min(chatState.reconnectAttempt, 5));
           chatState.streamRetry = window.setTimeout(() => {
@@ -1463,6 +2170,7 @@ export class ChatController {
     const payload = frame.data || {};
     const event = payload.event || payload;
     chatState.currentRunId = event.run_id || eventPayload(event).run_id || chatState.currentRunId;
+    publishChatContext();
     const sequence = Number(frame.id || eventSequence(event));
     if (sequence && sequence <= chatState.lastThreadSequence) return;
     if (sequence) {
@@ -1470,12 +2178,17 @@ export class ChatController {
       localStorage.setItem(`taroai.threadSequence.${chatState.currentThreadId}`, String(sequence));
     }
     if (frame.event === "heartbeat" || eventType(event) === "heartbeat") {
-      this.network(chatState.running ? "Live · agent is working" : "Live", chatState.running ? "active" : "success");
+      if (chatState.running) this.network(workingStatus(true), "active");
       return;
     }
     const type = eventType(event);
     const payloadDetail = eventPayload(event);
-    if (type.includes("assistant.delta") || type.includes("text.delta") || type.includes("message.delta")) {
+    const isTextDelta = ["assistant.delta", "text.delta", "message.delta"].some((name) => type.includes(name));
+    let terminalStatus = null;
+    if (type === "run.created" && ["chat", "autonomous", "workflow"].includes(payloadDetail.mode)) {
+      chatState.currentRunMode = payloadDetail.mode;
+    }
+    if (isTextDelta) {
       const detail = payloadDetail;
       const messageId = detail.message_id || event.message_id || `stream:${chatState.currentRunId || chatState.currentThreadId}`;
       const delta = detail.delta || detail.text || detail.content || "";
@@ -1483,11 +2196,20 @@ export class ChatController {
       if (existing) existing.content = `${existing.content || ""}${delta}`;
       else chatState.messages.push({ id: messageId, role: "assistant", content: delta, status: "streaming", created_at: new Date().toISOString() });
     }
+    if (type === "classifier_refusal") {
+      const streamId = `stream:${chatState.currentRunId || chatState.currentThreadId}`;
+      chatState.messages = chatState.messages.filter((message) => message.id !== streamId);
+    }
+    if (type === "assistant.stream.reset") {
+      const streamId = `stream:${chatState.currentRunId || chatState.currentThreadId}`;
+      chatState.messages = chatState.messages.filter((message) => message.id !== streamId);
+    }
     if (type === "assistant.message.completed") {
       const finalId = payloadDetail.message_id || `assistant:${chatState.currentRunId || Date.now()}`;
       const streamId = `stream:${chatState.currentRunId || chatState.currentThreadId}`;
       const streamed = chatState.messages.find((item) => item.id === streamId);
       const completed = chatState.messages.find((item) => item.id === finalId);
+      if (!streamed && !completed) chatState.enteringMessageId = finalId;
       const finalMessage = {
         ...(streamed || completed || {}),
         id: finalId,
@@ -1498,6 +2220,7 @@ export class ChatController {
         created_at: streamed?.created_at || completed?.created_at || event.created_at || new Date().toISOString(),
       };
       chatState.messages = [...chatState.messages.filter((item) => ![streamId, finalId].includes(item.id)), finalMessage];
+      this.network("Response ready", "success");
     }
     const streamedMessage = event.message || eventPayload(event).message || eventPayload(event).chat_message;
     if (type.includes("message") && streamedMessage && typeof streamedMessage === "object") {
@@ -1510,33 +2233,41 @@ export class ChatController {
         chatState.queue = chatState.queue.filter((item) => item.id !== message.id);
       }
     }
-    if (type.includes("artifact")) this.captureArtifactFromEvent(event);
+    if (type === "agent.steering.applied") {
+      const messageId = payloadDetail.message_id;
+      chatState.messages = chatState.messages.map((item) => item.id === messageId ? { ...item, dispatch_status: "completed" } : item);
+      chatState.queue = chatState.queue.filter((item) => item.id !== messageId);
+    }
+    if (type === "artifact.created") this.captureArtifactFromEvent(event);
     if (type.startsWith("coding.")) this.loadCodingWorkspace();
     if (!chatState.events.some((item) => eventSequence(item) && eventSequence(item) === sequence)) {
       chatState.events.push({ ...event, thread_sequence: sequence || eventSequence(event) });
       this.persistEventCache();
     }
+    if (type === "sandbox.command.executed") {
+      this.loadCommandOutput(event).then(() => this.renderConversation());
+    }
     if (type.includes("run.started") || type.includes("cycle.started") || type.includes("action.requested")) chatState.running = true;
     if (type === "run.status_changed") {
       const status = String(payloadDetail.status || "").toLowerCase();
       chatState.running = ACTIVE_RUN_STATES.has(status);
-      if (["succeeded", "failed", "cancelled", "timed_out"].includes(status)) {
-        this.network(
-          status === "succeeded" ? "Agent finished" : `Run ${status.replaceAll("_", " ")}`,
-          status === "succeeded" ? "success" : status === "cancelled" ? "warning" : "error",
-        );
-      }
+      if (status === "retrying") this.network(`${runSubject()} hit a temporary error · retrying`, "warning");
+      else if (status === "running") this.network(workingStatus(true), "active");
+      if (["succeeded", "failed", "cancelled", "timed_out"].includes(status)) terminalStatus = status;
     }
     if (type === "agent.loop.completed") {
       chatState.running = false;
       const outcome = String(payloadDetail.outcome || "complete").toLowerCase();
-      this.network(outcome === "complete" ? "Agent finished" : `Agent finished · ${outcome}`, outcome === "complete" ? "success" : "warning");
+      terminalStatus = outcome === "complete" ? "succeeded" : outcome;
+      this.persistPendingAgent(outcome);
       if (chatState.currentThreadId) {
-        this.loadSuggestions();
+        if (terminalStatus === "succeeded") this.loadSuggestions();
         this.api
           .get(`/api/threads/${encodeURIComponent(chatState.currentThreadId)}/messages`)
-          .then((messages) => {
-            chatState.messages = arrayFrom(messages, "messages", "chat_messages");
+          .then(async (messages) => {
+            chatState.messages = await this.hydrateMessageAttachments(
+              arrayFrom(messages, "messages", "chat_messages"),
+            );
             chatState.queue = chatState.messages.filter((message) => ["queued", "steering", "ready"].includes(dispatchStatus(message)));
             this.renderAll();
             this.maybePromoteManualMessage();
@@ -1544,11 +2275,41 @@ export class ChatController {
           .catch(() => {});
       }
     }
-    if (TERMINAL_EVENT_WORDS.some((word) => type.includes(word)) && (type.includes("run") || type.includes("loop"))) {
+    if (type === "agent.waiting_for_user") {
       chatState.running = false;
-      this.network(type.includes("fail") ? "Agent finished with issues" : "Agent finished", type.includes("fail") ? "error" : "success");
+      chatState.suggestions = arrayFrom(payloadDetail, "options").map(String).filter(Boolean);
+      this.setInputRequest(payloadDetail);
+      this.network("Waiting for your reply", "idle");
     }
-    this.renderAll();
+    if (type === "assistant.suggestions.generated") {
+      chatState.suggestions = arrayFrom(payloadDetail, "options").map(String).filter(Boolean);
+    }
+    if (type === "approval.requested") this.network("Awaiting approval", "idle");
+    terminalStatus ||= {
+      "run.succeeded": "succeeded",
+      "run.failed": "failed",
+      "run.cancelled": "cancelled",
+      "run.timed_out": "timed_out",
+    }[type] || null;
+    if (terminalStatus) {
+      chatState.running = false;
+      chatState.inputRequest = null;
+      chatState.inputAnswers = {};
+      chatState.inputExtra = "";
+      const stopped = terminalStatus === "cancelled";
+      this.network(
+        stopped
+          ? `${runSubject()} stopped`
+          : terminalStatus === "succeeded"
+            ? `${runSubject()} finished`
+            : terminalStatus === "timed_out"
+              ? `${runSubject()} timed out`
+              : `${runSubject()} finished with issues`,
+        terminalStatus === "succeeded" ? "success" : stopped ? "warning" : "error",
+      );
+    }
+    if (isTextDelta) this.scheduleConversationRender();
+    else this.renderAll();
   }
 
   captureArtifactFromEvent(event) {
@@ -1556,133 +2317,521 @@ export class ChatController {
     const artifact = payload.artifact || payload;
     const id = artifact.id || artifact.artifact_id || artifact.storage_object_id;
     if (!id) return;
-    chatState.artifacts = [{ ...artifact, id }, ...chatState.artifacts.filter((item) => item.id !== id)];
+    chatState.artifacts = [
+      { ...artifact, id, run_id: artifact.run_id || event.run_id || payload.run_id },
+      ...chatState.artifacts.filter((item) => item.id !== id),
+    ];
   }
 
-  eventCardKind(type) {
-    if (type.includes("approval")) return "approval";
-    if (type.includes("verification") || type.includes("verifier") || type.includes("verified")) return "verifier";
-    if (type.includes("replan")) return "replan";
-    if (type.includes("repair")) return "repair";
-    if (type.includes("observation") || type.includes("result")) return "observation";
-    if (type.includes("skill")) return "skill";
-    if (type.includes("tool") || type.includes("action")) return "tool";
-    if (type.includes("decision") || type.includes("plan")) return "decision";
-    if (type.includes("cycle") || type.includes("thinking") || type.includes("model")) return "thinking";
-    if (type.includes("fail") || type.includes("error") || type.includes("lost")) return "failure";
-    if (type.includes("run") || type.includes("loop")) return "thinking";
-    return null;
-  }
-
-  eventCardTitle(kind, type, payload) {
-    const explicit = payload.title || payload.label || payload.name || payload.skill_name || payload.tool_name;
-    if (explicit) return explicit;
-    return {
-      thinking: type.includes("completed") ? "Thinking complete" : "Thinking",
-      decision: "Decision",
-      skill: "Skill",
-      tool: "Tool",
-      observation: "Observation",
-      repair: "Repairing",
-      replan: "Replanning",
-      verifier: "Verifier",
-      approval: "Approval required",
-      failure: "Execution issue",
-    }[kind];
-  }
-
-  eventCardSummary(kind, payload, type) {
-    return (
-      payload.summary ||
-      payload.message ||
-      payload.reason ||
-      payload.description ||
-      payload.observation ||
-      payload.output_summary ||
-      payload.status ||
-      (type.includes("completed") ? "Completed" : kind === "thinking" ? "Working through the next step" : "Execution evidence")
+  async loadCommandOutputs(events) {
+    await Promise.all(
+      events
+        .filter((event) => eventType(event) === "sandbox.command.executed")
+        .map((event) => this.loadCommandOutput(event)),
     );
   }
 
-  renderExecutionCard(event) {
-    const type = eventType(event);
-    const kind = this.eventCardKind(type);
-    if (!kind) return null;
+  async loadCommandOutput(event) {
     const payload = eventPayload(event);
-    const details = document.createElement("details");
-    details.className = `agent-trace-card trace-${kind}`;
-    details.open = ["approval", "failure"].includes(kind);
-    const summary = document.createElement("summary");
-    const marker = document.createElement("span");
-    marker.className = "trace-marker";
-    marker.textContent = { thinking: "·", decision: "→", skill: "S", tool: "T", observation: "↳", repair: "↻", replan: "⌁", verifier: "✓", approval: "!", failure: "×" }[kind];
-    const copy = document.createElement("span");
-    const strong = document.createElement("strong");
-    strong.textContent = this.eventCardTitle(kind, type, payload);
-    const small = document.createElement("small");
-    small.textContent = text(this.eventCardSummary(kind, payload, type));
-    copy.append(strong, small);
-    const status = document.createElement("span");
-    status.className = "trace-status";
-    status.textContent = type.includes("completed") || type.includes("succeeded") ? "Done" : payload.status || (chatState.running ? "Live" : "Recorded");
-    summary.append(marker, copy, status);
-    const body = document.createElement("div");
-    body.className = "trace-detail";
-    const redacted = { ...payload };
-    for (const key of ["chain_of_thought", "reasoning", "hidden_reasoning", "secret", "token"]) delete redacted[key];
-    const pre = document.createElement("pre");
-    pre.textContent = text(redacted, "No additional detail");
-    body.append(pre);
-    if (kind === "approval" && payload.approval_id) {
-      const actions = document.createElement("div");
-      actions.className = "trace-actions";
-      for (const decision of ["approve", "reject"]) {
-        const button = document.createElement("button");
-        button.type = "button";
-        button.textContent = decision === "approve" ? "Approve" : "Reject";
-        button.addEventListener("click", (clickEvent) => {
-          clickEvent.preventDefault();
-          this.resolveApproval(payload.approval_id, decision);
-        });
-        actions.append(button);
-      }
-      body.append(actions);
-    }
-    if (kind === "failure" && (payload.connector_id || payload.connection_id)) {
-      const reconnect = document.createElement("button");
-      reconnect.type = "button";
-      reconnect.className = "trace-reconnect";
-      reconnect.textContent = "Reconnect and resume";
-      reconnect.addEventListener("click", (clickEvent) => {
-        clickEvent.preventDefault();
-        this.reconnectConnector(payload.connector_id || payload.connection_id, payload.action_id);
+    const key = payload.step_id || payload.storage_object_id;
+    const storageObjectId = payload.storage_object_id;
+    const cache = chatState.commandOutputs;
+    if (!key || !storageObjectId || cache.has(key)) return;
+    cache.set(key, {});
+    try {
+      const output = await this.api.get(`/api/storage/objects/${encodeURIComponent(storageObjectId)}/content`);
+      if (cache !== chatState.commandOutputs) return;
+      cache.set(key, {
+        stdout: safeCommandStream(output.stdout),
+        stderr: safeCommandStream(output.stderr),
       });
-      body.append(reconnect);
+    } catch { /* The safe execution summary remains available without raw output. */ }
+  }
+
+  renderApprovalCard(runId = chatState.currentRunId) {
+    const runEvents = this.runActivityEvents(runId);
+    const approvalEvents = runEvents.filter((item) => [
+        "approval.requested",
+        "approval.resolved",
+        "approval.rejected",
+        "action_approval",
+      ].includes(eventType(item)));
+    const resolvedApprovalIds = new Set(approvalEvents.flatMap((item) => {
+      const type = eventType(item);
+      const payload = eventPayload(item);
+      const approvalId = payload.approval_id || payload.manifestId;
+      const resolved = ["approval.resolved", "approval.rejected"].includes(type)
+        || (type === "action_approval" && payload.status !== "approval_required");
+      return resolved && approvalId ? [approvalId] : [];
+    }));
+    const pendingEvent = [...approvalEvents].reverse().find((item) => {
+      const type = eventType(item);
+      const payload = eventPayload(item);
+      const approvalId = payload.approval_id || payload.manifestId;
+      const pending = type === "approval.requested"
+        || (type === "action_approval" && payload.status === "approval_required");
+      return pending && approvalId && !resolvedApprovalIds.has(approvalId);
+    });
+    const event = pendingEvent || approvalEvents.at(-1);
+    if (!event) return null;
+    const type = eventType(event);
+    const resolution = ["approval.resolved", "approval.rejected"].includes(type);
+    const resolutionPayload = eventPayload(event);
+    const resolutionId = resolutionPayload.approval_id;
+    const request = resolution
+      ? [...runEvents].reverse().find((item) => (
+        eventType(item) === "approval.requested"
+        && eventPayload(item).approval_id === resolutionId
+      ))
+      : null;
+    const payload = resolution
+      ? { ...eventPayload(request || {}), ...resolutionPayload }
+      : resolutionPayload;
+    const connectorAction = type === "action_approval" || payload.kind === "connector_action";
+    if (
+      !["approval.requested", "approval.resolved", "approval.rejected", "action_approval"].includes(type)
+    ) return null;
+    const actionStatus = resolution
+      ? String(payload.status || (type === "approval.rejected" ? "rejected" : "approved"))
+      : connectorAction
+        ? String(payload.status || "approval_required")
+        : "approval_required";
+    const actionComplete = resolution || (type === "action_approval" && actionStatus !== "approval_required");
+    const approvalId = payload.approval_id || payload.manifestId;
+    if (!approvalId) return null;
+    const workflowPreview = payload.kind === "workflow" || String(payload.reason || "").startsWith("Approve workflow:")
+      ? [...runEvents].reverse().find((item) => eventType(item) === "workflow_preview")
+      : null;
+    const workflowSpec = eventPayload(workflowPreview || {}).spec || null;
+    const workflowSteps = arrayFrom(workflowSpec || {}, "phases")
+      .flatMap((phase) => arrayFrom(phase, "tasks"));
+    const card = document.createElement("section");
+    card.className = "chat-approval";
+    if (actionComplete) card.classList.add(`is-${actionStatus}`);
+    card.setAttribute("role", actionComplete ? "status" : "alert");
+    const marker = document.createElement("span");
+    marker.textContent = ["approved", "applied"].includes(actionStatus) ? "✓" : ["rejected", "apply_failed", "blocked_by_validation"].includes(actionStatus) ? "×" : actionComplete ? "…" : "!";
+    const copy = document.createElement("div");
+    const strong = document.createElement("strong");
+    const actionTitles = {
+      approved: "Action approved",
+      applying: "Applying action",
+      applied: "Action applied",
+      rejected: "Action rejected",
+      apply_failed: "Action failed",
+      blocked_by_validation: "Action blocked",
+      superseded: "Action superseded",
+    };
+    strong.textContent = actionComplete
+      ? actionTitles[actionStatus] || "Action updated"
+      : workflowSpec
+        ? "Review workflow"
+        : connectorAction
+          ? "Review action"
+          : "Approval required";
+    const reason = document.createElement("p");
+    reason.textContent = actionComplete
+      ? payload.error || ({
+        approved: "Approved. The agent continued.",
+        applied: "The connector action finished successfully.",
+        rejected: "Rejected. The action was not run.",
+      }[actionStatus] || "The action is no longer pending.")
+      : workflowSpec
+      ? `${workflowSteps.length} steps will run after approval. No task has run yet.`
+      : payload.reason || "Review this action before the agent continues.";
+    copy.append(strong, reason);
+    const toolName = payload.toolName || payload.preview?.toolName;
+    if (!workflowSpec && toolName) {
+      const preview = document.createElement("code");
+      preview.className = "chat-approval-tool";
+      preview.textContent = toolName;
+      copy.append(preview);
     }
-    details.append(summary, body);
+    if (connectorAction && payload.preview) {
+      const summary = document.createElement("dl");
+      summary.className = "chat-approval-preview";
+      const details = [
+        ["Provider", payload.provider || payload.preview.provider],
+        ["Capability", payload.preview.capability],
+        ["Risk", payload.preview.riskLevel],
+      ];
+      for (const [label, value] of details) {
+        if (value == null || value === "") continue;
+        const term = document.createElement("dt");
+        const description = document.createElement("dd");
+        term.textContent = label;
+        description.textContent = String(value);
+        summary.append(term, description);
+      }
+      const input = payload.preview.input;
+      if (input && typeof input === "object" && !Array.isArray(input)) {
+        const term = document.createElement("dt");
+        const description = document.createElement("dd");
+        term.textContent = "Input";
+        description.textContent = Object.entries(input)
+          .map(([key, value]) => `${key}: ${typeof value === "string" ? value : JSON.stringify(value)}`)
+          .join(" · ")
+          .slice(0, 320);
+        summary.append(term, description);
+      }
+      if (summary.childElementCount) copy.append(summary);
+    }
+    if (workflowSteps.length) {
+      const list = document.createElement("ol");
+      list.className = "chat-workflow-preview";
+      for (const step of workflowSteps) {
+        const item = document.createElement("li");
+        item.textContent = step.title || step.tool || step.id || "Workflow task";
+        list.append(item);
+      }
+      copy.append(list);
+    }
+    const actions = document.createElement("div");
+    for (const decision of actionComplete ? [] : ["approve", "reject"]) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = decision === "approve" && connectorAction ? "Approve & run" : decision === "approve" ? "Approve" : "Reject";
+      button.addEventListener("click", () => {
+        this.resolveApproval(approvalId, decision, connectorAction ? "connector_action" : payload.kind, runId);
+      });
+      actions.append(button);
+    }
+    card.append(marker, copy);
+    if (actions.childElementCount) card.append(actions);
+    return card;
+  }
+
+  async resolveApproval(approvalId, decision, kind = "action", runId = chatState.currentRunId) {
+    try {
+      if (kind === "connector_action" && chatState.currentThreadId) {
+        const base = `/api/threads/${encodeURIComponent(chatState.currentThreadId)}/action-manifests/${encodeURIComponent(approvalId)}`;
+        await this.api.post(`${base}/${decision}`, {}, { scope: `action-${decision}` });
+        if (decision === "approve") await this.api.post(`${base}/apply`, {}, { scope: "action-apply" });
+      } else {
+        const suffix = decision === "reject" ? "/reject" : "";
+        await this.api.post(
+          `/api/runs/${encodeURIComponent(runId)}/approvals${suffix}`,
+          { approval_id: approvalId },
+          { scope: `approval-${decision}` },
+        );
+      }
+      this.network(decision === "approve" ? (kind === "connector_action" ? "Action applied" : "Approved") : "Rejected", decision === "approve" ? "success" : "warning");
+      if (chatState.currentThreadId) {
+        await this.loadThread(chatState.currentThreadId, false);
+        if (kind === "connector_action") {
+          this.abortStream();
+          chatState.running = false;
+          this.renderAll();
+          return;
+        }
+        const latestType = eventType(chatState.events.at(-1) || {});
+        if (
+          decision === "approve"
+          && !["run.succeeded", "run.failed", "run.cancelled", "run.timed_out", "agent.loop.completed"].includes(latestType)
+        ) {
+          chatState.running = true;
+          this.renderAll();
+          this.startEventStream();
+        }
+      }
+    } catch (error) {
+      this.network(`${kind === "connector_action" ? "Action" : "Approval"} failed: ${error.message}`, "error");
+    }
+  }
+
+  renderWorkflowProgress(runId = chatState.currentRunId) {
+    const runEvents = this.runActivityEvents(runId);
+    const preview = [...runEvents].reverse().find((event) => eventType(event) === "workflow_preview");
+    if (!preview) return null;
+    const executionStarted = runEvents.some((event) => [
+      "workflow.started",
+      "workflow_started",
+      "workflow.resumed",
+      "workflow.paused",
+      "workflow.task.updated",
+      "workflow.completed",
+      "workflow.failed",
+      "workflow.cancelled",
+    ].includes(eventType(event)));
+    if (!executionStarted) return null;
+    const payload = eventPayload(preview);
+    const workflowId = payload.workflowId || payload.previewId;
+    const spec = payload.spec || {};
+    const tasks = arrayFrom(spec, "phases").flatMap((phase) =>
+      arrayFrom(phase, "tasks").map((task) => ({ ...task, phaseTitle: phase.title })),
+    );
+    const updates = new Map();
+    for (const event of runEvents) {
+      if (eventType(event) !== "workflow.task.updated") continue;
+      const detail = eventPayload(event);
+      if (!workflowId || detail.workflowId === workflowId) updates.set(detail.taskId, detail);
+    }
+    const completed = tasks.filter((task) => updates.get(task.id)?.status === "succeeded").length;
+    const failed = tasks.find((task) => ["failed", "cancelled", "blocked"].includes(updates.get(task.id)?.status));
+    let status = "ready";
+    for (const event of runEvents) {
+      const type = eventType(event);
+      const detail = eventPayload(event);
+      if (detail.workflowId && workflowId && detail.workflowId !== workflowId) continue;
+      if (["workflow.started", "workflow_started", "workflow.resumed"].includes(type)) status = "running";
+      else if (type === "workflow.paused") status = "paused";
+      else if (type === "workflow.completed") status = "succeeded";
+      else if (type === "workflow.failed") status = "failed";
+      else if (type === "workflow.cancelled") status = "cancelled";
+      else if (
+        type === "workflow.task.updated"
+        && ["pending", "queued", "running"].includes(detail.status)
+        && !["paused", "cancelled", "succeeded"].includes(status)
+      ) status = "running";
+    }
+    const details = document.createElement("details");
+    details.className = "chat-workflow-progress";
+    const summary = document.createElement("summary");
+    const title = document.createElement("span");
+    const statusTitle = failed || status === "failed"
+      ? "Workflow needs attention"
+      : status === "succeeded"
+        ? "Workflow completed"
+        : status === "paused"
+          ? "Workflow paused"
+          : status === "cancelled"
+            ? "Workflow cancelled"
+            : "Workflow";
+    title.innerHTML = `<strong>${statusTitle}</strong><small>${completed} of ${tasks.length} tasks complete</small>`;
+    const meter = document.createElement("span");
+    meter.className = "chat-workflow-meter";
+    meter.style.setProperty("--workflow-progress", `${tasks.length ? (completed / tasks.length) * 100 : 0}%`);
+    summary.append(title, meter);
+    details.append(summary);
+    const list = document.createElement("ol");
+    for (const task of tasks) {
+      const update = updates.get(task.id) || {};
+      const item = document.createElement("li");
+      item.dataset.state = update.status || "pending";
+      const copy = document.createElement("span");
+      const strong = document.createElement("strong");
+      const small = document.createElement("small");
+      strong.textContent = task.title || task.id;
+      small.textContent = update.error || update.status || "Waiting";
+      copy.append(strong, small);
+      item.append(copy);
+      const actions = document.createElement("span");
+      actions.className = "chat-workflow-task-actions";
+      if (update.childRunId && workflowId) {
+        const inspect = document.createElement("button");
+        inspect.type = "button";
+        inspect.textContent = "View worker";
+        inspect.setAttribute("aria-expanded", "false");
+        inspect.addEventListener("click", () => this.toggleWorkflowTaskMessages(workflowId, task.id, item, inspect));
+        actions.append(inspect);
+      }
+      if (["failed", "cancelled", "blocked"].includes(update.status) && workflowId) {
+        const retry = document.createElement("button");
+        retry.type = "button";
+        retry.textContent = "Retry";
+        retry.addEventListener("click", () => this.retryWorkflowTask(workflowId, task.id));
+        actions.append(retry);
+      }
+      if (actions.childElementCount) item.append(actions);
+      list.append(item);
+    }
+    details.append(list);
+    if (workflowId && ["running", "paused"].includes(status)) {
+      const controls = document.createElement("footer");
+      controls.className = "chat-workflow-actions";
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.textContent = status === "paused" ? "Resume" : "Pause";
+      toggle.addEventListener("click", () => this.controlWorkflow(workflowId, status === "paused" ? "resume" : "pause"));
+      const cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.textContent = "Cancel";
+      cancel.addEventListener("click", () => this.controlWorkflow(workflowId, "cancel"));
+      controls.append(toggle, cancel);
+      details.append(controls);
+    }
     return details;
   }
 
-  async resolveApproval(approvalId, decision) {
+  async toggleWorkflowTaskMessages(workflowId, taskId, item, button) {
+    const existing = query(".chat-workflow-transcript", item);
+    if (existing) {
+      existing.hidden = !existing.hidden;
+      button.textContent = existing.hidden ? "View worker" : "Hide worker";
+      button.setAttribute("aria-expanded", String(!existing.hidden));
+      return;
+    }
+    button.disabled = true;
+    button.textContent = "Loading…";
+    try {
+      const payload = await this.api.get(
+        `/api/workflows/${encodeURIComponent(workflowId)}/tasks/${encodeURIComponent(taskId)}/messages`,
+      );
+      const transcript = document.createElement("div");
+      transcript.className = "chat-workflow-transcript";
+      const messages = arrayFrom(payload, "messages")
+        .filter((message) => ["user", "assistant"].includes(message.role))
+        .slice(-8);
+      if (!messages.length) {
+        transcript.textContent = "The worker has not produced a message yet.";
+      } else {
+        for (const message of messages) {
+          const row = document.createElement("p");
+          row.dataset.role = message.role;
+          row.textContent = String(message.content || "").slice(0, 4000);
+          transcript.append(row);
+        }
+      }
+      item.append(transcript);
+      button.textContent = "Hide worker";
+      button.setAttribute("aria-expanded", "true");
+    } catch (error) {
+      button.textContent = "View worker";
+      this.network(`Could not load worker: ${error.message}`, "error");
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async controlWorkflow(workflowId, action) {
+    if (action === "cancel" && !window.confirm("Cancel this workflow?")) return;
     try {
       await this.api.post(
-        `/api/runs/${encodeURIComponent(chatState.currentRunId)}/approvals/${decision}`,
-        { approval_id: approvalId },
-        { scope: `approval-${decision}` },
+        `/api/workflows/${encodeURIComponent(workflowId)}/${action}`,
+        {},
+        { scope: `workflow-${action}` },
       );
-      this.network(decision === "approve" ? "Approved" : "Rejected", decision === "approve" ? "success" : "warning");
+      this.network(action === "resume" ? "Workflow resumed" : action === "pause" ? "Workflow paused" : "Workflow cancelled", action === "cancel" ? "warning" : "success");
     } catch (error) {
-      this.network(`Approval failed: ${error.message}`, "error");
+      this.network(`Could not ${action} workflow: ${error.message}`, "error");
+    }
+  }
+
+  async retryWorkflowTask(workflowId, taskId) {
+    try {
+      await this.api.post(
+        `/api/workflows/${encodeURIComponent(workflowId)}/tasks/${encodeURIComponent(taskId)}/retry`,
+        {},
+        { scope: "workflow-task-retry" },
+      );
+      this.network("Workflow task queued", "success");
+    } catch (error) {
+      this.network(`Could not retry task: ${error.message}`, "error");
+    }
+  }
+
+  renderSecretCapture() {
+    const requested = [...chatState.events].reverse().find((event) => eventType(event) === "secret_capture.requested");
+    if (!requested) return null;
+    const payload = eventPayload(requested);
+    const requestId = payload.requestId;
+    const resolved = chatState.events.some((event) =>
+      eventType(event) === "secret_capture.resolved" && eventPayload(event).requestId === requestId,
+    );
+    if (!requestId || resolved) return null;
+    const form = document.createElement("form");
+    form.className = "chat-secret-capture";
+    form.innerHTML = `<div><strong>Credential required</strong><p></p></div><label><span class="sr-only">Credential value</span><input type="password" name="value" autocomplete="new-password" required placeholder="Enter credential" /></label><button type="submit">Save securely</button>`;
+    form.querySelector("p").textContent = `${payload.name || "This tool"} is needed to continue. The value will not appear in the conversation.`;
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const input = form.elements.value;
+      const button = form.querySelector("button");
+      button.disabled = true;
+      try {
+        await this.api.post(
+          `/api/secret-captures/${encodeURIComponent(requestId)}`,
+          { value: input.value },
+          { scope: "secret-capture" },
+        );
+        input.value = "";
+        this.network("Credential saved; the task is resuming", "success");
+      } catch (error) {
+        button.disabled = false;
+        this.network(`Could not save credential: ${error.message}`, "error");
+      }
+    });
+    return form;
+  }
+
+  renderAgentAppResult() {
+    const event = [...chatState.events].reverse().find((item) =>
+      ["app_created", "app_updated"].includes(eventType(item)),
+    );
+    if (!event) return null;
+    const payload = eventPayload(event);
+    if (!payload.agentId) return null;
+    const card = document.createElement("section");
+    card.className = "chat-agent-app-result";
+    const mark = document.createElement("span");
+    mark.textContent = String(payload.name || "A").slice(0, 1).toUpperCase();
+    const copy = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = payload.name || "Agent draft";
+    const detail = document.createElement("p");
+    detail.textContent = `${payload.appKind === "workflow" ? "Workflow app" : "Agent"} · Draft v${payload.version || 1}`;
+    copy.append(title, detail);
+    const open = document.createElement("button");
+    open.type = "button";
+    open.textContent = eventType(event) === "app_created" ? "Review draft" : "Review update";
+    open.addEventListener("click", () => {
+      window.location.hash = `agents/${encodeURIComponent(payload.agentId)}`;
+    });
+    card.append(mark, copy, open);
+    return card;
+  }
+
+  toggleMessageMenu(control) {
+    const menu = query(".message-more-menu", control.closest(".message-meta"));
+    if (menu) menu.hidden = !menu.hidden;
+  }
+
+  async submitMessageFeedback(control) {
+    const messageId = control.dataset.messageId;
+    const rating = Number(control.dataset.rating);
+    if (!messageId || !chatState.currentRunId || ![-1, 1].includes(rating)) return;
+    try {
+      await this.api.post("/api/customer-success/feedback", {
+        submitted_by_user_id: this.api.settings().userId,
+        feedback_type: "thumbs_rating",
+        target_type: "run",
+        target_id: chatState.currentRunId,
+        run_id: chatState.currentRunId,
+        rating,
+        metadata: { message_id: messageId, thread_id: chatState.currentThreadId },
+      }, { scope: "message-feedback" });
+      chatState.feedbackByMessage.set(messageId, rating);
+      this.renderConversation();
+      this.network("Feedback recorded", "success");
+    } catch (error) {
+      this.network(`Could not record feedback: ${error.message}`, "error");
     }
   }
 
   renderMessage(message) {
+    const assistant = isAssistant(message);
     const article = document.createElement("article");
-    article.className = `message ${isAssistant(message) ? "message-agent" : "message-user"}`;
+    article.className = `message ${assistant ? "message-agent" : "message-user"}`;
     article.dataset.messageId = message.id || "";
-    const content = document.createElement("p");
-    content.textContent = messageContent(message);
-    article.append(content);
+    if (message.id && chatState.enteringMessageId === message.id) {
+      article.classList.add("is-chat-entering");
+      chatState.enteringMessageId = null;
+    }
+    const statusValue = dispatchStatus(message);
+    if (statusValue === "streaming") article.classList.add("is-streaming");
+    const body = document.createElement("div");
+    body.className = "message-body";
+    if (assistant) {
+      appendMarkdown(body, visibleMessageContent(message));
+    } else {
+      const content = document.createElement("p");
+      visibleMessageContent(message).split("\n").forEach((line, index) => {
+        if (index) content.append(document.createElement("br"));
+        content.append(line);
+      });
+      body.append(content);
+    }
+    article.append(body);
     const refs = arrayFrom(message.resource_refs || [], "items");
     const attachments = arrayFrom(message.attachments || [], "items");
     if (refs.length || attachments.length) {
@@ -1690,7 +2839,9 @@ export class ChatController {
       evidence.className = "message-evidence-chips";
       refs.forEach((item) => {
         const chip = document.createElement("span");
-        chip.textContent = `@${item.name || item.id}`;
+        const kind = { browser_profile: "Browser", connector: "Connector", agent: "Agent", skill: "Skill" }[item.type] || "Context";
+        const name = item.name && item.name !== item.id ? item.name : "";
+        chip.textContent = name ? `${kind}: ${name}` : kind;
         evidence.append(chip);
       });
       attachments.forEach((item) => {
@@ -1702,24 +2853,45 @@ export class ChatController {
     }
     const meta = document.createElement("footer");
     meta.className = "message-meta";
-    const time = document.createElement("time");
-    time.textContent = safeTime(message.created_at);
-    meta.append(time);
-    const statusValue = dispatchStatus(message);
-    if (!["completed", "sent", "succeeded"].includes(statusValue)) {
+    if (!["completed", "sent", "succeeded", "inflight", "streaming"].includes(statusValue)) {
       const status = document.createElement("span");
       status.className = `message-dispatch status-${statusValue}`;
       status.textContent = statusValue === "steering" ? "Steering" : statusValue;
       meta.append(status);
     }
-    if (isAssistant(message)) {
-      for (const [action, label] of [["copy", "Copy"], ["summarize", "Summarize"], ["speak", "Read aloud"]]) {
+    if (assistant && statusValue !== "streaming") {
+      const actions = [
+        ["messageCopy", "Copy", '<rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M5 15V5a1 1 0 0 1 1-1h10"></path>'],
+        ["messageFeedback", "Good response", '<path d="M7 10v10H4V10h3Zm3 10V9l4-6 1 1v5h4a1 1 0 0 1 1 1l-1 8a2 2 0 0 1-2 2h-7Z"></path>', "1"],
+        ["messageFeedback", "Bad response", '<path d="M7 14V4H4v10h3Zm3-10v11l4 6 1-1v-5h4a1 1 0 0 0 1-1l-1-8a2 2 0 0 0-2-2h-7Z"></path>', "-1"],
+        ["messageMore", "More options", '<circle cx="5" cy="12" r="1"></circle><circle cx="12" cy="12" r="1"></circle><circle cx="19" cy="12" r="1"></circle>'],
+      ];
+      for (const [dataset, label, path, rating] of actions) {
         const button = document.createElement("button");
         button.type = "button";
-        button.dataset[action === "copy" ? "messageCopy" : action === "summarize" ? "messageSummarize" : "messageSpeak"] = message.id;
-        button.textContent = label;
+        button.className = "message-icon-action";
+        button.dataset[dataset] = rating || message.id;
+        button.dataset.messageId = message.id;
+        if (rating) button.dataset.rating = rating;
+        button.title = label;
+        button.setAttribute("aria-label", label);
+        if (rating) button.setAttribute("aria-pressed", String(chatState.feedbackByMessage.get(message.id) === Number(rating)));
+        button.innerHTML = `<svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true">${path}</svg>`;
         meta.append(button);
       }
+      const menu = document.createElement("div");
+      menu.className = "message-more-menu";
+      menu.hidden = true;
+      const summarize = document.createElement("button");
+      summarize.type = "button";
+      summarize.dataset.messageSummarize = message.id;
+      summarize.textContent = "Summarize";
+      const speak = document.createElement("button");
+      speak.type = "button";
+      speak.dataset.messageSpeak = message.id;
+      speak.textContent = "Read aloud";
+      menu.append(summarize, speak);
+      meta.append(menu);
     }
     if (statusValue === "failed") {
       const retry = document.createElement("button");
@@ -1729,8 +2901,531 @@ export class ChatController {
       meta.append(retry);
       if (message.error) meta.title = message.error;
     }
-    article.append(meta);
+    if (meta.childElementCount) article.append(meta);
     return article;
+  }
+
+  runActivityEvents(runId = chatState.currentRunId) {
+    const skip = ["assistant.delta", "heartbeat", "text.delta", "message.delta"];
+    const events = chatState.events.filter((event) => !skip.some((type) => eventType(event).includes(type)));
+    if (!events.length) return [];
+    const lastRunId = runId || events.at(-1)?.run_id || null;
+    const scoped = lastRunId ? events.filter((event) => (event.run_id || eventPayload(event).run_id) === lastRunId) : [];
+    return scoped.length ? scoped : events;
+  }
+
+  describeActivityEvent(event) {
+    const type = eventType(event);
+    const p = eventPayload(event);
+    const clip = (value, max = 200) => {
+      const text = String(value ?? "").trim();
+      return text.length > max ? `${text.slice(0, max)}…` : text;
+    };
+    if (type === "model.operation.retrying") return { text: "Model connection interrupted · retrying", tone: "warn" };
+    if (type === "agent.decision.created") {
+      const decision = p.decision || {};
+      if (decision.kind === "respond") return { text: "Prepared the answer." };
+      if (decision.kind === "request_input") return { text: "Prepared a focused follow-up." };
+      return null;
+    }
+    if (type.startsWith("tool_call.")) {
+      const status = String(p.status || type.slice("tool_call.".length));
+      const tool = String(p.tool_name || "tool");
+      const label = tool === "web.search"
+        ? "Web search"
+        : tool === "web.fetch"
+          ? "Web page"
+          : tool === "sandbox.command"
+            ? "Code execution"
+            : tool === "browser.action"
+              ? "Browser action"
+              : tool === "skill.load" || tool.startsWith("skill.")
+                ? "Skill"
+                : tool.startsWith("connector.")
+                  ? "Connected tool"
+                  : tool;
+      const fallback = status === "started"
+        ? `${label} started`
+        : status === "completed"
+          ? `${label} completed`
+          : status === "awaiting_approval"
+            ? `${label} is waiting for approval`
+            : status === "cancelled"
+              ? `${label} cancelled`
+              : `${label} failed`;
+      return {
+        key: `tool:${p.action_id || p.step_id || tool}`,
+        text: clip(p.summary || fallback),
+        tone: status === "failed" ? "warn" : null,
+      };
+    }
+    if (type === "tool.failed") {
+      return { text: `Tool failed — ${clip(p.error || p.reason || "see logs", 120)}`, tone: "warn" };
+    }
+    if (type === "agent.verification.completed" && p.outcome !== "complete") return { text: "Checked the evidence and refined the result." };
+    return null;
+  }
+
+  renderSearchCard(runId = chatState.currentRunId) {
+    const events = [...this.runActivityEvents(runId)].reverse();
+    const decision = events.find((item) =>
+      eventType(item) === "agent.decision.created"
+      && eventPayload(item).decision?.tool_name === "web.search",
+    );
+    const event = events.find((item) => (
+      ["tool_call.started", "tool_call.completed", "tool_call.failed", "tool_call.cancelled", "tool_call.approval_required"].includes(eventType(item))
+      && eventPayload(item).tool_name === "web.search"
+    ) || (
+      eventType(item) === "agent.observation.recorded"
+      && eventPayload(item).success === false
+      && eventPayload(item).result?.tool_name === "web.search"
+    ) || item === decision);
+    if (!event) return null;
+    const running = event === decision || eventType(event) === "tool_call.started";
+    const failed = ["agent.observation.recorded", "tool_call.failed"].includes(eventType(event));
+    const cancelled = eventType(event) === "tool_call.cancelled";
+    const waiting = eventType(event) === "tool_call.approval_required";
+    const output = eventType(event) === "tool_call.completed" ? eventPayload(event).result?.output || {} : {};
+    const results = Array.isArray(output?.results) ? output.results : [];
+    const details = document.createElement("details");
+    details.className = `chat-search-card${running ? " is-running" : failed ? " is-error" : ""}`;
+    details.open = running;
+    if (running) details.setAttribute("aria-busy", "true");
+    const summary = document.createElement("summary");
+    const mark = document.createElement("span");
+    mark.setAttribute("aria-hidden", "true");
+    mark.textContent = "⌕";
+    const title = document.createElement("strong");
+    title.textContent = running ? "Searching the web" : waiting ? "Search needs approval" : cancelled ? "Search cancelled" : failed ? "Search failed" : "Searched the web";
+    const count = document.createElement("span");
+    count.textContent = running
+      ? "Working…"
+      : waiting
+      ? "Approval needed"
+      : cancelled
+      ? "Cancelled"
+      : failed
+      ? "Failed"
+      : results.length
+      ? `${results.length} result${results.length === 1 ? "" : "s"}`
+      : "Completed";
+    summary.append(mark, title, count);
+    details.append(summary);
+    const queryText = output.query || eventPayload(decision || {}).decision?.tool_input?.query;
+    if (queryText) {
+      const query = document.createElement("p");
+      query.textContent = queryText;
+      details.append(query);
+    }
+    if (running || waiting || cancelled || failed) return details;
+    const list = document.createElement("ul");
+    for (const result of results) {
+      try {
+        const url = new URL(result.url);
+        if (!["https:", "http:"].includes(url.protocol)) continue;
+        const item = document.createElement("li");
+        const link = document.createElement("a");
+        link.href = url.href;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.textContent = result.title || url.hostname;
+        const meta = document.createElement("small");
+        meta.textContent = [url.hostname.replace(/^www\./, ""), result.published_date].filter(Boolean).join(" · ");
+        item.append(link, meta);
+        list.append(item);
+      } catch { /* Ignore malformed provider URLs. */ }
+    }
+    if (list.childElementCount) details.append(list);
+    else {
+      const note = document.createElement("p");
+      note.textContent = "Source details were not retained for this run.";
+      details.append(note);
+    }
+    return details;
+  }
+
+  renderCodeCard(runId = chatState.currentRunId) {
+    const events = this.runActivityEvents(runId);
+    const decisions = events.filter((item) => {
+      const value = eventPayload(item).decision || {};
+      return eventType(item) === "agent.decision.created" && value.tool_name === "sandbox.command";
+    });
+    if (!decisions.length) return null;
+    const fragment = document.createDocumentFragment();
+    for (const [index, decision] of decisions.entries()) {
+      const start = events.indexOf(decision);
+      const next = decisions[index + 1];
+      const executionEvents = events.slice(start, next ? events.indexOf(next) : events.length);
+      const outcome = [...executionEvents].reverse().find((item) => (
+        ["tool_call.started", "tool_call.completed", "tool_call.failed", "tool_call.cancelled", "tool_call.approval_required"].includes(eventType(item))
+        && eventPayload(item).tool_name === "sandbox.command"
+      ) || (
+        eventType(item) === "agent.observation.recorded"
+        && eventPayload(item).result?.tool_name === "sandbox.command"
+        && eventPayload(item).success === false
+      ) || item === decision);
+      const running = outcome === decision || eventType(outcome || {}) === "tool_call.started";
+      const completed = eventType(outcome || {}) === "tool_call.completed" ? outcome : null;
+      const failed = ["agent.observation.recorded", "tool_call.failed"].includes(eventType(outcome || {}));
+      const cancelled = eventType(outcome || {}) === "tool_call.cancelled";
+      const waiting = eventType(outcome || {}) === "tool_call.approval_required";
+      const command = String(eventPayload(decision).decision?.tool_input?.command || "").trim();
+      const output = eventPayload(completed || {}).result?.output || {};
+      const execution = [...executionEvents].reverse().find((item) => eventType(item) === "sandbox.command.executed");
+      const executionPayload = eventPayload(execution || {});
+      const streams = chatState.commandOutputs.get(executionPayload.step_id || executionPayload.storage_object_id) || {};
+      const exitCode = Number(output.exit_code);
+      const status = waiting
+        ? "Approval needed"
+        : cancelled
+        ? "Cancelled"
+        : failed
+        ? "Failed"
+        : completed
+        ? Number.isFinite(exitCode) && exitCode !== 0 ? `Exit ${exitCode}` : "Completed"
+        : "Running";
+      const details = document.createElement("details");
+      details.className = `chat-search-card chat-code-card${running ? " is-running" : failed ? " is-error" : ""}`;
+      details.open = running;
+      if (running) details.setAttribute("aria-busy", "true");
+      const summary = document.createElement("summary");
+      const mark = document.createElement("span");
+      mark.setAttribute("aria-hidden", "true");
+      mark.textContent = ">_";
+      const title = document.createElement("strong");
+      title.textContent = running ? "Running code" : waiting ? "Code needs approval" : cancelled ? "Code cancelled" : failed ? "Code failed" : "Ran code";
+      const state = document.createElement("span");
+      state.textContent = status;
+      summary.append(mark, title, state);
+      details.append(summary);
+      if (command) {
+        const code = document.createElement("pre");
+        code.textContent = command;
+        details.append(code);
+      }
+      for (const [name, value] of [["stdout", streams.stdout], ["stderr", streams.stderr]]) {
+        if (!value) continue;
+        const label = document.createElement("small");
+        label.className = "chat-code-output-label";
+        label.textContent = name;
+        const stream = document.createElement("pre");
+        stream.className = `chat-code-output is-${name}`;
+        stream.textContent = value;
+        details.append(label, stream);
+      }
+      fragment.append(details);
+    }
+    return fragment;
+  }
+
+  renderUiElement(spec, elementId, seen = new Set()) {
+    const elements = spec?.elements;
+    const element = elements?.[elementId];
+    if (!element || seen.has(elementId) || seen.size >= 40) return null;
+    const branch = new Set(seen).add(elementId);
+    const props = element.props && typeof element.props === "object" ? element.props : element;
+    const children = Array.isArray(element.children) ? element.children : [];
+    let node;
+    if (element.type === "Card") {
+      node = document.createElement("section");
+      node.className = "chat-ui-card";
+      if (props.centered) node.classList.add("is-centered");
+      if (props.title) {
+        const title = document.createElement("strong");
+        title.textContent = String(props.title);
+        node.append(title);
+      }
+      if (props.description) {
+        const description = document.createElement("p");
+        description.className = "chat-ui-description";
+        description.textContent = String(props.description);
+        node.append(description);
+      }
+    } else if (element.type === "Stack") {
+      node = document.createElement("div");
+      node.className = "chat-ui-stack";
+      if (props.direction === "horizontal") node.classList.add("is-horizontal");
+      if (["sm", "md", "lg"].includes(props.gap)) node.classList.add(`gap-${props.gap}`);
+      if (["start", "center", "end", "stretch"].includes(props.align)) {
+        node.classList.add(`align-${props.align}`);
+      }
+    } else if (element.type === "Heading") {
+      const level = Math.min(4, Math.max(1, Number(props.level) || 2));
+      node = document.createElement(`h${level}`);
+      node.className = "chat-ui-heading";
+      node.textContent = String(props.text || "");
+    } else if (element.type === "Text") {
+      node = document.createElement("div");
+      node.className = "chat-ui-text";
+      if (["body", "caption", "muted", "lead", "code"].includes(props.variant)) {
+        node.classList.add(`is-${props.variant}`);
+      }
+      appendMarkdown(node, String(props.text || ""));
+    } else if (element.type === "Badge") {
+      node = document.createElement("span");
+      node.className = "chat-ui-badge";
+      const variant = props.variant || { success: "default", error: "destructive", neutral: "secondary" }[props.tone];
+      if (["default", "secondary", "destructive", "outline"].includes(variant)) {
+        node.classList.add(`is-${variant}`);
+      }
+      node.textContent = String(props.text || "");
+    } else if (element.type === "Separator") {
+      node = document.createElement("hr");
+      node.className = "chat-ui-separator";
+    } else {
+      return null;
+    }
+    for (const childId of children.slice(0, 40)) {
+      const child = this.renderUiElement(spec, String(childId), branch);
+      if (child) node.append(child);
+    }
+    return node;
+  }
+
+  renderUiCards(runId = chatState.currentRunId) {
+    const blocks = new Map();
+    for (const event of this.runActivityEvents(runId)) {
+      if (eventType(event) !== "ui_render") continue;
+      const payload = eventPayload(event);
+      if (payload.blockId && payload.spec) blocks.set(payload.blockId, payload);
+    }
+    return [...blocks.values()].flatMap((payload) => {
+      const root = this.renderUiElement(payload.spec, payload.spec.root);
+      if (!root) return [];
+      const section = document.createElement("section");
+      section.className = "chat-ui-render";
+      section.dataset.uiBlockId = payload.blockId;
+      section.setAttribute("aria-label", payload.title || "Structured result");
+      section.append(root);
+      return [section];
+    });
+  }
+
+  renderArtifactGroup(artifacts) {
+    if (!artifacts.length) return null;
+    const outputs = document.createElement("section");
+    outputs.className = "chat-inline-artifacts";
+    outputs.setAttribute("aria-label", "Created files");
+    const title = document.createElement("strong");
+    title.textContent = "Created files";
+    outputs.append(title);
+    for (const artifact of [...artifacts].reverse()) {
+      outputs.append(this.renderArtifactButton(artifact));
+    }
+    return outputs;
+  }
+
+  renderThoughtCard(runId = chatState.currentRunId) {
+    const events = this.runActivityEvents(runId);
+    if (!events.length) return null;
+    const steps = [];
+    const keyedSteps = new Map();
+    let retrying = false;
+    for (const event of events) {
+      const status = eventType(event) === "run.status_changed"
+        ? String(eventPayload(event).status || "").toLowerCase()
+        : "";
+      if (status === "retrying") {
+        retrying = true;
+        steps.push({ text: "Temporary execution error · retrying", tone: "warn" });
+        continue;
+      }
+      if (retrying && status === "running") {
+        retrying = false;
+        steps.push({ text: "Retry resumed" });
+        continue;
+      }
+      const step = this.describeActivityEvent(event);
+      if (!step) continue;
+      if (step.key && keyedSteps.has(step.key)) {
+        steps[keyedSteps.get(step.key)] = step;
+      } else {
+        if (step.key) keyedSteps.set(step.key, steps.length);
+        steps.push(step);
+      }
+    }
+    if (
+      !steps.length
+      && events.some((event) => eventType(event) === "model.operation.recorded")
+      && events.some((event) => eventType(event) === "assistant.message.completed")
+    ) steps.push({ text: "Prepared the answer." });
+    if (!steps.length) return null;
+    const started = new Date(events[0].created_at || "");
+    const lastMessage = chatState.messages.at(-1);
+    const responseReady = runId !== chatState.currentRunId
+      || !chatState.running
+      || (isAssistant(lastMessage || {}) && dispatchStatus(lastMessage) === "completed");
+    const responseEvent = responseReady
+      ? [...events].reverse().find((event) => eventType(event) === "assistant.message.completed")
+      : null;
+    const ended = new Date((responseEvent || events.at(-1)).created_at || "");
+    let pausedMilliseconds = 0;
+    let waitingAt = null;
+    for (const event of events) {
+      const createdAt = new Date(event.created_at || "");
+      if (Number.isNaN(createdAt.valueOf())) continue;
+      if ([
+        "agent.waiting_for_user",
+        "approval.requested",
+        "secret_capture.requested",
+      ].includes(eventType(event))) waitingAt = createdAt;
+      if (
+        waitingAt
+        && eventType(event) === "run.status_changed"
+        && String(eventPayload(event).status || "").toLowerCase() === "running"
+      ) {
+        pausedMilliseconds += createdAt - waitingAt;
+        waitingAt = null;
+      }
+    }
+    const seconds = !Number.isNaN(started.valueOf()) && !Number.isNaN(ended.valueOf())
+      ? Math.max(1, Math.round(((ended - started) - pausedMilliseconds) / 1000))
+      : null;
+    const live = chatState.running && runId === chatState.currentRunId && !responseReady;
+    const title = live ? steps.at(-1).text : seconds ? `Thought for ${seconds}s` : "Run activity";
+    const card = document.createElement("div");
+    card.className = "chat-thought";
+    card.classList.toggle("is-live", live);
+    card.classList.toggle("is-open", Boolean(chatState.thoughtOpen));
+    if (live) card.setAttribute("aria-live", "polite");
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "chat-thought-toggle";
+    toggle.dataset.thoughtToggle = "";
+    toggle.setAttribute("aria-expanded", String(Boolean(chatState.thoughtOpen)));
+    toggle.innerHTML = `<svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"></circle><path d="M12 8v4l2.5 2.5"></path></svg><span>${escapeHtml(title)}</span><span class="chat-thought-chevron" aria-hidden="true">›</span>`;
+    card.append(toggle);
+    const detail = document.createElement("div");
+    detail.className = "chat-thought-detail";
+    detail.hidden = !chatState.thoughtOpen;
+    for (const step of steps) {
+      const row = document.createElement("div");
+      row.className = "chat-thought-step";
+      if (step.tone === "warn") row.classList.add("is-warn");
+      const line = document.createElement("p");
+      line.className = "chat-thought-line";
+      line.textContent = step.text;
+      row.append(line);
+      if (step.code) {
+        const code = document.createElement("pre");
+        code.className = "chat-thought-code";
+        code.textContent = step.code;
+        row.append(code);
+      }
+      for (const note of step.notes || []) {
+        const noteEl = document.createElement("p");
+        noteEl.className = "chat-thought-note";
+        noteEl.textContent = note;
+        row.append(noteEl);
+      }
+      detail.append(row);
+    }
+    card.append(detail);
+    return card;
+  }
+
+  setInputRequest(payload) {
+    const entering = !chatState.inputRequest;
+    const questions = arrayFrom(payload, "questions")
+      .filter((item) => item && typeof item === "object" && String(item.question || "").trim())
+      .map((item) => ({
+        question: String(item.question).trim(),
+        options: arrayFrom(item, "options").map(String).filter(Boolean).slice(0, 6),
+        required: item.required !== false,
+      }));
+    const options = arrayFrom(payload, "options").map(String).filter(Boolean).slice(0, 6);
+    if (!questions.length && options.length) questions.push({ question: "", options, required: true });
+    chatState.inputRequest = questions.length ? { questions } : null;
+    chatState.inputRequestEntering = entering && Boolean(chatState.inputRequest);
+    chatState.inputAnswers = {};
+    chatState.inputExtra = "";
+  }
+
+  inputRequestComplete() {
+    const questions = chatState.inputRequest?.questions || [];
+    return questions.every((question, index) => question.required === false || String(chatState.inputAnswers[index] || "").trim());
+  }
+
+  selectInputOption(control) {
+    chatState.inputAnswers[control.dataset.inputQuestion] = control.dataset.inputOption;
+    this.renderConversation();
+  }
+
+  updateInputSubmitState() {
+    const submit = query("[data-input-submit]", this.refs.conversation);
+    if (submit) submit.disabled = !this.inputRequestComplete();
+  }
+
+  submitInputRequest() {
+    const questions = chatState.inputRequest?.questions || [];
+    if (!questions.length || !this.inputRequestComplete()) return;
+    const answers = questions.map((question, index) => {
+      const answer = String(chatState.inputAnswers[index] || "").trim();
+      if (!answer) return "";
+      const prompt = question.question.replace(/[?？:]$/, "").trim();
+      return prompt ? `${prompt}：${answer}` : answer;
+    }).filter(Boolean);
+    if (chatState.inputExtra.trim()) answers.push(chatState.inputExtra.trim());
+    return this.sendThreadMessage(answers.join(" · "));
+  }
+
+  renderInputRequest() {
+    const questions = chatState.inputRequest?.questions || [];
+    if (!questions.length) return null;
+    const section = document.createElement("section");
+    section.className = "chat-input-request";
+    if (chatState.inputRequestEntering) {
+      section.classList.add("is-chat-entering");
+      chatState.inputRequestEntering = false;
+    }
+    section.setAttribute("aria-label", "Answer the follow-up questions");
+    questions.forEach((question, index) => {
+      const field = document.createElement("fieldset");
+      const legend = document.createElement("legend");
+      legend.textContent = question.question || "Choose one option";
+      field.append(legend);
+      if (question.options.length) {
+        const options = document.createElement("div");
+        options.className = "chat-input-options";
+        for (const option of question.options) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.dataset.inputQuestion = String(index);
+          button.dataset.inputOption = option;
+          button.textContent = option;
+          const selected = chatState.inputAnswers[index] === option;
+          button.classList.toggle("is-selected", selected);
+          button.setAttribute("aria-pressed", String(selected));
+          options.append(button);
+        }
+        field.append(options);
+      } else {
+        const input = document.createElement("textarea");
+        input.rows = 2;
+        input.dataset.inputText = String(index);
+        input.placeholder = "Type your answer";
+        input.value = chatState.inputAnswers[index] || "";
+        field.append(input);
+      }
+      section.append(field);
+    });
+    if (questions.every((question) => question.options.length)) {
+      const extra = document.createElement("textarea");
+      extra.rows = 2;
+      extra.dataset.inputExtra = "";
+      extra.placeholder = "Anything else you'd like to add? (optional)";
+      extra.value = chatState.inputExtra;
+      section.append(extra);
+    }
+    const footer = document.createElement("footer");
+    const submit = document.createElement("button");
+    submit.type = "button";
+    submit.dataset.inputSubmit = "";
+    submit.textContent = "Submit";
+    submit.disabled = !this.inputRequestComplete();
+    footer.append(submit);
+    section.append(footer);
+    return section;
   }
 
   renderConversation() {
@@ -1758,48 +3453,206 @@ export class ChatController {
       return;
     }
 
-    const timeline = [
-      ...chatState.messages.map((item, index) => ({ kind: "message", item, time: item.created_at || item.updated_at, order: index * 10 })),
-      ...chatState.events.map((item, index) => ({ kind: "event", item, time: item.created_at || eventPayload(item).created_at, order: eventSequence(item) || 100000 + index })),
-    ].sort((left, right) => {
-      const leftTime = left.time ? new Date(left.time).valueOf() : Number.NaN;
-      const rightTime = right.time ? new Date(right.time).valueOf() : Number.NaN;
-      if (!Number.isNaN(leftTime) && !Number.isNaN(rightTime) && leftTime !== rightTime) return leftTime - rightTime;
-      return left.order - right.order;
-    });
-    let traceGroup = null;
-    for (const entry of timeline) {
-      if (entry.kind === "message") {
-        traceGroup = null;
-        this.refs.conversation.append(this.renderMessage(entry.item));
-        continue;
-      }
-      const card = this.renderExecutionCard(entry.item);
-      if (!card) continue;
-      if (!traceGroup) {
-        traceGroup = document.createElement("section");
-        traceGroup.className = "agent-trace-stack";
-        this.refs.conversation.append(traceGroup);
-      }
-      traceGroup.append(card);
+    let renderedDay = "";
+    const lastAssistantId = [...chatState.messages].reverse().find((message) => isAssistant(message))?.id;
+    const liveAssistantId = chatState.running
+      ? [...chatState.messages].reverse().find((message) => isAssistant(message) && dispatchStatus(message) === "streaming")?.id
+      : null;
+    const assistantRunIds = new Map();
+    const activityMessageIds = new Map();
+    for (const event of chatState.events) {
+      if (eventType(event) !== "assistant.message.completed") continue;
+      const messageId = eventPayload(event).message_id;
+      const runId = event.run_id || eventPayload(event).run_id;
+      if (!messageId || !runId) continue;
+      assistantRunIds.set(messageId, runId);
+      activityMessageIds.set(runId, messageId);
     }
-    if (!chatState.running && chatState.messages.length) {
-      this.renderSuggestions(chatState.suggestions.length ? chatState.suggestions : ["Summarize the result", "Turn this into an agent", "What should I do next?"]);
+    if (chatState.running && chatState.currentRunId) {
+      activityMessageIds.set(chatState.currentRunId, liveAssistantId);
     }
+    const renderedRunIds = new Set();
+    const displayableArtifacts = chatState.artifacts.filter(isDisplayableArtifact);
+    let currentApprovalCard = null;
+    let thoughtRendered = false;
+    let searchRendered = false;
+    let codeRendered = false;
+    for (const message of chatState.messages) {
+      const createdAt = new Date(message.created_at || message.updated_at || "");
+      const day = Number.isNaN(createdAt.valueOf()) ? "" : createdAt.toDateString();
+      if (day && day !== renderedDay) {
+        renderedDay = day;
+        const divider = document.createElement("div");
+        divider.className = "conversation-day";
+        const label = document.createElement("span");
+        label.textContent = day === new Date().toDateString()
+          ? "Today"
+          : new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(createdAt);
+        divider.append(label);
+        this.refs.conversation.append(divider);
+      }
+      const fallbackRunId = message.id && ((!chatState.running && message.id === lastAssistantId) || message.id === liveAssistantId)
+        ? chatState.currentRunId
+        : null;
+      const messageRunId = assistantRunIds.get(message.id) || fallbackRunId;
+      const activityMessageForRun = Boolean(
+        messageRunId
+        && !renderedRunIds.has(messageRunId)
+        && (
+          message.id === activityMessageIds.get(messageRunId)
+          || (!chatState.running && message.id === lastAssistantId)
+        )
+      );
+      if (activityMessageForRun) {
+        renderedRunIds.add(messageRunId);
+        const currentRun = messageRunId === chatState.currentRunId;
+        const search = this.renderSearchCard(messageRunId);
+        if (search) {
+          this.refs.conversation.append(search);
+          if (currentRun) searchRendered = true;
+        }
+        const code = this.renderCodeCard(messageRunId);
+        if (code) {
+          this.refs.conversation.append(code);
+          if (currentRun) codeRendered = true;
+        }
+        const thought = this.renderThoughtCard(messageRunId);
+        if (thought) {
+          this.refs.conversation.append(thought);
+          if (currentRun) thoughtRendered = true;
+        }
+        const approvalCard = this.renderApprovalCard(messageRunId);
+        if (approvalCard) this.refs.conversation.append(approvalCard);
+        const workflowProgress = this.renderWorkflowProgress(messageRunId);
+        if (workflowProgress) this.refs.conversation.append(workflowProgress);
+        if (currentRun) currentApprovalCard = approvalCard;
+      }
+      this.refs.conversation.append(this.renderMessage(message));
+      if (activityMessageForRun) {
+        for (const card of this.renderUiCards(messageRunId)) this.refs.conversation.append(card);
+        const outputs = this.renderArtifactGroup(
+          displayableArtifacts.filter((artifact) => artifact.run_id === messageRunId),
+        );
+        if (outputs) this.refs.conversation.append(outputs);
+      }
+    }
+    if (!searchRendered) {
+      const search = this.renderSearchCard();
+      if (search) this.refs.conversation.append(search);
+    }
+    if (!codeRendered) {
+      const code = this.renderCodeCard();
+      if (code) this.refs.conversation.append(code);
+    }
+    if (!renderedRunIds.has(chatState.currentRunId)) {
+      for (const card of this.renderUiCards()) this.refs.conversation.append(card);
+    }
+    const unattachedArtifacts = displayableArtifacts.filter(
+      (artifact) => !artifact.run_id || !renderedRunIds.has(artifact.run_id),
+    );
+    const unattachedOutputs = this.renderArtifactGroup(unattachedArtifacts);
+    if (unattachedOutputs) this.refs.conversation.append(unattachedOutputs);
+    if (!renderedRunIds.has(chatState.currentRunId)) {
+      currentApprovalCard = this.renderApprovalCard();
+      if (currentApprovalCard) this.refs.conversation.append(currentApprovalCard);
+      const workflowProgress = this.renderWorkflowProgress();
+      if (workflowProgress) this.refs.conversation.append(workflowProgress);
+    }
+    const secretCapture = this.renderSecretCapture();
+    if (secretCapture) this.refs.conversation.append(secretCapture);
+    const agentAppResult = this.renderAgentAppResult();
+    if (agentAppResult) this.refs.conversation.append(agentAppResult);
+    const runEvents = this.runActivityEvents();
+    const responseReady = assistantResponseReady();
+    const failedRun = [...runEvents]
+      .reverse()
+      .find((event) => ["run.failed", "run.timed_out"].includes(eventType(event)));
+    const classifierRefusal = [...runEvents]
+      .reverse()
+      .find((event) => eventType(event) === "classifier_refusal");
+    const policyBlock = [...runEvents]
+      .reverse()
+      .find((event) => eventType(event) === "policy.blocked");
+    const completedRun = [...runEvents]
+      .reverse()
+      .find((event) => eventType(event) === "agent.loop.completed");
+    if (!chatState.running && classifierRefusal) {
+      this.renderInlineNotice(
+        "Safety filter declined this request",
+        "The model's safety filter flagged this request. Try rephrasing it or choose another model.",
+        "warning",
+      );
+    } else if (!chatState.running && policyBlock) {
+      this.renderInlineNotice(
+        "Request blocked",
+        eventPayload(policyBlock).reason || "This request cannot be completed under the current policy.",
+        "failure",
+      );
+    } else if (
+      !chatState.running
+      && failedRun
+      && String(eventPayload(completedRun || {}).outcome || "failed") !== "complete"
+    ) {
+      const reason = String(eventPayload(failedRun).reason || "");
+      const failure = {
+        model_budget_exceeded: ["Usage limit reached", "This workspace reached its model usage limit. Choose another model or ask an owner to update the limit."],
+        cost_budget_exhausted: ["Usage limit reached", "This run reached its cost limit. Any completed output is preserved."],
+        model_policy_denied: ["Model not allowed", "The selected model is not allowed for this request. Choose another model."],
+        model_gateway_error: ["Model provider error", "The selected model provider did not complete the response. Retry or choose another model."],
+        workflow_task_failed: ["Workflow task failed", "A workflow task failed. Completed task output is preserved; review the task and retry."],
+      }[reason] || (eventType(failedRun) === "run.timed_out"
+        ? ["The run timed out", "Any completed output is preserved. Retry with a smaller request or a longer run limit."]
+        : ["The run ended with an error", "Any completed output is preserved. Retry the message or choose another model."]);
+      this.renderInlineNotice(
+        failure[0],
+        failure[1],
+        "failure",
+      );
+    }
+    if (chatState.running && !responseReady && !currentApprovalCard) {
+      const thought = thoughtRendered ? null : this.renderThoughtCard();
+      if (thought) this.refs.conversation.append(thought);
+      else if (!liveAssistantId) {
+        const thinking = document.createElement("div");
+        thinking.className = "chat-thinking";
+        thinking.setAttribute("role", "status");
+        const marker = document.createElement("span");
+        marker.setAttribute("aria-hidden", "true");
+        marker.textContent = "✻";
+        const label = document.createElement("span");
+        label.textContent = "Thinking";
+        if (chatState.currentRunMode !== "chat") label.textContent = `${runSubject()} is working`;
+        thinking.append(marker, label);
+        this.refs.conversation.append(thinking);
+      }
+    }
+    const inputRequest = !chatState.running ? this.renderInputRequest() : null;
+    if (inputRequest) this.refs.conversation.append(inputRequest);
+    else if (!chatState.running && chatState.messages.length && chatState.suggestions.length) this.renderSuggestions(chatState.suggestions);
     requestAnimationFrame(() => {
-      if (this.refs.chatScroll) this.refs.chatScroll.scrollTop = this.refs.chatScroll.scrollHeight;
+      this.refs.conversation.scrollTop = this.refs.conversation.scrollHeight;
     });
   }
 
   renderSuggestions(suggestions) {
     const row = document.createElement("div");
     row.className = "quick-row thread-suggestions";
+    if (chatState.suggestionsEntering) {
+      row.classList.add("is-chat-entering");
+      chatState.suggestionsEntering = false;
+    }
     row.setAttribute("aria-label", "Suggested follow-ups");
     for (const suggestion of suggestions) {
       const button = document.createElement("button");
       button.type = "button";
       button.dataset.suggestion = suggestion;
-      button.textContent = suggestion;
+      const arrow = document.createElement("span");
+      arrow.className = "suggestion-arrow";
+      arrow.setAttribute("aria-hidden", "true");
+      arrow.textContent = "↳";
+      const label = document.createElement("span");
+      label.textContent = suggestion;
+      button.append(arrow, label);
       row.append(button);
     }
     this.refs.conversation.append(row);
@@ -1841,23 +3694,28 @@ export class ChatController {
   renderArtifacts() {
     if (!this.refs.artifactList) return;
     this.refs.artifactList.replaceChildren();
-    if (this.refs.artifactEmpty) this.refs.artifactEmpty.hidden = Boolean(chatState.artifacts.length);
-    for (const artifact of chatState.artifacts) {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "thread-artifact-item";
-      button.dataset.threadArtifact = artifact.id || artifact.artifact_id;
-      const icon = document.createElement("span");
-      icon.textContent = artifact.kind === "dashboard" ? "▦" : "□";
-      const copy = document.createElement("span");
-      const title = document.createElement("strong");
-      title.textContent = artifact.name || artifact.title || artifact.filename || "Artifact";
-      const meta = document.createElement("small");
-      meta.textContent = artifact.media_type || artifact.kind || artifact.status || "Output";
-      copy.append(title, meta);
-      button.append(icon, copy);
-      this.refs.artifactList.append(button);
+    const artifacts = chatState.artifacts.filter(isDisplayableArtifact);
+    if (this.refs.artifactEmpty) this.refs.artifactEmpty.hidden = Boolean(artifacts.length);
+    for (const artifact of artifacts) {
+      this.refs.artifactList.append(this.renderArtifactButton(artifact));
     }
+  }
+
+  renderArtifactButton(artifact) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "thread-artifact-item";
+    button.dataset.threadArtifact = artifact.id || artifact.artifact_id;
+    const icon = document.createElement("span");
+    icon.textContent = artifact.kind === "dashboard" ? "▦" : "□";
+    const copy = document.createElement("span");
+    const title = document.createElement("strong");
+    title.textContent = artifact.name || artifact.title || artifact.filename || "Artifact";
+    const meta = document.createElement("small");
+    meta.textContent = artifact.media_type || artifact.kind || artifact.status || "Output";
+    copy.append(title, meta);
+    button.append(icon, copy);
+    return button;
   }
 
   async openArtifact(artifactId) {
@@ -1992,9 +3850,11 @@ export class ChatController {
   }
 
   openSidecar(view = "artifacts") {
+    this.closeThreadMenu();
     chatState.activeSidecar = view;
     this.refs.sidecar?.classList.remove("is-operations-open");
     this.refs.sidecar?.classList.add("is-artifact-open", "is-chat-sidecar-open");
+    setText(this.refs.sidecarState, "artifact");
     queryAll("[data-sidecar-tab]").forEach((button) => {
       button.classList.toggle("is-active", button.dataset.sidecarTab === view);
     });
@@ -2008,12 +3868,47 @@ export class ChatController {
     if (view === "code") this.loadCodingWorkspace();
   }
 
+  closeArtifactSidecar() {
+    window.taroaiArtifacts?.close?.();
+    chatState.activeArtifact = null;
+    this.refs.sidecar?.classList.remove("is-artifact-open", "is-chat-sidecar-open");
+    if (this.refs.artifactStage) {
+      this.refs.artifactStage.replaceChildren();
+      this.refs.artifactStage.hidden = true;
+    }
+    setText(this.refs.sidecarState, "closed");
+  }
+
   renderDetails() {
     setText(this.refs.detailId, chatState.currentThreadId || "Not started");
     setText(this.refs.detailRun, chatState.currentRunId || (chatState.running ? "Starting" : "Idle"));
     this.renderModelButton();
-    setText(this.refs.threadPresence, chatState.running ? "Working" : chatState.currentThreadId ? "Saved" : "Ready");
-    this.refs.threadPresence?.classList.toggle("running", chatState.running);
+    const terminalRun = [...chatState.events]
+      .reverse()
+      .find((event) => eventType(event).startsWith("run.") && TERMINAL_EVENT_WORDS.some((word) => eventType(event).includes(word)));
+    const terminalStatus = terminalRun ? eventType(terminalRun).split(".").at(-1) : null;
+    const latestApproval = [...chatState.events]
+      .reverse()
+      .find((event) => eventType(event).startsWith("approval.") || eventType(event) === "action_approval");
+    const awaitingApproval = eventType(latestApproval || {}) === "approval.requested"
+      || (eventType(latestApproval || {}) === "action_approval" && eventPayload(latestApproval).status === "approval_required");
+    const responseReady = assistantResponseReady();
+    setText(
+      this.refs.threadPresence,
+      awaitingApproval
+        ? "Awaiting approval"
+        : responseReady && chatState.running
+          ? "Response ready"
+        : chatState.running
+        ? "Working"
+        : terminalStatus
+          ? `${terminalStatus[0].toUpperCase()}${terminalStatus.slice(1)}`
+          : chatState.currentThreadId
+            ? "Saved"
+            : "Ready",
+    );
+    this.refs.threadPresence?.classList.toggle("running", chatState.running && !responseReady);
+    if (this.refs.moreButton) this.refs.moreButton.hidden = !chatState.currentThreadId;
     if (this.refs.shareButton) this.refs.shareButton.disabled = !chatState.currentThreadId;
     this.refs.createAgentButtons.forEach((button) => {
       button.disabled = !chatState.currentThreadId || chatState.running;
@@ -2021,7 +3916,17 @@ export class ChatController {
     });
   }
 
+  scheduleConversationRender() {
+    if (this.conversationFrame !== null) return;
+    this.conversationFrame = requestAnimationFrame(() => {
+      this.conversationFrame = null;
+      this.renderConversation();
+    });
+  }
+
   renderAll() {
+    if (this.conversationFrame !== null) cancelAnimationFrame(this.conversationFrame);
+    this.conversationFrame = null;
     this.renderThreads();
     this.renderConversation();
     this.renderQueue();
@@ -2034,9 +3939,10 @@ export class ChatController {
   }
 
   async shareThread() {
+    this.closeThreadMenu();
     if (!chatState.currentThreadId) return;
     try {
-      const share = await this.api.post(`/api/threads/${encodeURIComponent(chatState.currentThreadId)}/share`, {}, { scope: "thread-share" });
+      const share = await this.api.post(`/api/threads/${encodeURIComponent(chatState.currentThreadId)}/shares`, {}, { scope: "thread-share" });
       chatState.share = share;
       this.openShareDialog(share);
     } catch (error) {
@@ -2049,6 +3955,7 @@ export class ChatController {
     try {
       const payload = await this.api.get(`/api/threads/${encodeURIComponent(chatState.currentThreadId)}/suggestions`);
       chatState.suggestions = arrayFrom(payload, "suggestions", "items").map((item) => typeof item === "string" ? item : item.label || item.prompt).filter(Boolean);
+      chatState.suggestionsEntering = Boolean(chatState.suggestions.length);
       this.renderConversation();
     } catch {
       chatState.suggestions = [];
@@ -2068,7 +3975,9 @@ export class ChatController {
   openShareDialog(share) {
     const dialog = document.createElement("dialog");
     dialog.className = "chat-dialog share-dialog";
-    const shareUrl = share.url || share.share_url || `${location.origin}${location.pathname}#shared/${share.token || share.id}`;
+    const threadId = chatState.currentThreadId;
+    const sharePath = share.url || share.share_url;
+    const shareUrl = sharePath ? new URL(sharePath, `${this.api.settings().apiBase}/`).href : "";
     dialog.innerHTML = `
       <form method="dialog" class="chat-dialog-card">
         <header><div><small>Read-only link</small><h2>Share this thread</h2></div><button value="close" aria-label="Close">×</button></header>
@@ -2082,12 +3991,230 @@ export class ChatController {
       setText(query("[data-share-copy]", dialog), "Copied");
     });
     query("[data-share-revoke]", dialog).addEventListener("click", async () => {
-      await this.api.delete(`/api/threads/${encodeURIComponent(chatState.currentThreadId)}/share`, { scope: "share-revoke" });
+      await this.api.delete(`/api/threads/${encodeURIComponent(threadId)}/shares/${encodeURIComponent(share.id)}`, { scope: "share-revoke" });
       chatState.share = null;
       dialog.close();
     });
     dialog.addEventListener("close", () => dialog.remove());
     dialog.showModal();
+  }
+
+  openAgentBuilderDialog() {
+    const dialog = document.createElement("dialog");
+    dialog.className = "chat-dialog agent-builder-dialog";
+    const resources = (type) => chatState.capabilities.filter((item) => item.type === type && item.enabled);
+    const resourceList = (type, emptyText) => {
+      const items = resources(type);
+      if (!items.length) return `
+        <div class="agent-builder-empty">
+          <p>${emptyText}</p>
+          <button type="button" data-agent-builder-manage="${type}s">${type === "connector" ? "Manage connectors" : "Manage skills"}</button>
+        </div>`;
+      return items.map((item) => `
+        <button type="button" class="agent-builder-resource" data-agent-builder-resource="${escapeHtml(`${item.type}:${item.id}`)}">
+          <span aria-hidden="true">${item.icon}</span>
+          <span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.description || item.type)}</small></span>
+        </button>`).join("");
+    };
+    dialog.innerHTML = `
+      <div class="agent-builder-card">
+        <header>
+          <button type="button" class="agent-builder-back" data-agent-builder-back aria-label="Back" hidden>←</button>
+          <div><h2 data-agent-builder-title>Create an agent</h2><p data-agent-builder-subtitle>Choose how to build your agent</p></div>
+          <button type="button" class="agent-builder-close" data-dialog-close aria-label="Close">×</button>
+        </header>
+        <section data-agent-builder-view="choose">
+          <div class="agent-builder-options">
+            <button type="button" class="agent-builder-option" data-agent-builder-go="form" data-agent-builder-kind="agent">
+              <span class="agent-builder-option-art is-scratch" aria-hidden="true">+</span><strong>Start from scratch</strong><small>Describe your agent</small>
+            </button>
+            <button type="button" class="agent-builder-option" data-agent-builder-go="form" data-agent-builder-kind="workflow">
+              <span class="agent-builder-option-art" aria-hidden="true">⌘</span><strong>Workflow Agent</strong><small>Build a multi-step workflow</small>
+            </button>
+            <button type="button" class="agent-builder-option" data-agent-builder-go="connectors">
+              <span class="agent-builder-option-art" aria-hidden="true">C</span><strong>Add a connector</strong><small>Connect your services</small>
+            </button>
+            <button type="button" class="agent-builder-option" data-agent-builder-go="skills">
+              <span class="agent-builder-option-art" aria-hidden="true">S</span><strong>Choose a skill</strong><small>Start with an installed skill</small>
+            </button>
+          </div>
+        </section>
+        <form class="agent-builder-form" data-agent-builder-form data-agent-builder-view="form" hidden>
+          <input type="hidden" name="agent_kind" value="agent" />
+          <label><span>Agent name</span><input name="name" placeholder="e.g. Stock Analyzer" /></label>
+          <label><span data-agent-builder-goal-label>What should this agent do?</span><textarea name="goal" rows="3" placeholder="Describe the agent's task..." required></textarea></label>
+          <fieldset>
+            <legend>Output format</legend>
+            <input type="hidden" name="output_format" value="dashboard" />
+            <div class="agent-builder-formats">
+              <button type="button" data-agent-output="dashboard" class="is-selected" aria-pressed="true">Dashboard</button>
+              <button type="button" data-agent-output="markdown" aria-pressed="false">Markdown</button>
+              <button type="button" data-agent-output="html" aria-pressed="false">HTML</button>
+            </div>
+          </fieldset>
+          <button type="submit" class="agent-builder-submit">Create</button>
+        </form>
+        <section class="agent-builder-resources" data-agent-builder-view="skills" hidden>
+          <input type="search" data-agent-builder-search placeholder="Search skills..." aria-label="Search skills" />
+          <div data-agent-builder-resource-list>${resourceList("skill", "No installed skills available.")}</div>
+        </section>
+        <section class="agent-builder-resources" data-agent-builder-view="connectors" hidden>
+          <div data-agent-builder-resource-list>${resourceList("connector", "No connected connectors available.")}</div>
+        </section>
+      </div>`;
+    document.body.append(dialog);
+    const form = query("[data-agent-builder-form]", dialog);
+    const showView = (view, kind = "agent") => {
+      queryAll("[data-agent-builder-view]", dialog).forEach((section) => { section.hidden = section.dataset.agentBuilderView !== view; });
+      const choice = view === "choose";
+      const title = view === "skills" ? "Choose a skill" : view === "connectors" ? "Add a connector" : view === "form" ? (kind === "workflow" ? "Workflow Agent" : "Start from scratch") : "Create an agent";
+      setText(query("[data-agent-builder-title]", dialog), title);
+      setText(query("[data-agent-builder-subtitle]", dialog), choice ? "Choose how to build your agent" : "");
+      query("[data-agent-builder-back]", dialog).hidden = choice;
+      if (view === "form") {
+        form.elements.agent_kind.value = kind;
+        const workflow = kind === "workflow";
+        setText(query("[data-agent-builder-goal-label]", dialog), workflow ? "What should this workflow do?" : "What should this agent do?");
+        form.elements.goal.placeholder = workflow ? "Describe the steps and the final result..." : "Describe the agent's task...";
+        setText(query(".agent-builder-submit", dialog), workflow ? "Create workflow agent" : "Create");
+      }
+    };
+    const sendPrompt = async (prompt, resource = null, pendingAgent = {}) => {
+      if (resource && !chatState.resourceRefs.some((item) => item.type === resource.type && item.id === resource.id)) {
+        chatState.resourceRefs.push({ ...resourceReference(resource), name: resource.name });
+      }
+      if (!chatState.currentThreadId) {
+        try {
+          await this.createThread();
+        } catch (error) {
+          this.network(`Could not create thread: ${error.message}`, "error");
+          return;
+        }
+      }
+      const pendingKey = `taroai.pendingAgent.${chatState.currentThreadId}`;
+      localStorage.setItem(pendingKey, JSON.stringify(pendingAgent));
+      dialog.close();
+      this.renderResourceChips();
+      this.refs.input.value = prompt;
+      this.saveDraft();
+      this.syncComposer();
+      if (!await this.sendThreadMessage(null, null, "autonomous")) localStorage.removeItem(pendingKey);
+    };
+    dialog.addEventListener("click", (event) => {
+      const close = event.target.closest("[data-dialog-close]");
+      if (close) return dialog.close();
+      if (event.target.closest("[data-agent-builder-back]")) return showView("choose");
+      const next = event.target.closest("[data-agent-builder-go]");
+      if (next) return showView(next.dataset.agentBuilderGo, next.dataset.agentBuilderKind || "agent");
+      const manage = event.target.closest("[data-agent-builder-manage]");
+      if (manage) {
+        dialog.close();
+        window.location.hash = `brain/${manage.dataset.agentBuilderManage}`;
+        return;
+      }
+      const output = event.target.closest("[data-agent-output]");
+      if (output) {
+        form.elements.output_format.value = output.dataset.agentOutput;
+        queryAll("[data-agent-output]", dialog).forEach((button) => {
+          const selected = button === output;
+          button.classList.toggle("is-selected", selected);
+          button.setAttribute("aria-pressed", String(selected));
+        });
+        return;
+      }
+      const resourceButton = event.target.closest("[data-agent-builder-resource]");
+      if (!resourceButton) return;
+      const resource = chatState.capabilities.find((item) => `${item.type}:${item.id}` === resourceButton.dataset.agentBuilderResource);
+      if (!resource) return;
+      const prompt = resource.type === "skill"
+        ? `@${resource.name} Create an agent using this skill. Use it as the foundation and configure the agent based on the skill's capabilities.`
+        : `Create an agent that uses my connected ${resource.name} integration. Build an agent that automates a useful workflow with this connector.`;
+      sendPrompt(prompt, resource, {
+        name: `${resource.name} Agent`,
+        description: `Reusable agent built with ${resource.name}.`,
+        format: "markdown",
+        kind: "agent",
+      });
+    });
+    query("[data-agent-builder-search]", dialog).addEventListener("input", (event) => {
+      const search = event.target.value.trim().toLowerCase();
+      queryAll("[data-agent-builder-resource]", query('[data-agent-builder-view="skills"]', dialog)).forEach((button) => {
+        button.hidden = Boolean(search) && !button.textContent.toLowerCase().includes(search);
+      });
+    });
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const data = new FormData(form);
+      const name = String(data.get("name") || "").trim();
+      const goal = String(data.get("goal") || "").trim();
+      const format = String(data.get("output_format") || "dashboard");
+      const workflow = data.get("agent_kind") === "workflow";
+      if (!goal) return;
+      const prompt = workflow
+        ? `${name ? `Create a workflow agent named "${name}" that ${goal}.` : `Create a workflow agent that ${goal}.`} Design a minimal multi-step workflow.spec DAG and define only necessary input fields; do not add pass-through input or output-only nodes. Save exactly one reviewable draft with the native agent.create_draft tool (app_kind: workflow); its required instructions field must contain the complete reusable workflow behavior. Do not execute the workflow during creation. The final output should be in ${format} format.`
+        : `${name ? `Create an agent named "${name}" that ${goal}.` : `Create an agent that ${goal}.`} The agent output should be in ${format} format.`;
+      sendPrompt(prompt, null, {
+        name: name || (workflow ? "Workflow Agent" : "Reusable Agent"),
+        description: goal,
+        format,
+        kind: workflow ? "workflow" : "agent",
+      });
+    });
+    dialog.addEventListener("close", () => dialog.remove());
+    dialog.showModal();
+  }
+
+  async persistPendingAgent(outcome) {
+    const threadId = chatState.currentThreadId;
+    if (!threadId) return;
+    const key = `taroai.pendingAgent.${threadId}`;
+    const raw = localStorage.getItem(key);
+    if (!raw) return;
+    const createdEvent = chatState.events.find(
+      (event) => event.run_id === chatState.currentRunId && eventType(event) === "app_created",
+    );
+    localStorage.removeItem(key);
+    if (createdEvent) {
+      this.network(`Agent draft “${eventPayload(createdEvent).name || "Agent"}” created`, "success");
+      window.dispatchEvent(new CustomEvent("taroai:agents-changed"));
+      return;
+    }
+    if (outcome !== "complete") {
+      this.network("Agent was not created because the builder run did not complete", "warning");
+      return;
+    }
+    try {
+      const pending = JSON.parse(raw);
+      const extracted = await this.api.post(
+        `/api/threads/${encodeURIComponent(threadId)}/extract-agent`,
+        { name: pending.name },
+        { scope: "agent-builder-extract" },
+      );
+      const version = {
+        ...extracted.version,
+        instructions: pending.description || extracted.version.instructions,
+        output_contract: {
+          ...(extracted.version.output_contract || {}),
+          type: "string",
+          format: pending.format || "markdown",
+        },
+        runtime_snapshot: {
+          ...(extracted.version.runtime_snapshot || {}),
+          autonomy_mode: pending.kind === "workflow" ? "workflow" : "autonomous",
+        },
+        change_note: "Created from the Chat agent builder",
+      };
+      const created = await this.api.post("/api/agents", {
+        workspace_id: extracted.workspace_id,
+        name: pending.name || extracted.name,
+        description: pending.description || extracted.description,
+        version,
+      }, { scope: "agent-builder-create" });
+      this.network(`Agent draft “${created.agent?.name || pending.name}” created`, "success");
+      window.dispatchEvent(new CustomEvent("taroai:agents-changed"));
+    } catch (error) {
+      this.network(`Could not save agent draft: ${error.message}`, "error");
+    }
   }
 
   openCreateAgentDialog() {
@@ -2183,13 +4310,25 @@ export class ChatController {
     if (!message) return;
     await navigator.clipboard?.writeText(messageContent(message));
     this.network("Message copied", "success");
+    window.setTimeout(() => {
+      if (this.refs.networkState?.dataset.state === "success" && this.refs.networkState.textContent === "Message copied") {
+        this.network("Ready", "idle");
+      }
+    }, 1200);
   }
 
   retryMessage(messageId) {
     const message = chatState.messages.find((item) => item.id === messageId);
     if (!message) return;
     chatState.messages = chatState.messages.filter((item) => item.id !== messageId);
-    this.sendThreadMessage(messageContent(message), chatState.running ? "queue" : "auto");
+    chatState.uploads = arrayFrom(message.attachments || [], "items").map((attachment) => ({
+      ...(typeof attachment === "string" ? {} : attachment),
+      id: typeof attachment === "string" ? attachment : attachment.id || attachment.storage_object_id,
+      status: "Ready",
+      progress: 1,
+    }));
+    const mode = message.kind === "workflow" ? "workflow" : message.kind === "agent" ? "autonomous" : "chat";
+    this.sendThreadMessage(messageContent(message), chatState.running ? "queue" : "auto", mode);
   }
 
   speakMessage(messageId, control) {
@@ -2232,9 +4371,9 @@ export function createChatController() {
   return singleton;
 }
 
-export async function sendThreadMessage(content, deliveryMode = "auto", resourceRefs = [], attachments = []) {
+export async function sendThreadMessage(content, deliveryMode = "auto", resourceRefs = [], attachments = [], mode = null) {
   if (!singleton) createChatController();
   chatState.resourceRefs = resourceRefs;
   chatState.uploads = attachments.map((attachment) => ({ ...attachment, id: attachment.id || attachment, status: "Ready", progress: 1 }));
-  return singleton.sendThreadMessage(content, deliveryMode);
+  return singleton.sendThreadMessage(content, deliveryMode, mode);
 }

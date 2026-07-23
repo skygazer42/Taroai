@@ -15,7 +15,23 @@ class ModelGatewayConfigurationError(ModelGatewayError):
 
 
 class ModelGatewayResponseError(ModelGatewayError):
-    pass
+    def __init__(self, message: str, *, retryable: bool = False):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+class ModelSafetyRefusalError(ModelGatewayError):
+    def __init__(
+        self,
+        *,
+        provider: str | None = None,
+        model_id: str | None = None,
+        original_text: str = "",
+    ):
+        super().__init__("model safety filter declined the request")
+        self.provider = provider
+        self.model_id = model_id
+        self.original_text = original_text
 
 
 class ModelPolicyDeniedError(ModelGatewayError):
@@ -52,6 +68,11 @@ class PlannedToolCall(BaseModel):
     skill_id: str | None = None
     tool_input: dict[str, Any] = Field(default_factory=dict)
     approval_required: bool = False
+    depends_on: list[str] | None = None
+    phase_id: str | None = None
+    phase_title: str | None = None
+    tool_mode: Literal["read_only", "standard", "code"] = "standard"
+    model_hint: Literal["fast", "strong"] = "strong"
 
 
 class ModelGatewayRequest(BaseModel):
@@ -78,6 +99,8 @@ class ModelCatalogEntry(BaseModel):
     model_id: str = Field(min_length=1)
     display_name: str = Field(min_length=1)
     reasoning_efforts: list[ReasoningEffort] = Field(default_factory=list)
+    default_reasoning_effort: ReasoningEffort | None = None
+    configured: bool = True
 
 
 class ModelGatewayResponse(BaseModel):

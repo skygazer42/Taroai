@@ -4939,7 +4939,7 @@ def test_install_validation_runner_uses_release_transfer_evidence(
     assert check.metadata["signature_key_id"] == key_id
     assert check.metadata["transfer_evidence_package_version"] == "0.1.0"
     assert check.metadata["transfer_evidence_app_version"] == "0.1.0"
-    assert check.metadata["transfer_evidence_migration_count"] == 39
+    assert check.metadata["transfer_evidence_migration_count"] == 45
 
 
 def test_install_validation_runner_rejects_transfer_evidence_signature_outside_package_dir(
@@ -5224,7 +5224,7 @@ def test_install_validation_runner_reports_stale_release_upgrade_matrix(
     assert check.status == "failed"
     assert (
         "upgrade matrix must cover migration range "
-        "001_initial to 039_evaluation_runtime"
+            "001_initial to 045_tenant_invitations"
     ) in check.message
     assert check.metadata["upgrade_matrix_error_count"] == 1
 

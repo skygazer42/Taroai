@@ -1,6 +1,5 @@
 # Roadmap and Coverage Matrix Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Provide a reviewable roadmap that maps the original enterprise Agent Workspace requirements to the existing implementation plans, priorities, dependencies, and release gates.
 

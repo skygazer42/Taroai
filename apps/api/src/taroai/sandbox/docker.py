@@ -196,15 +196,14 @@ class DockerSandboxAdapter(SandboxAdapter):
         path.parent.mkdir(parents=True, exist_ok=True)
         content_bytes = file_write.content_bytes()
         path.write_bytes(content_bytes)
-        return SandboxFileRef(
+        return SandboxFileRef.from_bytes(
+            content_bytes,
             tenant_id=file_write.tenant_id,
             workspace_id=file_write.workspace_id,
             run_id=file_write.run_id,
             session_id=file_write.session_id,
             path=self._workspace_display_path(path, session),
             content_type=file_write.content_type,
-            size_bytes=len(content_bytes),
-            content=file_write.content if file_write.content_base64 is None else None,
         )
 
     def download_file(
@@ -217,16 +216,15 @@ class DockerSandboxAdapter(SandboxAdapter):
         resolved_path = self._resolve_workspace_path(session, path)
         if not resolved_path.exists() or not resolved_path.is_file():
             raise NotFoundError(f"Sandbox file not found: {path}")
-        content = resolved_path.read_text(encoding="utf-8")
-        return SandboxFileRef(
+        content = resolved_path.read_bytes()
+        return SandboxFileRef.from_bytes(
+            content,
             tenant_id=session.tenant_id,
             workspace_id=session.workspace_id,
             run_id=session.run_id,
             session_id=session.id,
             path=self._workspace_display_path(resolved_path, session),
             content_type=self._content_type(resolved_path),
-            size_bytes=len(content.encode("utf-8")),
-            content=content,
         )
 
     def list_files(self, tenant_id: str, session_id: str) -> list[SandboxFileRef]:

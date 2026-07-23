@@ -1,4 +1,4 @@
-import { chatApi } from "./chat-api.js";
+import { chatApi } from "./chat-api.js?v=20260722-flow115";
 
 function asArray(value, ...keys) {
   if (Array.isArray(value)) return value;
@@ -12,6 +12,7 @@ export class AgentBrainUI {
     this.root = document.querySelector("[data-product-route-experience]");
     this.connectors = [];
     this.skills = [];
+    this.memories = [];
     this.browserProfiles = [];
     this.browserSessions = [];
     this.engineConnections = [];
@@ -35,7 +36,8 @@ export class AgentBrainUI {
   }
 
   route() {
-    const active = window.location.hash.replace(/^#/, "").split("/")[0] === "brain";
+    const [route, requestedTab] = window.location.hash.replace(/^#/, "").split("/");
+    const active = route === "brain";
     if (!active) {
       if (this.root?.dataset.owner === "brain") {
         this.root.hidden = true;
@@ -49,6 +51,7 @@ export class AgentBrainUI {
     this.root.hidden = false;
     document.querySelector("[data-app='taroai-workspace']")?.setAttribute("data-rich-route", "brain");
     this.renderShell();
+    this.switchTab(["connectors", "skills", "memory", "secrets", "browser", "engines", "repositories"].includes(requestedTab) ? requestedTab : "connectors");
     this.load();
   }
 
@@ -57,7 +60,7 @@ export class AgentBrainUI {
       <section class="capability-page agent-brain-page">
         <header class="capability-page-header">
           <div><p>Workspace capabilities</p><h1>Agent Brain</h1><span>Control the skills and connected services available to every agent turn.</span></div>
-          <button type="button" data-brain-refresh>Refresh</button>
+          <div class="capability-header-actions"><button type="button" class="primary" data-mcp-create>Add MCP server</button><button type="button" data-brain-refresh>Refresh</button></div>
         </header>
         <nav class="skill-detail-tabs" aria-label="Agent Brain sections">
           <button class="is-active" data-brain-tab="connectors">Connectors</button>
@@ -85,7 +88,8 @@ export class AgentBrainUI {
 
   async load() {
     const workspace = encodeURIComponent(this.api.settings().workspaceId);
-    const [connectors, skills, browserProfiles, browserSessions, engineConnections, engineSessions, repositories, codingWorkspaces] = await Promise.allSettled([
+    const user = encodeURIComponent(this.api.settings().userId);
+    const [connectors, skills, browserProfiles, browserSessions, engineConnections, engineSessions, repositories, codingWorkspaces, memories] = await Promise.allSettled([
       this.api.get(`/api/connectors?workspace_id=${workspace}`),
       this.api.get(`/api/workspaces/${workspace}/skills`),
       this.api.get(`/api/browser/profiles?workspace_id=${workspace}`),
@@ -94,6 +98,7 @@ export class AgentBrainUI {
       this.api.get(`/api/agent-engines/sessions?workspace_id=${workspace}`),
       this.api.get(`/api/repositories?workspace_id=${workspace}`),
       this.api.get(`/api/coding-workspaces?workspace_id=${workspace}`),
+      this.api.get(`/api/memory?scope_type=user&scope_id=${user}`),
     ]);
     this.connectors = connectors.status === "fulfilled" ? asArray(connectors.value, "connectors") : [];
     this.skills = skills.status === "fulfilled" ? asArray(skills.value, "skills") : [];
@@ -103,6 +108,7 @@ export class AgentBrainUI {
     this.engineSessions = engineSessions.status === "fulfilled" ? asArray(engineSessions.value, "sessions") : [];
     this.repositories = repositories.status === "fulfilled" ? asArray(repositories.value, "repositories") : [];
     this.codingWorkspaces = codingWorkspaces.status === "fulfilled" ? asArray(codingWorkspaces.value, "coding_workspaces") : [];
+    this.memories = memories.status === "fulfilled" ? asArray(memories.value, "memories") : [];
     if (!this.selectedConnectorId || !this.connectors.some((item) => item.id === this.selectedConnectorId)) {
       this.selectedConnectorId = this.connectors[0]?.id || null;
     }
@@ -124,8 +130,8 @@ export class AgentBrainUI {
     if (!list || !detail) return;
     list.replaceChildren();
     if (!this.connectors.length) {
-      list.innerHTML = `<div class="route-empty compact"><span>C</span><strong>No connector definitions</strong><p>Ask a workspace administrator to add a governed connector definition.</p></div>`;
-      detail.innerHTML = `<div class="route-empty"><span>+</span><strong>Connect external services</strong><p>Connector credentials stay in the Secret Vault and agent calls use scoped capabilities.</p></div>`;
+      list.innerHTML = `<div class="route-empty compact"><span>C</span><strong>No connectors yet</strong><p>Add an MCP server to make its tools available to agents.</p></div>`;
+      detail.innerHTML = `<div class="route-empty"><span>+</span><strong>Connect an MCP server</strong><p>Tool permissions are discovered before the connector is enabled.</p><button type="button" class="primary" data-mcp-create>Add MCP server</button></div>`;
       return;
     }
     for (const connector of this.connectors) {
@@ -173,11 +179,121 @@ export class AgentBrainUI {
     const engines = this.root.querySelector("[data-brain-panel='engines']");
     const repositories = this.root.querySelector("[data-brain-panel='repositories']");
     if (skills) skills.innerHTML = `<div class="brain-summary-card"><span>S</span><div><h2>${this.skills.length} workspace skills</h2><p>Inspect SKILL.md, package files, evaluations, and pinned versions.</p><button data-open-skills>Manage skills</button></div></div>`;
-    if (memory) memory.innerHTML = `<div class="brain-summary-card"><span>M</span><div><h2>Memory</h2><p>Long-term facts and reviewed memories are governed by the workspace memory service.</p><button data-open-operations>Open memory operations</button></div></div>`;
+    if (memory) this.renderMemory(memory);
     if (secrets) secrets.innerHTML = `<div class="brain-summary-card"><span>K</span><div><h2>Secrets</h2><p>Connector credentials remain in the Secret Vault and are issued to tools as short-lived leases.</p></div></div>`;
     if (browser) this.renderBrowser(browser);
     if (engines) this.renderEngines(engines);
     if (repositories) this.renderRepositories(repositories);
+  }
+
+  openMcpConnectorEditor() {
+    const dialog = document.createElement("dialog");
+    dialog.className = "chat-dialog";
+    dialog.innerHTML = `<form class="chat-dialog-card">
+      <header><div><small>Model Context Protocol</small><h2>Add MCP server</h2></div><button type="button" data-close aria-label="Close">×</button></header>
+      <p>Taroai connects over Streamable HTTP and discovers the server's tools before enabling it.</p>
+      <label><span>Name</span><input name="display_name" maxlength="160" autocomplete="off" placeholder="Company tools" required /></label>
+      <label><span>Server URL</span><input name="url" type="url" inputmode="url" autocomplete="url" placeholder="https://mcp.example.com/mcp" required /></label>
+      <label><span>Secret reference ID <small>Optional · sent as a Bearer token</small></span><input name="secret_ref_id" autocomplete="off" placeholder="Secret Vault reference" /></label>
+      <footer><button type="button" data-close>Cancel</button><button class="primary" type="submit">Connect</button></footer>
+    </form>`;
+    document.body.append(dialog);
+    dialog.addEventListener("click", (event) => {
+      if (event.target.closest("[data-close]")) dialog.close();
+    });
+    dialog.addEventListener("close", () => dialog.remove());
+    dialog.querySelector("form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const data = new FormData(event.currentTarget);
+      const secretRefId = String(data.get("secret_ref_id") || "").trim();
+      const submit = event.currentTarget.querySelector("[type='submit']");
+      submit.disabled = true;
+      submit.textContent = "Discovering tools…";
+      let created = null;
+      try {
+        created = await this.api.post("/api/connectors", {
+          workspace_id: this.api.settings().workspaceId,
+          type: "mcp_server",
+          display_name: String(data.get("display_name") || "").trim(),
+          auth_mode: secretRefId ? "api_key" : "none",
+          ...(secretRefId ? { credential: { secret_ref_id: secretRefId, required_actions: ["mcp.call"] } } : {}),
+          metadata: { mcp: { url: String(data.get("url") || "").trim() } },
+        }, { scope: "mcp-create" });
+        this.selectedConnectorId = created.id;
+        await this.api.post(`/api/connectors/${encodeURIComponent(created.id)}/enable`, {}, { scope: "mcp-enable" });
+        dialog.close();
+        await this.load();
+        await window.taroaiChat?.loadCapabilities?.();
+        this.toast("MCP server connected", "success");
+      } catch (error) {
+        if (created) {
+          dialog.close();
+          await this.load();
+          this.toast(`MCP server saved as a draft: ${error.message}`, "warning");
+          return;
+        }
+        submit.disabled = false;
+        submit.textContent = "Connect";
+        this.toast(error.message || "MCP server could not be added", "error");
+      }
+    });
+    dialog.showModal();
+    dialog.querySelector("input")?.focus();
+  }
+
+  renderMemory(root) {
+    root.innerHTML = `
+      <section class="brain-memory-ledger">
+        <header>
+          <div><small>Personal context</small><h2>Long-term memory</h2><p>Saved details can shape future replies. New memories always require your approval.</p></div>
+          <button type="button" data-memory-chat>Ask Chat to remember</button>
+        </header>
+        <div data-memory-list></div>
+      </section>`;
+    const list = root.querySelector("[data-memory-list]");
+    if (!this.memories.length) {
+      list.innerHTML = `<div class="route-empty compact"><span>M</span><strong>No saved memories</strong><p>Ask Chat to remember a stable preference when you want it carried into future conversations.</p><button data-memory-chat>Save a preference</button></div>`;
+      return;
+    }
+    for (const memory of [...this.memories].reverse()) {
+      const row = document.createElement("article");
+      row.className = "brain-memory-row";
+      const heading = document.createElement("div");
+      const title = document.createElement("strong");
+      title.textContent = memory.metadata?.source === "explicit_agent_save" ? "Saved from Chat" : "Reviewed memory";
+      const createdAt = new Date(memory.created_at || "");
+      const date = Number.isNaN(createdAt.valueOf())
+        ? "Date unavailable"
+        : new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(createdAt);
+      const meta = document.createElement("small");
+      meta.textContent = memory.expires_at ? `${date} · Expires ${new Date(memory.expires_at).toLocaleDateString()}` : `${date} · No expiry`;
+      heading.append(title, meta);
+      const content = document.createElement("p");
+      content.textContent = memory.content;
+      const forget = document.createElement("button");
+      forget.type = "button";
+      forget.className = "brain-memory-forget";
+      forget.dataset.memoryForget = memory.id;
+      forget.textContent = "Forget";
+      forget.setAttribute("aria-label", `Forget memory: ${memory.content.slice(0, 80)}`);
+      row.append(heading, content, forget);
+      list.append(row);
+    }
+  }
+
+  async forgetMemory(memoryId) {
+    if (!window.confirm("Forget this memory? It will no longer shape future replies.")) return;
+    const previous = this.memories;
+    this.memories = this.memories.filter((memory) => memory.id !== memoryId);
+    this.renderStaticPanels();
+    try {
+      await this.api.delete(`/api/memory/${encodeURIComponent(memoryId)}`);
+      this.toast("Memory forgotten", "success");
+    } catch (error) {
+      this.memories = previous;
+      this.renderStaticPanels();
+      this.toast(error.message || "Memory could not be forgotten. Try again.", "error");
+    }
   }
 
   click(event) {
@@ -189,9 +305,12 @@ export class AgentBrainUI {
       return this.renderConnectors();
     }
     if (button.matches("[data-brain-refresh]")) return this.load();
+    if (button.matches("[data-mcp-create]")) return this.openMcpConnectorEditor();
     if (button.matches("[data-connector-connect]")) return this.connect();
     if (button.matches("[data-connector-toggle]")) return this.toggle();
     if (button.matches("[data-open-skills]")) window.location.hash = "skills";
+    if (button.matches("[data-memory-chat]")) this.prefill("请记住：");
+    if (button.dataset.memoryForget) return this.forgetMemory(button.dataset.memoryForget);
     if (button.matches("[data-brain-start-browser]")) this.prefill("Use the browser to ");
     if (button.matches("[data-browser-profile-create]")) return this.openBrowserProfileEditor();
     if (button.dataset.browserProfileId) {

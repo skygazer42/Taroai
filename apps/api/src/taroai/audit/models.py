@@ -2,8 +2,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from taroai.domain import AuditEvent
-
+from taroai.domain import AuditEvent as AuditEvent
 
 class AuditActor(BaseModel):
     tenant_id: str

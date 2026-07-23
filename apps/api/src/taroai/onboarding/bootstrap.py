@@ -19,25 +19,12 @@ from taroai.knowledge import (
 )
 from taroai.onboarding.models import TenantBootstrapRequest, TenantBootstrapResult
 from taroai.onboarding.readiness import TenantReadinessService
-from taroai.skills import (
-    InMemorySkillRegistry,
-    SkillManifest,
-    SkillRuntime,
-    SkillType,
-    SkillVisibility,
-    SqlSkillRegistry,
-)
 from taroai.store import InMemoryControlPlaneStore, NotFoundError, TenantAccessError
+from taroai.tenancy import ensure_tenant_member_role
 
 
 TENANT_OWNER_ROLE_ID = "tenant_owner"
 TENANT_OWNER_ROLE_NAME = "Tenant Owner"
-STARTER_SKILL_IDS = [
-    "starter.knowledge_search",
-    "starter.artifact_writer",
-]
-
-
 class TenantBootstrapService(BaseModel):
     identity_service: InMemoryIdentityService | SqlIdentityService
     store: InMemoryControlPlaneStore | SqlControlPlaneRepository
@@ -45,7 +32,6 @@ class TenantBootstrapService(BaseModel):
     readiness_service: TenantReadinessService
     audit_service: Any | None = None
     knowledge_service: InMemoryKnowledgeService | SqlKnowledgeService | None = None
-    skill_registry: InMemorySkillRegistry | SqlSkillRegistry | None = None
     solution_pack_service: Any | None = None
 
     def bootstrap(
@@ -58,9 +44,16 @@ class TenantBootstrapService(BaseModel):
         tenant_slug = self._tenant_slug(request, tenant_id)
         starter_workspace_id = request.starter_workspace_id or self._starter_workspace_id(tenant_slug)
         owner_role = self._get_or_create_owner_role(tenant_id)
+        ensure_tenant_member_role(self.identity_service, tenant_id)
         owner = self._get_or_create_owner(
             tenant_id=tenant_id,
             request=request,
+        )
+        self.store.register_workspace(
+            tenant_id,
+            starter_workspace_id,
+            owner.id,
+            request.starter_workspace_name.strip(),
         )
         self._assign_owner_role(
             tenant_id=tenant_id,
@@ -73,11 +66,7 @@ class TenantBootstrapService(BaseModel):
             workspace_id=starter_workspace_id,
             name=request.starter_knowledge_base_name,
         )
-        starter_skill_ids = self._seed_starter_skill_pack(
-            tenant_id=tenant_id,
-            owner_user_id=owner.id,
-            workspace_id=starter_workspace_id,
-        )
+        starter_skill_ids: list[str] = []
         starter_solution_pack_skill_ids = self._seed_starter_solution_packs(
             tenant_id=tenant_id,
             owner_user_id=owner.id,
@@ -124,6 +113,12 @@ class TenantBootstrapService(BaseModel):
                 "skills.read",
                 "skills.install",
                 "skills.invoke",
+                "connectors.read",
+                "connectors.manage",
+                "connectors.invoke",
+                "triggers.read",
+                "triggers.manage",
+                "triggers.invoke",
                 "storage.write",
                 "storage.read",
                 "memory.write",
@@ -154,6 +149,7 @@ class TenantBootstrapService(BaseModel):
                 "sso.manage",
                 "scim.read",
                 "scim.manage",
+                "organization.manage",
             ]
         ]
 
@@ -263,88 +259,6 @@ class TenantBootstrapService(BaseModel):
             ),
         )
         return knowledge_base.id
-
-    def _seed_starter_skill_pack(
-        self,
-        tenant_id: str,
-        owner_user_id: str,
-        workspace_id: str,
-    ) -> list[str]:
-        if self.skill_registry is None:
-            return []
-        seeded_skill_ids: list[str] = []
-        for manifest in self._starter_skill_manifests():
-            try:
-                entry = self.skill_registry.get_for_tenant(tenant_id, manifest.id)
-            except NotFoundError:
-                entry = self.skill_registry.register_for_tenant(
-                    tenant_id=tenant_id,
-                    created_by_user_id=owner_user_id,
-                    manifest=manifest,
-                )
-            if entry.status != "published":
-                self.skill_registry.publish(tenant_id, manifest.id)
-            self.skill_registry.install_for_workspace(
-                tenant_id=tenant_id,
-                workspace_id=workspace_id,
-                skill_id=manifest.id,
-                installed_by_user_id=owner_user_id,
-            )
-            seeded_skill_ids.append(manifest.id)
-        return seeded_skill_ids
-
-    def _starter_skill_manifests(self) -> list[SkillManifest]:
-        return [
-            SkillManifest(
-                id="starter.knowledge_search",
-                version="1.0.0",
-                name="Starter Knowledge Search",
-                description="Search approved tenant knowledge for grounded answers.",
-                type=SkillType.API,
-                owner="taroai/starter",
-                input_schema={
-                    "type": "object",
-                    "required": ["query"],
-                    "properties": {"query": {"type": "string"}},
-                },
-                output_schema={
-                    "type": "object",
-                    "required": ["results"],
-                    "properties": {"results": {"type": "array"}},
-                },
-                required_scopes=["knowledge.read"],
-                visibility=SkillVisibility.TENANT,
-                runtime=SkillRuntime(sandbox="service", timeout_seconds=60),
-                billing_meters=["tool_call_count"],
-            ),
-            SkillManifest(
-                id="starter.artifact_writer",
-                version="1.0.0",
-                name="Starter Artifact Writer",
-                description="Write governed run artifacts into tenant storage.",
-                type=SkillType.DOCUMENT,
-                owner="taroai/starter",
-                input_schema={
-                    "type": "object",
-                    "required": ["name", "content"],
-                    "properties": {
-                        "name": {"type": "string"},
-                        "content": {"type": "string"},
-                    },
-                },
-                output_schema={
-                    "type": "object",
-                    "required": ["artifact_id"],
-                    "properties": {"artifact_id": {"type": "string"}},
-                },
-                required_scopes=["storage.write"],
-                risk_level="medium",
-                approval_required=["external_share"],
-                visibility=SkillVisibility.TENANT,
-                runtime=SkillRuntime(sandbox="service", timeout_seconds=120),
-                billing_meters=["tool_call_count", "artifact_bytes"],
-            ),
-        ]
 
     def _seed_starter_solution_packs(
         self,

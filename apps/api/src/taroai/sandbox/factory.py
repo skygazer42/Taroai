@@ -30,6 +30,18 @@ def build_sandbox_adapter(settings: Any) -> SandboxAdapter:
             security_opts=settings.sandbox_docker_security_opts,
             tmpfs_mounts=settings.sandbox_docker_tmpfs_mounts,
         )
+    if settings.sandbox_provider == "e2b" and settings.e2b_api_key:
+        from taroai.sandbox.e2b import E2BSandboxAdapter
+
+        return E2BSandboxAdapter(
+            api_key=settings.e2b_api_key,
+            template=settings.e2b_template,
+            request_timeout_seconds=settings.e2b_request_timeout_seconds,
+            max_session_ttl_seconds=settings.e2b_max_session_ttl_seconds,
+            max_sessions=settings.sandbox_max_sessions,
+            max_sessions_per_tenant=settings.sandbox_max_sessions_per_tenant,
+            max_sessions_per_run=settings.sandbox_max_sessions_per_run,
+        )
     if settings.sandbox_provider in {"k8s", "e2b"}:
         return HttpSandboxAdapter(
             provider=settings.sandbox_provider,

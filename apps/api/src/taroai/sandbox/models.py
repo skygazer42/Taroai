@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from taroai.domain import new_id, utc_now
 
@@ -32,6 +32,7 @@ class SandboxCreateRequest(BaseModel):
     tenant_id: str = Field(min_length=1)
     workspace_id: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
+    thread_id: str | None = None
     image: str = Field(default="python:3.12-slim", min_length=1)
     network_mode: SandboxNetworkMode = SandboxNetworkMode.DISABLED
     timeout_seconds: int = Field(default=300, ge=1)
@@ -66,6 +67,7 @@ class SandboxCommand(BaseModel):
     tenant_id: str = Field(min_length=1)
     workspace_id: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
+    thread_id: str | None = None
     session_id: str = Field(min_length=1)
     command: str = Field(min_length=1)
     cwd: str = "/workspace"
@@ -93,11 +95,18 @@ class SandboxCommandResult(BaseModel):
     output_uri: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
 
+    @model_validator(mode="after")
+    def match_status_to_exit_code(self):
+        if self.exit_code != 0 and self.status == SandboxCommandStatus.SUCCEEDED:
+            self.status = SandboxCommandStatus.FAILED
+        return self
+
 
 class SandboxFileWrite(BaseModel):
     tenant_id: str = Field(min_length=1)
     workspace_id: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
+    thread_id: str | None = None
     session_id: str = Field(min_length=1)
     path: str = Field(min_length=1)
     content: str = ""
@@ -131,7 +140,32 @@ class SandboxFileRef(BaseModel):
     content_type: str = "text/plain"
     size_bytes: int = 0
     content: str | None = None
+    content_base64: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
+
+    @classmethod
+    def from_bytes(cls, content: bytes, **values: Any) -> "SandboxFileRef":
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            return cls(
+                **values,
+                size_bytes=len(content),
+                content_base64=base64.b64encode(content).decode("ascii"),
+            )
+        return cls(**values, size_bytes=len(content), content=text)
+
+    def content_bytes(self) -> bytes:
+        if self.content_base64 is None:
+            return (self.content or "").encode("utf-8")
+        if self.content is not None:
+            raise ValueError(
+                "sandbox file ref cannot include text and base64 content together"
+            )
+        try:
+            return base64.b64decode(self.content_base64, validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise ValueError("sandbox file ref content_base64 is invalid") from error
 
 
 class SandboxSnapshot(BaseModel):

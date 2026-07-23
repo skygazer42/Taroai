@@ -403,6 +403,18 @@ def test_production_environment_rejects_memory_secret_service_backend():
     )
 
 
+def test_production_environment_rejects_local_secret_service_backend():
+    with pytest.raises(ValidationError) as error:
+        Settings(
+            **production_cloud_settings(secret_service_backend="local"),
+        )
+
+    assert (
+        "production environment requires a non-local secret service backend"
+        in str(error.value)
+    )
+
+
 def test_customer_operated_deployment_rejects_dev_request_headers():
     with pytest.raises(ValidationError) as error:
         Settings(
@@ -684,3 +696,16 @@ def test_deepseek_model_gateway_env_profile_is_parseable_without_secret_values()
     assert "TAROAI_MODEL_GATEWAY_VERIFICATION_PROFILE=deepseek" in text
     assert "TAROAI_MODEL_GATEWAY_API_KEY_ENV_VAR=DEEPSEEK_API_KEY" in text
     assert "sk-" not in text
+
+
+def test_zhipu_model_gateway_env_profile_is_parseable_without_secret_values():
+    path = Path("infra/config/zhipu.env.example")
+
+    text = path.read_text()
+    settings = load_settings(env_file=path)
+
+    assert settings.model_gateway_base_url == "https://open.bigmodel.cn/api/paas/v4"
+    assert settings.model_gateway_model == "glm-4.7"
+    assert settings.model_gateway_timeout_seconds == 120
+    assert settings.model_gateway_api_key == ""
+    assert "TAROAI_MODEL_GATEWAY_API_KEY_ENV_VAR=ZHIPU_API_KEY" in text

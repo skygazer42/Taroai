@@ -20,12 +20,14 @@ from taroai.model_gateway import (
     ModelMessage,
     ModelPolicy,
     ModelPolicyScope,
+    ModelProviderApiUpsert,
     ModelProviderConfig,
     ModelProviderChangeRequestCreate,
     ModelProviderFallbackPolicy,
     ModelProviderRateLimit,
     ModelProviderRateLimitError,
     ModelProviderRateLimiter,
+    ModelProviderRecord,
     ModelProviderRegistry,
     ModelGatewayRouter,
     ModelProviderUpsert,
@@ -87,6 +89,65 @@ def test_model_provider_registry_filters_explicit_provider_and_reasoning_capabil
 
     assert [provider.id for provider in registry.candidates(supported)] == ["deepseek"]
     assert registry.candidates(unsupported) == []
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "file:///tmp/model.sock",
+        "https:///v1",
+        "https://user:password@model.example.com/v1",
+        "https://model.example.com/v1?region=cn",
+        "https://model.example.com/v1#models",
+        "https://model.example.com:99999/v1",
+        " https://model.example.com/v1",
+    ],
+)
+def test_model_provider_models_reject_invalid_or_unsafe_base_urls(base_url):
+    with pytest.raises(ValueError, match="base_url"):
+        ModelProviderConfig(id="provider", base_url=base_url)
+    with pytest.raises(ValueError, match="base_url"):
+        ModelProviderRecord.model_validate(
+            {
+                "tenant_id": "tenant_acme",
+                "id": "provider",
+                "provider": {"id": "provider", "base_url": base_url},
+            }
+        )
+    with pytest.raises(ValueError, match="base_url"):
+        ModelProviderApiUpsert(
+            base_url=base_url,
+            api_key_secret_ref_id="secret_provider_key",
+        )
+    with pytest.raises(ValueError, match="base_url"):
+        ModelProviderUpsert(
+            tenant_id="tenant_acme",
+            id="provider",
+            base_url=base_url,
+            api_key_secret_ref_id="secret_provider_key",
+        )
+
+
+def test_model_provider_models_allow_private_http_base_url():
+    base_url = "http://model.internal:8000/v1"
+
+    assert ModelProviderConfig(id="provider", base_url=base_url).base_url == base_url
+    assert (
+        ModelProviderApiUpsert(
+            base_url=base_url,
+            api_key_secret_ref_id="secret_provider_key",
+        ).base_url
+        == base_url
+    )
+    assert (
+        ModelProviderUpsert(
+            tenant_id="tenant_acme",
+            id="provider",
+            base_url=base_url,
+            api_key_secret_ref_id="secret_provider_key",
+        ).base_url
+        == base_url
+    )
 
 
 class RecordingModelGatewayRouter(ModelGatewayRouter):
@@ -402,6 +463,8 @@ def test_model_gateway_router_passes_provider_chat_request_options(monkeypatch):
                     base_url="https://api.deepseek.com",
                     api_key="sk-provider",
                     default_model="deepseek-v4-flash",
+                    reasoning_efforts=["none", "high"],
+                    default_reasoning_effort="none",
                     chat_request_options={
                         "response_format": {"type": "json_object"},
                         "thinking": {"type": "disabled"},
@@ -411,12 +474,29 @@ def test_model_gateway_router_passes_provider_chat_request_options(monkeypatch):
         )
     )
 
-    response = router.create_plan(create_model_request(model=None))
+    response = router.create_plan(
+        create_model_request(model=None).model_copy(
+            update={"reasoning_effort": "none"}
+        )
+    )
 
     assert response.provider == "deepseek"
     assert payloads[0]["model"] == "deepseek-v4-flash"
+    assert payloads[0]["reasoning_effort"] == "none"
     assert payloads[0]["response_format"] == {"type": "json_object"}
     assert payloads[0]["thinking"] == {"type": "disabled"}
+
+
+def test_model_gateway_router_drops_none_for_provider_without_reasoning_support():
+    provider = ModelProviderConfig(id="plain", default_model="plain-chat")
+    router = ModelGatewayRouter(
+        provider_registry=ModelProviderRegistry(providers=[provider])
+    )
+    request = create_model_request(model=None).model_copy(
+        update={"reasoning_effort": "none"}
+    )
+
+    assert router._request_for_provider(provider, request).reasoning_effort is None
 
 
 def test_model_gateway_router_skips_rate_limited_provider_before_invocation():
@@ -948,6 +1028,34 @@ def test_model_provider_store_persists_status_and_secret_reference(tmp_path):
     assert restarted.list_providers("tenant_other") == []
 
 
+def test_model_provider_store_reads_postgresql_jsonb_and_timestamps():
+    now = utc_now()
+    provider = ModelProviderConfig(
+        id="postgres-provider",
+        api_key_secret_ref_id="secret_postgres_provider",
+        default_model="gpt-enterprise",
+        model_ids=["gpt-enterprise"],
+        tenant_id="tenant_acme",
+    )
+    record = SqlModelProviderStore(
+        config=DatabaseConfig(url="sqlite:///:memory:")
+    )._provider_record_from_row(
+        {
+            "tenant_id": "tenant_acme",
+            "provider_id": provider.id,
+            "config": provider.model_dump(mode="json"),
+            "status": "active",
+            "current_version": 1,
+            "updated_by_user_id": "model_admin",
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+
+    assert record.provider == provider
+    assert record.created_at == record.updated_at == now
+
+
 def test_model_provider_store_records_versions_and_rolls_back(tmp_path):
     database_url = f"sqlite:///{tmp_path / 'taroai.sqlite3'}"
     MigrationRunner(
@@ -1103,7 +1211,10 @@ def test_model_gateway_router_loads_enabled_provider_store_records():
     assert not isinstance(disabled_app.state.runtime.model_gateway, ModelGatewayRouter)
     gateway = enabled_app.state.runtime.model_gateway
     assert isinstance(gateway, ModelGatewayRouter)
-    assert gateway.provider_registry.providers[0].id == "tenant-openai"
+    assert [provider.id for provider in gateway.provider_registry.providers] == [
+        "tenant-openai",
+        "default",
+    ]
 
 
 def test_worker_runner_loads_enabled_sql_provider_store_records(tmp_path):
@@ -1137,7 +1248,10 @@ def test_worker_runner_loads_enabled_sql_provider_store_records(tmp_path):
 
     gateway = runner.worker.runtime.model_gateway
     assert isinstance(gateway, ModelGatewayRouter)
-    assert gateway.provider_registry.providers[0].id == "worker-openai"
+    assert [provider.id for provider in gateway.provider_registry.providers] == [
+        "worker-openai",
+        "default",
+    ]
 
 
 def test_agent_runtime_uses_policy_resolved_model_for_gateway_request():

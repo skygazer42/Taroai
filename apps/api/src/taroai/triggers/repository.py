@@ -2,7 +2,6 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-from pydantic import BaseModel
 
 from taroai.db import DatabaseConfig
 from taroai.db.connection import connect_database
@@ -46,8 +45,8 @@ class SqlTriggerStore(TriggerStore):
     def get(self, tenant_id: str, trigger_id: str) -> TriggerDefinition:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT * FROM trigger_definitions WHERE id = ?",
-                (trigger_id,),
+                "SELECT * FROM trigger_definitions WHERE tenant_id = ? AND id = ?",
+                (tenant_id, trigger_id),
             ).fetchone()
         if row is None:
             raise NotFoundError(f"Trigger not found: {trigger_id}")
@@ -70,13 +69,14 @@ class SqlTriggerStore(TriggerStore):
 
     def list_all(self) -> list[TriggerDefinition]:
         with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT * FROM trigger_definitions
-                ORDER BY tenant_id, created_at, id
-                """
+            tenants = connection.execute(
+                "SELECT id FROM tenants ORDER BY id"
             ).fetchall()
-        return [self._trigger_from_row(row) for row in rows]
+        return [
+            trigger
+            for tenant in tenants
+            for trigger in self.list_by_tenant(str(tenant["id"]))
+        ]
 
     def update_status(
         self,
@@ -135,6 +135,15 @@ class SqlTriggerStore(TriggerStore):
                 ),
             )
         return updated
+
+    def delete(self, tenant_id: str, trigger_id: str) -> TriggerDefinition:
+        trigger = self.get(tenant_id, trigger_id)
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM trigger_definitions WHERE tenant_id = ? AND id = ?",
+                (tenant_id, trigger_id),
+            )
+        return trigger
 
     def _connect(self):
         return connect_database(self.config)
@@ -245,8 +254,8 @@ class SqlTriggerStore(TriggerStore):
     def _json(self, value: Any) -> str:
         return json.dumps(value, separators=(",", ":"))
 
-    def _loads(self, value: str) -> Any:
-        return json.loads(value)
+    def _loads(self, value: Any) -> Any:
+        return json.loads(value) if isinstance(value, str) else value
 
     def _dt_or_none(self, value: datetime | None) -> str | None:
         if value is None:

@@ -1,6 +1,5 @@
 # Agent Builder and Workflow Templates Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Build the reusable agent/workflow creation layer that lets solution engineers and tenant admins turn successful work patterns into governed templates, workflows, forms, and published agent apps.
 

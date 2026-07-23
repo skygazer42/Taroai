@@ -16,7 +16,7 @@ from taroai.connectors import (
     SourceAclPrincipal,
 )
 from taroai.db import DatabaseConfig, MigrationRunner, SqlControlPlaneRepository
-from taroai.domain import RunCreate, RunMode, RunStatus
+from taroai.domain import ChatThreadCreate, RunCreate, RunMode, RunStatus
 from taroai.guardrails import InMemoryGuardrailService
 from taroai.knowledge import (
     InMemoryKnowledgeService,
@@ -34,12 +34,16 @@ from taroai.lifecycle import (
 from taroai.deployment import RestoreDrillVerificationConfig
 from taroai.deployment_evidence import RestoreDrillVerificationResult
 from taroai.model_gateway import (
+    ModelGatewayRouter,
     ModelGatewayRequest,
     ModelMessage,
     ModelPolicy,
     ModelPolicyDeniedError,
+    ModelProviderConfig,
     ModelPolicyScopeUpsert,
     PlannedToolCall,
+    ModelProviderUpsert,
+    SqlModelProviderStore,
     SqlModelPolicyStore,
 )
 from taroai.identity import InMemoryIdentityService
@@ -71,7 +75,6 @@ from taroai.workers import (
     RestoreDrillExecutionJob,
     RestoreDrillExecutionWorker,
     RestoreDrillExecutionWorkerRunner,
-    RestoreDrillSchedulerWorker,
     RunExecutionJob,
     TriggerDueJob,
     TriggerDueWorker,
@@ -91,6 +94,12 @@ from taroai.workers.runner import (
     build_trigger_due_worker_runner,
     build_restore_drill_scheduler_worker_runner,
     WorkerProcessConfig,
+)
+from taroai.workflow import (
+    WorkflowCoordinator,
+    WorkflowPhaseSpec,
+    WorkflowSpec,
+    WorkflowTaskSpec,
 )
 from tests.api.adapters import DeterministicModelGateway, DeterministicToolGateway
 
@@ -143,6 +152,149 @@ def test_agent_worker_runner_processes_one_queued_run():
     assert result.last_job_id == job.id
     assert job.status == JobStatus.SUCCEEDED
     assert store.get_run("tenant_acme", run.id).status == RunStatus.SUCCEEDED
+
+
+def test_agent_worker_refreshes_model_runtime_before_execution():
+    store = InMemoryControlPlaneStore()
+    queue = InMemoryJobQueue()
+    run = store.create_run(
+        tenant_id="tenant_acme",
+        user_id="user_1",
+        payload=RunCreate(
+            workspace_id="workspace_sales",
+            message="Use the newly approved model.",
+            mode="autonomous",
+            model_id="fresh-model",
+        ),
+    )
+    queue.enqueue(
+        JobType.RUN_EXECUTION,
+        RunExecutionJob(
+            tenant_id=run.tenant_id,
+            workspace_id=run.workspace_id,
+            user_id=run.user_id,
+            run_id=run.id,
+            requested_by_user_id=run.user_id,
+        ),
+    )
+    runtime = AgentRuntime(
+        store=store,
+        model_gateway=DeterministicModelGateway(),
+        model_policy=ModelPolicy(
+            default_model="old-model",
+            allowed_models=["old-model"],
+        ),
+        tool_gateway=DeterministicToolGateway(),
+    )
+    refreshes = []
+
+    def refresh_model_runtime():
+        refreshes.append(True)
+        runtime.model_policy = ModelPolicy(
+            default_model="fresh-model",
+            allowed_models=["fresh-model"],
+        )
+
+    worker = AgentWorker(
+        runtime=runtime,
+        queue=queue,
+        refresh_model_runtime=refresh_model_runtime,
+    )
+
+    worker.process_next()
+
+    assert refreshes == [True]
+    assert store.get_run(run.tenant_id, run.id).status == RunStatus.SUCCEEDED
+
+
+def test_agent_worker_dispatches_next_workflow_task_without_continuing_hidden_thread():
+    store = InMemoryControlPlaneStore()
+    queue = InMemoryJobQueue()
+    parent = store.create_run(
+        tenant_id="tenant_acme",
+        user_id="user_1",
+        payload=RunCreate(
+            workspace_id="workspace_sales",
+            message="Complete two steps.",
+            mode=RunMode.WORKFLOW,
+        ),
+    )
+    runtime = AgentRuntime(
+        store=store,
+        model_gateway=DeterministicModelGateway(
+            plan=[
+                PlannedToolCall(
+                    id="worker_step",
+                    title="Complete worker task",
+                    tool_name="planning.record",
+                )
+            ]
+        ),
+        tool_gateway=DeterministicToolGateway(),
+    )
+    runtime._save_state(runtime._initial_state(parent))
+    workflow = store.create_workflow(
+        parent,
+        WorkflowSpec(
+            name="Two steps",
+            phases=[
+                WorkflowPhaseSpec(
+                    id="phase",
+                    title="Phase",
+                    tasks=[
+                        WorkflowTaskSpec(id="first", title="First"),
+                        WorkflowTaskSpec(
+                            id="second",
+                            title="Second",
+                            dependsOn=["first"],
+                        ),
+                    ],
+                )
+            ],
+            finalSynthesisPrompt="Return the result.",
+        ),
+    )
+    store.update_workflow("tenant_acme", workflow.id, status="running")
+    coordinator = WorkflowCoordinator(store=store, runtime=runtime)
+    first = coordinator.ready_runs("tenant_acme", workflow.id)[0]
+    queue.enqueue(
+        JobType.RUN_EXECUTION,
+        RunExecutionJob(
+            tenant_id=first.tenant_id,
+            workspace_id=first.workspace_id,
+            user_id=first.user_id,
+            run_id=first.id,
+            requested_by_user_id=first.user_id,
+        ),
+    )
+
+    worker = AgentWorker(
+        runtime=runtime,
+        queue=queue,
+        workflow_coordinator=coordinator,
+        chat_service=type(
+            "UnexpectedChatContinuation",
+            (),
+            {
+                "continue_thread": lambda *_: pytest.fail(
+                    "workflow worker threads are not chat continuations"
+                )
+            },
+        )(),
+    )
+
+    completed_job = worker.process_next()
+
+    assert completed_job is not None
+    assert completed_job.status == JobStatus.SUCCEEDED
+    assert len(queue.jobs) == 2
+    assert queue.jobs[1].status == JobStatus.PENDING
+    second = next(
+        task
+        for task in store.list_workflow_tasks("tenant_acme", workflow.id)
+        if task.task_id == "second"
+    )
+    assert second.child_run_id == queue.jobs[1].payload["run_id"]
 
 
 def test_trigger_due_worker_runner_processes_one_queued_trigger():
@@ -605,7 +757,104 @@ def test_agent_worker_records_job_audit_with_worker_actor():
     ]
 
 
-def test_agent_worker_records_failed_job_audit_with_worker_actor():
+def test_agent_worker_acks_thread_run_without_a_queued_continuation():
+    store = InMemoryControlPlaneStore()
+    queue = InMemoryJobQueue()
+    thread = store.create_chat_thread(
+        "tenant_acme",
+        "user_1",
+        ChatThreadCreate(workspace_id="workspace_sales", title="Scheduled run"),
+    )
+    run = store.create_run(
+        tenant_id="tenant_acme",
+        user_id="user_1",
+        payload=RunCreate(
+            workspace_id="workspace_sales",
+            message="Complete the scheduled task.",
+            mode=RunMode.AUTONOMOUS,
+            thread_id=thread.id,
+        ),
+    )
+    queued_job = queue.enqueue(
+        JobType.RUN_EXECUTION,
+        RunExecutionJob(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_sales",
+            user_id="user_1",
+            run_id=run.id,
+            requested_by_user_id="user_1",
+        ),
+    )
+    worker = AgentWorker(
+        runtime=AgentRuntime(
+            store=store,
+            model_gateway=DeterministicModelGateway(),
+            tool_gateway=DeterministicToolGateway(),
+        ),
+        queue=queue,
+        chat_service=type(
+            "IdleChatService",
+            (),
+            {"continue_thread": lambda *_: None},
+        )(),
+    )
+
+    completed = worker.process_next()
+
+    assert completed is not None
+    assert completed.id == queued_job.id
+    assert completed.status == JobStatus.SUCCEEDED
+    assert store.get_run("tenant_acme", run.id).status == RunStatus.SUCCEEDED
+
+
+def test_agent_worker_acks_a_handled_run_failure():
+    store = InMemoryControlPlaneStore()
+    queue = InMemoryJobQueue()
+    run = store.create_run(
+        tenant_id="tenant_acme",
+        user_id="run_owner_1",
+        payload=RunCreate(
+            workspace_id="workspace_sales",
+            message="Create a worker audited brief.",
+            mode="autonomous",
+        ),
+    )
+    queue.enqueue(
+        JobType.RUN_EXECUTION,
+        RunExecutionJob(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_sales",
+            user_id="run_owner_1",
+            run_id=run.id,
+            requested_by_user_id="run_owner_1",
+        ),
+        max_attempts=1,
+    )
+    worker = AgentWorker(
+        runtime=AgentRuntime(
+            store=store,
+            model_gateway=DeterministicModelGateway(),
+            model_policy=ModelPolicy(
+                default_model="gpt-denied",
+                denied_models=["gpt-denied"],
+            ),
+        ),
+        queue=queue,
+    )
+
+    completed = worker.process_next()
+
+    assert completed is not None
+    assert completed.status == JobStatus.SUCCEEDED
+    assert store.get_run("tenant_acme", run.id).status == RunStatus.FAILED
+
+
+def test_agent_worker_records_dead_letter_audit_and_terminates_run():
+    class ExplodingRuntime(AgentRuntime):
+        def execute_run(self, tenant_id: str, run_id: str):
+            self.store.update_run_status(tenant_id, run_id, RunStatus.RUNNING)
+            raise RuntimeError("model client crashed")
+
     store = InMemoryControlPlaneStore()
     queue = InMemoryJobQueue()
     run = store.create_run(
@@ -629,14 +878,7 @@ def test_agent_worker_records_failed_job_audit_with_worker_actor():
         max_attempts=1,
     )
     worker = AgentWorker(
-        runtime=AgentRuntime(
-            store=store,
-            model_gateway=DeterministicModelGateway(),
-            model_policy=ModelPolicy(
-                default_model="gpt-denied",
-                denied_models=["gpt-denied"],
-            ),
-        ),
+        runtime=ExplodingRuntime(store=store),
         queue=queue,
         worker_id="agent_worker_1",
         audit_service=AuditService(store=store),
@@ -646,6 +888,10 @@ def test_agent_worker_records_failed_job_audit_with_worker_actor():
 
     assert rejected is not None
     assert rejected.status == JobStatus.DEAD_LETTER
+    assert store.get_run("tenant_acme", run.id).status == RunStatus.FAILED
+    assert store.get_runtime_state("tenant_acme", run.id).failure_reason == (
+        "worker_retries_exhausted"
+    )
     worker_events = [
         event
         for event in store.list_audit_events("tenant_acme")
@@ -663,6 +909,81 @@ def test_agent_worker_records_failed_job_audit_with_worker_actor():
     assert failed_event.metadata["final_job_status"] == "dead_letter"
     assert failed_event.metadata["actor"]["actor_type"] == "worker"
     assert failed_event.metadata["actor"]["user_id"] == "operator_1"
+
+
+def test_agent_worker_marks_run_retrying_after_temporary_failure():
+    class ExplodingRuntime(AgentRuntime):
+        def execute_run(self, tenant_id: str, run_id: str):
+            self.store.update_run_status(tenant_id, run_id, RunStatus.RUNNING)
+            raise RuntimeError("temporary model failure")
+
+    store = InMemoryControlPlaneStore()
+    queue = InMemoryJobQueue()
+    run = store.create_run(
+        tenant_id="tenant_acme",
+        user_id="user_1",
+        payload=RunCreate(
+            workspace_id="workspace_sales",
+            message="Retry this run.",
+            mode="workflow",
+        ),
+    )
+    queue.enqueue(
+        JobType.RUN_EXECUTION,
+        RunExecutionJob(
+            tenant_id=run.tenant_id,
+            workspace_id=run.workspace_id,
+            user_id=run.user_id,
+            run_id=run.id,
+            requested_by_user_id=run.user_id,
+        ),
+        max_attempts=2,
+    )
+
+    rejected = AgentWorker(runtime=ExplodingRuntime(store=store), queue=queue).process_next()
+
+    assert rejected is not None
+    assert rejected.status == JobStatus.PENDING
+    assert store.get_run(run.tenant_id, run.id).status == RunStatus.RETRYING
+    assert store.list_run_events(run.tenant_id, run.id)[-1].payload == {
+        "status": "retrying"
+    }
+
+
+def test_agent_worker_terminates_run_after_final_lease_expires():
+    from datetime import datetime, timezone
+
+    store = InMemoryControlPlaneStore()
+    queue = InMemoryJobQueue()
+    run = store.create_run(
+        tenant_id="tenant_acme",
+        user_id="user_1",
+        payload=RunCreate(
+            workspace_id="workspace_sales",
+            message="Recover an abandoned worker run.",
+            mode="autonomous",
+        ),
+    )
+    old = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    queued = queue.enqueue(
+        JobType.RUN_EXECUTION,
+        RunExecutionJob(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_sales",
+            user_id="user_1",
+            run_id=run.id,
+            requested_by_user_id="user_1",
+        ),
+        now=old,
+        max_attempts=1,
+    )
+    queue.claim(JobType.RUN_EXECUTION, "dead_worker", now=old, lease_seconds=1)
+    store.update_run_status("tenant_acme", run.id, RunStatus.RUNNING)
+
+    AgentWorker(runtime=AgentRuntime(store=store), queue=queue).process_next()
+
+    assert queue.get(queued.id).status == JobStatus.DEAD_LETTER
+    assert store.get_run("tenant_acme", run.id).status == RunStatus.FAILED
 
 
 def test_agent_worker_runner_stops_after_idle_poll_limit():
@@ -762,6 +1083,69 @@ def test_build_agent_worker_runner_loads_sql_model_policy_store(tmp_path: Path):
     ].model_sensitivity_limits == {"enterprise-approved": 3}
 
 
+def test_build_agent_worker_runner_refreshes_sql_model_configuration(tmp_path: Path):
+    database_url = f"sqlite:///{tmp_path / 'worker-model-refresh.sqlite3'}"
+    config = DatabaseConfig(url=database_url)
+    MigrationRunner(
+        config=config,
+        migrations_path=Path("apps/api/migrations"),
+    ).apply()
+    provider_store = SqlModelProviderStore(config=config)
+    policy_store = SqlModelPolicyStore(config=config)
+    provider_store.upsert_provider(
+        ModelProviderUpsert(
+            tenant_id="tenant_acme",
+            id="tenant-model",
+            workspace_id="workspace_sales",
+            api_key_secret_ref_id="secret_model_key",
+            default_model="old-model",
+            model_ids=["old-model"],
+        )
+    )
+    policy_store.upsert_scope(
+        ModelPolicyScopeUpsert(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_sales",
+            default_model="old-model",
+            allowed_models=["old-model"],
+        )
+    )
+    settings = Settings(
+        database_url=database_url,
+        model_gateway_provider_store_backend="sql",
+        model_gateway_policy_store_backend="sql",
+        _env_file=None,
+    )
+    runner = build_agent_worker_runner(settings, queue=InMemoryJobQueue())
+
+    provider_store.upsert_provider(
+        ModelProviderUpsert(
+            tenant_id="tenant_acme",
+            id="tenant-model",
+            workspace_id="workspace_sales",
+            api_key_secret_ref_id="secret_model_key",
+            default_model="fresh-model",
+            model_ids=["fresh-model"],
+        )
+    )
+    policy_store.upsert_scope(
+        ModelPolicyScopeUpsert(
+            tenant_id="tenant_acme",
+            workspace_id="workspace_sales",
+            default_model="fresh-model",
+            allowed_models=["fresh-model"],
+        )
+    )
+
+    assert runner.worker.refresh_model_runtime is not None
+    runner.worker.refresh_model_runtime()
+
+    gateway = runner.worker.runtime.model_gateway
+    assert isinstance(gateway, ModelGatewayRouter)
+    assert gateway.provider_registry.providers[0].default_model == "fresh-model"
+    assert runner.worker.runtime.model_policy.scoped_policies[0].default_model == "fresh-model"
+
+
 def test_build_agent_worker_runner_loads_sql_billing_pricing_rule_store(tmp_path: Path):
     database_url = f"sqlite:///{tmp_path / 'worker-billing-pricing.sqlite3'}"
     MigrationRunner(
@@ -834,7 +1218,33 @@ def test_build_agent_worker_runner_wires_model_gateway_secret_ref_from_settings(
     assert gateway.secret_service is not None
 
 
-def test_build_agent_worker_runner_registers_runtime_tool_handlers():
+def test_build_agent_worker_runner_resolves_chat_model_providers():
+    runner = build_agent_worker_runner(
+        Settings(
+            model_gateway_allowed_models=["gpt-worker"],
+            model_gateway_providers=[
+                ModelProviderConfig(
+                    id="worker-provider",
+                    default_model="gpt-worker",
+                )
+            ],
+            _env_file=None,
+        ),
+        queue=InMemoryJobQueue(),
+    )
+
+    catalog = runner.worker.chat_service.model_catalog(
+        "tenant_acme",
+        "workspace_sales",
+        "user_1",
+    )
+
+    assert [(item.provider_id, item.model_id) for item in catalog] == [
+        ("worker-provider", "gpt-worker")
+    ]
+
+
+def test_build_agent_worker_runner_omits_disabled_runtime_tool_handlers():
     runner = build_agent_worker_runner(
         Settings(_env_file=None),
         queue=InMemoryJobQueue(),
@@ -842,8 +1252,8 @@ def test_build_agent_worker_runner_registers_runtime_tool_handlers():
 
     tool_names = set(runner.worker.runtime.tool_gateway.policies)
 
-    assert "sandbox.command" in tool_names
-    assert "browser.action" in tool_names
+    assert "sandbox.command" not in tool_names
+    assert "browser.action" not in tool_names
 
 
 def test_build_agent_worker_runner_wires_runtime_policy_service():

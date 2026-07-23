@@ -52,6 +52,66 @@ def test_sql_identity_service_rejects_case_insensitive_duplicate_email(tmp_path:
         )
 
 
+def test_sql_identity_service_normalizes_postgresql_duplicate_user(monkeypatch):
+    class UniqueViolation(Exception):
+        sqlstate = "23505"
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, error_type, error, traceback):
+            return None
+
+        def execute(self, sql, params):
+            if "INSERT INTO users" in sql:
+                raise UniqueViolation("duplicate key value violates unique constraint")
+
+    monkeypatch.setattr(
+        "taroai.identity.repository.connect_database",
+        lambda _config: Connection(),
+    )
+    service = SqlIdentityService(
+        config=DatabaseConfig(url="postgresql://example"),
+        password_hasher=PasswordHasher(salt="test_salt", iterations=1),
+    )
+
+    with pytest.raises(ValueError, match="User already exists"):
+        service.create_user(
+            UserAccountCreate(
+                tenant_id="tenant_acme",
+                email="luke@example.com",
+                display_name="Luke",
+                password="correct horse battery staple",
+            )
+        )
+
+
+def test_sql_identity_service_finds_same_email_across_tenants(tmp_path: Path):
+    database_url = f"sqlite:///{tmp_path / 'taroai.sqlite3'}"
+    prepare_database(database_url)
+    service = SqlIdentityService(
+        config=DatabaseConfig(url=database_url),
+        password_hasher=PasswordHasher(salt="test_salt"),
+    )
+    for tenant_id in ["tenant_zulu", "tenant_acme"]:
+        service.create_user(
+            UserAccountCreate(
+                tenant_id=tenant_id,
+                email="luke@example.com",
+                display_name="Luke",
+                password="correct horse battery staple",
+            )
+        )
+
+    accounts = service.find_users_by_email("  LUKE@EXAMPLE.COM ")
+
+    assert [account.tenant_id for account in accounts] == [
+        "tenant_acme",
+        "tenant_zulu",
+    ]
+
+
 def test_sql_identity_service_persists_users_roles_and_disabled_status(tmp_path: Path):
     database_url = f"sqlite:///{tmp_path / 'taroai.sqlite3'}"
     prepare_database(database_url)
@@ -254,7 +314,6 @@ def test_auth_endpoint_can_login_with_sql_identity_service_after_restart(tmp_pat
     login = client.post(
         "/api/auth/login",
         json={
-            "tenant_id": "tenant_acme",
             "email": "luke@example.com",
             "password": "correct horse battery staple",
         },

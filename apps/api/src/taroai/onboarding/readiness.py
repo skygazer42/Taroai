@@ -14,9 +14,6 @@ from taroai.store import InMemoryControlPlaneStore
 from taroai.workers import JobQueue
 
 
-STARTER_SKILL_ID_PREFIX = "starter."
-
-
 class TenantReadinessService(BaseModel):
     identity_service: InMemoryIdentityService | SqlIdentityService
     store: InMemoryControlPlaneStore | SqlControlPlaneRepository
@@ -35,7 +32,7 @@ class TenantReadinessService(BaseModel):
             self._billing_read_check(tenant_id),
             self._storage_check(),
             self._queue_check(),
-            self._starter_skills_check(tenant_id),
+            self._skills_runtime_check(tenant_id),
             self._knowledge_spaces_check(tenant_id),
         ]
         blocking_checks = [
@@ -131,26 +128,23 @@ class TenantReadinessService(BaseModel):
             },
         )
 
-    def _starter_skills_check(self, tenant_id: str) -> TenantReadinessCheck:
+    def _skills_runtime_check(self, tenant_id: str) -> TenantReadinessCheck:
         if self.skill_registry is None:
-            return self._warning("starter_skills", "starter skill registry is not attached")
+            return self._warning("skills_runtime", "skill registry is not attached")
         try:
             entries = self.skill_registry.list_for_tenant(tenant_id)
             analytics = self.skill_registry.get_marketplace_analytics(tenant_id)
         except Exception as error:
-            return self._warning("starter_skills", "starter skill registry cannot be queried", {"error": str(error)})
-        starter_skill_ids = [
-            entry.manifest.id
-            for entry in entries
-            if entry.manifest.id.startswith(STARTER_SKILL_ID_PREFIX)
-        ]
-        if starter_skill_ids == []:
-            return self._warning("starter_skills", "starter skill packs are not seeded yet")
+            return self._warning(
+                "skills_runtime",
+                "skill registry cannot be queried",
+                {"error": str(error)},
+            )
         return self._passed(
-            "starter_skills",
-            "starter skill packs are seeded",
+            "skills_runtime",
+            "skill registry is available",
             {
-                "skill_ids": starter_skill_ids,
+                "skill_count": len(entries),
                 "installation_count": analytics.total_installations,
             },
         )

@@ -19,7 +19,9 @@ COPY entrypoint.sh /app/entrypoint.sh
 
 RUN sed -i 's/\r$//' /app/entrypoint.sh \
     && chmod +x /app/entrypoint.sh \
-    && chown -R taroai:taroai /app
+    && install -d -o taroai -g taroai /data/taroai
+
+USER taroai
 
 EXPOSE 8000
 

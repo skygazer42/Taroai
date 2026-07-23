@@ -21,6 +21,7 @@ from taroai.domain import (
     new_id,
     utc_now,
 )
+from taroai.store import NotFoundError
 
 
 class AgentRegistryService:
@@ -50,38 +51,95 @@ class AgentRegistryService:
         tenant_id: str,
         user_id: str,
         payload: AgentDefinitionCreate,
+        source_run_id: str | None = None,
     ):
         now = utc_now()
         definition = AgentDefinition(
-            id=new_id("agent"), tenant_id=tenant_id,
-            workspace_id=payload.workspace_id, name=payload.name,
-            description=payload.description, latest_version=1,
-            created_by_user_id=user_id, created_at=now, updated_at=now,
+            id=new_id("agent"),
+            tenant_id=tenant_id,
+            workspace_id=payload.workspace_id,
+            name=payload.name,
+            description=payload.description,
+            app_kind=payload.app_kind,
+            write_autonomy=payload.write_autonomy,
+            latest_version=1,
+            created_by_user_id=user_id,
+            created_at=now,
+            updated_at=now,
         )
         version = AgentVersion(
-            id=new_id("agent_version"), tenant_id=tenant_id,
-            workspace_id=payload.workspace_id, agent_id=definition.id,
-            version=1, spec=payload.version, created_by_user_id=user_id,
+            id=new_id("agent_version"),
+            tenant_id=tenant_id,
+            workspace_id=payload.workspace_id,
+            agent_id=definition.id,
+            version=1,
+            spec=payload.version,
+            created_by_user_id=user_id,
             created_at=now,
         )
-        return self.registry.create(definition, version)
+        created = self.registry.create(definition, version)
+        self.store.record_audit_event(
+            tenant_id=tenant_id,
+            workspace_id=definition.workspace_id,
+            user_id=user_id,
+            run_id=source_run_id,
+            event_type="agent.created",
+            metadata={
+                "agent_id": definition.id,
+                "version": version.version,
+                "app_kind": definition.app_kind,
+            },
+        )
+        return created
 
-    def extract(self, tenant_id: str, thread_id: str, name: str | None = None) -> AgentDraft:
+    def update_definition(
+        self,
+        tenant_id: str,
+        user_id: str,
+        agent_id: str,
+        *,
+        source_run_id: str | None = None,
+        **changes: Any,
+    ) -> AgentDefinition:
+        updated = self.registry.update_definition(tenant_id, agent_id, **changes)
+        self.store.record_audit_event(
+            tenant_id=tenant_id,
+            workspace_id=updated.workspace_id,
+            user_id=user_id,
+            run_id=source_run_id,
+            event_type="agent.updated",
+            metadata={"agent_id": agent_id, "fields": sorted(changes)},
+        )
+        return updated
+
+    def extract(
+        self, tenant_id: str, thread_id: str, name: str | None = None
+    ) -> AgentDraft:
         thread = self.store.get_chat_thread(tenant_id, thread_id)
         runs = [
-            run for run in self.store.list_runs(tenant_id, thread.workspace_id)
+            run
+            for run in self.store.list_runs(tenant_id, thread.workspace_id)
             if run.thread_id == thread_id and run.status == RunStatus.SUCCEEDED
         ]
         if not runs:
             raise ValueError("A successful Thread Run is required to extract an Agent")
         source_run = sorted(runs, key=lambda item: (item.updated_at, item.id))[-1]
         messages = self.store.list_chat_messages(tenant_id, thread_id)
-        user_messages = [message.content for message in messages if message.role.value == "user"]
+        user_messages = [
+            message.content for message in messages if message.role.value == "user"
+        ]
         resource_refs = [
             ref.model_dump(mode="json")
             for message in messages
             for ref in message.resource_refs
         ]
+        reference_file_ids = list(
+            dict.fromkeys(
+                str(item.get("id"))
+                for item in resource_refs
+                if item.get("type") == "file" and item.get("id")
+            )
+        )
         runtime_state = self._runtime_snapshot(tenant_id, source_run.id)
         used_skills = runtime_state.get("runtime_metadata", {}).get("used_skills", [])
         skill_bindings = {
@@ -115,22 +173,22 @@ class AgentRegistryService:
                     + "\n".join(f"- {item}" for item in user_messages[-8:])
                 ),
                 skill_bindings=list(skill_bindings.values()),
-                connector_bindings=[item for item in resource_refs if item.get("type") == "connector"],
-                knowledge_bindings=[item for item in resource_refs if item.get("type") == "knowledge"],
-                reference_files=[{"storage_object_id": item} for item in source_run.attachments],
-                model_policy={
-                    "provider_id": source_run.provider_id,
-                    "model_id": source_run.model_id,
-                    "reasoning_effort": source_run.reasoning_effort,
-                },
+                connector_bindings=[
+                    item for item in resource_refs if item.get("type") == "connector"
+                ],
+                knowledge_bindings=[
+                    item for item in resource_refs if item.get("type") == "knowledge"
+                ],
+                reference_files=[
+                    {"storage_object_id": item} for item in reference_file_ids
+                ],
+                model_policy={},
                 runtime_snapshot={
                     **runtime_state.get("runtime_metadata", {}).get(
                         "runtime_snapshot", {}
                     ),
                     "source_run_id": source_run.id,
-                    "checkpoint_sequence": runtime_state.get(
-                        "checkpoint_sequence", 0
-                    ),
+                    "checkpoint_sequence": runtime_state.get("checkpoint_sequence", 0),
                     "autonomy_mode": "workflow",
                 },
                 source_thread_id=thread.id,
@@ -141,12 +199,17 @@ class AgentRegistryService:
             source_run_id=source_run.id,
         )
 
-    def create_version(self, tenant_id: str, user_id: str, agent_id: str, spec: AgentVersionSpec):
+    def create_version(
+        self, tenant_id: str, user_id: str, agent_id: str, spec: AgentVersionSpec
+    ):
         definition = self.registry.get(tenant_id, agent_id)
         version = AgentVersion(
-            id=new_id("agent_version"), tenant_id=tenant_id,
-            workspace_id=definition.workspace_id, agent_id=agent_id,
-            version=definition.latest_version + 1, spec=spec,
+            id=new_id("agent_version"),
+            tenant_id=tenant_id,
+            workspace_id=definition.workspace_id,
+            agent_id=agent_id,
+            version=definition.latest_version + 1,
+            spec=spec,
             created_by_user_id=user_id,
         )
         return self.registry.add_version(version)
@@ -161,16 +224,24 @@ class AgentRegistryService:
     def publish(self, tenant_id: str, agent_id: str, version: int):
         target = self.registry.get_version(tenant_id, agent_id, version)
         for binding in target.spec.skill_bindings:
-            if not (binding.get("id") or binding.get("skill_id")) or not binding.get("version"):
-                raise ValueError("Published Agent skill bindings must pin id and version")
+            if not (binding.get("id") or binding.get("skill_id")) or not binding.get(
+                "version"
+            ):
+                raise ValueError(
+                    "Published Agent skill bindings must pin id and version"
+                )
         for reference in target.spec.reference_files:
             storage_object_id = reference.get("storage_object_id")
             if not storage_object_id:
-                raise ValueError("Published Agent reference files must pin storage_object_id")
+                raise ValueError(
+                    "Published Agent reference files must pin storage_object_id"
+                )
             if self.storage_catalog is not None:
                 storage_object = self.storage_catalog.get(tenant_id, storage_object_id)
                 if storage_object.workspace_id != target.workspace_id:
-                    raise ValueError("Published Agent reference file is not in the Agent workspace")
+                    raise ValueError(
+                        "Published Agent reference file is not in the Agent workspace"
+                    )
         for runtime_file in target.spec.runtime_snapshot.get("files", []):
             storage_object_id = runtime_file.get("storage_object_id")
             sandbox_path = str(runtime_file.get("sandbox_path") or "")
@@ -181,46 +252,70 @@ class AgentRegistryService:
                 or sandbox_path.startswith("/workspace/artifacts/")
                 or ".." in sandbox_path.split("/")
             ):
-                raise ValueError("Agent runtime snapshot files must pin storage and sandbox paths")
+                raise ValueError(
+                    "Agent runtime snapshot files must pin storage and sandbox paths"
+                )
             if self.storage_catalog is not None:
                 storage_object = self.storage_catalog.get(tenant_id, storage_object_id)
                 if storage_object.workspace_id != target.workspace_id:
-                    raise ValueError("Agent runtime snapshot file is not in the Agent workspace")
+                    raise ValueError(
+                        "Agent runtime snapshot file is not in the Agent workspace"
+                    )
         browser_profile_id = target.spec.runtime_snapshot.get("browser_profile_id")
         if browser_profile_id and self.browser_profile_service is not None:
             profile = self.browser_profile_service.get_profile(
                 tenant_id, str(browser_profile_id)
             )
-            if profile.workspace_id != target.workspace_id or profile.status != "active":
+            if (
+                profile.workspace_id != target.workspace_id
+                or profile.status != "active"
+            ):
                 raise ValueError("Agent browser profile is not active in its workspace")
         engine_type = str(target.spec.runtime_snapshot.get("engine_type") or "native")
         connection_id = target.spec.runtime_snapshot.get("engine_connection_id")
         if engine_type not in {"native", "opencode", "codex", "claude"}:
-            raise ValueError("Agent runtime snapshot contains an unsupported Engine type")
+            raise ValueError(
+                "Agent runtime snapshot contains an unsupported Engine type"
+            )
         if engine_type != "native" and not connection_id:
             raise ValueError("External Agent Engines require engine_connection_id")
         if connection_id and self.agent_engine_registry is not None:
-            connection = self.agent_engine_registry.get_connection(tenant_id, str(connection_id))
+            connection = self.agent_engine_registry.get_connection(
+                tenant_id, str(connection_id)
+            )
             if (
                 connection.workspace_id != target.workspace_id
                 or connection.status != "active"
                 or connection.engine_type.value != engine_type
             ):
-                raise ValueError("Agent Engine connection is not active for this Agent version")
+                raise ValueError(
+                    "Agent Engine connection is not active for this Agent version"
+                )
         repository_id = target.spec.runtime_snapshot.get("repository_id")
         if repository_id and self.coding_workspace_registry is not None:
             repository = self.coding_workspace_registry.get_repository(
                 tenant_id, str(repository_id)
             )
-            if repository.workspace_id != target.workspace_id or repository.status != "active":
-                raise ValueError("Agent repository binding is not active in its workspace")
+            if (
+                repository.workspace_id != target.workspace_id
+                or repository.status != "active"
+            ):
+                raise ValueError(
+                    "Agent repository binding is not active in its workspace"
+                )
         model_policy = target.spec.model_policy
         if bool(model_policy.get("provider_id")) != bool(model_policy.get("model_id")):
-            raise ValueError("Agent model policy must pin provider_id and model_id together")
+            raise ValueError(
+                "Agent model policy must pin provider_id and model_id together"
+            )
         evaluation_suite_id = target.spec.runtime_snapshot.get("evaluation_suite_id")
-        evaluation_suite_version = target.spec.runtime_snapshot.get("evaluation_suite_version")
+        evaluation_suite_version = target.spec.runtime_snapshot.get(
+            "evaluation_suite_version"
+        )
         if bool(evaluation_suite_id) != bool(evaluation_suite_version):
-            raise ValueError("Agent evaluation binding must pin suite id and version together")
+            raise ValueError(
+                "Agent evaluation binding must pin suite id and version together"
+            )
         if evaluation_suite_id:
             if self.evaluation_service is None or self.evaluation_repository is None:
                 raise ValueError("Agent evaluation service is not available")
@@ -260,6 +355,17 @@ class AgentRegistryService:
             raise ValueError("Agent version is not published")
         self._validate_input(version.spec.input_schema, payload.input)
         model_policy = version.spec.model_policy
+        if bool(payload.provider_id) != bool(payload.model_id):
+            raise ValueError(
+                "Agent run model override requires provider_id and model_id"
+            )
+        provider_id = payload.provider_id or model_policy.get("provider_id")
+        model_id = payload.model_id or model_policy.get("model_id")
+        reasoning_effort = (
+            payload.reasoning_effort
+            if payload.reasoning_effort is not None
+            else model_policy.get("reasoning_effort")
+        )
         resource_refs = [
             ResourceReference(
                 type="agent", id=definition.id, version=str(version.version)
@@ -272,19 +378,28 @@ class AgentRegistryService:
             ChatThreadCreate(
                 workspace_id=definition.workspace_id,
                 title=f"{definition.name} run",
-                provider_id=model_policy.get("provider_id"),
-                model_id=model_policy.get("model_id"),
-                reasoning_effort=model_policy.get("reasoning_effort"),
+                provider_id=provider_id,
+                model_id=model_id,
+                reasoning_effort=reasoning_effort,
                 resource_refs=resource_refs,
             ),
         )
-        content = json.dumps(payload.input, ensure_ascii=False)
+        execution_content = json.dumps(payload.input, ensure_ascii=False)
+        single_value = next(iter(payload.input.values()), None)
+        display_content = (
+            single_value
+            if len(payload.input) == 1 and isinstance(single_value, str)
+            else execution_content
+            if payload.input
+            else f"Run {definition.name}"
+        )
         message = self.store.append_chat_message(
             tenant_id,
             thread.id,
             user_id,
             ChatMessageCreate(
-                content=content,
+                content=display_content,
+                execution_content=execution_content,
                 dispatch_status=ChatMessageDispatchStatus.INFLIGHT,
                 attachments=[
                     item["storage_object_id"]
@@ -303,7 +418,7 @@ class AgentRegistryService:
                 message=(
                     version.spec.instructions
                     + "\n\nStructured input:\n"
-                    + content
+                    + execution_content
                 ),
                 attachments=[
                     item["storage_object_id"]
@@ -312,21 +427,26 @@ class AgentRegistryService:
                 ],
                 thread_id=thread.id,
                 trigger_message_id=message.id,
-                provider_id=model_policy.get("provider_id"),
-                model_id=model_policy.get("model_id"),
-                reasoning_effort=model_policy.get("reasoning_effort"),
+                provider_id=provider_id,
+                model_id=model_id,
+                reasoning_effort=reasoning_effort,
                 mode=RunMode(
                     payload.mode
-                    or version.spec.runtime_snapshot.get(
-                        "autonomy_mode", RunMode.WORKFLOW.value
+                    or (
+                        RunMode.WORKFLOW.value
+                        if definition.app_kind == "workflow"
+                        else RunMode.AUTONOMOUS.value
                     )
                 ),
                 resource_refs=resource_refs,
             ),
         )
         return AgentInvocation(
-            agent_id=definition.id, agent_version=version.version,
-            thread_id=thread.id, message_id=message.id, run_id=run.id,
+            agent_id=definition.id,
+            agent_version=version.version,
+            thread_id=thread.id,
+            message_id=message.id,
+            run_id=run.id,
             events_url=f"/api/threads/{thread.id}/events",
         )
 
@@ -338,8 +458,12 @@ class AgentRegistryService:
                 raise ValueError(f"Missing required Agent input field: {required}")
         properties = schema.get("properties", {})
         python_types = {
-            "string": str, "number": (int, float), "integer": int,
-            "boolean": bool, "array": list, "object": dict,
+            "string": str,
+            "number": (int, float),
+            "integer": int,
+            "boolean": bool,
+            "array": list,
+            "object": dict,
         }
         for key, item in value.items():
             expected_name = properties.get(key, {}).get("type")
@@ -350,7 +474,7 @@ class AgentRegistryService:
     def _runtime_snapshot(self, tenant_id: str, run_id: str) -> dict[str, Any]:
         try:
             return self.store.get_runtime_state(tenant_id, run_id).state_payload
-        except Exception:
+        except NotFoundError:
             return {}
 
     def _resource_refs(self, spec: AgentVersionSpec) -> list[ResourceReference]:
@@ -367,7 +491,11 @@ class AgentRegistryService:
                         ResourceReference(
                             type=kind,
                             id=str(resource_id),
-                            version=(str(binding["version"]) if binding.get("version") else None),
+                            version=(
+                                str(binding["version"])
+                                if binding.get("version")
+                                else None
+                            ),
                         )
                     )
         return refs

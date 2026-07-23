@@ -32,14 +32,16 @@ from taroai.secrets import (
     SecretAccessDeniedError,
     SecretLeaseExpiredError,
     SecretNotFoundError,
+    SecretStoreError,
 )
 from taroai.lifecycle import TenantOffboardingTransitionError
 from taroai.licensing import LicenseEntitlementDeniedError
 from taroai.storage import ObjectStorageConfigurationError, StorageContentRejectedError
 from taroai.store import NotFoundError, RunTransitionError, TenantAccessError
 from taroai.tool_gateway import ToolApprovalRequiredError, ToolExecutionError
-from taroai.triggers import AgentHandoffDeniedError, TriggerWebhookSignatureError
-from taroai.workers import RedisQueueConfigurationError
+from taroai.triggers.handoff import AgentHandoffDeniedError
+from taroai.triggers.webhook import TriggerWebhookSignatureError
+from taroai.workers.queue import RedisQueueConfigurationError
 
 
 class ApiError(BaseModel):
@@ -212,6 +214,13 @@ def default_exception_rules() -> list[ApiExceptionRule]:
             status_code=status.HTTP_404_NOT_FOUND,
             code="not_found",
             message="not found",
+        ),
+        ApiExceptionRule(
+            exception_type=SecretStoreError,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            code="secret_backend_unavailable",
+            message="secret backend is unavailable",
+            retryable=True,
         ),
         ApiExceptionRule(
             exception_type=RedisQueueConfigurationError,

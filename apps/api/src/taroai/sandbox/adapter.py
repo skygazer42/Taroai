@@ -33,6 +33,14 @@ class SandboxAdapter(BaseModel):
     def execute(self, command: SandboxCommand) -> SandboxCommandResult:
         raise SandboxProviderUnavailableError("sandbox provider is disabled")
 
+    def cancel_command(
+        self,
+        tenant_id: str,
+        session_id: str,
+        command_id: str,
+    ) -> bool:
+        return False
+
     def upload_file(self, file_write: SandboxFileWrite) -> SandboxFileRef:
         raise SandboxProviderUnavailableError("sandbox provider is disabled")
 

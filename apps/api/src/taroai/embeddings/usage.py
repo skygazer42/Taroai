@@ -26,7 +26,7 @@ class EmbeddingUsageRecord(BaseModel):
     workspace_id: str | None = None
     user_id: str = Field(min_length=1)
     run_id: str | None = None
-    purpose: Literal["knowledge_index", "knowledge_query"]
+    purpose: Literal["knowledge_index", "knowledge_query", "memory_query"]
     response: EmbeddingGatewayResponse
     input_count: int = Field(ge=1)
     provider: str = Field(default=EMBEDDING_PROVIDER, min_length=1)

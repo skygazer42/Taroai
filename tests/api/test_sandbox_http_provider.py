@@ -1,3 +1,4 @@
+import base64
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -15,6 +16,7 @@ from taroai.sandbox import (
     build_sandbox_adapter,
 )
 from taroai.sandbox.adapter import SandboxProviderUnavailableError
+from taroai.sandbox.http import HttpSandboxAdapter
 
 
 class RecordingSandboxProvider:
@@ -237,6 +239,121 @@ class RecordingSandboxProvider:
 
     def _response_body(self, key: str, body: dict) -> dict:
         return body | self.response_overrides.get(key, {})
+
+
+def test_http_transport_accepts_controller_declared_provider():
+    with RecordingSandboxProvider() as provider:
+        adapter = HttpSandboxAdapter(
+            provider="http",
+            base_url=provider.url,
+            api_key="sandbox_secret",
+            timeout_seconds=3,
+        )
+
+        capabilities = adapter.get_capabilities()
+        session = adapter.create(
+            SandboxCreateRequest(
+                tenant_id="tenant_acme",
+                workspace_id="workspace_sales",
+                run_id="run_1",
+                image="python:3.12-slim",
+                network_mode=SandboxNetworkMode.DISABLED,
+                timeout_seconds=30,
+            )
+        )
+
+    assert capabilities.provider == "k8s"
+    assert session.provider == "k8s"
+
+
+def test_http_transport_round_trips_binary_file_content():
+    content = b"\x89PNG\r\n\x1a\n\x00\xff"
+    content_base64 = base64.b64encode(content).decode("ascii")
+    with RecordingSandboxProvider(
+        response_overrides={
+            "files": {
+                "content": None,
+                "content_base64": content_base64,
+                "size_bytes": len(content),
+            }
+        }
+    ) as provider:
+        adapter = HttpSandboxAdapter(
+            provider="http",
+            base_url=provider.url,
+            api_key="sandbox_secret",
+            timeout_seconds=3,
+        )
+        session = adapter.create(
+            SandboxCreateRequest(
+                tenant_id="tenant_acme",
+                workspace_id="workspace_sales",
+                run_id="run_1",
+            )
+        )
+        uploaded = adapter.upload_file(
+            SandboxFileWrite(
+                tenant_id="tenant_acme",
+                workspace_id="workspace_sales",
+                run_id="run_1",
+                session_id=session.id,
+                path="/workspace/image.png",
+                content_base64=content_base64,
+                content_type="image/png",
+            )
+        )
+        downloaded = adapter.download_file(
+            "tenant_acme", session.id, "/workspace/image.png"
+        )
+
+    assert uploaded.content_bytes() == content
+    assert downloaded.content_bytes() == content
+
+
+def test_http_transport_command_timeout_covers_sandbox_command(monkeypatch):
+    import taroai.sandbox.http as http_module
+
+    timeouts = []
+    build_opener = http_module.build_opener
+
+    def recording_build_opener(*handlers):
+        opener = build_opener(*handlers)
+
+        class RecordingOpener:
+            def open(self, request, *, timeout):
+                timeouts.append(timeout)
+                return opener.open(request, timeout=timeout)
+
+        return RecordingOpener()
+
+    monkeypatch.setattr(http_module, "build_opener", recording_build_opener)
+    with RecordingSandboxProvider() as provider:
+        adapter = HttpSandboxAdapter(
+            provider="http",
+            base_url=provider.url,
+            api_key="sandbox_secret",
+            timeout_seconds=3,
+            enforce_capabilities=False,
+        )
+        session = adapter.create(
+            SandboxCreateRequest(
+                tenant_id="tenant_acme",
+                workspace_id="workspace_sales",
+                run_id="run_1",
+            )
+        )
+        adapter.execute(
+            SandboxCommand(
+                tenant_id="tenant_acme",
+                workspace_id="workspace_sales",
+                run_id="run_1",
+                session_id=session.id,
+                command="sleep 60",
+                timeout_seconds=60,
+            )
+        )
+
+    assert timeouts == [3, 65]
 
 
 def test_enterprise_sandbox_provider_uses_controller_protocol():

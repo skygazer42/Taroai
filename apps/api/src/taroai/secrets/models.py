@@ -1,5 +1,7 @@
 from datetime import datetime
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from taroai.domain import utc_now
@@ -100,3 +102,19 @@ class SecretLeaseResolution(BaseModel):
             "action": self.action,
             "expires_at": self.expires_at.isoformat(),
         }
+
+
+class SecretCaptureRequest(BaseModel):
+    id: str
+    tenant_id: str
+    workspace_id: str
+    run_id: str
+    name: str = Field(min_length=1, max_length=200)
+    tool_name: str | None = None
+    connector_id: str | None = None
+    action_id: str | None = None
+    actions: list[str] = Field(default_factory=list)
+    status: Literal["pending", "resolved", "cancelled"] = "pending"
+    secret_ref_id: str | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    resolved_at: datetime | None = None

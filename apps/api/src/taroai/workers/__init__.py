@@ -35,30 +35,40 @@ from taroai.workers.queue import (
     RedisJobQueue,
     RedisQueueConfigurationError,
 )
-from taroai.workers.runner import (
-    AgentWorkerRunner,
-    CleanupWorkerRunner,
-    ConnectorSyncWorkerRunner,
-    RestoreDrillDueWorkerRunner,
-    RestoreDrillEvidenceWorkerRunner,
-    RestoreDrillExecutionWorkerRunner,
-    RestoreDrillSchedulerWorkerRunner,
-    TriggerDueWorkerRunner,
-    TriggerSchedulerWorkerRunner,
-    WorkerLoopResult,
-    build_agent_worker_runner,
-    build_cleanup_worker_runner,
-    build_connector_sync_worker_runner,
-    build_restore_drill_due_worker_runner,
-    build_restore_drill_evidence_worker_runner,
-    build_restore_drill_execution_worker_runner,
-    build_restore_drill_scheduler_worker_runner,
-    build_worker_connector_registry,
-    build_worker_knowledge_service,
-    build_trigger_due_worker_runner,
-    build_trigger_scheduler_worker_runner,
-    build_worker_queue,
-)
+
+
+_RUNNER_EXPORTS = {
+    "AgentWorkerRunner",
+    "CleanupWorkerRunner",
+    "ConnectorSyncWorkerRunner",
+    "RestoreDrillDueWorkerRunner",
+    "RestoreDrillEvidenceWorkerRunner",
+    "RestoreDrillExecutionWorkerRunner",
+    "RestoreDrillSchedulerWorkerRunner",
+    "TriggerDueWorkerRunner",
+    "TriggerSchedulerWorkerRunner",
+    "WorkerLoopResult",
+    "build_agent_worker_runner",
+    "build_cleanup_worker_runner",
+    "build_connector_sync_worker_runner",
+    "build_restore_drill_due_worker_runner",
+    "build_restore_drill_evidence_worker_runner",
+    "build_restore_drill_execution_worker_runner",
+    "build_restore_drill_scheduler_worker_runner",
+    "build_worker_connector_registry",
+    "build_worker_knowledge_service",
+    "build_trigger_due_worker_runner",
+    "build_trigger_scheduler_worker_runner",
+    "build_worker_queue",
+}
+
+
+def __getattr__(name: str):
+    if name not in _RUNNER_EXPORTS:
+        raise AttributeError(name)
+    from importlib import import_module
+
+    return getattr(import_module("taroai.workers.runner"), name)
 
 __all__ = [
     "AgentWorker",

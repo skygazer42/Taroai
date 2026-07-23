@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from taroai.db import DatabaseConfig, MigrationRunner
+from taroai.domain import utc_now
 from taroai.model_gateway import (
     ModelPolicyChangeRequestCreate,
     ModelPolicyScopeUpsert,
@@ -54,6 +55,50 @@ def test_sql_model_policy_store_persists_tenant_and_workspace_scopes(tmp_path: P
     assert scopes[1].to_policy_scope().model_sensitivity_limits == {"sales-approved": 4}
     assert [scope.tenant_id for scope in all_scopes] == ["tenant_acme", "tenant_acme"]
     assert restarted.list_scopes("tenant_other") == []
+
+
+def test_sql_model_policy_store_reads_postgresql_jsonb_and_timestamps():
+    now = utc_now()
+    store = SqlModelPolicyStore(config=DatabaseConfig(url="sqlite:///:memory:"))
+
+    scope = store._record_from_row(
+        {
+            "tenant_id": "tenant_acme",
+            "workspace_id": "workspace_sales",
+            "default_model": "gpt-enterprise",
+            "allowed_models": ["gpt-enterprise"],
+            "denied_models": [],
+            "model_sensitivity_limits": {"gpt-enterprise": 4},
+            "updated_by_user_id": "model_admin",
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    change = store._change_request_from_row(
+        {
+            "tenant_id": "tenant_acme",
+            "request_id": "policy_change_1",
+            "operation": "upsert_scope",
+            "payload": {
+                "scope_upsert": {
+                    "tenant_id": "tenant_acme",
+                    "workspace_id": "workspace_sales",
+                    "default_model": "gpt-enterprise",
+                }
+            },
+            "status": "pending",
+            "requested_by_user_id": "model_admin",
+            "reviewed_by_user_id": None,
+            "created_at": now,
+            "reviewed_at": None,
+        }
+    )
+
+    assert scope.allowed_models == ["gpt-enterprise"]
+    assert scope.model_sensitivity_limits == {"gpt-enterprise": 4}
+    assert scope.created_at == now
+    assert change.scope_upsert.workspace_id == "workspace_sales"
+    assert change.created_at == now
 
 
 def test_sql_model_policy_store_applies_requested_scope_only_after_approval(

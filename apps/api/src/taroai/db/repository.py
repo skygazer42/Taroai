@@ -20,15 +20,18 @@ from taroai.domain import (
     ChatThread,
     ChatThreadCreate,
     IdempotencyRecord,
+    Notification,
     Run,
     RunCreate,
     RunEvent,
     RunStatus,
     new_id,
+    notification_for_agent_run_status,
     utc_now,
 )
 from taroai.errors import AgentActionLeaseConflictError
 from taroai.licensing.models import LicenseValidationResult
+from taroai.secrets import SecretCaptureRequest
 from taroai.store import (
     NotFoundError,
     RETRYABLE_RUN_STATUSES,
@@ -37,6 +40,7 @@ from taroai.store import (
     TERMINAL_RUN_STATUSES,
     TenantAccessError,
 )
+from taroai.workflow import WorkflowRun, WorkflowSpec, WorkflowTask
 
 if TYPE_CHECKING:
     from taroai.agent.models import (
@@ -53,6 +57,240 @@ class SqlControlPlaneRepository(BaseModel):
 
     def initialize_schema(self, migrations_path: Path) -> None:
         MigrationRunner(config=self.config, migrations_path=migrations_path).apply()
+
+    def register_workspace(
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        user_id: str,
+        workspace_name: str | None = None,
+    ) -> None:
+        with self._connect() as connection:
+            self._ensure_context(
+                connection,
+                tenant_id,
+                workspace_id,
+                user_id,
+                workspace_name=workspace_name,
+            )
+
+    def list_workspace_ids(self, tenant_id: str) -> list[str]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id FROM workspaces
+                WHERE tenant_id = ?
+                ORDER BY created_at, id
+                """,
+                (tenant_id,),
+            ).fetchall()
+        return [row["id"] for row in rows]
+
+    def get_tenant(self, tenant_id: str):
+        from taroai.tenancy import TenantInfo
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT id, name FROM tenants WHERE id = ?",
+                (tenant_id,),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError(f"Tenant not found: {tenant_id}")
+        return TenantInfo(id=row["id"], name=row["name"])
+
+    def rename_tenant(self, tenant_id: str, name: str):
+        from taroai.tenancy import TenantInfo
+
+        with self._connect() as connection:
+            result = connection.execute(
+                "UPDATE tenants SET name = ? WHERE id = ?",
+                (name, tenant_id),
+            )
+            if result.rowcount == 0:
+                raise NotFoundError(f"Tenant not found: {tenant_id}")
+        return TenantInfo(id=tenant_id, name=name)
+
+    def list_workspaces(self, tenant_id: str):
+        from taroai.tenancy import WorkspaceInfo
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, tenant_id, name FROM workspaces
+                WHERE tenant_id = ?
+                ORDER BY created_at, id
+                """,
+                (tenant_id,),
+            ).fetchall()
+        return [WorkspaceInfo.model_validate(dict(row)) for row in rows]
+
+    def create_workspace(
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        user_id: str,
+        name: str,
+    ):
+        from taroai.tenancy import WorkspaceInfo
+
+        with self._connect() as connection:
+            self._ensure_context(
+                connection,
+                tenant_id,
+                workspace_id,
+                user_id,
+                workspace_name=name,
+            )
+            row = connection.execute(
+                """
+                SELECT id, tenant_id, name FROM workspaces
+                WHERE tenant_id = ? AND id = ?
+                """,
+                (tenant_id, workspace_id),
+            ).fetchone()
+        return WorkspaceInfo.model_validate(dict(row))
+
+    def rename_workspace(
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        name: str,
+    ):
+        from taroai.tenancy import WorkspaceInfo
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                UPDATE workspaces SET name = ?
+                WHERE tenant_id = ? AND id = ?
+                RETURNING id, tenant_id, name
+                """,
+                (name, tenant_id, workspace_id),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError(f"Workspace not found: {workspace_id}")
+        return WorkspaceInfo.model_validate(dict(row))
+
+    def create_tenant_invitation(self, invitation):
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO tenant_invitations (
+                    id, tenant_id, email, token_hash, invited_by_user_id,
+                    created_at, expires_at, accepted_at, revoked_at,
+                    accepted_by_user_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    invitation.id,
+                    invitation.tenant_id,
+                    invitation.email,
+                    invitation.token_hash,
+                    invitation.invited_by_user_id,
+                    self._dt(invitation.created_at),
+                    self._dt(invitation.expires_at),
+                    None,
+                    None,
+                    None,
+                ),
+            )
+        return invitation.model_copy(deep=True)
+
+    def list_tenant_invitations(self, tenant_id: str):
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM tenant_invitations
+                WHERE tenant_id = ?
+                ORDER BY created_at DESC, id DESC
+                """,
+                (tenant_id,),
+            ).fetchall()
+        return [self._tenant_invitation_from_row(row) for row in rows]
+
+    def get_tenant_invitation(self, tenant_id: str, invitation_id: str):
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM tenant_invitations
+                WHERE tenant_id = ? AND id = ?
+                """,
+                (tenant_id, invitation_id),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError(f"Tenant invitation not found: {invitation_id}")
+        return self._tenant_invitation_from_row(row)
+
+    def get_tenant_invitation_by_token_hash(self, tenant_id: str, token_hash: str):
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM tenant_invitations
+                WHERE tenant_id = ? AND token_hash = ?
+                """,
+                (tenant_id, token_hash),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("Tenant invitation not found")
+        return self._tenant_invitation_from_row(row)
+
+    def revoke_tenant_invitation(
+        self,
+        tenant_id: str,
+        invitation_id: str,
+        revoked_at: datetime,
+    ):
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                UPDATE tenant_invitations SET revoked_at = ?
+                WHERE tenant_id = ? AND id = ?
+                  AND accepted_at IS NULL AND revoked_at IS NULL
+                  AND expires_at > ?
+                RETURNING *
+                """,
+                (
+                    self._dt(revoked_at),
+                    tenant_id,
+                    invitation_id,
+                    self._dt(revoked_at),
+                ),
+            ).fetchone()
+        if row is None:
+            self.get_tenant_invitation(tenant_id, invitation_id)
+            raise ValueError("Tenant invitation is no longer pending")
+        return self._tenant_invitation_from_row(row)
+
+    def accept_tenant_invitation(
+        self,
+        tenant_id: str,
+        invitation_id: str,
+        accepted_by_user_id: str,
+        accepted_at: datetime,
+    ):
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                UPDATE tenant_invitations
+                SET accepted_at = ?, accepted_by_user_id = ?
+                WHERE tenant_id = ? AND id = ?
+                  AND accepted_at IS NULL AND revoked_at IS NULL
+                  AND expires_at > ?
+                RETURNING *
+                """,
+                (
+                    self._dt(accepted_at),
+                    accepted_by_user_id,
+                    tenant_id,
+                    invitation_id,
+                    self._dt(accepted_at),
+                ),
+            ).fetchone()
+        if row is None:
+            self.get_tenant_invitation(tenant_id, invitation_id)
+            raise ValueError("Tenant invitation is no longer pending")
+        return self._tenant_invitation_from_row(row)
 
     def create_run(self, tenant_id: str, user_id: str, payload: RunCreate) -> Run:
         with self._connect() as connection:
@@ -438,6 +676,7 @@ class SqlControlPlaneRepository(BaseModel):
                 created_by_user_id=user_id,
                 role=payload.role,
                 content=payload.content,
+                execution_content=payload.execution_content,
                 kind=payload.kind,
                 dispatch_status=payload.dispatch_status,
                 delivery_status=payload.delivery_status,
@@ -450,10 +689,10 @@ class SqlControlPlaneRepository(BaseModel):
                 """
                 INSERT INTO chat_messages (
                     id, tenant_id, workspace_id, thread_id, sequence,
-                    created_by_user_id, role, kind, content, dispatch_status,
+                    created_by_user_id, role, kind, content, execution_content, dispatch_status,
                     delivery_status, attachments, resource_refs, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     message.id,
@@ -465,6 +704,7 @@ class SqlControlPlaneRepository(BaseModel):
                     message.role.value,
                     message.kind,
                     message.content,
+                    message.execution_content,
                     message.dispatch_status.value,
                     message.delivery_status.value,
                     self._json(message.attachments),
@@ -523,6 +763,7 @@ class SqlControlPlaneRepository(BaseModel):
     ) -> ChatMessage:
         field_columns = {
             "content": "content",
+            "execution_content": "execution_content",
             "kind": "kind",
             "dispatch_status": "dispatch_status",
             "delivery_status": "delivery_status",
@@ -1205,6 +1446,40 @@ class SqlControlPlaneRepository(BaseModel):
             return None
         return self._agent_action_from_row(row)
 
+    def cancel_agent_action(
+        self,
+        tenant_id: str,
+        action_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> "AgentAction":
+        completed_at = self._lease_time(now or utc_now())
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                UPDATE agent_actions
+                SET status = ?, lease_owner_id = NULL, lease_expires_at = NULL,
+                    completed_at = ?
+                WHERE tenant_id = ? AND id = ?
+                  AND status IN (?, ?, ?)
+                RETURNING *
+                """,
+                (
+                    "cancelled",
+                    self._dt(completed_at),
+                    tenant_id,
+                    action_id,
+                    "pending",
+                    "running",
+                    "uncertain",
+                ),
+            ).fetchone()
+        return (
+            self._agent_action_from_row(row)
+            if row is not None
+            else self.get_agent_action(tenant_id, action_id)
+        )
+
     def recover_expired_agent_actions(
         self,
         tenant_id: str,
@@ -1791,7 +2066,98 @@ class SqlControlPlaneRepository(BaseModel):
                     "run.status_changed",
                     {"status": updated_run.status.value},
                 )
+            trigger_message = (
+                connection.execute(
+                    """
+                    SELECT kind FROM chat_messages
+                    WHERE tenant_id = ? AND id = ?
+                    """,
+                    (tenant_id, run.trigger_message_id),
+                ).fetchone()
+                if run.trigger_message_id
+                else None
+            )
+            if run.status != status and (
+                trigger_message is None
+                or trigger_message["kind"] != "workflow_task"
+            ):
+                notification = notification_for_agent_run_status(updated_run, status)
+                if notification is not None:
+                    connection.execute(
+                        """
+                        INSERT INTO notifications (
+                            id, tenant_id, user_id, type, title, body, run_id,
+                            thread_id, created_at, read_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            notification.id,
+                            notification.tenant_id,
+                            notification.user_id,
+                            notification.type,
+                            notification.title,
+                            notification.body,
+                            notification.run_id,
+                            notification.thread_id,
+                            self._dt(notification.created_at),
+                            None,
+                        ),
+                    )
         return updated_run
+
+    def list_notifications(
+        self, tenant_id: str, user_id: str, limit: int = 50
+    ) -> list[Notification]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM notifications
+                WHERE tenant_id = ? AND user_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (tenant_id, user_id, limit),
+            ).fetchall()
+        return [self._notification_from_row(row) for row in rows]
+
+    def count_unread_notifications(self, tenant_id: str, user_id: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS unread_count FROM notifications
+                WHERE tenant_id = ? AND user_id = ? AND read_at IS NULL
+                """,
+                (tenant_id, user_id),
+            ).fetchone()
+        return int(row["unread_count"])
+
+    def mark_notification_read(
+        self, tenant_id: str, user_id: str, notification_id: str
+    ) -> Notification:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                UPDATE notifications
+                SET read_at = COALESCE(read_at, ?)
+                WHERE tenant_id = ? AND user_id = ? AND id = ?
+                RETURNING *
+                """,
+                (self._dt(utc_now()), tenant_id, user_id, notification_id),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError(f"Notification not found: {notification_id}")
+        return self._notification_from_row(row)
+
+    def mark_all_notifications_read(self, tenant_id: str, user_id: str) -> int:
+        with self._connect() as connection:
+            result = connection.execute(
+                """
+                UPDATE notifications SET read_at = ?
+                WHERE tenant_id = ? AND user_id = ? AND read_at IS NULL
+                """,
+                (self._dt(utc_now()), tenant_id, user_id),
+            )
+        return result.rowcount
 
     def cancel_run(
         self,
@@ -1983,6 +2349,12 @@ class SqlControlPlaneRepository(BaseModel):
         run_id: str,
         step_id: str,
         reason: str,
+        *,
+        kind: str = "action",
+        subject_type: str | None = None,
+        subject_id: str | None = None,
+        preview_payload: dict[str, Any] | None = None,
+        validation_payload: dict[str, Any] | None = None,
     ) -> ApprovalRequest:
         run = self.get_run(tenant_id, run_id)
         approval = ApprovalRequest(
@@ -1993,6 +2365,11 @@ class SqlControlPlaneRepository(BaseModel):
             step_id=step_id,
             reason=reason,
             status=ApprovalStatus.PENDING,
+            kind=kind,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            preview_payload=preview_payload or {},
+            validation_payload=validation_payload or {},
             requested_by_user_id=run.user_id,
             created_at=utc_now(),
         )
@@ -2001,9 +2378,11 @@ class SqlControlPlaneRepository(BaseModel):
                 """
                 INSERT INTO approval_requests (
                     id, tenant_id, workspace_id, run_id, step_id, reason, status,
-                    requested_by_user_id, resolved_by_user_id, created_at, resolved_at
+                    requested_by_user_id, resolved_by_user_id, created_at, resolved_at,
+                    kind, subject_type, subject_id, preview_payload,
+                    validation_payload, execution_status, error
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     approval.id,
@@ -2017,13 +2396,30 @@ class SqlControlPlaneRepository(BaseModel):
                     approval.resolved_by_user_id,
                     self._dt(approval.created_at),
                     None,
+                    approval.kind,
+                    approval.subject_type,
+                    approval.subject_id,
+                    self._json(approval.preview_payload),
+                    self._json(approval.validation_payload),
+                    approval.execution_status,
+                    approval.error,
                 ),
             )
             self._append_run_event(
                 connection,
                 run,
                 "approval.requested",
-                {"approval_id": approval.id, "step_id": step_id, "reason": reason},
+                {
+                    "approval_id": approval.id,
+                    "step_id": step_id,
+                    "reason": reason,
+                    "kind": approval.kind,
+                    "subject_type": approval.subject_type,
+                    "subject_id": approval.subject_id,
+                    "preview": approval.preview_payload,
+                    "validation": approval.validation_payload,
+                    "execution_status": approval.execution_status,
+                },
             )
         return approval
 
@@ -2113,18 +2509,12 @@ class SqlControlPlaneRepository(BaseModel):
                 )
                 self._append_run_event(connection, run, "approval.cancelled", metadata)
                 cancelled.append(
-                    ApprovalRequest(
-                        id=row["id"],
-                        tenant_id=row["tenant_id"],
-                        workspace_id=row["workspace_id"],
-                        run_id=row["run_id"],
-                        step_id=row["step_id"],
-                        reason=row["reason"],
-                        status=ApprovalStatus.CANCELLED,
-                        requested_by_user_id=row["requested_by_user_id"],
-                        resolved_by_user_id=cancelled_by_user_id,
-                        created_at=self._parse_dt(row["created_at"]),
-                        resolved_at=resolved_at,
+                    self._approval_from_row(row).model_copy(
+                        update={
+                            "status": ApprovalStatus.CANCELLED,
+                            "resolved_by_user_id": cancelled_by_user_id,
+                            "resolved_at": resolved_at,
+                        }
                     )
                 )
         return cancelled
@@ -2193,18 +2583,12 @@ class SqlControlPlaneRepository(BaseModel):
                     created_at=utc_now(),
                 ),
             )
-        return ApprovalRequest(
-            id=row["id"],
-            tenant_id=row["tenant_id"],
-            workspace_id=row["workspace_id"],
-            run_id=row["run_id"],
-            step_id=row["step_id"],
-            reason=row["reason"],
-            status=status,
-            requested_by_user_id=row["requested_by_user_id"],
-            resolved_by_user_id=resolved_by_user_id,
-            created_at=self._parse_dt(row["created_at"]),
-            resolved_at=resolved_at,
+        return self._approval_from_row(row).model_copy(
+            update={
+                "status": status,
+                "resolved_by_user_id": resolved_by_user_id,
+                "resolved_at": resolved_at,
+            }
         )
 
     def list_approval_requests(self, tenant_id: str, run_id: str) -> list[ApprovalRequest]:
@@ -2219,6 +2603,356 @@ class SqlControlPlaneRepository(BaseModel):
                 (tenant_id, run_id),
             ).fetchall()
         return [self._approval_from_row(row) for row in rows]
+
+    def update_approval_execution(
+        self,
+        tenant_id: str,
+        run_id: str,
+        approval_id: str,
+        execution_status: str,
+        error: str | None = None,
+    ) -> ApprovalRequest:
+        run = self.get_run(tenant_id, run_id)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM approval_requests
+                WHERE tenant_id = ? AND run_id = ? AND id = ?
+                """,
+                (tenant_id, run_id, approval_id),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"Approval request not found: {approval_id}")
+            connection.execute(
+                """
+                UPDATE approval_requests SET execution_status = ?, error = ?
+                WHERE tenant_id = ? AND run_id = ? AND id = ?
+                """,
+                (execution_status, error, tenant_id, run_id, approval_id),
+            )
+            self._append_run_event(
+                connection,
+                run,
+                "approval.execution_updated",
+                {
+                    "approval_id": approval_id,
+                    "execution_status": execution_status,
+                    "error": error,
+                },
+            )
+        return self._approval_from_row(
+            {**dict(row), "execution_status": execution_status, "error": error}
+        )
+
+    def create_workflow(self, run: Run, spec: WorkflowSpec) -> WorkflowRun:
+        existing = self.get_workflow_for_parent_run(run.tenant_id, run.id)
+        if existing is not None:
+            return existing
+        now = utc_now()
+        workflow = WorkflowRun(
+            id=new_id("workflow"),
+            tenant_id=run.tenant_id,
+            workspace_id=run.workspace_id,
+            parent_run_id=run.id,
+            parent_thread_id=run.thread_id,
+            user_id=run.user_id,
+            status="awaiting_approval",
+            spec=spec,
+            created_at=now,
+            updated_at=now,
+        )
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO workflow_runs (
+                    id, tenant_id, workspace_id, parent_run_id, parent_thread_id,
+                    user_id, status, spec, approval_id, created_at, updated_at,
+                    completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    workflow.id,
+                    workflow.tenant_id,
+                    workflow.workspace_id,
+                    workflow.parent_run_id,
+                    workflow.parent_thread_id,
+                    workflow.user_id,
+                    workflow.status,
+                    self._json(workflow.spec.model_dump(mode="json", by_alias=True)),
+                    None,
+                    self._dt(now),
+                    self._dt(now),
+                    None,
+                ),
+            )
+            for phase in spec.phases:
+                for task_spec in phase.tasks:
+                    task = WorkflowTask(
+                        id=new_id("workflow_task"),
+                        tenant_id=run.tenant_id,
+                        workspace_id=run.workspace_id,
+                        workflow_id=workflow.id,
+                        task_id=task_spec.id,
+                        phase_id=phase.id,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO workflow_tasks (
+                            id, tenant_id, workspace_id, workflow_id, task_id,
+                            phase_id, status, child_thread_id, child_run_id,
+                            summary, error, attempts, created_at, updated_at,
+                            completed_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            task.id,
+                            task.tenant_id,
+                            task.workspace_id,
+                            task.workflow_id,
+                            task.task_id,
+                            task.phase_id,
+                            task.status,
+                            None,
+                            None,
+                            "",
+                            None,
+                            0,
+                            self._dt(now),
+                            self._dt(now),
+                            None,
+                        ),
+                    )
+        return workflow
+
+    def get_workflow(self, tenant_id: str, workflow_id: str) -> WorkflowRun:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM workflow_runs WHERE tenant_id = ? AND id = ?",
+                (tenant_id, workflow_id),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError(f"Workflow not found: {workflow_id}")
+        return self._workflow_from_row(row)
+
+    def get_workflow_for_parent_run(
+        self, tenant_id: str, run_id: str
+    ) -> WorkflowRun | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM workflow_runs
+                WHERE tenant_id = ? AND parent_run_id = ?
+                """,
+                (tenant_id, run_id),
+            ).fetchone()
+        return self._workflow_from_row(row) if row is not None else None
+
+    def update_workflow(
+        self, tenant_id: str, workflow_id: str, **changes: Any
+    ) -> WorkflowRun:
+        workflow = self.get_workflow(tenant_id, workflow_id)
+        allowed = {"status", "approval_id", "completed_at"}
+        unknown = set(changes) - allowed
+        if unknown:
+            raise ValueError(f"Unsupported workflow fields: {sorted(unknown)}")
+        updated = workflow.model_copy(
+            update={**changes, "updated_at": utc_now()}, deep=True
+        )
+        columns = {"status": "status", "approval_id": "approval_id", "completed_at": "completed_at"}
+        assignments = [f"{columns[key]} = ?" for key in changes]
+        values = [
+            self._dt(value) if key == "completed_at" and value is not None else value
+            for key, value in changes.items()
+        ]
+        assignments.append("updated_at = ?")
+        values.append(self._dt(updated.updated_at))
+        with self._connect() as connection:
+            connection.execute(
+                f"UPDATE workflow_runs SET {', '.join(assignments)} "
+                "WHERE tenant_id = ? AND id = ?",
+                (*values, tenant_id, workflow_id),
+            )
+        return updated
+
+    def list_workflow_tasks(
+        self, tenant_id: str, workflow_id: str
+    ) -> list[WorkflowTask]:
+        self.get_workflow(tenant_id, workflow_id)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM workflow_tasks
+                WHERE tenant_id = ? AND workflow_id = ?
+                ORDER BY created_at, id
+                """,
+                (tenant_id, workflow_id),
+            ).fetchall()
+        return [self._workflow_task_from_row(row) for row in rows]
+
+    def get_workflow_task_for_child_run(
+        self, tenant_id: str, run_id: str
+    ) -> WorkflowTask | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM workflow_tasks
+                WHERE tenant_id = ? AND child_run_id = ?
+                """,
+                (tenant_id, run_id),
+            ).fetchone()
+        return self._workflow_task_from_row(row) if row is not None else None
+
+    def update_workflow_task(
+        self, tenant_id: str, task_record_id: str, **changes: Any
+    ) -> WorkflowTask:
+        allowed = {
+            "status", "child_thread_id", "child_run_id", "summary", "error",
+            "attempts", "completed_at",
+        }
+        unknown = set(changes) - allowed
+        if unknown:
+            raise ValueError(f"Unsupported workflow task fields: {sorted(unknown)}")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM workflow_tasks WHERE tenant_id = ? AND id = ?",
+                (tenant_id, task_record_id),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"Workflow task not found: {task_record_id}")
+            task = self._workflow_task_from_row(row)
+            updated = task.model_copy(
+                update={**changes, "updated_at": utc_now()}, deep=True
+            )
+            assignments = [f"{key} = ?" for key in changes]
+            values = [
+                self._dt(value) if key == "completed_at" and value is not None else value
+                for key, value in changes.items()
+            ]
+            assignments.append("updated_at = ?")
+            values.append(self._dt(updated.updated_at))
+            connection.execute(
+                f"UPDATE workflow_tasks SET {', '.join(assignments)} "
+                "WHERE tenant_id = ? AND id = ?",
+                (*values, tenant_id, task_record_id),
+            )
+        return updated
+
+    def create_secret_capture_request(
+        self,
+        run: Run,
+        *,
+        name: str,
+        tool_name: str | None = None,
+        connector_id: str | None = None,
+        action_id: str | None = None,
+        actions: list[str] | None = None,
+    ) -> SecretCaptureRequest:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM secret_capture_requests
+                WHERE tenant_id = ? AND run_id = ? AND name = ? AND status = 'pending'
+                """,
+                (run.tenant_id, run.id, name),
+            ).fetchone()
+            if row is not None:
+                return self._secret_capture_from_row(row)
+            capture = SecretCaptureRequest(
+                id=new_id("secret_capture"),
+                tenant_id=run.tenant_id,
+                workspace_id=run.workspace_id,
+                run_id=run.id,
+                name=name,
+                tool_name=tool_name,
+                connector_id=connector_id,
+                action_id=action_id,
+                actions=actions or [],
+            )
+            connection.execute(
+                """
+                INSERT INTO secret_capture_requests (
+                    id, tenant_id, workspace_id, run_id, name, tool_name,
+                    connector_id, action_id, actions, status, secret_ref_id,
+                    created_at, resolved_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    capture.id,
+                    capture.tenant_id,
+                    capture.workspace_id,
+                    capture.run_id,
+                    capture.name,
+                    capture.tool_name,
+                    capture.connector_id,
+                    capture.action_id,
+                    self._json(capture.actions),
+                    capture.status,
+                    None,
+                    self._dt(capture.created_at),
+                    None,
+                ),
+            )
+            self._append_run_event(
+                connection,
+                run,
+                "secret_capture.requested",
+                {
+                    "requestId": capture.id,
+                    "name": capture.name,
+                    "toolName": capture.tool_name,
+                    "connectorId": capture.connector_id,
+                    "actions": capture.actions,
+                },
+            )
+        return capture
+
+    def get_secret_capture_request(
+        self, tenant_id: str, request_id: str
+    ) -> SecretCaptureRequest:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM secret_capture_requests
+                WHERE tenant_id = ? AND id = ?
+                """,
+                (tenant_id, request_id),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError(f"Secret capture request not found: {request_id}")
+        return self._secret_capture_from_row(row)
+
+    def resolve_secret_capture_request(
+        self, tenant_id: str, request_id: str, secret_ref_id: str
+    ) -> SecretCaptureRequest:
+        capture = self.get_secret_capture_request(tenant_id, request_id)
+        if capture.status != "pending":
+            raise ValueError("secret capture request is no longer pending")
+        resolved_at = utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE secret_capture_requests
+                SET status = 'resolved', secret_ref_id = ?, resolved_at = ?
+                WHERE tenant_id = ? AND id = ? AND status = 'pending'
+                """,
+                (secret_ref_id, self._dt(resolved_at), tenant_id, request_id),
+            )
+            run = self.get_run(tenant_id, capture.run_id)
+            self._append_run_event(
+                connection,
+                run,
+                "secret_capture.resolved",
+                {"requestId": request_id, "secretRefId": secret_ref_id},
+            )
+        return capture.model_copy(
+            update={
+                "status": "resolved",
+                "secret_ref_id": secret_ref_id,
+                "resolved_at": resolved_at,
+            }
+        )
 
     def save_runtime_state(self, state: Any) -> RunStateSnapshot:
         self.get_run(state.tenant_id, state.run_id)
@@ -2287,8 +3021,8 @@ class SqlControlPlaneRepository(BaseModel):
         self.get_run(tenant_id, run_id)
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT * FROM runtime_states WHERE run_id = ?",
-                (run_id,),
+                "SELECT * FROM runtime_states WHERE tenant_id = ? AND run_id = ?",
+                (tenant_id, run_id),
             ).fetchone()
         if row is None:
             raise NotFoundError(f"Runtime state not found: {run_id}")
@@ -2410,7 +3144,14 @@ class SqlControlPlaneRepository(BaseModel):
     def _connect(self):
         return connect_database(self.config)
 
-    def _ensure_context(self, connection, tenant_id: str, workspace_id: str, user_id: str) -> None:
+    def _ensure_context(
+        self,
+        connection,
+        tenant_id: str,
+        workspace_id: str,
+        user_id: str,
+        workspace_name: str | None = None,
+    ) -> None:
         self._ensure_tenant(connection, tenant_id)
         now = self._dt(utc_now())
         self._insert_context_record_or_verify_owner(
@@ -2421,7 +3162,7 @@ class SqlControlPlaneRepository(BaseModel):
                 ON CONFLICT DO NOTHING
                 RETURNING id
             """,
-            insert_params=(workspace_id, tenant_id, workspace_id, now),
+            insert_params=(workspace_id, tenant_id, workspace_name or workspace_id, now),
             lookup_sql="""
                 SELECT id FROM workspaces
                 WHERE tenant_id = ? AND id = ?
@@ -2530,7 +3271,36 @@ class SqlControlPlaneRepository(BaseModel):
         if not found:
             raise NotFoundError(f"Chat thread not found: {thread_id}")
 
+    def _lock_run_for_sequence(
+        self,
+        connection,
+        tenant_id: str,
+        run_id: str,
+    ) -> None:
+        if self.config.dialect == "postgresql":
+            row = connection.execute(
+                """
+                SELECT id FROM runs
+                WHERE tenant_id = ? AND id = ?
+                FOR UPDATE
+                """,
+                (tenant_id, run_id),
+            ).fetchone()
+            found = row is not None
+        else:
+            result = connection.execute(
+                """
+                UPDATE runs SET updated_at = updated_at
+                WHERE tenant_id = ? AND id = ?
+                """,
+                (tenant_id, run_id),
+            )
+            found = result.rowcount == 1
+        if not found:
+            raise NotFoundError(f"Run not found: {run_id}")
+
     def _append_run_event(self, connection, run: Run, event_type: str, payload: dict[str, Any]) -> RunEvent:
+        self._lock_run_for_sequence(connection, run.tenant_id, run.id)
         if run.thread_id is not None:
             self._lock_chat_thread_for_sequence(
                 connection,
@@ -2778,6 +3548,7 @@ class SqlControlPlaneRepository(BaseModel):
             created_by_user_id=row["created_by_user_id"],
             role=row["role"],
             content=row["content"],
+            execution_content=self._row_value(row, "execution_content"),
             kind=row["kind"],
             dispatch_status=row["dispatch_status"],
             delivery_status=row["delivery_status"],
@@ -2892,10 +3663,75 @@ class SqlControlPlaneRepository(BaseModel):
             step_id=row["step_id"],
             reason=row["reason"],
             status=ApprovalStatus(row["status"]),
+            kind=self._row_value(row, "kind") or "action",
+            subject_type=self._row_value(row, "subject_type"),
+            subject_id=self._row_value(row, "subject_id"),
+            preview_payload=self._loads(
+                self._row_value(row, "preview_payload") or "{}"
+            ),
+            validation_payload=self._loads(
+                self._row_value(row, "validation_payload") or "{}"
+            ),
+            execution_status=(
+                self._row_value(row, "execution_status") or "not_started"
+            ),
+            error=self._row_value(row, "error"),
             requested_by_user_id=row["requested_by_user_id"],
             resolved_by_user_id=row["resolved_by_user_id"],
             created_at=self._parse_dt(row["created_at"]),
             resolved_at=self._parse_dt(row["resolved_at"]) if row["resolved_at"] else None,
+        )
+
+    def _workflow_from_row(self, row) -> WorkflowRun:
+        return WorkflowRun(
+            id=row["id"],
+            tenant_id=row["tenant_id"],
+            workspace_id=row["workspace_id"],
+            parent_run_id=row["parent_run_id"],
+            parent_thread_id=row["parent_thread_id"],
+            user_id=row["user_id"],
+            status=row["status"],
+            spec=WorkflowSpec.model_validate(self._loads(row["spec"])),
+            approval_id=row["approval_id"],
+            created_at=self._parse_dt(row["created_at"]),
+            updated_at=self._parse_dt(row["updated_at"]),
+            completed_at=self._parse_optional_dt(row["completed_at"]),
+        )
+
+    def _workflow_task_from_row(self, row) -> WorkflowTask:
+        return WorkflowTask(
+            id=row["id"],
+            tenant_id=row["tenant_id"],
+            workspace_id=row["workspace_id"],
+            workflow_id=row["workflow_id"],
+            task_id=row["task_id"],
+            phase_id=row["phase_id"],
+            status=row["status"],
+            child_thread_id=row["child_thread_id"],
+            child_run_id=row["child_run_id"],
+            summary=row["summary"],
+            error=row["error"],
+            attempts=int(row["attempts"]),
+            created_at=self._parse_dt(row["created_at"]),
+            updated_at=self._parse_dt(row["updated_at"]),
+            completed_at=self._parse_optional_dt(row["completed_at"]),
+        )
+
+    def _secret_capture_from_row(self, row) -> SecretCaptureRequest:
+        return SecretCaptureRequest(
+            id=row["id"],
+            tenant_id=row["tenant_id"],
+            workspace_id=row["workspace_id"],
+            run_id=row["run_id"],
+            name=row["name"],
+            tool_name=row["tool_name"],
+            connector_id=row["connector_id"],
+            action_id=row["action_id"],
+            actions=self._loads(row["actions"]),
+            status=row["status"],
+            secret_ref_id=row["secret_ref_id"],
+            created_at=self._parse_dt(row["created_at"]),
+            resolved_at=self._parse_optional_dt(row["resolved_at"]),
         )
 
     def _billing_meter_from_row(self, row) -> BillingMeterEvent:
@@ -2948,6 +3784,36 @@ class SqlControlPlaneRepository(BaseModel):
             model_id=self._row_value(row, "model_id"),
             reasoning_effort=self._row_value(row, "reasoning_effort"),
             resource_refs=self._loads(self._row_value(row, "resource_refs", "[]")),
+        )
+
+    def _notification_from_row(self, row) -> Notification:
+        return Notification(
+            id=row["id"],
+            tenant_id=row["tenant_id"],
+            user_id=row["user_id"],
+            type=row["type"],
+            title=row["title"],
+            body=row["body"],
+            run_id=row["run_id"],
+            thread_id=row["thread_id"],
+            created_at=self._parse_dt(row["created_at"]),
+            read_at=self._parse_optional_dt(row["read_at"]),
+        )
+
+    def _tenant_invitation_from_row(self, row):
+        from taroai.tenancy import TenantInvitationRecord
+
+        return TenantInvitationRecord(
+            id=row["id"],
+            tenant_id=row["tenant_id"],
+            email=row["email"],
+            token_hash=row["token_hash"],
+            invited_by_user_id=row["invited_by_user_id"],
+            created_at=self._parse_dt(row["created_at"]),
+            expires_at=self._parse_dt(row["expires_at"]),
+            accepted_at=self._parse_optional_dt(row["accepted_at"]),
+            revoked_at=self._parse_optional_dt(row["revoked_at"]),
+            accepted_by_user_id=row["accepted_by_user_id"],
         )
 
     def _idempotency_record_from_row(self, row) -> IdempotencyRecord:
