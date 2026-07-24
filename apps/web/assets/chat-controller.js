@@ -47,7 +47,6 @@ export const chatState = {
   share: null,
   suggestions: [],
   promotingManual: false,
-  thoughtOpen: false,
   inputRequest: null,
   inputAnswers: {},
   inputExtra: "",
@@ -330,14 +329,14 @@ function commandActivity(payload = {}) {
 }
 
 function commandSubject(command, kind = "run_command") {
-  const tokens = String(command || "").match(/"[^"]*"|'[^']*'|\S+/g)?.map((item) => item.replace(/^(['"])(.*)\1$/, "$2")) || [];
+  const value = String(command || "").trim().replace(/\s+/g, " ");
+  if (kind !== "run_command") return value.length > 180 ? `${value.slice(0, 180)}…` : value;
+  const tokens = value.match(/"[^"]*"|'[^']*'|\S+/g)?.map((item) => item.replace(/^(['"])(.*)\1$/, "$2")) || [];
   if (!tokens.length) return "";
   const executable = tokens[0].split(/[\\/]/).at(-1);
   let target = executable;
   if (/^(python\d*|node|bash|sh|zsh)$/.test(executable)) {
     target = tokens.slice(1).find((item) => /\.(py|m?js|cjs|sh)$/i.test(item)) || executable;
-  } else if (kind !== "run_command") {
-    target = [...tokens.slice(1)].reverse().find((item) => !item.startsWith("-")) || executable;
   }
   return target.split(/[\\/]/).filter(Boolean).at(-1)?.slice(0, 80) || executable;
 }
@@ -802,7 +801,7 @@ export class ChatController {
         "[data-remove-create-intent], [data-remove-browser-profile], [data-browser-profile-id], [data-browser-profile-none], " +
         "[data-browser-profile-create-default], [data-browser-profile-new], [data-voice-input], " +
         "[data-thread-create-agent], [data-thread-artifact], [data-artifact-copy], [data-artifact-download], " +
-        "[data-coding-tab], [data-coding-change], [data-coding-action], [data-thought-toggle], " +
+        "[data-coding-tab], [data-coding-change], [data-coding-action], " +
         "[data-message-copy], [data-message-retry], [data-message-speak], [data-message-summarize], " +
         "[data-run-retry], [data-run-continue], [data-ui-submit], [data-ui-action], " +
         "[data-message-feedback], [data-message-more], [data-input-option], [data-input-submit], [data-suggestion]",
@@ -820,19 +819,6 @@ export class ChatController {
     this.stopOwnedEvent(event);
 
     if (control.matches("[data-new-chat]")) return this.startNewChat();
-    if (control.matches("[data-thought-toggle]")) {
-      const expanded = control.getAttribute("aria-expanded") !== "true";
-      chatState.thoughtOpen = expanded;
-      if (control.dataset.disclosureKey) {
-        chatState.disclosureOpen.set(control.dataset.disclosureKey, expanded);
-      }
-      const card = control.closest(".chat-thought");
-      card?.classList.toggle("is-open", expanded);
-      control.setAttribute("aria-expanded", String(expanded));
-      const detail = query(".chat-thought-detail", card);
-      if (detail) detail.hidden = !expanded;
-      return;
-    }
     if (control.matches("#send-button")) return this.sendThreadMessage();
     if (control.matches("#model-selector-button")) return this.toggleModelMenu();
     if (control.matches("[data-chat-model]")) return this.selectModel(control.dataset.chatModel);
@@ -872,7 +858,7 @@ export class ChatController {
     if (control.matches("[data-coding-tab]")) return this.switchCodingTab(control.dataset.codingTab);
     if (control.matches("[data-coding-change]")) return this.selectCodingChange(control.dataset.codingChange);
     if (control.matches("[data-coding-action]")) return this.requestCodingAction(control.dataset.codingAction);
-    if (control.matches("[data-message-copy]")) return this.copyMessage(control.dataset.messageCopy);
+    if (control.matches("[data-message-copy]")) return this.copyMessage(control.dataset.messageCopy, control);
     if (control.matches("[data-message-retry]")) return this.retryMessage(control.dataset.messageRetry);
     if (control.matches("[data-run-retry]")) return this.retryRun(control.dataset.runRetry);
     if (control.matches("[data-run-continue]")) return this.continueFailedRun(control.dataset.runContinue);
@@ -1118,7 +1104,6 @@ export class ChatController {
     chatState.inputRequest = null;
     chatState.inputAnswers = {};
     chatState.inputExtra = "";
-    chatState.thoughtOpen = false;
     this.network("Opening thread…", "loading");
     this.renderConversation();
     try {
@@ -1374,7 +1359,6 @@ export class ChatController {
     chatState.inputRequest = null;
     chatState.inputAnswers = {};
     chatState.inputExtra = "";
-    chatState.thoughtOpen = false;
     chatState.browserProfile = null;
     chatState.lastThreadSequence = 0;
     publishChatContext();
@@ -2107,7 +2091,6 @@ export class ChatController {
     chatState.inputRequest = null;
     chatState.inputAnswers = {};
     chatState.inputExtra = "";
-    chatState.thoughtOpen = false;
     chatState.messages.push(optimistic);
     if (startedWithoutThread) localStorage.removeItem("taroai.threadDraft.new");
     this.clearDraft();
@@ -2493,7 +2476,6 @@ export class ChatController {
       chatState.messages = chatState.messages.filter((message) => message.id !== streamId);
     }
     if (type === "assistant.message.completed") {
-      chatState.thoughtOpen = false;
       const finalId = payloadDetail.message_id || `assistant:${chatState.currentRunId || Date.now()}`;
       const streamId = `stream:${chatState.currentRunId || chatState.currentThreadId}`;
       const streamed = chatState.messages.find((item) => item.id === streamId);
@@ -2582,7 +2564,6 @@ export class ChatController {
     }[type] || null;
     if (terminalStatus) {
       chatState.running = false;
-      chatState.thoughtOpen = false;
       chatState.inputRequest = null;
       chatState.inputAnswers = {};
       chatState.inputExtra = "";
@@ -3145,6 +3126,16 @@ export class ChatController {
       });
       article.append(evidence);
     }
+    if (!assistant && message.id) {
+      const copyButton = document.createElement("button");
+      copyButton.type = "button";
+      copyButton.className = "message-user-copy";
+      copyButton.dataset.messageCopy = message.id;
+      copyButton.title = "Copy message";
+      copyButton.setAttribute("aria-label", "Copy message");
+      copyButton.innerHTML = '<svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M5 15V5a1 1 0 0 1 1-1h10"></path></svg>';
+      article.append(copyButton);
+    }
     const meta = document.createElement("footer");
     meta.className = "message-meta";
     if (!["completed", "sent", "succeeded", "inflight", "streaming"].includes(statusValue)) {
@@ -3241,31 +3232,22 @@ export class ChatController {
     if (["model.operation.started", "model.operation.completed", "model.operation.failed", "model.operation.recorded"].includes(type)) {
       const status = type.slice("model.operation.".length);
       const operation = String(p.operation || "model").toLowerCase();
-      const labels = {
-        decide: ["Choosing the next action", "Chose the next action."],
-        respond_or_act: ["Choosing the next action", "Chose the next action."],
-        respond: ["Writing the response", "Response ready."],
-        verify: ["Checking the result", "Checked the result."],
-        compact: ["Summarizing the conversation", "Summarized the conversation."],
-      }[operation] || ["Working with the model", "Model step completed."];
-      const failed = status === "failed";
-      const textValue = failed ? "Model step failed." : status === "started" ? labels[0] : labels[1];
-      return {
-        key: operation === "verify"
-          ? "verification:current"
-          : `model:${p.operation_id || eventSequence(event)}`,
-        text: p.attempt > 1 ? `${textValue} · retry ${p.attempt}` : textValue,
-        tone: failed ? "warn" : null,
-        transient: !failed,
-      };
+      const key = operation === "verify"
+        ? "verification:current"
+        : `model:${p.operation_id || eventSequence(event)}`;
+      if (status === "failed") return { key, text: "Model step failed.", tone: "warn" };
+      return status === "started" && ["decide", "respond_or_act", "respond"].includes(operation)
+        ? { key, text: "Thinking", kind: "thinking", transient: true }
+        : null;
     }
     if (type === "model.operation.retrying") return { text: "Model connection interrupted · retrying", tone: "warn" };
     if (type === "agent.verification.started") {
-      return { key: `verification:${p.cycle_id || "current"}`, text: "Checking the result" };
+      return { key: `verification:${p.cycle_id || "current"}`, text: "Checking the result", transient: true };
     }
     if (type === "agent.verification.completed") {
       const complete = p.outcome === "complete";
       const checks = Array.isArray(p.evidence) ? p.evidence.length : 0;
+      if (complete && !checks) return null;
       return {
         key: `verification:${p.cycle_id || "current"}`,
         text: complete && checks
@@ -3278,8 +3260,6 @@ export class ChatController {
     }
     if (type === "agent.verification.skipped") return null;
     if (type === "agent.decision.created") {
-      const decision = p.decision || {};
-      if (decision.kind === "request_input") return { text: "Prepared a focused follow-up." };
       return null;
     }
     if (type.startsWith("tool_call.")) {
@@ -3350,16 +3330,18 @@ export class ChatController {
     bindDisclosure(
       details,
       `tool:${runId}:web.search:${actionKey || toolActivityKey(lifecycleEvent || {}) || eventSequence(decision || event)}`,
-      running,
+      false,
     );
     if (running) details.setAttribute("aria-busy", "true");
     const summary = document.createElement("summary");
     const mark = document.createElement("span");
+    mark.className = "chat-tool-mark";
     mark.setAttribute("aria-hidden", "true");
     mark.textContent = "⌕";
     const title = document.createElement("strong");
     title.textContent = running ? "Searching the web" : waiting ? "Search needs approval" : cancelled ? "Search cancelled" : failed ? "Search failed" : "Searched the web";
     const count = document.createElement("span");
+    count.className = "chat-tool-state";
     count.textContent = running
       ? "Working…"
       : waiting
@@ -3374,18 +3356,35 @@ export class ChatController {
     summary.append(mark, title, count);
     details.append(summary);
     const queryText = output.query || eventPayload(decision || {}).decision?.tool_input?.query;
+    const body = document.createElement("div");
+    body.className = "chat-search-results";
     if (queryText) {
-      const query = document.createElement("p");
-      query.textContent = queryText;
-      details.append(query);
+      const query = document.createElement("div");
+      query.className = "chat-search-query";
+      const queryMark = document.createElement("span");
+      queryMark.setAttribute("aria-hidden", "true");
+      queryMark.textContent = "⌕";
+      const queryValue = document.createElement("span");
+      queryValue.textContent = String(queryText);
+      query.append(queryMark, queryValue);
+      body.append(query);
     }
-    if (running || waiting || cancelled || failed) return details;
+    if (running || waiting || cancelled || failed) {
+      if (body.childElementCount) details.append(body);
+      return details;
+    }
     const list = document.createElement("ul");
     for (const result of results) {
       try {
         const url = new URL(result.url);
         if (!["https:", "http:"].includes(url.protocol)) continue;
         const item = document.createElement("li");
+        const sourceIcon = document.createElement("span");
+        sourceIcon.className = "chat-search-source-icon";
+        sourceIcon.setAttribute("aria-hidden", "true");
+        sourceIcon.textContent = url.hostname.replace(/^www\./, "").charAt(0).toUpperCase();
+        const copy = document.createElement("div");
+        copy.className = "chat-search-source-copy";
         const link = document.createElement("a");
         link.href = url.href;
         link.target = "_blank";
@@ -3393,16 +3392,18 @@ export class ChatController {
         link.textContent = result.title || url.hostname;
         const meta = document.createElement("small");
         meta.textContent = [url.hostname.replace(/^www\./, ""), result.published_date].filter(Boolean).join(" · ");
-        item.append(link, meta);
+        copy.append(link, meta);
+        item.append(sourceIcon, copy);
         list.append(item);
       } catch { /* Ignore malformed provider URLs. */ }
     }
-    if (list.childElementCount) details.append(list);
+    if (list.childElementCount) body.append(list);
     else {
       const note = document.createElement("p");
       note.textContent = "Source details were not retained for this run.";
-      details.append(note);
+      body.append(note);
     }
+    details.append(body);
     return details;
   }
 
@@ -3438,32 +3439,26 @@ export class ChatController {
       const commandPayload = eventPayload(outcome || {});
       const commandCopy = commandActivity(commandPayload);
       const subject = commandSubject(command, commandPayload.command_kind);
-      const output = eventPayload(completed || {}).result?.output || {};
       const execution = [...executionEvents].reverse().find((item) => eventType(item) === "sandbox.command.executed");
       const executionPayload = eventPayload(execution || {});
       const streams = chatState.commandOutputs.get(executionPayload.step_id || executionPayload.storage_object_id) || {};
-      const exitCode = Number(output.exit_code);
-      const status = waiting
-        ? "Approval needed"
-        : cancelled
-        ? "Cancelled"
-        : failed
-        ? "Failed"
-        : completed
-        ? Number.isFinite(exitCode) && exitCode !== 0 ? `Exit ${exitCode}` : "Completed"
-        : "Running";
       const details = document.createElement("details");
       details.className = `chat-search-card chat-code-card${running ? " is-running" : failed ? " is-error" : ""}`;
       bindDisclosure(
         details,
         `tool:${runId}:sandbox.command:${actionKey || toolActivityKey(outcome || {}) || eventPayload(decision).decision?.action_key || eventSequence(decision)}`,
-        running,
+        failed || waiting,
       );
       if (running) details.setAttribute("aria-busy", "true");
       const summary = document.createElement("summary");
       const mark = document.createElement("span");
+      mark.className = "chat-tool-mark";
       mark.setAttribute("aria-hidden", "true");
-      mark.textContent = ">_";
+      mark.textContent = {
+        read_file: "▯",
+        list_files: "≡",
+        search_files: "⌕",
+      }[commandPayload.command_kind] || ">_";
       const title = document.createElement("strong");
       const activity = running
         ? commandCopy.started
@@ -3474,10 +3469,14 @@ export class ChatController {
             : failed
               ? `${commandCopy.noun} failed`
               : commandCopy.completed;
-      title.textContent = subject ? `${activity} · ${subject}` : activity;
-      const state = document.createElement("span");
-      state.textContent = status;
-      summary.append(mark, title, state);
+      title.textContent = activity;
+      summary.append(mark, title);
+      if (subject) {
+        const detail = document.createElement("span");
+        detail.className = "chat-tool-summary-detail";
+        detail.textContent = subject;
+        summary.append(detail);
+      }
       details.append(summary);
       if (command) {
         const code = document.createElement("pre");
@@ -3547,15 +3546,6 @@ export class ChatController {
       const failed = type === "tool_call.failed";
       const waiting = type === "tool_call.approval_required";
       const running = type === "tool_call.started";
-      const status = waiting
-        ? "Approval needed"
-        : failed
-          ? "Failed"
-          : type === "tool_call.cancelled"
-            ? "Cancelled"
-            : running
-              ? "Running"
-              : "Completed";
       const skillOutput = tool === "skill.load" && payload.result?.output && typeof payload.result.output === "object"
         ? payload.result.output
         : {};
@@ -3566,27 +3556,26 @@ export class ChatController {
         .join(" ");
       const details = document.createElement("details");
       details.className = `chat-search-card chat-code-card chat-tool-card${running ? " is-running" : failed ? " is-error" : ""}`;
-      bindDisclosure(details, `tool:${runId}:${tool}:${key}`, running || failed || waiting);
+      bindDisclosure(details, `tool:${runId}:${tool}:${key}`, failed || waiting);
       if (running) details.setAttribute("aria-busy", "true");
       const summary = document.createElement("summary");
       const mark = document.createElement("span");
+      mark.className = "chat-tool-mark";
       mark.setAttribute("aria-hidden", "true");
       mark.textContent = "↗";
       const title = document.createElement("strong");
       title.textContent = tool === "skill.load"
         ? running
           ? `Loading ${skillName}`
+          : waiting
+            ? `${skillName} needs approval`
           : failed
             ? `Could not load ${skillName}`
             : type === "tool_call.cancelled"
               ? `Cancelled loading ${skillName}`
               : `Used ${skillName}`
-        : toolLabel(tool);
-      const state = document.createElement("span");
-      state.textContent = tool === "skill.load" && !failed && !waiting
-        ? running ? "Loading…" : type === "tool_call.cancelled" ? "Cancelled" : "Ready"
-        : status;
-      summary.append(mark, title, state);
+        : String(payload.summary || toolLabel(tool));
+      summary.append(mark, title);
       details.append(summary);
 
       const name = document.createElement("p");
@@ -3865,66 +3854,23 @@ export class ChatController {
     const responseReady = runId !== chatState.currentRunId
       || !chatState.running
       || (isAssistant(lastMessage || {}) && dispatchStatus(lastMessage) === "completed");
-    if (!steps.length && !responseReady && latestStep) steps.push(latestStep);
-    if (
-      !steps.length
-      && events.some((event) => eventType(event) === "assistant.message.completed")
-    ) steps.push({ text: "Prepared the answer." });
+    if (!responseReady && latestStep?.transient) steps.push(latestStep);
+    else if (!steps.length && !responseReady && latestStep) steps.push(latestStep);
     if (!steps.length) return null;
-    const started = new Date(events[0].created_at || "");
-    const responseEvent = responseReady
-      ? [...events].reverse().find((event) => eventType(event) === "assistant.message.completed")
-      : null;
-    const ended = new Date((responseEvent || events.at(-1)).created_at || "");
-    let pausedMilliseconds = 0;
-    let waitingAt = null;
-    for (const event of events) {
-      const createdAt = new Date(event.created_at || "");
-      if (Number.isNaN(createdAt.valueOf())) continue;
-      if ([
-        "agent.waiting_for_user",
-        "approval.requested",
-        "secret_capture.requested",
-      ].includes(eventType(event))) waitingAt = createdAt;
-      if (
-        waitingAt
-        && eventType(event) === "run.status_changed"
-        && String(eventPayload(event).status || "").toLowerCase() === "running"
-      ) {
-        pausedMilliseconds += createdAt - waitingAt;
-        waitingAt = null;
-      }
-    }
-    const seconds = !Number.isNaN(started.valueOf()) && !Number.isNaN(ended.valueOf())
-      ? Math.max(1, Math.round(((ended - started) - pausedMilliseconds) / 1000))
-      : null;
     const live = chatState.running && runId === chatState.currentRunId && !responseReady;
-    const title = live ? latestStep?.text || steps.at(-1).text : seconds ? `Thought for ${seconds}s` : "Run activity";
-    const disclosureKey = `thought:${runId || chatState.currentRunId || "current"}`;
-    const expanded = chatState.disclosureOpen.has(disclosureKey)
-      ? chatState.disclosureOpen.get(disclosureKey)
-      : live;
     const card = document.createElement("div");
     card.className = "chat-thought";
     card.classList.toggle("is-live", live);
-    card.classList.toggle("is-open", expanded);
     if (live) card.setAttribute("aria-live", "polite");
-    const toggle = document.createElement("button");
-    toggle.type = "button";
-    toggle.className = "chat-thought-toggle";
-    toggle.dataset.thoughtToggle = "";
-    toggle.dataset.disclosureKey = disclosureKey;
-    toggle.setAttribute("aria-expanded", String(expanded));
-    toggle.innerHTML = `<svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"></circle><path d="M12 8v4l2.5 2.5"></path></svg><span>${escapeHtml(title)}</span><span class="chat-thought-chevron" aria-hidden="true">›</span>`;
-    card.append(toggle);
     const detail = document.createElement("div");
     detail.className = "chat-thought-detail";
-    detail.hidden = !expanded;
+    detail.hidden = false;
     for (const step of steps) {
       const row = document.createElement("div");
       row.className = "chat-thought-step";
       if (step.key) row.dataset.activityKey = step.key;
       if (step.tone === "warn") row.classList.add("is-warn");
+      if (step.kind === "thinking") row.classList.add("is-thinking");
       const activityCard = step.tool === "web.search"
         ? this.renderSearchCard(runId, step.actionKey)
         : step.tool === "sandbox.command"
@@ -4949,10 +4895,23 @@ export class ChatController {
     recognition.start();
   }
 
-  async copyMessage(messageId) {
+  async copyMessage(messageId, control = null) {
     const message = chatState.messages.find((item) => item.id === messageId);
     if (!message) return;
     await navigator.clipboard?.writeText(messageContent(message));
+    if (control) {
+      const markup = control.innerHTML;
+      control.dataset.copied = "true";
+      control.title = "Copied";
+      control.setAttribute("aria-label", "Copied");
+      control.innerHTML = '<svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"></path></svg>';
+      window.setTimeout(() => {
+        delete control.dataset.copied;
+        control.title = "Copy message";
+        control.setAttribute("aria-label", "Copy message");
+        control.innerHTML = markup;
+      }, 1200);
+    }
     this.network("Message copied", "success");
     window.setTimeout(() => {
       if (this.refs.networkState?.dataset.state === "success" && this.refs.networkState.textContent === "Message copied") {

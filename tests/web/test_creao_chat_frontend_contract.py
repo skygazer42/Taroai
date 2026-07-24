@@ -679,26 +679,27 @@ def test_policy_refusal_replaces_the_generic_failure_notice():
     assert "} else if (" in render
 
 
-def test_completed_run_exposes_a_collapsed_thought_summary():
+def test_run_activity_renders_only_useful_safe_events():
     source = chat_controller_source()
     styles = (WEB_ROOT / "assets" / "styles.css").read_text()
+    describe = function_source(source, "  describeActivityEvent(event)", "  renderSearchCard(")
     render_thought = function_source(source, "  renderThoughtCard(runId = chatState.currentRunId)", "  renderConversation()")
 
     assert 'card.className = "chat-thought"' in render_thought
-    assert "Thought for" in render_thought
+    assert 'kind: "thinking"' in describe
+    assert "duration_ms" not in describe
     assert 'eventType(event) === "model.operation.recorded"' in render_thought
-    assert 'steps.push({ text: "Prepared the answer." })' in render_thought
+    assert 'steps.push({ text: "Prepared the answer." })' not in render_thought
     assert "const keyedSteps = new Map()" in render_thought
     assert "steps[keyedSteps.get(step.key)] = step" in render_thought
+    assert "detail.hidden = false" in render_thought
+    assert 'step.kind === "thinking"' in render_thought
     assert 'type.startsWith("tool_call.")' in source
     assert 'key: `tool:${toolActivityKey(event) || eventSequence(event)}`' in source
-    assert 'toggle.dataset.thoughtToggle = ""' in render_thought
     assert "runActivityEvents()" in source
-    assert 'control.matches("[data-thought-toggle]")' in source
-    assert 'const expanded = control.getAttribute("aria-expanded") !== "true"' in source
-    assert "chatState.disclosureOpen.set(control.dataset.disclosureKey, expanded)" in source
-    assert ".chat-thought-toggle" in styles
+    assert 'control.matches("[data-thought-toggle]")' not in source
     assert ".chat-thought-detail" in styles
+    assert ".chat-thought-step.is-thinking" in styles
 
 
 def test_activity_timeline_pairs_safe_lifecycle_events_in_sequence():
@@ -709,10 +710,12 @@ def test_activity_timeline_pairs_safe_lifecycle_events_in_sequence():
 
     for event_type in ["model.operation.started", "model.operation.completed", "model.operation.failed"]:
         assert event_type in describe
+    assert '["decide", "respond_or_act", "respond"].includes(operation)' in describe
+    assert 'status === "started"' in describe
     assert 'operation === "verify"' in describe
     assert '"verification:current"' in describe
     assert '`model:${p.operation_id || eventSequence(event)}`' in describe
-    assert 'transient: !failed' in describe
+    assert 'kind: "thinking", transient: true' in describe
     assert '["agent.conversation.loaded", "agent.loop.started", "agent.cycle.started"]' in describe
     assert 'type === "run.attachments.materialized"' in describe
     assert 'Prepared uploaded file · ${filename}' in describe
@@ -738,10 +741,10 @@ def test_completed_response_stops_presenting_backend_cleanup_as_thinking():
     details = function_source(source, "  renderDetails()", "  renderAll()")
 
     assert 'this.network("Response ready", "success")' in stream
-    assert 'eventType(event) === "assistant.message.completed"' in thought
+    assert 'eventType(event) === "assistant.message.completed"' not in thought
     assert "&& !responseReady" in thought
     assert "chatState.running && !responseReady && !currentApprovalCard" in conversation
-    assert "!chatState.running || assistantResponseReady()" in composer
+    assert "chatState.running && !assistantResponseReady()" in composer
     assert '? "Response ready"' in details
     assert 'classList.toggle("running", chatState.running && !responseReady)' in details
 
@@ -759,12 +762,16 @@ def test_web_search_results_render_as_a_structured_source_block():
     assert 'cancelled ? "Search cancelled"' in search
     assert 'if (running || waiting || cancelled || failed)' in search
     assert 'details.setAttribute("aria-busy", "true")' in search
+    assert 'body.className = "chat-search-results"' in search
+    assert 'query.className = "chat-search-query"' in search
+    assert 'sourceIcon.className = "chat-search-source-icon"' in search
     assert 'tool === "web.fetch"' in source
     assert 'p.summary || fallback' in source
     assert 'link.rel = "noopener noreferrer"' in search
     assert 'note.textContent = "Source details were not retained for this run."' in search
     assert "this.renderSearchCard(runId, step.actionKey)" in thought
     assert ".chat-search-card" in asset_source("styles.css")
+    assert ".chat-search-results" in asset_source("styles.css")
 
 
 def test_sandbox_command_renders_as_a_structured_code_block():
@@ -776,7 +783,10 @@ def test_sandbox_command_renders_as_a_structured_code_block():
     assert 'value.tool_name === "sandbox.command"' in code
     assert "const commandCopy = commandActivity(commandPayload)" in code
     assert "commandSubject(command, commandPayload.command_kind)" in code
-    assert '`${activity} · ${subject}`' in code
+    assert 'kind !== "run_command"' in source
+    assert "title.textContent = activity" in code
+    assert 'detail.className = "chat-tool-summary-detail"' in code
+    assert "detail.textContent = subject" in code
     assert 'read_file: { started: "Reading file", completed: "Read file"' in source
     assert 'list_files: { started: "Listing files", completed: "Listed files"' in source
     assert 'search_files: { started: "Searching files", completed: "Found files"' in source
@@ -785,7 +795,7 @@ def test_sandbox_command_renders_as_a_structured_code_block():
     assert 'eventType(item) === "agent.observation.recorded"' in code
     assert 'item === decision' in code
     assert 'details.setAttribute("aria-busy", "true")' in code
-    assert '? "Failed"' in code
+    assert "failed || waiting" in code
     assert "for (const [index, decision] of decisions.entries())" in code
     assert "/api/storage/objects/${encodeURIComponent(storageObjectId)}/content" in output_loader
     assert "stdout: safeCommandStream(output.stdout)" in output_loader
@@ -904,8 +914,8 @@ def test_agent_brain_can_create_and_enable_an_mcp_server():
 
     assert 'data-mcp-create>Add MCP server' in source
     assert 'type: "mcp_server"' in source
-    assert 'auth_mode: secretRefId ? "api_key" : "none"' in source
-    assert 'required_actions: ["mcp.call"]' in source
+    assert 'auth_mode: token ? "mcp" : "none"' in source
+    assert '/mcp-credential`' in source
     assert 'metadata: { mcp: { url:' in source
     assert 'this.api.post(`/api/connectors/${encodeURIComponent(created.id)}/enable`' in source
     assert 'this.toast("MCP server connected", "success")' in source
@@ -1036,18 +1046,12 @@ def test_agent_result_deep_links_to_the_created_draft_and_shows_mounted_files():
 def test_live_run_shows_compact_activity_without_rebuilding_the_conversation():
     source = chat_controller_source()
     render_thought = function_source(source, "  renderThoughtCard(runId = chatState.currentRunId)", "  renderConversation()")
-    click = function_source(source, "  onClick(event)", "  onInput(event)")
 
-    assert "live ? latestStep?.text || steps.at(-1).text" in render_thought
+    assert "if (!responseReady && latestStep?.transient)" in render_thought
     assert 'card.classList.toggle("is-live", live)' in render_thought
-    assert "chatState.disclosureOpen.has(disclosureKey)" in render_thought
-    assert "toggle.dataset.disclosureKey = disclosureKey" in render_thought
-    assert "toggle.disabled = live" not in render_thought
-    assert "detail.hidden = !expanded" in render_thought
-    thought_handler = click[click.index('control.matches("[data-thought-toggle]")'):click.index('control.matches("#send-button")')]
-    assert 'card?.classList.toggle("is-open", expanded)' in thought_handler
-    assert "chatState.disclosureOpen.set(control.dataset.disclosureKey, expanded)" in thought_handler
-    assert "this.renderConversation()" not in thought_handler
+    assert "detail.hidden = false" in render_thought
+    assert 'row.classList.add("is-thinking")' in render_thought
+    assert "disclosureKey" not in render_thought
 
 
 def test_streaming_batches_dom_work_and_preserves_terminal_statuses():
@@ -1072,14 +1076,12 @@ def test_new_thread_draft_is_removed_after_thread_creation():
     assert 'localStorage.removeItem("taroai.threadDraft.new")' in send
 
 
-def test_thought_duration_excludes_user_pause_time():
+def test_thought_activity_avoids_misleading_wall_clock_duration():
     source = chat_controller_source()
     render_thought = function_source(source, "  renderThoughtCard(runId = chatState.currentRunId)", "  renderConversation()")
 
-    assert '"agent.waiting_for_user"' in render_thought
-    assert '"approval.requested"' in render_thought
-    assert '"secret_capture.requested"' in render_thought
-    assert "pausedMilliseconds += createdAt - waitingAt" in render_thought
+    assert "pausedMilliseconds" not in render_thought
+    assert "Thought for" not in render_thought
 
 
 def test_chat_and_agent_runs_keep_distinct_status_copy():
@@ -1126,8 +1128,7 @@ def test_motion_and_composer_growth_respect_user_and_content():
     assert "@media (prefers-reduced-motion: reduce)" in styles
     assert "*::before" in styles and "*::after" in styles
     assert "animation-duration: 0.01ms !important" in styles
-    assert '.workspace-shell[data-chat-state="thread"] #composer-input' in styles
-    assert "max-height: 180px" in styles
+    assert "max-height: min(150px, 35dvh)" in styles
     assert ".is-chat-entering" in styles
     assert ".chat-dialog[open]" in styles
     assert "visibility 0s linear 150ms" in styles
@@ -1292,6 +1293,8 @@ def test_agent_editor_pins_installed_skills_and_explicit_sandbox_access():
     assert "/api/knowledge-bases?workspace_id=${workspace}" in editor
     assert 'data.getAll("connector_binding")' in save
     assert 'data.getAll("knowledge_binding")' in save
+    assert ")).values()).filter" in editor
+    assert "))).values()).filter" not in editor
 
 
 def test_agent_mutations_refresh_the_shared_homepage_cards():
@@ -1299,7 +1302,6 @@ def test_agent_mutations_refresh_the_shared_homepage_cards():
 
     for start, end in [
         ("  async change(event)", "  async exportAgent"),
-        ("  async run(form)", "  async openDraft"),
         ("  async saveDraft(form, dialog, agent = {})", "  async restore"),
         ("  async restore(version)", "  async publishDraft"),
         ("  async publishDraft(version)", "  async evaluateVersion"),
@@ -1378,9 +1380,9 @@ def test_account_settings_aggregates_agent_api_keys_without_broad_key_creation()
     assert ".settings-api-key-row" in asset_source("styles.css")
     assert '"Settings": "设置"' in asset_source("i18n.js")
     index = (WEB_ROOT / "index.html").read_text()
-    assert "styles.css?v=20260723-flow131" in index
+    assert "styles.css?v=20260724-flow140" in index
     assert "i18n.js?v=20260723-flow132" in index
-    assert "main.js?v=20260723-flow132" in index
+    assert "main.js?v=20260724-flow140" in index
 
 
 def test_agent_sessions_escape_persisted_content_before_rendering():
@@ -1486,6 +1488,22 @@ def test_chat_attachment_names_survive_send_reload_and_retry():
     assert "chatState.browserProfile = refs.find" in retry
     assert ".then(async (messages)" in stream
     assert "await this.hydrateMessageAttachments(" in stream
+
+
+def test_user_message_bubble_keeps_a_directional_shape_and_flat_evidence_row():
+    source = chat_controller_source()
+    render_message = function_source(source, "  renderMessage(message)", "  runActivityEvents(")
+    styles = asset_source("styles.css")
+
+    assert 'copyButton.className = "message-user-copy"' in render_message
+    assert "copyButton.dataset.messageCopy = message.id" in render_message
+    assert "border-radius: 20px 20px 7px 20px" in styles
+    assert ".message-user:hover .message-user-copy" in styles
+    assert ".message-user-copy:focus-visible" in styles
+    assert ".message-user + .message-user" in styles
+    assert ".message-user .message-evidence-chips span" in styles
+    assert "background: transparent" in styles
+    assert "max-width: 90%" in styles
 
 
 def test_created_artifacts_are_available_inside_the_conversation():

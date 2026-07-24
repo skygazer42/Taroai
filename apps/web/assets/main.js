@@ -1,6 +1,6 @@
-import { createChatController } from "./chat-controller.js?v=20260723-flow131";
+import { createChatController } from "./chat-controller.js?v=20260724-flow140";
 import { createSkillsUI } from "./skills-ui.js?v=20260723-flow127";
-import { createAgentsUI } from "./agents-ui.js?v=20260723-flow132";
+import { createAgentsUI } from "./agents-ui.js?v=20260724-flow134";
 import { createArtifactsUI } from "./artifacts-ui.js?v=20260722-flow115";
 import { createSpeechUI } from "./speech-ui.js?v=20260723-flow127";
 import { createAgentBrainUI } from "./brain-ui.js?v=20260723-flow121";

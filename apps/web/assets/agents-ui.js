@@ -1,5 +1,5 @@
 import { chatApi } from "./chat-api.js?v=20260722-flow115";
-import { chatState, queueAgentRunHandoff } from "./chat-controller.js?v=20260723-flow131";
+import { chatState, queueAgentRunHandoff } from "./chat-controller.js?v=20260724-flow140";
 
 function list(value, ...keys) {
   if (Array.isArray(value)) return value;
@@ -677,13 +677,13 @@ export class AgentsUI {
     this.draftConnectors = Array.from(new Map([
       ...(connectors.status === "fulfilled" ? list(connectors.value, "connectors").filter((item) => item.status === "enabled") : []),
       ...pinnedConnectors,
-    ].map((item) => [item.id || item.connector_id, item]))).values()).filter((item) => item.id || item.connector_id);
+    ].map((item) => [item.id || item.connector_id, item])).values()).filter((item) => item.id || item.connector_id);
     const pinnedKnowledge = list(agent.knowledge_bindings || agent.knowledge, "items");
     const pinnedKnowledgeIds = new Set(pinnedKnowledge.map((item) => item.id || item.knowledge_id));
     this.draftKnowledgeBases = Array.from(new Map([
       ...(knowledgeBases.status === "fulfilled" ? list(knowledgeBases.value, "knowledge_bases", "bases") : []),
       ...pinnedKnowledge,
-    ].map((item) => [item.id || item.knowledge_id, item]))).values()).filter((item) => item.id || item.knowledge_id);
+    ].map((item) => [item.id || item.knowledge_id, item])).values()).filter((item) => item.id || item.knowledge_id);
     const sandboxReadiness = readiness.status === "fulfilled" ? readiness.value?.checks?.sandbox || {} : {};
     const networkModes = sandboxNetworkModes(sandboxReadiness);
     const selectedNetworkMode = networkModes.includes(agent.runtime_snapshot?.network_mode)
