@@ -1,4 +1,5 @@
 import { chatApi } from "./chat-api.js?v=20260722-flow115";
+import { icon, iconElement } from "./icons.js?v=20260724-icons2";
 
 function items(payload) {
   if (Array.isArray(payload)) return payload;
@@ -13,11 +14,18 @@ function formatBytes(value) {
   return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
 }
 
-function fileKind(file) {
+export function fileKind(file) {
   const type = String(file.content_type || "").toLowerCase();
   if (type.startsWith("image/")) return "image";
   if (type === "application/pdf") return "pdf";
-  if (type.includes("json") || type.includes("text") || type.includes("xml") || type.includes("javascript")) return "text";
+  if (
+    type.startsWith("text/") ||
+    type === "application/json" ||
+    type.endsWith("+json") ||
+    type === "application/xml" ||
+    type.endsWith("+xml") ||
+    type.includes("javascript")
+  ) return "text";
   return "binary";
 }
 
@@ -63,9 +71,9 @@ export class FilesUI {
   renderShell() {
     this.root.innerHTML = `
       <section class="capability-page files-page">
-        <header class="capability-page-header"><div><p>Workspace drive</p><h1>Files</h1><span>Persistent inputs and outputs that can be reopened, pinned to Agents, and materialized into fresh runs.</span></div><div class="capability-header-actions"><button type="button" data-files-refresh>Refresh</button><button class="primary" type="button" data-files-upload>Upload files</button><input type="file" multiple hidden data-files-upload-input /></div></header>
-        <div class="capability-toolbar files-toolbar"><label><span aria-hidden="true">⌕</span><input data-files-route-search type="search" placeholder="Search workspace files" /></label><label class="files-run-toggle"><input type="checkbox" data-files-include-runs /> Include run outputs</label><div data-files-route-count>0 files</div></div>
-        <div class="files-product-layout"><section class="workspace-file-list" data-workspace-file-list><div class="route-loading">Loading workspace files…</div></section><aside class="workspace-file-inspector" data-workspace-file-inspector><div class="route-empty"><span>F</span><strong>Select a file</strong><p>Preview content, inspect provenance, attach it to Chat, or move it into a folder.</p></div></aside></div>
+        <header class="capability-page-header"><div><p>Workspace drive</p><h1>Files</h1><span>Persistent inputs and outputs that can be reopened, pinned to Agents, and materialized into fresh runs.</span></div><div class="capability-header-actions"><button type="button" data-files-refresh>${icon("refresh-cw")}<span>Refresh</span></button><button class="primary" type="button" data-files-upload>${icon("upload")}<span>Upload files</span></button><input type="file" multiple hidden data-files-upload-input /></div></header>
+        <div class="capability-toolbar files-toolbar"><label><span aria-hidden="true">${icon("search")}</span><input data-files-route-search type="search" placeholder="Search workspace files" /></label><label class="files-run-toggle"><input type="checkbox" data-files-include-runs /> Include run outputs</label><div data-files-route-count>0 files</div></div>
+        <div class="files-product-layout"><section class="workspace-file-list" data-workspace-file-list><div class="route-loading">Loading workspace files…</div></section><aside class="workspace-file-inspector" data-workspace-file-inspector><div class="route-empty"><span>${icon("file")}</span><strong>Select a file</strong><p>Preview content, inspect provenance, attach it to Chat, or move it into a folder.</p></div></aside></div>
         <div class="route-toast" data-files-toast hidden></div>
       </section>`;
   }
@@ -98,7 +106,7 @@ export class FilesUI {
       const glyph = document.createElement("span");
       const heading = document.createElement("strong");
       const message = document.createElement("p");
-      glyph.textContent = "F";
+      glyph.append(iconElement("file"));
       heading.textContent = error ? "Files unavailable" : "No workspace files yet";
       message.textContent = error || "Upload a durable input here, or attach a file in Chat. It will remain available after the run ends.";
       empty.append(glyph, heading, message);
@@ -107,7 +115,7 @@ export class FilesUI {
     }
     const heading = document.createElement("div");
     heading.className = "workspace-file-row workspace-file-heading";
-    heading.innerHTML = "<span>Name</span><span>Source</span><span>Size</span><span>Updated</span>";
+    heading.innerHTML = "<span>File name</span><span>Source</span><span>Size</span><span>Updated</span>";
     target.append(heading);
     for (const file of this.files) {
       const row = document.createElement("button");
@@ -118,7 +126,7 @@ export class FilesUI {
       const name = document.createElement("span");
       name.className = "workspace-file-name";
       const glyph = document.createElement("i");
-      glyph.textContent = fileKind(file).slice(0, 1).toUpperCase();
+      glyph.append(iconElement({ image: "image", text: "file-code", pdf: "file" }[fileKind(file)] || "file"));
       const copy = document.createElement("span");
       const strong = document.createElement("strong");
       strong.textContent = file.logical_path || file.filename || file.id;
@@ -143,7 +151,7 @@ export class FilesUI {
     this.releasePreview();
     target.replaceChildren();
     if (!this.selected) {
-      target.innerHTML = '<div class="route-empty"><span>F</span><strong>Select a file</strong><p>Preview content and reuse it in a new Agent run.</p></div>';
+      target.innerHTML = `<div class="route-empty"><span>${icon("file")}</span><strong>Select a file</strong><p>Preview content and reuse it in a new Agent run.</p></div>`;
       return;
     }
     const file = this.selected;
@@ -156,7 +164,7 @@ export class FilesUI {
     heading.textContent = file.logical_path || file.filename;
     title.append(eyebrow, heading);
     const actions = document.createElement("div");
-    actions.innerHTML = '<button type="button" data-file-use>Use in Chat</button><button type="button" data-file-download>Download</button>';
+    actions.innerHTML = `<button type="button" data-file-use>${icon("paperclip")}<span>Use in Chat</span></button><button type="button" data-file-download>${icon("download")}<span>Download</span></button>`;
     header.append(title, actions);
     const facts = document.createElement("dl");
     facts.className = "workspace-file-facts";
@@ -180,7 +188,7 @@ export class FilesUI {
     preview.innerHTML = '<div class="route-loading">Loading preview…</div>';
     const management = document.createElement("footer");
     management.className = "workspace-file-management";
-    management.innerHTML = '<button type="button" data-file-rename>Rename or move</button><button class="danger" type="button" data-file-delete>Delete</button>';
+    management.innerHTML = `<button type="button" data-file-rename>${icon("folder")}<span>Rename or move</span></button><button class="danger" type="button" data-file-delete>${icon("trash-2")}<span>Delete</span></button>`;
     target.append(header, facts, preview, management);
     await this.loadPreview(preview, file);
   }
@@ -212,9 +220,9 @@ export class FilesUI {
         }
         return;
       }
-      target.innerHTML = '<div class="route-empty compact"><span>↓</span><strong>Preview unavailable</strong><p>Download this binary file or attach it directly to Chat.</p></div>';
+      target.innerHTML = `<div class="route-empty compact"><span>${icon("download")}</span><strong>Preview unavailable</strong><p>Download this binary file or attach it directly to Chat.</p></div>`;
     } catch (error) {
-      target.innerHTML = `<div class="route-empty compact"><span>!</span><strong>Preview unavailable</strong><p></p></div>`;
+      target.innerHTML = `<div class="route-empty compact"><span>${icon("triangle-alert")}</span><strong>Preview unavailable</strong><p></p></div>`;
       target.querySelector("p").textContent = error.message;
     }
   }

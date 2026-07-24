@@ -1,4 +1,5 @@
 import { chatApi } from "./chat-api.js?v=20260722-flow115";
+import { icon } from "./icons.js?v=20260724-icons2";
 
 function asArray(value, ...keys) {
   if (Array.isArray(value)) return value;
@@ -60,7 +61,7 @@ export class AgentBrainUI {
       <section class="capability-page agent-brain-page">
         <header class="capability-page-header">
           <div><p>Workspace capabilities</p><h1>Agent Brain</h1><span>Control the skills and connected services available to every agent turn.</span></div>
-          <div class="capability-header-actions"><button type="button" data-learn-mcp-create>Microsoft Learn</button><button type="button" data-github-mcp-create>GitHub</button><button type="button" class="primary" data-mcp-create>Add MCP server</button><button type="button" data-brain-refresh>Refresh</button></div>
+          <div class="capability-header-actions"><button type="button" data-learn-mcp-create>${icon("external-link")}<span>Microsoft Learn</span></button><button type="button" data-github-mcp-create>${icon("folder")}<span>GitHub</span></button><button type="button" class="primary" data-mcp-create>${icon("plus")}<span>Add MCP server</span></button><button type="button" data-brain-refresh aria-label="Refresh">${icon("refresh-cw")}<span>Refresh</span></button></div>
         </header>
         <nav class="skill-detail-tabs" aria-label="Agent Brain sections">
           <button class="is-active" data-brain-tab="connectors">Connectors</button>
@@ -73,7 +74,7 @@ export class AgentBrainUI {
         </nav>
         <section data-brain-panel="connectors" class="capability-split brain-connectors">
           <aside class="capability-list" data-connector-list><div class="route-loading">Loading connectors…</div></aside>
-          <article class="capability-detail" data-connector-detail><div class="route-empty"><span>C</span><strong>Select a connector</strong><p>Inspect authorization, capabilities, and workspace availability.</p></div></article>
+          <article class="capability-detail" data-connector-detail><div class="route-empty"><span>${icon("plug")}</span><strong>Select a connector</strong><p>Inspect authorization, capabilities, and workspace availability.</p></div></article>
         </section>
         <section data-brain-panel="skills" hidden></section>
         <section data-brain-panel="memory" hidden></section>
@@ -130,8 +131,8 @@ export class AgentBrainUI {
     if (!list || !detail) return;
     list.replaceChildren();
     if (!this.connectors.length) {
-      list.innerHTML = `<div class="route-empty compact"><span>C</span><strong>No connectors yet</strong><p>Add an MCP server to make its tools available to agents.</p></div>`;
-      detail.innerHTML = `<div class="route-empty"><span>+</span><strong>Connect an MCP server</strong><p>Tool permissions are discovered before the connector is enabled.</p><button type="button" class="primary" data-mcp-create>Add MCP server</button></div>`;
+      list.innerHTML = `<div class="route-empty compact"><span>${icon("plug")}</span><strong>No connectors yet</strong><p>Add an MCP server to make its tools available to agents.</p></div>`;
+      detail.innerHTML = `<div class="route-empty"><span>${icon("plus")}</span><strong>Connect an MCP server</strong><p>Tool permissions are discovered before the connector is enabled.</p><button type="button" class="primary" data-mcp-create>Add MCP server</button></div>`;
       return;
     }
     for (const connector of this.connectors) {
@@ -140,7 +141,7 @@ export class AgentBrainUI {
       button.className = "capability-list-item";
       button.classList.toggle("is-active", connector.id === this.selectedConnectorId);
       button.dataset.connectorId = connector.id;
-      button.innerHTML = `<span class="capability-glyph">C</span><span><strong></strong><small></small><em></em></span><i data-state="${connector.status === "enabled" ? "enabled" : "disabled"}"></i>`;
+      button.innerHTML = `<span class="capability-glyph">${icon("plug")}</span><span><strong></strong><small></small><em></em></span><i data-state="${connector.status === "enabled" ? "enabled" : "disabled"}"></i>`;
       button.querySelector("strong").textContent = connector.display_name;
       button.querySelector("small").textContent = connector.type.replaceAll("_", " ");
       button.querySelector("em").textContent = `${connector.auth_mode} · ${connector.status}`;
@@ -154,7 +155,7 @@ export class AgentBrainUI {
     const needsCredential = connector.type === "mcp_server" && (connector.status === "needs_reauth" || (connector.status === "draft" && !connector.credential_ref));
     detail.innerHTML = `
       <header class="capability-detail-header">
-        <div><span class="capability-glyph large">C</span><div><small>${connector.type.replaceAll("_", " ")}</small><h2></h2><p>${connector.id}</p></div></div>
+        <div><span class="capability-glyph large">${icon("plug")}</span><div><small>${connector.type.replaceAll("_", " ")}</small><h2></h2><p>${connector.id}</p></div></div>
         <div>${needsCredential ? `<button class="primary" data-connector-credential>Add credential</button>` : ""}${oauth && !enabled ? `<button class="primary" data-connector-connect>${connector.status === "needs_reauth" ? "Reconnect" : "Connect"}</button>` : ""}<button data-connector-toggle>${enabled ? "Disable" : oauth ? "Enable after authorization" : "Enable"}</button></div>
       </header>
       <div class="skill-evidence-strip"><div><small>Status</small><strong>${connector.status}</strong></div><div><small>Authorization</small><strong>${connector.auth_mode}</strong></div><div><small>Capabilities</small><strong>${capabilities.length}</strong></div><div><small>Sensitivity</small><strong>${connector.sensitivity_level}</strong></div></div>
@@ -179,9 +180,9 @@ export class AgentBrainUI {
     const browser = this.root.querySelector("[data-brain-panel='browser']");
     const engines = this.root.querySelector("[data-brain-panel='engines']");
     const repositories = this.root.querySelector("[data-brain-panel='repositories']");
-    if (skills) skills.innerHTML = `<div class="brain-summary-card"><span>S</span><div><h2>${this.skills.length} workspace skills</h2><p>Inspect SKILL.md, package files, evaluations, and pinned versions.</p><button data-open-skills>Manage skills</button></div></div>`;
+    if (skills) skills.innerHTML = `<div class="brain-summary-card"><span>${icon("blocks")}</span><div><h2>${this.skills.length} workspace skills</h2><p>Inspect SKILL.md, package files, evaluations, and pinned versions.</p><button data-open-skills>Manage skills</button></div></div>`;
     if (memory) this.renderMemory(memory);
-    if (secrets) secrets.innerHTML = `<div class="brain-summary-card"><span>K</span><div><h2>Secrets</h2><p>Connector credentials remain in the Secret Vault and are issued to tools as short-lived leases.</p></div></div>`;
+    if (secrets) secrets.innerHTML = `<div class="brain-summary-card"><span>${icon("lock")}</span><div><h2>Secrets</h2><p>Connector credentials remain in the Secret Vault and are issued to tools as short-lived leases.</p></div></div>`;
     if (browser) this.renderBrowser(browser);
     if (engines) this.renderEngines(engines);
     if (repositories) this.renderRepositories(repositories);
@@ -191,7 +192,7 @@ export class AgentBrainUI {
     const dialog = document.createElement("dialog");
     dialog.className = "chat-dialog";
     dialog.innerHTML = `<form class="chat-dialog-card" autocomplete="off">
-      <header><div><small>Model Context Protocol</small><h2>${existingConnector ? "Add MCP credential" : "Add MCP server"}</h2></div><button type="button" data-close aria-label="Close">×</button></header>
+      <header><div><small>Model Context Protocol</small><h2>${existingConnector ? "Add MCP credential" : "Add MCP server"}</h2></div><button type="button" data-close aria-label="Close">${icon("x")}</button></header>
       <p>Taroai connects over Streamable HTTP and discovers the server's tools before enabling it.</p>
       <label><span>Name</span><input name="display_name" maxlength="160" autocomplete="off" placeholder="Company tools" required /></label>
       <label><span>Server URL</span><input name="url" type="url" inputmode="url" autocomplete="url" placeholder="https://mcp.example.com/mcp" required /></label>
@@ -256,7 +257,7 @@ export class AgentBrainUI {
       </section>`;
     const list = root.querySelector("[data-memory-list]");
     if (!this.memories.length) {
-      list.innerHTML = `<div class="route-empty compact"><span>M</span><strong>No saved memories</strong><p>Ask Chat to remember a stable preference when you want it carried into future conversations.</p><button data-memory-chat>Save a preference</button></div>`;
+      list.innerHTML = `<div class="route-empty compact"><span>${icon("brain-circuit")}</span><strong>No saved memories</strong><p>Ask Chat to remember a stable preference when you want it carried into future conversations.</p><button data-memory-chat>Save a preference</button></div>`;
       return;
     }
     for (const memory of [...this.memories].reverse()) {
@@ -350,15 +351,15 @@ export class AgentBrainUI {
     const selected = this.repositories.find((item) => item.id === this.selectedRepositoryId) || null;
     root.innerHTML = `<section class="repository-workspace"><aside><header><div><small>Source control</small><h2>Repositories</h2></div><button class="primary" data-repository-create>Connect</button></header><div data-repository-list></div></aside><article data-repository-detail></article></section>`;
     const list = root.querySelector("[data-repository-list]");
-    if (!this.repositories.length) list.innerHTML = `<div class="route-empty compact"><span>R</span><strong>No repositories</strong><p>Connect a governed Git repository for coding Agents.</p></div>`;
+    if (!this.repositories.length) list.innerHTML = `<div class="route-empty compact"><span>${icon("code-xml")}</span><strong>No repositories</strong><p>Connect a governed Git repository for coding Agents.</p></div>`;
     for (const repository of this.repositories) {
       const button = document.createElement("button"); button.type = "button"; button.className = "repository-row"; button.classList.toggle("is-active", repository.id === this.selectedRepositoryId); button.dataset.repositoryId = repository.id;
-      button.innerHTML = `<span>R</span><div><strong></strong><small></small></div><i data-state="${repository.status}"></i>`; button.querySelector("strong").textContent = repository.name; button.querySelector("small").textContent = `${repository.provider} · ${repository.default_branch}`; list.append(button);
+      button.innerHTML = `<span>${icon("folder")}</span><div><strong></strong><small></small></div><i data-state="${repository.status}"></i>`; button.querySelector("strong").textContent = repository.name; button.querySelector("small").textContent = `${repository.provider} · ${repository.default_branch}`; list.append(button);
     }
     const detail = root.querySelector("[data-repository-detail]");
-    if (!selected) { detail.innerHTML = `<div class="route-empty"><span>R</span><strong>Connect a repository</strong><p>Credentials stay in the selected Connector; Coding Workspaces receive a run-scoped checkout.</p><button data-repository-create>Connect repository</button></div>`; return; }
+    if (!selected) { detail.innerHTML = `<div class="route-empty"><span>${icon("code-xml")}</span><strong>Connect a repository</strong><p>Credentials stay in the selected Connector; Coding Workspaces receive a run-scoped checkout.</p><button data-repository-create>Connect repository</button></div>`; return; }
     const sessions = this.codingWorkspaces.filter((item) => item.repository_id === selected.id);
-    detail.innerHTML = `<header class="repository-heading"><div><span>R</span><div><small>${selected.provider}</small><h2></h2><p></p></div></div><button class="danger" data-repository-disable ${selected.status !== "active" ? "disabled" : ""}>Disable</button></header><div class="engine-facts"><div><small>Default branch</small><strong>${selected.default_branch}</strong></div><div><small>Authentication</small><strong>${selected.connector_id ? "Connector" : "Public HTTPS"}</strong></div><div><small>Coding sessions</small><strong>${sessions.length}</strong></div></div><section class="repository-session-list"><header><h3>Recent worktrees</h3></header><div data-repository-sessions></div></section>`;
+    detail.innerHTML = `<header class="repository-heading"><div><span>${icon("folder")}</span><div><small>${selected.provider}</small><h2></h2><p></p></div></div><button class="danger" data-repository-disable ${selected.status !== "active" ? "disabled" : ""}>Disable</button></header><div class="engine-facts"><div><small>Default branch</small><strong>${selected.default_branch}</strong></div><div><small>Authentication</small><strong>${selected.connector_id ? "Connector" : "Public HTTPS"}</strong></div><div><small>Coding sessions</small><strong>${sessions.length}</strong></div></div><section class="repository-session-list"><header><h3>Recent worktrees</h3></header><div data-repository-sessions></div></section>`;
     detail.querySelector("h2").textContent = selected.name; detail.querySelector(".repository-heading p").textContent = selected.repository_url;
     const sessionList = detail.querySelector("[data-repository-sessions]");
     for (const item of sessions) { const row = document.createElement("article"); row.className = "coding-evidence-row"; const title = document.createElement("strong"); title.textContent = item.branch; const meta = document.createElement("small"); meta.textContent = `${item.status} · ${item.run_id}`; const body = document.createElement("p"); body.textContent = item.worktree_path; row.append(title, meta, body); sessionList.append(row); }
@@ -367,7 +368,7 @@ export class AgentBrainUI {
 
   openRepositoryEditor() {
     const dialog = document.createElement("dialog"); dialog.className = "chat-dialog repository-dialog";
-    dialog.innerHTML = `<form class="chat-dialog-card"><header><div><small>Governed source</small><h2>Connect repository</h2></div><button type="button" data-close>×</button></header><label><span>Name</span><input name="name" required /></label><label><span>Provider</span><select name="provider"><option value="github">GitHub</option><option value="gitlab">GitLab</option><option value="bitbucket">Bitbucket</option><option value="generic">Generic Git</option></select></label><label><span>HTTPS repository URL</span><input name="repository_url" type="url" required placeholder="https://github.com/org/repository" /></label><label><span>Default branch</span><input name="default_branch" value="main" required /></label><label><span>Connector ID</span><input name="connector_id" placeholder="Optional GitHub/GitLab Connector" /></label><footer><button type="button" data-close>Cancel</button><button class="primary" type="submit">Connect</button></footer></form>`;
+    dialog.innerHTML = `<form class="chat-dialog-card"><header><div><small>Governed source</small><h2>Connect repository</h2></div><button type="button" data-close aria-label="Close">${icon("x")}</button></header><label><span>Name</span><input name="name" required /></label><label><span>Provider</span><select name="provider"><option value="github">GitHub</option><option value="gitlab">GitLab</option><option value="bitbucket">Bitbucket</option><option value="generic">Generic Git</option></select></label><label><span>HTTPS repository URL</span><input name="repository_url" type="url" required placeholder="https://github.com/org/repository" /></label><label><span>Default branch</span><input name="default_branch" value="main" required /></label><label><span>Connector ID</span><input name="connector_id" placeholder="Optional GitHub/GitLab Connector" /></label><footer><button type="button" data-close>Cancel</button><button class="primary" type="submit">Connect</button></footer></form>`;
     document.body.append(dialog); dialog.querySelectorAll("[data-close]").forEach((button) => button.addEventListener("click", () => dialog.close()));
     dialog.querySelector("form").addEventListener("submit", async (event) => { event.preventDefault(); const data = new FormData(event.currentTarget); const submit = event.currentTarget.querySelector("[type='submit']"); submit.disabled = true; try { const created = await this.api.post("/api/repositories", { workspace_id: this.api.settings().workspaceId, name: data.get("name"), provider: data.get("provider"), repository_url: data.get("repository_url"), default_branch: data.get("default_branch"), connector_id: String(data.get("connector_id") || "").trim() || null }, { scope: "repository-connect" }); this.selectedRepositoryId = created.id; dialog.close(); this.toast("Repository connected", "success"); await this.load(); await window.taroaiChat?.loadCapabilities?.(); } catch (error) { submit.disabled = false; this.toast(error.message, "error"); } });
     dialog.addEventListener("close", () => dialog.remove()); dialog.showModal();
@@ -387,22 +388,22 @@ export class AgentBrainUI {
     const selected = this.selectedEngineConnection();
     root.innerHTML = `<section class="engine-workspace"><aside><header><div><small>Inner loops</small><h2>Agent Engines</h2></div><button class="primary" data-engine-create>Connect</button></header><div data-engine-list></div></aside><article><div data-engine-detail></div><section class="engine-session-list"><header><h3>Engine sessions</h3><span>${this.engineSessions.filter((item) => ["starting", "running", "waiting_approval"].includes(item.status)).length} active</span></header><div data-engine-sessions></div></section></article></section>`;
     const list = root.querySelector("[data-engine-list]");
-    if (!this.engineConnections.length) list.innerHTML = `<div class="route-empty compact"><span>E</span><strong>No Engine connections</strong><p>Connect an OpenCode, Codex, or Claude runner. Native execution remains available.</p></div>`;
+    if (!this.engineConnections.length) list.innerHTML = `<div class="route-empty compact"><span>${icon("terminal")}</span><strong>No Engine connections</strong><p>Connect an OpenCode, Codex, or Claude runner. Native execution remains available.</p></div>`;
     for (const connection of this.engineConnections) {
       const button = document.createElement("button");
       button.type = "button";
       button.className = "engine-connection-row";
       button.classList.toggle("is-active", connection.id === this.selectedEngineConnectionId);
       button.dataset.engineConnectionId = connection.id;
-      button.innerHTML = `<span>${connection.engine_type.slice(0, 1).toUpperCase()}</span><div><strong></strong><small></small></div><i data-state="${connection.status}"></i>`;
+      button.innerHTML = `<span>${icon("square-terminal")}</span><div><strong></strong><small></small></div><i data-state="${connection.status}"></i>`;
       button.querySelector("strong").textContent = connection.name;
       button.querySelector("small").textContent = `${connection.engine_type} · ${connection.capabilities?.length || 0} capabilities`;
       list.append(button);
     }
     const detail = root.querySelector("[data-engine-detail]");
-    if (!selected) detail.innerHTML = `<div class="route-empty"><span>E</span><strong>Connect an Agent Engine</strong><p>Taroai governs the session while the selected runner owns its coding loop.</p><button data-engine-create>Connect Engine</button></div>`;
+    if (!selected) detail.innerHTML = `<div class="route-empty"><span>${icon("terminal")}</span><strong>Connect an Agent Engine</strong><p>Taroai governs the session while the selected runner owns its coding loop.</p><button data-engine-create>Connect Engine</button></div>`;
     else {
-      detail.innerHTML = `<header class="engine-heading"><div><span>${selected.engine_type.slice(0, 1).toUpperCase()}</span><div><small>${selected.engine_type} runner</small><h2></h2><p></p></div></div><button class="danger" data-engine-disable ${selected.status !== "active" ? "disabled" : ""}>Disable</button></header><div class="engine-facts"><div><small>Status</small><strong>${selected.status}</strong></div><div><small>Authentication</small><strong>${selected.secret_ref_present ? "Secret Vault" : "None"}</strong></div><div><small>Capabilities</small><strong>${selected.capabilities?.length || 0}</strong></div></div><form class="engine-session-launch"><label><span>Task</span><textarea rows="3" data-engine-task placeholder="Implement the requested change and report diff, tests, and artifacts."></textarea></label><label><span>Working directory</span><input data-engine-cwd value="/workspace" /></label><button class="primary" type="button" data-engine-session-start ${selected.status !== "active" ? "disabled" : ""}>Start session</button></form>`;
+      detail.innerHTML = `<header class="engine-heading"><div><span>${icon("square-terminal")}</span><div><small>${selected.engine_type} runner</small><h2></h2><p></p></div></div><button class="danger" data-engine-disable ${selected.status !== "active" ? "disabled" : ""}>Disable</button></header><div class="engine-facts"><div><small>Status</small><strong>${selected.status}</strong></div><div><small>Authentication</small><strong>${selected.secret_ref_present ? "Secret Vault" : "None"}</strong></div><div><small>Capabilities</small><strong>${selected.capabilities?.length || 0}</strong></div></div><form class="engine-session-launch"><label><span>Task</span><textarea rows="3" data-engine-task placeholder="Implement the requested change and report diff, tests, and artifacts."></textarea></label><label><span>Working directory</span><input data-engine-cwd value="/workspace" /></label><button class="primary" type="button" data-engine-session-start ${selected.status !== "active" ? "disabled" : ""}>Start session</button></form>`;
       detail.querySelector("h2").textContent = selected.name;
       detail.querySelector(".engine-heading p").textContent = selected.endpoint_url || "Taroai native runtime";
     }
@@ -422,7 +423,7 @@ export class AgentBrainUI {
   openEngineEditor() {
     const dialog = document.createElement("dialog");
     dialog.className = "chat-dialog engine-dialog";
-    dialog.innerHTML = `<form class="chat-dialog-card"><header><div><small>Remote inner loop</small><h2>Connect Agent Engine</h2></div><button type="button" data-close>×</button></header><label><span>Name</span><input name="name" required /></label><label><span>Engine type</span><select name="engine_type"><option value="opencode">OpenCode Server</option><option value="codex">Codex app-server Runner</option><option value="claude">Claude Agent SDK Runner</option><option value="native">Taroai Native</option></select></label><label><span>Runner endpoint</span><input name="endpoint_url" type="url" placeholder="https://runner.example.com" /></label><label><span>Secret reference ID</span><input name="secret_ref_id" placeholder="Optional Secret Vault reference" /></label><label><span>Capabilities</span><input name="capabilities" placeholder="stream_events, approvals, steering, checkpoints" /></label><footer><button type="button" data-close>Cancel</button><button class="primary" type="submit">Connect</button></footer></form>`;
+    dialog.innerHTML = `<form class="chat-dialog-card"><header><div><small>Remote inner loop</small><h2>Connect Agent Engine</h2></div><button type="button" data-close aria-label="Close">${icon("x")}</button></header><label><span>Name</span><input name="name" required /></label><label><span>Engine type</span><select name="engine_type"><option value="opencode">OpenCode Server</option><option value="codex">Codex app-server Runner</option><option value="claude">Claude Agent SDK Runner</option><option value="native">Taroai Native</option></select></label><label><span>Runner endpoint</span><input name="endpoint_url" type="url" placeholder="https://runner.example.com" /></label><label><span>Secret reference ID</span><input name="secret_ref_id" placeholder="Optional Secret Vault reference" /></label><label><span>Capabilities</span><input name="capabilities" placeholder="stream_events, approvals, steering, checkpoints" /></label><footer><button type="button" data-close>Cancel</button><button class="primary" type="submit">Connect</button></footer></form>`;
     document.body.append(dialog);
     dialog.querySelectorAll("[data-close]").forEach((button) => button.addEventListener("click", () => dialog.close()));
     dialog.querySelector("form").addEventListener("submit", async (event) => {
@@ -464,7 +465,7 @@ export class AgentBrainUI {
       const payload = await this.api.get(`/api/agent-engines/sessions/${encodeURIComponent(sessionId)}/events?refresh=true`);
       const events = asArray(payload, "events");
       const dialog = document.createElement("dialog"); dialog.className = "chat-dialog engine-events-dialog";
-      dialog.innerHTML = `<div class="chat-dialog-card"><header><div><small>Normalized Runner stream</small><h2>Engine events</h2></div><button type="button" data-close>×</button></header><div data-engine-event-list></div><footer><button type="button" data-close>Done</button></footer></div>`;
+      dialog.innerHTML = `<div class="chat-dialog-card"><header><div><small>Normalized Runner stream</small><h2>Engine events</h2></div><button type="button" data-close aria-label="Close">${icon("x")}</button></header><div data-engine-event-list></div><footer><button type="button" data-close>Done</button></footer></div>`;
       const list = dialog.querySelector("[data-engine-event-list]");
       for (const event of events) {
         const row = document.createElement("article"); row.className = "engine-event-row";
@@ -505,7 +506,7 @@ export class AgentBrainUI {
       </section>`;
     const profileList = root.querySelector("[data-browser-profile-list]");
     if (!this.browserProfiles.length) {
-      profileList.innerHTML = `<div class="route-empty compact"><span>B</span><strong>No profiles yet</strong><p>Create a governed browser identity with its own saved cookies and domain boundary.</p></div>`;
+      profileList.innerHTML = `<div class="route-empty compact"><span>${icon("globe")}</span><strong>No profiles yet</strong><p>Create a governed browser identity with its own saved cookies and domain boundary.</p></div>`;
     }
     for (const item of this.browserProfiles) {
       const button = document.createElement("button");
@@ -513,17 +514,17 @@ export class AgentBrainUI {
       button.className = "browser-profile-row";
       button.classList.toggle("is-active", item.id === this.selectedBrowserProfileId);
       button.dataset.browserProfileId = item.id;
-      button.innerHTML = `<span class="browser-profile-mark">${item.is_default ? "D" : "B"}</span><span><strong></strong><small></small></span><i data-state="${item.status}"></i>`;
+      button.innerHTML = `<span class="browser-profile-mark">${icon("globe")}</span><span><strong></strong><small></small></span><i data-state="${item.status}"></i>`;
       button.querySelector("strong").textContent = item.name;
       button.querySelector("small").textContent = `${item.allowed_domains?.length || 0} domains · revision ${item.revision || 0}`;
       profileList.append(button);
     }
     const detail = root.querySelector("[data-browser-profile-detail]");
     if (!profile) {
-      detail.innerHTML = `<div class="route-empty"><span>B</span><strong>Create a browser profile</strong><p>Profiles keep login state private while Agents receive only a scoped profile reference.</p><button data-browser-profile-create>Create profile</button></div>`;
+      detail.innerHTML = `<div class="route-empty"><span>${icon("globe")}</span><strong>Create a browser profile</strong><p>Profiles keep login state private while Agents receive only a scoped profile reference.</p><button data-browser-profile-create>Create profile</button></div>`;
     } else {
       detail.innerHTML = `
-        <header class="browser-profile-heading"><div><span class="browser-profile-mark large">B</span><div><small>${profile.is_default ? "Workspace default" : "Browser profile"}</small><h2></h2><p></p></div></div><div><button data-browser-profile-edit>Edit</button><button data-browser-profile-default ${profile.is_default || profile.status !== "active" ? "disabled" : ""}>Make default</button><button class="danger" data-browser-profile-disable ${profile.status !== "active" ? "disabled" : ""}>Disable</button></div></header>
+        <header class="browser-profile-heading"><div><span class="browser-profile-mark large">${icon("globe")}</span><div><small>${profile.is_default ? "Workspace default" : "Browser profile"}</small><h2></h2><p></p></div></div><div><button data-browser-profile-edit>Edit</button><button data-browser-profile-default ${profile.is_default || profile.status !== "active" ? "disabled" : ""}>Make default</button><button class="danger" data-browser-profile-disable ${profile.status !== "active" ? "disabled" : ""}>Disable</button></div></header>
         <div class="browser-profile-facts"><div><small>State</small><strong>${profile.status}</strong></div><div><small>Saved state</small><strong>${profile.has_saved_state ? `Revision ${profile.revision}` : "Not captured"}</strong></div><div><small>Last used</small><strong>${profile.last_used_at ? new Date(profile.last_used_at).toLocaleString() : "Never"}</strong></div></div>
         <section class="browser-domain-boundary"><header><div><small>Network boundary</small><h3>Allowed domains</h3></div></header><div data-browser-domain-list></div></section>
         <form class="browser-session-launch" data-browser-session-launch><label><span>Start URL</span><input type="url" placeholder="https://example.com" data-browser-start-url /></label><button class="primary" type="button" data-browser-session-open ${profile.status !== "active" ? "disabled" : ""}>Open session</button><button type="button" data-brain-start-browser>Use in Chat</button></form>`;
@@ -553,7 +554,7 @@ export class AgentBrainUI {
   openBrowserProfileEditor(profile = null) {
     const dialog = document.createElement("dialog");
     dialog.className = "chat-dialog browser-profile-dialog";
-    dialog.innerHTML = `<form class="chat-dialog-card"><header><div><small>Private browser state</small><h2>${profile ? "Edit browser profile" : "Create browser profile"}</h2></div><button type="button" data-close>×</button></header><label><span>Name</span><input name="name" required maxlength="120" /></label><label><span>Description</span><textarea name="description" rows="3"></textarea></label><label><span>Allowed domains</span><textarea name="allowed_domains" rows="5" placeholder="github.com\n*.example.com"></textarea><small>One hostname per line. Leave empty to use the workspace browser policy.</small></label><label class="browser-default-check"><input name="is_default" type="checkbox" /><span>Use as the workspace default profile</span></label><footer><button type="button" data-close>Cancel</button><button class="primary" type="submit">${profile ? "Save changes" : "Create profile"}</button></footer></form>`;
+    dialog.innerHTML = `<form class="chat-dialog-card"><header><div><small>Private browser state</small><h2>${profile ? "Edit browser profile" : "Create browser profile"}</h2></div><button type="button" data-close aria-label="Close">${icon("x")}</button></header><label><span>Name</span><input name="name" required maxlength="120" /></label><label><span>Description</span><textarea name="description" rows="3"></textarea></label><label><span>Allowed domains</span><textarea name="allowed_domains" rows="5" placeholder="github.com\n*.example.com"></textarea><small>One hostname per line. Leave empty to use the workspace browser policy.</small></label><label class="browser-default-check"><input name="is_default" type="checkbox" /><span>Use as the workspace default profile</span></label><footer><button type="button" data-close>Cancel</button><button class="primary" type="submit">${profile ? "Save changes" : "Create profile"}</button></footer></form>`;
     document.body.append(dialog);
     const form = dialog.querySelector("form");
     form.elements.name.value = profile?.name || "";

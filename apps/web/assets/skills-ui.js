@@ -1,5 +1,6 @@
 import { chatApi } from "./chat-api.js?v=20260722-flow115";
-import { chatState } from "./chat-controller.js?v=20260724-flow140";
+import { chatState } from "./chat-controller.js?v=20260724-design4";
+import { icon, iconElement } from "./icons.js?v=20260724-icons2";
 
 function items(value, ...keys) {
   if (Array.isArray(value)) return value;
@@ -94,13 +95,13 @@ export class SkillsUI {
           <div class="capability-header-actions"><button type="button" data-skill-import-github>Install from GitHub</button><button type="button" class="primary" data-skill-import-zip>Upload ZIP</button><input type="file" accept=".zip,application/zip" data-skill-zip hidden /></div>
         </header>
         <div class="capability-toolbar">
-          <label><span aria-hidden="true">⌕</span><input type="search" data-skill-search placeholder="Search installed and available skills" /></label>
+          <label><span aria-hidden="true">${icon("search")}</span><input type="search" data-skill-search placeholder="Search installed and available skills" /></label>
           <div role="tablist"><button class="is-active" data-skill-filter="all">All</button><button data-skill-filter="builtin">Built-in</button><button data-skill-filter="custom">Custom</button></div>
           <button type="button" data-skills-refresh>Refresh</button>
         </div>
         <div class="capability-split">
           <aside class="capability-list" data-skill-list><div class="route-loading">Loading skills…</div></aside>
-          <article class="capability-detail" data-skill-detail><div class="route-empty"><span>S</span><strong>Select a skill</strong><p>Inspect instructions, supporting files, version state, and evaluation evidence.</p></div></article>
+          <article class="capability-detail" data-skill-detail><div class="route-empty"><span>${icon("blocks")}</span><strong>Select a skill</strong><p>Inspect instructions, supporting files, version state, and evaluation evidence.</p></div></article>
         </div>
         <div class="route-toast" data-skill-toast hidden></div>
       </section>`;
@@ -168,7 +169,7 @@ export class SkillsUI {
     list.replaceChildren();
     const skills = this.filtered();
     if (!skills.length) {
-      list.innerHTML = `<div class="route-empty compact"><span>S</span><strong>No matching skills</strong><p>Install a package or change the current search.</p></div>`;
+      list.innerHTML = `<div class="route-empty compact"><span>${icon("blocks")}</span><strong>No matching skills</strong><p>Install a package or change the current search.</p></div>`;
       return;
     }
     for (const skill of skills) {
@@ -244,7 +245,7 @@ export class SkillsUI {
     const detail = this.root.querySelector("[data-skill-detail]");
     if (!detail) return;
     if (!this.selected) {
-      detail.innerHTML = `<div class="route-empty"><span>S</span><strong>Select a skill</strong><p>Inspect instructions, files, versions, and evaluation evidence.</p></div>`;
+      detail.innerHTML = `<div class="route-empty"><span>${icon("blocks")}</span><strong>Select a skill</strong><p>Inspect instructions, files, versions, and evaluation evidence.</p></div>`;
       return;
     }
     const skill = this.selected;
@@ -395,7 +396,7 @@ export class SkillsUI {
       button.type = "button";
       button.dataset.skillFile = path;
       button.classList.toggle("is-active", path === (this.activeFile?.path || this.activeFile?.name));
-      button.textContent = `${path.includes("/") ? "└ " : ""}${path}`;
+      button.append(iconElement("file"), document.createTextNode(path));
       tree.append(button);
     }
     const content = this.activeFile?.content || this.activeFile?.text || "Select a package file.";

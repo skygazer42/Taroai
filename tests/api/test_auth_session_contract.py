@@ -144,9 +144,10 @@ def test_auth_endpoint_extends_only_remembered_sessions():
 
 
 def test_auth_session_endpoint_syncs_valid_session_and_hides_invalid_state():
+    identity_service = build_identity_service()
     client = TestClient(
         create_app(
-            identity_service=build_identity_service(),
+            identity_service=identity_service,
             store=InMemoryControlPlaneStore(
                 workspace_tenants={
                     "workspace_sales": "tenant_acme",
@@ -174,6 +175,9 @@ def test_auth_session_endpoint_syncs_valid_session_and_hides_invalid_state():
     assert session["email"] == "luke@example.com"
     assert session["display_name"] == "Luke"
     assert session["workspace_id"] == "workspace_sales"
+
+    identity_service.get_user("tenant_acme", login["user_id"]).display_name = "Skygazer42"
+    assert client.get("/api/auth/session", headers=headers).json()["display_name"] == "Skygazer42"
 
     selected_session = client.get(
         "/api/auth/session",

@@ -1,4 +1,5 @@
 import { chatApi } from "./chat-api.js?v=20260722-flow115";
+import { icon } from "./icons.js?v=20260724-icons2";
 
 function contentOf(artifact) {
   return artifact.content ?? artifact.text ?? artifact.markdown ?? artifact.source ?? artifact.srcdoc ?? artifact.data ?? "";
@@ -265,7 +266,7 @@ export class ArtifactsUI {
     if (!this.artifact?.id) return;
     const dialog = document.createElement("dialog");
     dialog.className = "chat-dialog artifact-share-dialog";
-    dialog.innerHTML = `<form class="chat-dialog-card"><header><div><small>External artifact</small><h2>Create share link</h2></div><button type="button" data-close>×</button></header><p>The link opens this artifact only. Workspace conversations, files, and credentials remain private.</p><label><span>Expires after</span><select name="expires_in_hours"><option value="24">24 hours</option><option value="168" selected>7 days</option><option value="720">30 days</option></select></label><footer><button type="button" data-close>Cancel</button><button class="primary" type="submit">Create link</button></footer></form>`;
+    dialog.innerHTML = `<form class="chat-dialog-card"><header><div><small>External artifact</small><h2>Create share link</h2></div><button type="button" data-close aria-label="Close">${icon("x")}</button></header><p>The link opens this artifact only. Workspace conversations, files, and credentials remain private.</p><label><span>Expires after</span><select name="expires_in_hours"><option value="24">24 hours</option><option value="168" selected>7 days</option><option value="720">30 days</option></select></label><footer><button type="button" data-close>Cancel</button><button class="primary" type="submit">Create link</button></footer></form>`;
     document.body.append(dialog);
     const form = dialog.querySelector("form");
     dialog.querySelectorAll("[data-close]").forEach((button) => button.addEventListener("click", () => dialog.close()));
@@ -276,7 +277,7 @@ export class ArtifactsUI {
       try {
         const result = await this.api.post(`/api/artifacts/${encodeURIComponent(this.artifact.id)}/share`, { expires_in_hours: Number(new FormData(form).get("expires_in_hours")) }, { scope: "artifact-share" });
         await navigator.clipboard?.writeText(result.url);
-        form.innerHTML = `<header><div><small>Share link ready</small><h2>Link copied</h2></div><button type="button" data-close>×</button></header><label><span>Public URL</span><input data-artifact-share-url readonly /></label><p data-artifact-share-expiry></p><footer><button class="primary" type="button" data-close>Done</button></footer>`;
+        form.innerHTML = `<header><div><small>Share link ready</small><h2>Link copied</h2></div><button type="button" data-close aria-label="Close">${icon("x")}</button></header><label><span>Public URL</span><input data-artifact-share-url readonly /></label><p data-artifact-share-expiry></p><footer><button class="primary" type="button" data-close>Done</button></footer>`;
         form.querySelector("[data-artifact-share-url]").value = result.url;
         form.querySelector("[data-artifact-share-expiry]").textContent = `Expires ${new Date(result.expires_at).toLocaleString()}`;
         form.querySelectorAll("[data-close]").forEach((button) => button.addEventListener("click", () => dialog.close()));

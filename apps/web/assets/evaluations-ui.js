@@ -1,4 +1,5 @@
 import { chatApi } from "./chat-api.js?v=20260722-flow115";
+import { icon } from "./icons.js?v=20260724-icons2";
 
 function list(value, ...keys) {
   if (Array.isArray(value)) return value;
@@ -143,7 +144,7 @@ export class EvaluationsUI {
     const example = { id: "agent-quality", version: "1.0.0", target_kind: "agent", description: "Release checks for reusable Agents", cases: [{ id: "basic-request", version: "1", input: { request: "Produce a concise result." }, input_schema: { type: "object", properties: { request: { type: "string" } }, required: ["request"] }, expected: { scorer: "contains", contains: ["result"] }, critical: true }], gate: { minimum_score: 0.85, minimum_success_rate: 0.9, maximum_tool_error_rate: 0.05, maximum_human_intervention_rate: 0.1 } };
     const dialog = document.createElement("dialog");
     dialog.className = "chat-dialog agent-editor-dialog";
-    dialog.innerHTML = `<form class="chat-dialog-card evaluation-suite-editor" data-evaluation-suite-form><header><div><small>Immutable version</small><h2>New evaluation suite</h2></div><button type="button" data-close>×</button></header><label><span>Suite JSON</span><textarea name="suite" rows="22"></textarea></label><footer><button type="button" data-close>Cancel</button><button class="primary" type="submit">Register suite</button></footer></form>`;
+    dialog.innerHTML = `<form class="chat-dialog-card evaluation-suite-editor" data-evaluation-suite-form><header><div><small>Immutable version</small><h2>New evaluation suite</h2></div><button type="button" data-close aria-label="Close">${icon("x")}</button></header><label><span>Suite JSON</span><textarea name="suite" rows="22"></textarea></label><footer><button type="button" data-close>Cancel</button><button class="primary" type="submit">Register suite</button></footer></form>`;
     dialog.querySelector("textarea").value = JSON.stringify(example, null, 2);
     dialog.querySelectorAll("[data-close]").forEach((button) => button.addEventListener("click", () => dialog.close()));
     dialog.addEventListener("close", () => dialog.remove());
@@ -179,7 +180,7 @@ export class EvaluationsUI {
     try {
       const evidence = await this.api.get(`/api/evaluations/runs/${encodeURIComponent(runId)}/evidence`);
       const dialog = document.createElement("dialog"); dialog.className = "chat-dialog agent-editor-dialog";
-      dialog.innerHTML = `<div class="chat-dialog-card evaluation-evidence-dialog"><header><div><small>Redaction-safe record</small><h2>Evaluation evidence</h2></div><button type="button" data-close>×</button></header><pre></pre><footer><button type="button" data-close>Close</button></footer></div>`;
+      dialog.innerHTML = `<div class="chat-dialog-card evaluation-evidence-dialog"><header><div><small>Redaction-safe record</small><h2>Evaluation evidence</h2></div><button type="button" data-close aria-label="Close">${icon("x")}</button></header><pre></pre><footer><button type="button" data-close>Close</button></footer></div>`;
       dialog.querySelector("pre").textContent = JSON.stringify(evidence, null, 2);
       dialog.querySelectorAll("[data-close]").forEach((button) => button.addEventListener("click", () => dialog.close()));
       dialog.addEventListener("close", () => dialog.remove()); document.body.append(dialog); dialog.showModal();

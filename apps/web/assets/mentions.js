@@ -25,7 +25,15 @@ function normalizeOne(candidate, fallbackType) {
     description: candidate.description || candidate.summary || candidate.status || "",
     enabled: candidate.enabled !== false && candidate.status !== "disabled",
     is_default: Boolean(candidate.is_default),
-    icon: { skill: "S", connector: "C", agent: "A", knowledge: "K", file: "F", browser_profile: "B", repository: "R" }[type] || "@",
+    icon: {
+      skill: "blocks",
+      connector: "plug",
+      agent: "bot",
+      knowledge: "database",
+      file: "file",
+      browser_profile: "globe",
+      repository: "code-xml",
+    }[type] || "app-window",
   };
 }
 

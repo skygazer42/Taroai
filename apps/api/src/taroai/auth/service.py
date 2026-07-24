@@ -201,7 +201,15 @@ class AuthService(BaseModel):
             raise AuthRequiredError("invalid access token") from error
         if account.status != "active":
             raise AuthRequiredError("access token revoked")
-        return claims
+        return claims.model_copy(
+            update={
+                "email": account.email,
+                "display_name": account.display_name,
+                "role_ids": self.identity_service.list_role_ids_for_user(
+                    account.tenant_id, account.id
+                ),
+            }
+        )
 
     def _claims_for_account(
         self,

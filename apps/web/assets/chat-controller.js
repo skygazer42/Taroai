@@ -1,4 +1,5 @@
 import { chatApi } from "./chat-api.js?v=20260722-flow115";
+import { icon, iconElement, setIcon } from "./icons.js?v=20260724-icons2";
 import {
   filterMentionCandidates,
   insertMention,
@@ -184,6 +185,19 @@ function toolLabel(tool) {
   return tool;
 }
 
+function toolIcon(tool) {
+  if (tool === "web.search") return "search";
+  if (tool === "web.fetch") return "globe";
+  if (tool === "sandbox.command") return "terminal";
+  if (tool === "browser.action") return "compass";
+  if (tool === "tool.search") return "search";
+  if (tool === "ui.render") return "app-window";
+  if (tool === "memory.save") return "brain-circuit";
+  if (tool === "skill.load" || tool.startsWith("skill.")) return "blocks";
+  if (tool.startsWith("mcp.") || tool.startsWith("connector.")) return "plug";
+  return "wrench";
+}
+
 function setText(element, value) {
   if (element) element.textContent = value;
 }
@@ -235,21 +249,6 @@ const PROVIDER_LABELS = {
   sakana: "Sakana",
 };
 
-const PROVIDER_GLYPHS = {
-  anthropic: "✳",
-  openai: "⬡",
-  google: "✦",
-  gemini: "✦",
-  meta: "∞",
-  deepseek: "◗",
-  zhipu: "◇",
-  zai: "◇",
-  minimax: "✶",
-  moonshot: "☾",
-  xai: "✕",
-  sakana: "≋",
-};
-
 const MODEL_PRESENTATION = {
   "claude-sonnet-5": { name: "Claude Sonnet 5", description: "Everyday coding, agents, and professional work at scale.", isNew: true },
   "claude-opus-4-8": { name: "Claude Opus 4.8", description: "Deep reasoning for the hardest problems." },
@@ -274,10 +273,10 @@ function providerLabel(providerId) {
   return PROVIDER_LABELS[known] || `${key.slice(0, 1).toUpperCase()}${key.slice(1)}` || "Models";
 }
 
-function providerGlyph(providerId) {
-  const key = String(providerId || "").toLowerCase();
-  const known = Object.keys(PROVIDER_GLYPHS).find((id) => key === id || key.startsWith(`${id}-`));
-  return PROVIDER_GLYPHS[known] || "✹";
+function displayProvider(model) {
+  return model.provider_id === "default" && String(model.model_id).toLowerCase().startsWith("grok-")
+    ? "xai"
+    : model.provider_id;
 }
 
 function normalizedModel(model, providerFallback = "") {
@@ -1045,7 +1044,8 @@ export class ChatController {
       button.type = "button";
       button.dataset.threadId = thread.id;
       const title = document.createElement("strong");
-      title.textContent = `${thread.pinned ? "• " : ""}${thread.title || "Untitled thread"}`;
+      if (thread.pinned) title.append(iconElement("pin"));
+      title.append(document.createTextNode(thread.title || "Untitled thread"));
       button.append(title);
       const runStatus = String(thread.run_status || "").toLowerCase();
       if (thread.running || ACTIVE_RUN_STATES.has(runStatus)) {
@@ -1503,15 +1503,20 @@ export class ChatController {
     }
     const groups = new Map();
     for (const model of chatState.modelCatalog) {
-      if (!groups.has(model.provider_id)) groups.set(model.provider_id, []);
-      groups.get(model.provider_id).push(model);
+      const provider = displayProvider(model);
+      if (!groups.has(provider)) groups.set(provider, []);
+      groups.get(provider).push(model);
     }
     let firstGroup = true;
     for (const [provider, models] of groups) {
       const label = document.createElement("p");
       label.className = "menu-group-label";
       label.classList.toggle("menu-group-follow", !firstGroup);
-      label.textContent = providerLabel(provider);
+      const providerName = document.createElement("span");
+      providerName.textContent = providerLabel(provider);
+      const modelCount = document.createElement("small");
+      modelCount.textContent = `${models.length} model${models.length === 1 ? "" : "s"}`;
+      label.append(providerName, modelCount);
       this.refs.modelMenu.append(label);
       firstGroup = false;
       for (const model of models) {
@@ -1529,7 +1534,7 @@ export class ChatController {
         if (locked) button.disabled = true;
         const mark = document.createElement("span");
         mark.className = "model-mark";
-        mark.textContent = providerGlyph(model.provider_id);
+        mark.append(iconElement("bot"));
         const copy = document.createElement("span");
         const nameRow = document.createElement("span");
         nameRow.className = "model-name-row";
@@ -1540,7 +1545,7 @@ export class ChatController {
           const lock = document.createElement("span");
           lock.className = "model-lock";
           lock.setAttribute("aria-label", "Locked");
-          lock.textContent = "🔒";
+          lock.append(iconElement("lock"));
           nameRow.append(lock);
         } else if (model.is_new || (Array.isArray(model.tags) && model.tags.includes("new"))) {
           const badge = document.createElement("span");
@@ -1548,18 +1553,12 @@ export class ChatController {
           badge.textContent = "NEW";
           nameRow.append(badge);
         }
-        const info = document.createElement("span");
-        info.className = "model-info";
-        info.title = model.description;
-        info.setAttribute("aria-hidden", "true");
-        info.textContent = "ⓘ";
-        nameRow.append(info);
         const small = document.createElement("small");
         small.textContent = locked ? "Requires paid plan" : model.description;
         copy.append(nameRow, small);
         button.append(mark, copy);
         row.append(button);
-        if (model.reasoning_efforts.length) {
+        if (model.reasoning_efforts.length > 1) {
           if (!locked) {
             const currentEffort =
               (selected ? chatState.selectedModel?.reasoning_effort : model.reasoning_effort) ||
@@ -1570,7 +1569,7 @@ export class ChatController {
             effort.setAttribute("role", "menuitem");
             effort.dataset.modelEffort = currentEffort;
             effort.dataset.modelKey = modelKey(model);
-            effort.textContent = `${currentEffort} ›`;
+            effort.append(document.createTextNode(currentEffort), iconElement("chevron-right"));
             effort.title = "Cycle reasoning effort";
             row.append(effort);
           }
@@ -1578,7 +1577,7 @@ export class ChatController {
         const check = document.createElement("span");
         check.className = "model-check";
         check.setAttribute("aria-hidden", "true");
-        check.textContent = selected ? "✓" : "";
+        if (selected) check.append(iconElement("check"));
         row.append(check);
         this.refs.modelMenu.append(row);
       }
@@ -1587,13 +1586,13 @@ export class ChatController {
 
   renderModelButton() {
     if (!chatState.selectedModel) {
-      setText(this.refs.selectedModelGlyph, "✹");
+      setIcon(this.refs.selectedModelGlyph, "sparkles");
       setText(this.refs.selectedModel, "Choose model");
       setText(this.refs.detailModel, "");
       return;
     }
     const effort = chatState.selectedModel.reasoning_effort;
-    setText(this.refs.selectedModelGlyph, providerGlyph(chatState.selectedModel.provider_id));
+    setIcon(this.refs.selectedModelGlyph, "sparkles");
     setText(this.refs.selectedModel, chatState.selectedModel.display_name);
     setText(this.refs.detailModel, [chatState.selectedModel.provider_id, chatState.selectedModel.model_id, effort].filter(Boolean).join(" / "));
   }
@@ -1745,16 +1744,16 @@ export class ChatController {
       button.role = "option";
       button.className = index === 0 ? "is-active" : "";
       button.dataset.mentionId = `${candidate.type}:${candidate.id}`;
-      const icon = document.createElement("span");
-      icon.className = `mention-icon mention-icon-${candidate.type}`;
-      icon.textContent = candidate.icon;
+      const mark = document.createElement("span");
+      mark.className = `mention-icon mention-icon-${candidate.type}`;
+      mark.append(iconElement(candidate.icon));
       const copy = document.createElement("span");
       const strong = document.createElement("strong");
       strong.textContent = candidate.name;
       const small = document.createElement("small");
       small.textContent = `${candidate.type}${candidate.description ? ` · ${candidate.description}` : ""}`;
       copy.append(strong, small);
-      button.append(icon, copy);
+      button.append(mark, copy);
       this.refs.mentionResults?.append(button);
     });
     if (this.refs.mentionMenu) this.refs.mentionMenu.hidden = false;
@@ -1816,18 +1815,18 @@ export class ChatController {
     const profiles = chatState.capabilities.filter((item) => item.type === "browser_profile" && item.enabled);
     const profileButtons = profiles.map((profile) => `
       <button type="button" role="menuitemradio" aria-checked="${profile.id === chatState.browserProfile?.id}" data-browser-profile-id="${escapeHtml(profile.id)}">
-        <span aria-hidden="true">◎</span><span>${escapeHtml(profile.name)}</span><span aria-hidden="true">${profile.id === chatState.browserProfile?.id ? "✓" : ""}</span>
+        <span aria-hidden="true">${icon("globe")}</span><span>${escapeHtml(profile.name)}</span><span aria-hidden="true">${profile.id === chatState.browserProfile?.id ? icon("check") : ""}</span>
       </button>`).join("");
     menu.innerHTML = profiles.length ? `
-      ${profiles.length > 1 ? `<button type="button" role="menuitemradio" aria-checked="${!chatState.browserProfile}" data-browser-profile-none><span aria-hidden="true">◎</span><span>No profile</span><span>${chatState.browserProfile ? "" : "✓"}</span></button>` : ""}
+      ${profiles.length > 1 ? `<button type="button" role="menuitemradio" aria-checked="${!chatState.browserProfile}" data-browser-profile-none><span aria-hidden="true">${icon("globe")}</span><span>No profile</span><span>${chatState.browserProfile ? "" : icon("check")}</span></button>` : ""}
       ${profileButtons}
       <div class="menu-separator"></div>
-      <button type="button" role="menuitem" data-browser-profile-new><span aria-hidden="true">+</span><span>Create profile</span></button>
+      <button type="button" role="menuitem" data-browser-profile-new><span aria-hidden="true">${icon("plus")}</span><span>Create profile</span></button>
       <form class="browser-profile-inline-form" data-browser-profile-form hidden>
         <input name="name" maxlength="120" placeholder="Profile name..." aria-label="Profile name" required />
-        <button type="submit" aria-label="Create profile">✓</button>
+        <button type="submit" aria-label="Create profile">${icon("check")}</button>
       </form>` : `
-      <button type="button" role="menuitem" data-browser-profile-create-default><span aria-hidden="true">+</span><span>Create default profile</span></button>`;
+      <button type="button" role="menuitem" data-browser-profile-create-default><span aria-hidden="true">${icon("plus")}</span><span>Create default profile</span></button>`;
     query("[data-browser-profile-form]", menu)?.addEventListener("submit", (event) => {
       event.preventDefault();
       this.createBrowserProfile(new FormData(event.currentTarget).get("name"));
@@ -1872,12 +1871,12 @@ export class ChatController {
     const empty = drive ? "Connect Google Drive to import files directly from your Drive." : "No connected connectors available.";
     dialog.innerHTML = `
       <div class="chat-dialog-card">
-        <header><div><small>Workspace resources</small><h2>${title}</h2></div><button type="button" data-close aria-label="Close">×</button></header>
+        <header><div><small>Workspace resources</small><h2>${title}</h2></div><button type="button" data-close aria-label="Close">${icon("x")}</button></header>
         <p>${drive ? "Choose a connected Google Drive account to use in this chat." : "Choose a connected service to reference in your message."}</p>
         <div class="composer-resource-options">
           ${resources.length ? resources.map((item) => `
             <button type="button" class="agent-builder-resource" data-composer-resource="${escapeHtml(item.id)}">
-              <span aria-hidden="true">${escapeHtml(item.icon)}</span><span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.description || "Connected integration")}</small></span>
+              <span aria-hidden="true">${icon(item.icon)}</span><span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.description || "Connected integration")}</small></span>
             </button>`).join("") : `<p class="agent-builder-empty">${empty}</p>`}
         </div>
         <footer><button type="button" data-close>Cancel</button><button type="button" class="primary" data-manage-connectors>Manage connectors</button></footer>
@@ -1921,7 +1920,7 @@ export class ChatController {
       remove.type = "button";
       remove.dataset.removeCreateIntent = "";
       remove.setAttribute("aria-label", `Remove ${intent.label} intent`);
-      remove.textContent = "×";
+      remove.append(iconElement("x"));
       chip.append(remove);
       this.refs.resourceChips.append(chip);
     }
@@ -1940,7 +1939,7 @@ export class ChatController {
       if (resource.persistentBrowserProfile) remove.dataset.removeBrowserProfile = "";
       else remove.dataset.removeResource = `${resource.type}:${resource.id}`;
       remove.setAttribute("aria-label", `Remove ${resource.name || resource.id}`);
-      remove.textContent = "×";
+      remove.append(iconElement("x"));
       chip.append(kind, name, remove);
       this.refs.resourceChips.append(chip);
     }
@@ -1982,9 +1981,9 @@ export class ChatController {
       const chip = document.createElement("div");
       chip.className = "upload-chip";
       chip.dataset.status = upload.status.toLowerCase();
-      const icon = document.createElement("span");
-      icon.className = "upload-file-icon";
-      icon.textContent = "□";
+      const mark = document.createElement("span");
+      mark.className = "upload-file-icon";
+      mark.append(iconElement("file"));
       const copy = document.createElement("span");
       const strong = document.createElement("strong");
       strong.textContent = upload.filename || upload.name || "Upload";
@@ -1997,8 +1996,8 @@ export class ChatController {
       remove.type = "button";
       remove.dataset.removeUpload = upload.id;
       remove.setAttribute("aria-label", `Remove ${strong.textContent}`);
-      remove.textContent = "×";
-      chip.append(icon, copy, remove);
+      remove.append(iconElement("x"));
+      chip.append(mark, copy, remove);
       this.refs.uploadList.append(chip);
     }
   }
@@ -2683,7 +2682,15 @@ export class ChatController {
     if (actionComplete) card.classList.add(`is-${actionStatus}`);
     card.setAttribute("role", actionComplete ? "status" : "alert");
     const marker = document.createElement("span");
-    marker.textContent = ["approved", "applied"].includes(actionStatus) ? "✓" : ["rejected", "apply_failed", "blocked_by_validation"].includes(actionStatus) ? "×" : actionComplete ? "…" : "!";
+    marker.append(iconElement(
+      ["approved", "applied"].includes(actionStatus)
+        ? "check"
+        : ["rejected", "apply_failed", "blocked_by_validation"].includes(actionStatus)
+          ? "x"
+          : actionComplete
+            ? "ellipsis"
+            : "triangle-alert",
+    ));
     const copy = document.createElement("div");
     const strong = document.createElement("strong");
     const actionTitles = {
@@ -3039,7 +3046,7 @@ export class ChatController {
     const card = document.createElement("section");
     card.className = "chat-agent-app-result";
     const mark = document.createElement("span");
-    mark.textContent = String(payload.name || "A").slice(0, 1).toUpperCase();
+    mark.append(iconElement(payload.appKind === "workflow" ? "workflow" : "bot"));
     const copy = document.createElement("div");
     const title = document.createElement("strong");
     title.textContent = payload.name || "Agent draft";
@@ -3121,7 +3128,7 @@ export class ChatController {
       });
       attachments.forEach((item) => {
         const chip = document.createElement("span");
-        chip.textContent = `□ ${item.filename || item.name || item.id || item}`;
+        chip.append(iconElement("file"), document.createTextNode(item.filename || item.name || item.id || item));
         evidence.append(chip);
       });
       article.append(evidence);
@@ -3133,7 +3140,7 @@ export class ChatController {
       copyButton.dataset.messageCopy = message.id;
       copyButton.title = "Copy message";
       copyButton.setAttribute("aria-label", "Copy message");
-      copyButton.innerHTML = '<svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M5 15V5a1 1 0 0 1 1-1h10"></path></svg>';
+      copyButton.append(iconElement("copy"));
       article.append(copyButton);
     }
     const meta = document.createElement("footer");
@@ -3337,7 +3344,7 @@ export class ChatController {
     const mark = document.createElement("span");
     mark.className = "chat-tool-mark";
     mark.setAttribute("aria-hidden", "true");
-    mark.textContent = "⌕";
+    mark.append(iconElement("search"));
     const title = document.createElement("strong");
     title.textContent = running ? "Searching the web" : waiting ? "Search needs approval" : cancelled ? "Search cancelled" : failed ? "Search failed" : "Searched the web";
     const count = document.createElement("span");
@@ -3363,7 +3370,7 @@ export class ChatController {
       query.className = "chat-search-query";
       const queryMark = document.createElement("span");
       queryMark.setAttribute("aria-hidden", "true");
-      queryMark.textContent = "⌕";
+      queryMark.append(iconElement("search"));
       const queryValue = document.createElement("span");
       queryValue.textContent = String(queryText);
       query.append(queryMark, queryValue);
@@ -3454,11 +3461,11 @@ export class ChatController {
       const mark = document.createElement("span");
       mark.className = "chat-tool-mark";
       mark.setAttribute("aria-hidden", "true");
-      mark.textContent = {
-        read_file: "▯",
-        list_files: "≡",
-        search_files: "⌕",
-      }[commandPayload.command_kind] || ">_";
+      mark.append(iconElement({
+        read_file: "file",
+        list_files: "list",
+        search_files: "file-search",
+      }[commandPayload.command_kind] || "terminal"));
       const title = document.createElement("strong");
       const activity = running
         ? commandCopy.started
@@ -3562,7 +3569,7 @@ export class ChatController {
       const mark = document.createElement("span");
       mark.className = "chat-tool-mark";
       mark.setAttribute("aria-hidden", "true");
-      mark.textContent = "↗";
+      mark.append(iconElement(toolIcon(tool)));
       const title = document.createElement("strong");
       title.textContent = tool === "skill.load"
         ? running
@@ -4205,7 +4212,7 @@ export class ChatController {
         thinking.setAttribute("role", "status");
         const marker = document.createElement("span");
         marker.setAttribute("aria-hidden", "true");
-        marker.textContent = "✻";
+        marker.append(iconElement("brain-circuit"));
         const label = document.createElement("span");
         label.textContent = "Thinking";
         if (chatState.currentRunMode !== "chat") label.textContent = `${runSubject()} is working`;
@@ -4238,7 +4245,7 @@ export class ChatController {
       const arrow = document.createElement("span");
       arrow.className = "suggestion-arrow";
       arrow.setAttribute("aria-hidden", "true");
-      arrow.textContent = "↳";
+      arrow.append(iconElement("arrow-right"));
       const label = document.createElement("span");
       label.textContent = suggestion;
       button.append(arrow, label);
@@ -4296,15 +4303,15 @@ export class ChatController {
     button.type = "button";
     button.className = "thread-artifact-item";
     button.dataset.threadArtifact = artifact.id || artifact.artifact_id;
-    const icon = document.createElement("span");
-    icon.textContent = artifact.kind === "dashboard" ? "▦" : "□";
+    const mark = document.createElement("span");
+    mark.append(iconElement(artifact.kind === "dashboard" ? "grid-2x2" : "file"));
     const copy = document.createElement("span");
     const title = document.createElement("strong");
     title.textContent = artifact.name || artifact.title || artifact.filename || "Artifact";
     const meta = document.createElement("small");
     meta.textContent = artifact.media_type || artifact.kind || artifact.status || "Output";
     copy.append(title, meta);
-    button.append(icon, copy);
+    button.append(mark, copy);
     return button;
   }
 
@@ -4570,7 +4577,7 @@ export class ChatController {
     const shareUrl = sharePath ? new URL(sharePath, `${this.api.settings().apiBase}/`).href : "";
     dialog.innerHTML = `
       <form method="dialog" class="chat-dialog-card">
-        <header><div><small>Read-only link</small><h2>Share this thread</h2></div><button value="close" aria-label="Close">×</button></header>
+        <header><div><small>Read-only link</small><h2>Share this thread</h2></div><button value="close" aria-label="Close">${icon("x")}</button></header>
         <p>Anyone with this link can view the published conversation and artifacts. Private Operations data stays hidden.</p>
         <div class="share-link-row"><input value="${escapeHtml(shareUrl)}" readonly /><button type="button" data-share-copy>Copy link</button></div>
         <footer><button type="button" class="danger-text" data-share-revoke>Revoke link</button><button value="close">Done</button></footer>
@@ -4602,30 +4609,30 @@ export class ChatController {
         </div>`;
       return items.map((item) => `
         <button type="button" class="agent-builder-resource" data-agent-builder-resource="${escapeHtml(`${item.type}:${item.id}`)}">
-          <span aria-hidden="true">${item.icon}</span>
+          <span aria-hidden="true">${icon(item.icon)}</span>
           <span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.description || item.type)}</small></span>
         </button>`).join("");
     };
     dialog.innerHTML = `
       <div class="agent-builder-card">
         <header>
-          <button type="button" class="agent-builder-back" data-agent-builder-back aria-label="Back" hidden>←</button>
+          <button type="button" class="agent-builder-back" data-agent-builder-back aria-label="Back" hidden>${icon("arrow-left")}</button>
           <div><h2 data-agent-builder-title>Create an agent</h2><p data-agent-builder-subtitle>Choose how to build your agent</p></div>
-          <button type="button" class="agent-builder-close" data-dialog-close aria-label="Close">×</button>
+          <button type="button" class="agent-builder-close" data-dialog-close aria-label="Close">${icon("x")}</button>
         </header>
         <section data-agent-builder-view="choose">
           <div class="agent-builder-options">
             <button type="button" class="agent-builder-option" data-agent-builder-go="form" data-agent-builder-kind="agent">
-              <span class="agent-builder-option-art is-scratch" aria-hidden="true">+</span><strong>Start from scratch</strong><small>Describe your agent</small>
+              <span class="agent-builder-option-art is-scratch" aria-hidden="true">${icon("plus")}</span><strong>Start from scratch</strong><small>Describe your agent</small>
             </button>
             <button type="button" class="agent-builder-option" data-agent-builder-go="form" data-agent-builder-kind="workflow">
-              <span class="agent-builder-option-art" aria-hidden="true">⌘</span><strong>Workflow Agent</strong><small>Build a multi-step workflow</small>
+              <span class="agent-builder-option-art" aria-hidden="true">${icon("workflow")}</span><strong>Workflow Agent</strong><small>Build a multi-step workflow</small>
             </button>
             <button type="button" class="agent-builder-option" data-agent-builder-go="connectors">
-              <span class="agent-builder-option-art" aria-hidden="true">C</span><strong>Add a connector</strong><small>Connect your services</small>
+              <span class="agent-builder-option-art" aria-hidden="true">${icon("plug")}</span><strong>Add a connector</strong><small>Connect your services</small>
             </button>
             <button type="button" class="agent-builder-option" data-agent-builder-go="skills">
-              <span class="agent-builder-option-art" aria-hidden="true">S</span><strong>Choose a skill</strong><small>Start with an installed skill</small>
+              <span class="agent-builder-option-art" aria-hidden="true">${icon("blocks")}</span><strong>Choose a skill</strong><small>Start with an installed skill</small>
             </button>
           </div>
         </section>
@@ -4817,7 +4824,7 @@ export class ChatController {
     const suggestedName = chatState.thread?.title && chatState.thread.title !== "New thread" ? chatState.thread.title : "Reusable agent";
     dialog.innerHTML = `
       <form class="chat-dialog-card" data-agent-draft-form>
-        <header><div><small>From successful thread</small><h2>Create an agent</h2></div><button type="button" data-dialog-close aria-label="Close">×</button></header>
+        <header><div><small>From successful thread</small><h2>Create an agent</h2></div><button type="button" data-dialog-close aria-label="Close">${icon("x")}</button></header>
         <p>Review what should become reusable. The draft keeps this thread's model, skills, references, and output contract.</p>
         <label><span>Name</span><input name="name" value="${escapeHtml(suggestedName)}" required /></label>
         <label><span>Description</span><textarea name="description" rows="2" placeholder="What this agent reliably accomplishes"></textarea></label>

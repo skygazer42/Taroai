@@ -3,6 +3,10 @@
   "private": true,
   "version": "0.1.0",
   "scripts": {
+    "build:icons": "node scripts/build-icons.mjs",
     "serve": "python3 -m http.server 3000 --directory ."
+  },
+  "devDependencies": {
+    "lucide": "1.26.0"
   }
 }

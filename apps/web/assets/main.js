@@ -1,14 +1,17 @@
-import { createChatController } from "./chat-controller.js?v=20260724-flow140";
-import { createSkillsUI } from "./skills-ui.js?v=20260723-flow127";
-import { createAgentsUI } from "./agents-ui.js?v=20260724-flow134";
-import { createArtifactsUI } from "./artifacts-ui.js?v=20260722-flow115";
-import { createSpeechUI } from "./speech-ui.js?v=20260723-flow127";
-import { createAgentBrainUI } from "./brain-ui.js?v=20260723-flow121";
-import { createFilesUI } from "./files-ui.js?v=20260722-flow115";
-import { createEvaluationsUI } from "./evaluations-ui.js?v=20260722-flow115";
-import { createWorkspaceUI } from "./workspace-ui.js?v=20260722-flow115";
+import { hydrateIcons, icon, iconElement, setIcon } from "./icons.js?v=20260724-icons2";
+import { resolveAccountIdentity, resolveGreetingFontSize } from "./account-identity.js?v=20260724-design7";
+import { createChatController } from "./chat-controller.js?v=20260724-design4";
+import { createSkillsUI } from "./skills-ui.js?v=20260724-design4";
+import { createAgentsUI } from "./agents-ui.js?v=20260724-design4";
+import { createArtifactsUI } from "./artifacts-ui.js?v=20260724-design4";
+import { createSpeechUI } from "./speech-ui.js?v=20260724-design4";
+import { createAgentBrainUI } from "./brain-ui.js?v=20260724-design4";
+import { createFilesUI } from "./files-ui.js?v=20260724-design4";
+import { createEvaluationsUI } from "./evaluations-ui.js?v=20260724-design4";
+import { createWorkspaceUI } from "./workspace-ui.js?v=20260724-design4";
 
 window.__taroaiThreadChat = true;
+hydrateIcons();
 
 const state = {
   currentRunId: null,
@@ -108,15 +111,15 @@ const ROUTE_DEFINITIONS = {
     cards: [],
   },
   discover: {
-    eyebrow: "Explore",
+    eyebrow: "Capability directory",
     title: "Discover",
-    description: "Reusable agents and skills available in the current workspace.",
+    description: "Published Agents and verified Skills ready for this workspace.",
     cards: [],
   },
   feed: {
-    eyebrow: "Workspace activity",
+    eyebrow: "Execution ledger",
     title: "Feed",
-    description: "Recent runs from the current workspace.",
+    description: "Recent Agent updates and runs in one workspace record.",
     cards: [],
   },
   agents: {
@@ -178,9 +181,11 @@ const elements = {
   accountMeta: document.querySelector("[data-account-meta]"),
   accountButton: document.querySelector("[data-account-menu-toggle]"),
   accountMenu: document.querySelector("[data-account-menu]"),
+  accountMenuAvatar: document.querySelector("[data-account-menu-avatar]"),
   accountMenuName: document.querySelector("[data-account-menu-name]"),
   accountMenuMeta: document.querySelector("[data-account-menu-meta]"),
   accountSignIn: document.querySelector("[data-account-sign-in]"),
+  accountWorkspaces: document.querySelector("[data-account-workspaces]"),
   accountSettings: document.querySelector("[data-account-settings]"),
   accountSignOut: document.querySelector("[data-account-sign-out]"),
   localeChoices: document.querySelectorAll("[data-locale-choice]"),
@@ -574,23 +579,35 @@ function routeCards(routeName, definition) {
       ? published.map((agent) => ({
           title: agent.name || "Untitled agent",
           description: agent.description || "Reusable workspace agent",
-          meta: agent.status || `v${agent.latest_version || agent.version || 1}`,
+          meta: "Published Agent",
+          detail: `v${agent.latest_version || agent.version || 1}`,
+          icon: agent.app_kind === "workflow" ? "workflow" : "bot",
+          kind: "agent",
+          status: agent.status || "published",
           action: `agent:${agent.id || agent.agent_id}`,
-          actionLabel: "Open",
+          actionLabel: "Open Agent",
         }))
-      : [{ title: "No published agents", description: "Publish an agent before sharing it from Discover.", meta: "Workspace", action: "route:agents", actionLabel: "Open Agents" }];
+      : [{ title: "No published agents", description: "Publish an agent before sharing it from Discover.", meta: "Workspace", detail: "No published items", icon: "bot", kind: "agent", status: "empty", action: "route:agents", actionLabel: "Open Agents" }];
     const storeItems = state.storeItems.length
       ? state.storeItems.map((item) => ({
           title: item.name || item.id,
           description: item.description || "Verified capability bundled with this deployment.",
-          meta: `${item.publisher || "Taroai"} · ${item.skill_count || 0} skill${item.skill_count === 1 ? "" : "s"}`,
+          meta: item.publisher || "Taroai",
+          detail: `${item.skill_count || 0} skill${item.skill_count === 1 ? "" : "s"}`,
+          icon: "blocks",
+          kind: "store",
+          status: "verified",
           action: `store:${item.id}`,
           actionLabel: "View & install",
         }))
       : [{
           title: "Built-in Store",
           description: "No built-in capabilities are available in this deployment.",
-          meta: "0 available",
+          meta: "Taroai",
+          detail: "0 available",
+          icon: "blocks",
+          kind: "store",
+          status: "empty",
           action: "route:skills",
           actionLabel: "Open Skills",
         }];
@@ -599,7 +616,11 @@ function routeCards(routeName, definition) {
       description: state.workspaceSkills.length
         ? "Inspect, enable, or try the skills installed in this workspace."
         : "Install a reusable skill from GitHub or a ZIP package.",
-      meta: `${state.workspaceSkills.length} installed`,
+      meta: "Workspace Skills",
+      detail: `${state.workspaceSkills.length} installed`,
+      icon: "sparkles",
+      kind: "skill",
+      status: state.workspaceSkills.length ? "ready" : "empty",
       action: "route:skills",
       actionLabel: "Browse skills",
     }];
@@ -607,21 +628,33 @@ function routeCards(routeName, definition) {
   if (routeName === "feed") {
     const notifications = state.notifications.slice(0, 12).map((notification) => ({
       title: notification.title || "Agent update",
-      description: `${notification.body || "Your agent has an update."} · ${shortDateTime(notification.created_at)}`,
-      meta: notification.read_at ? "Agent" : "New · Agent",
+      description: notification.body || "Your agent has an update.",
+      meta: notification.read_at ? "Agent update" : "Unread update",
+      detail: shortDateTime(notification.created_at),
+      occurredAt: notification.created_at,
+      icon: "bot",
+      kind: "notification",
+      status: notification.read_at ? "read" : "unread",
       action: `notification:${notification.id}`,
       actionLabel: "Open",
     }));
-    const runs = state.runHistory.slice(0, Math.max(0, 12 - notifications.length)).map((run) => ({
+    const runs = state.runHistory.slice(0, 12).map((run) => ({
       title: run.message || run.id,
-      description: `${run.status || "created"} · ${shortDateTime(run.created_at)}`,
-      meta: "Run",
+      description: run.status || "created",
+      meta: "Chat run",
+      detail: shortDateTime(run.created_at),
+      occurredAt: run.created_at,
+      icon: "activity",
+      kind: "run",
+      status: run.status || "created",
       action: `run:${run.id}`,
-      actionLabel: "Open",
+      actionLabel: "Open run",
     }));
     return notifications.length || runs.length
       ? [...notifications, ...runs]
-      : [{ title: "No activity yet", description: "Start a chat or schedule an agent to create the first workspace update.", meta: "Workspace", action: "chat", actionLabel: "Start a chat" }];
+        .sort((left, right) => Date.parse(right.occurredAt || 0) - Date.parse(left.occurredAt || 0))
+        .slice(0, 12)
+      : [{ title: "No activity yet", description: "Start a chat or schedule an agent to create the first workspace update.", meta: "Workspace", detail: "No recent runs", icon: "activity", kind: "empty", status: "empty", action: "chat", actionLabel: "Start a chat" }];
   }
   if (routeName === "workspaces") {
     return [{ title: state.workspaceId, description: "The workspace connected to this session.", meta: "Current workspace", action: "operations", actionLabel: "Open" }];
@@ -634,18 +667,28 @@ function renderRouteCards(cards) {
   for (const card of cards) {
     const article = document.createElement("article");
     article.className = "product-route-card";
+    article.dataset.routeCardKind = card.kind || "item";
+    article.dataset.routeCardStatus = card.status || "ready";
+    const top = document.createElement("div");
+    top.className = "product-route-card-top";
     const meta = document.createElement("span");
     meta.className = "product-route-card-meta";
-    meta.textContent = card.meta;
+    meta.append(iconElement(card.icon || "arrow-right"), document.createTextNode(card.meta));
+    const detail = document.createElement("span");
+    detail.className = "product-route-card-detail";
+    detail.textContent = card.detail || "";
+    top.append(meta, detail);
     const title = document.createElement("h2");
     title.textContent = card.title;
     const description = document.createElement("p");
     description.textContent = card.description;
+    const footer = document.createElement("footer");
     const action = document.createElement("button");
     action.type = "button";
     action.dataset.routeAction = card.action;
-    action.textContent = card.actionLabel;
-    article.append(meta, title, description, action);
+    action.append(document.createTextNode(card.actionLabel), iconElement("arrow-right"));
+    footer.append(action);
+    article.append(top, title, description, footer);
     elements.routeCards.append(article);
   }
 }
@@ -798,7 +841,7 @@ function renderHomepageAgents(error = "") {
   elements.agentCardRail.replaceChildren();
   if (!state.accessToken || error || !state.homepageAgents.length) {
     const signedOut = !state.accessToken;
-    elements.agentCardRail.innerHTML = `<article class="agent-card homepage-agent-empty"><header><span class="agent-card-art" aria-hidden="true">A</span><h3>${signedOut ? "Sign in to view agents" : error || "No agents yet"}</h3></header><p>${signedOut ? "Your workspace agents will appear here." : error || "Create one from a successful conversation."}</p><footer><button type="button" ${signedOut ? "data-auth-dialog-open" : "data-open-agent-library"}>${signedOut ? "Sign in" : "Open Agents"}</button></footer></article>`;
+    elements.agentCardRail.innerHTML = `<article class="agent-card homepage-agent-empty"><header><span class="agent-card-art" aria-hidden="true">${icon("bot")}</span><h3>${signedOut ? "Sign in to view agents" : error || "No agents yet"}</h3></header><p>${signedOut ? "Your workspace agents will appear here." : error || "Create one from a successful conversation."}</p><footer><button type="button" ${signedOut ? "data-auth-dialog-open" : "data-open-agent-library"}>${signedOut ? "Sign in" : "Open Agents"}</button></footer></article>`;
     renderAgentUpdatesPill();
     syncAgentRailNext();
     return;
@@ -810,7 +853,7 @@ function renderHomepageAgents(error = "") {
     const mark = document.createElement("span");
     mark.className = "agent-card-art";
     mark.setAttribute("aria-hidden", "true");
-    mark.textContent = (agent.name || "A").slice(0, 1).toUpperCase();
+    mark.append(iconElement(agent.app_kind === "workflow" ? "workflow" : "bot"));
     const title = document.createElement("h3");
     title.textContent = agent.name || "Untitled agent";
     header.append(mark, title);
@@ -842,13 +885,13 @@ function renderHomepageAgents(error = "") {
     if (runs) {
       const stat = document.createElement("span");
       stat.className = "agent-stat";
-      stat.textContent = `∿ ${runs}`;
+      stat.append(iconElement("activity"), document.createTextNode(runs));
       footer.append(stat);
     }
     if (likes) {
       const stat = document.createElement("span");
       stat.className = "agent-stat";
-      stat.textContent = `♡ ${likes}`;
+      stat.append(iconElement("heart"), document.createTextNode(likes));
       footer.append(stat);
     }
     if (!runs && !likes) {
@@ -1039,7 +1082,7 @@ function renderAttachmentChips() {
     remove.type = "button";
     remove.setAttribute("aria-label", `Remove ${name.textContent}`);
     remove.dataset.removeAttachmentId = attachment.id;
-    remove.textContent = "×";
+    remove.append(iconElement("x"));
     chip.append(name, remove);
     elements.attachmentChips.append(chip);
   }
@@ -1060,15 +1103,15 @@ function renderFilesDialog() {
     const empty = document.createElement("div");
     empty.className = "files-empty-state";
     empty.setAttribute("data-files-empty", "");
-    const icon = document.createElement("span");
-    icon.className = "files-empty-icon";
-    icon.setAttribute("aria-hidden", "true");
-    icon.textContent = "▧";
+    const mark = document.createElement("span");
+    mark.className = "files-empty-icon";
+    mark.setAttribute("aria-hidden", "true");
+    mark.append(iconElement("file"));
     const title = document.createElement("p");
     title.textContent = "No files yet";
     const copy = document.createElement("small");
     copy.textContent = "Files generated or uploaded will appear here.";
-    empty.append(icon, title, copy);
+    empty.append(mark, title, copy);
     elements.filesList.append(empty);
   } else {
     for (const storageObject of candidates) {
@@ -1482,13 +1525,18 @@ function renderAuth(status) {
   const acceptingInvitation = !hasToken && state.authMode === "invite";
   const resettingPassword = !hasToken && state.authMode === "reset";
   const email = elements.loginEmail.value.trim() || state.authEmail;
+  const identity = resolveAccountIdentity(state.authDisplayName, email);
   elements.authStatus.textContent = status || (hasToken ? "Signed in" : "");
-  elements.accountName.textContent = hasToken ? email : "Sign in";
+  elements.accountName.textContent = hasToken ? identity.name : "Sign in";
   elements.accountMeta.textContent = hasToken ? "Workspace" : "Connect your workspace";
-  elements.accountAvatar.textContent = hasToken ? email.slice(0, 1).toUpperCase() : "→";
-  elements.accountMenuName.textContent = hasToken ? email : "Sign in";
+  if (hasToken) elements.accountAvatar.textContent = identity.initials;
+  else setIcon(elements.accountAvatar, "circle-user-round");
+  if (hasToken) elements.accountMenuAvatar.textContent = identity.initials;
+  else setIcon(elements.accountMenuAvatar, "circle-user-round");
+  elements.accountMenuName.textContent = hasToken ? identity.name : "Sign in";
   elements.accountMenuMeta.textContent = hasToken ? "Workspace" : "Connect your workspace";
   elements.accountSignIn.hidden = hasToken;
+  elements.accountWorkspaces.hidden = !hasToken;
   elements.accountSettings.hidden = !hasToken;
   elements.accountSignOut.hidden = !hasToken;
   elements.accountButton.setAttribute("aria-haspopup", hasToken ? "menu" : "dialog");
@@ -1499,10 +1547,11 @@ function renderAuth(status) {
   }
   if (elements.planPill) elements.planPill.hidden = !hasToken;
   if (elements.heroGreeting) {
-    const firstName = hasToken
-      ? state.authDisplayName.trim().split(/\s+/)[0] || email.split("@")[0].split(/[._-]/)[0]
-      : "";
-    const greetingName = /^\d+$/.test(firstName) ? "" : firstName;
+    const greetingName = hasToken ? identity.shortName : "";
+    elements.heroGreeting.style.setProperty(
+      "--hero-greeting-max-size",
+      `${resolveGreetingFontSize(greetingName)}px`,
+    );
     elements.heroGreeting.textContent = greetingName ? `How can I help, ${greetingName}?` : "How can I help?";
   }
   elements.loginButton.hidden = hasToken;
@@ -2464,7 +2513,7 @@ async function registerAccount() {
   const email = elements.loginEmail.value.trim();
   const password = elements.loginPassword.value;
   if (!displayName || !email || password.length < 8) {
-    renderAuth("Enter your name, email, and a password of at least 8 characters.");
+    renderAuth("Enter a username, email, and a password of at least 8 characters.");
     return;
   }
   renderAuth("Creating account…");
@@ -2562,7 +2611,7 @@ async function acceptInvitation() {
   const displayName = elements.signupName.value.trim();
   const password = elements.loginPassword.value;
   if (!state.invitationToken || !state.invitationTenantId || !displayName || password.length < 8) {
-    renderAuth("Enter your name and a password of at least 8 characters.");
+    renderAuth("Enter a username and a password of at least 8 characters.");
     return;
   }
   renderAuth("Joining workspace…");
@@ -2937,7 +2986,7 @@ function shortDateTime(value) {
   if (Number.isNaN(date.getTime())) {
     return String(value);
   }
-  return date.toLocaleString([], {
+  return date.toLocaleString(document.documentElement.lang || undefined, {
     month: "short",
     day: "numeric",
     hour: "2-digit",
@@ -2959,7 +3008,7 @@ function renderConversationForRun(run) {
       row.className = "tool-trace-row";
       const icon = document.createElement("span");
       icon.setAttribute("aria-hidden", "true");
-      icon.textContent = event.type?.includes("command") ? "⌁" : "⌘";
+      icon.append(iconElement(event.type?.includes("command") ? "terminal" : "workflow"));
       const label = document.createElement("span");
       label.textContent = event.type || "Run event";
       row.append(icon, label);
@@ -5047,10 +5096,15 @@ document.addEventListener("click", (event) => {
 });
 elements.accountButton.addEventListener("click", () => {
   if (!state.accessToken) return openAuthDialog();
+  if (window.matchMedia("(max-width: 720px)").matches) setMobileNavOpen(true);
   window.taroaiChat?.closeModelMenu();
   setActivePopover(state.activePopover === "account" ? null : "account", elements.accountButton);
 });
 elements.accountSignIn.addEventListener("click", () => openAuthDialog());
+elements.accountWorkspaces.addEventListener("click", () => {
+  closeActivePopover(false);
+  renderAppRoute("workspaces", true);
+});
 elements.accountSettings.addEventListener("click", () => void openSettingsDialog());
 elements.accountSignOut.addEventListener("click", () => {
   closeActivePopover(false);
