@@ -192,7 +192,7 @@ def test_private_upgrade_matrix_covers_current_migration_range():
     matrix = Path("infra/package/upgrade-matrix.md").read_text()
 
     assert (
-        "001_initial to 046_agent_api_keys"
+        "001_initial to 049_billing_meter_run_index"
         in matrix
     )
     assert "model policy version history" in matrix

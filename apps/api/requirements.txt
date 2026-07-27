@@ -2,6 +2,7 @@ fastapi==0.115.12
 boto3>=1.34,<2.0
 cryptography>=46.0,<47.0
 e2b==2.32.0
+httpx==0.28.1
 langgraph==1.0.10
 mcp==1.28.1
 pydantic==2.12.3

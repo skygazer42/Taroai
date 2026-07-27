@@ -1,9 +1,9 @@
 import json
-from collections.abc import Callable
+import threading
 from typing import Any
-from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+
+import httpx
 
 from taroai.tool_gateway import (
     ToolExecutionError,
@@ -19,6 +19,22 @@ from taroai.domain import utc_now
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 TAVILY_EXTRACT_URL = "https://api.tavily.com/extract"
 
+_HTTP_CLIENT: httpx.Client | None = None
+_HTTP_CLIENT_LOCK = threading.Lock()
+
+
+def _shared_http_client() -> httpx.Client:
+    """Process-wide pooled HTTP client for Tavily search/extract calls."""
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None:
+        with _HTTP_CLIENT_LOCK:
+            if _HTTP_CLIENT is None:
+                _HTTP_CLIENT = httpx.Client(
+                    timeout=httpx.Timeout(15.0),
+                    follow_redirects=True,
+                )
+    return _HTTP_CLIENT
+
 
 def _safe_text(value: Any, limit: int) -> str:
     return (
@@ -33,7 +49,7 @@ def register_web_search_tool_handler(
     gateway: ToolGateway,
     api_key: str,
     timeout_seconds: int = 15,
-    requester: Callable[..., Any] = urlopen,
+    client: httpx.Client | None = None,
 ) -> None:
     gateway.register_tool(
         ToolPolicy(
@@ -80,7 +96,7 @@ def register_web_search_tool_handler(
                 "additionalProperties": False,
             },
         ),
-        lambda request: _search(api_key, timeout_seconds, requester, request),
+        lambda request: _search(api_key, timeout_seconds, client, request),
     )
     gateway.register_tool(
         ToolPolicy(
@@ -111,14 +127,14 @@ def register_web_search_tool_handler(
                 "additionalProperties": False,
             },
         ),
-        lambda request: _fetch(api_key, timeout_seconds, requester, request),
+        lambda request: _fetch(api_key, timeout_seconds, client, request),
     )
 
 
 def _search(
     api_key: str,
     timeout_seconds: int,
-    requester: Callable[..., Any],
+    client: httpx.Client | None,
     request: ToolGatewayRequest,
 ) -> ToolResult:
     query = str(request.tool_input["query"]).strip()
@@ -137,23 +153,24 @@ def _search(
         payload["time_range"] = str(time_range)
     if include_domains := request.tool_input.get("include_domains"):
         payload["include_domains"] = [str(item) for item in include_domains]
-    http_request = Request(
-        TAVILY_SEARCH_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
     try:
-        with requester(http_request, timeout=timeout_seconds) as response:
-            body = json.loads(response.read().decode("utf-8"))
-    except HTTPError as error:
-        raise ToolExecutionError(
-            f"web search request failed with HTTP {error.code}"
-        ) from error
-    except (URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as error:
+        response = (client or _shared_http_client()).post(
+            TAVILY_SEARCH_URL,
+            content=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=timeout_seconds,
+        )
+        if response.status_code >= 400:
+            raise ToolExecutionError(
+                f"web search request failed with HTTP {response.status_code}"
+            )
+        body = json.loads(response.content.decode("utf-8"))
+    except httpx.HTTPError as error:
+        raise ToolExecutionError("web search provider is unavailable") from error
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise ToolExecutionError("web search provider is unavailable") from error
     if not isinstance(body, dict) or not isinstance(body.get("results"), list):
         raise ToolExecutionError("web search provider returned an invalid response")
@@ -198,7 +215,7 @@ def _search(
 def _fetch(
     api_key: str,
     timeout_seconds: int,
-    requester: Callable[..., Any],
+    client: httpx.Client | None,
     request: ToolGatewayRequest,
 ) -> ToolResult:
     url = str(request.tool_input["url"]).strip()
@@ -211,23 +228,24 @@ def _fetch(
         "include_images": False,
         "format": "markdown",
     }
-    http_request = Request(
-        TAVILY_EXTRACT_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
     try:
-        with requester(http_request, timeout=timeout_seconds) as response:
-            body = json.loads(response.read().decode("utf-8"))
-    except HTTPError as error:
-        raise ToolExecutionError(
-            f"web fetch request failed with HTTP {error.code}"
-        ) from error
-    except (URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as error:
+        response = (client or _shared_http_client()).post(
+            TAVILY_EXTRACT_URL,
+            content=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=timeout_seconds,
+        )
+        if response.status_code >= 400:
+            raise ToolExecutionError(
+                f"web fetch request failed with HTTP {response.status_code}"
+            )
+        body = json.loads(response.content.decode("utf-8"))
+    except httpx.HTTPError as error:
+        raise ToolExecutionError("web fetch provider is unavailable") from error
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise ToolExecutionError("web fetch provider is unavailable") from error
     results = body.get("results") if isinstance(body, dict) else None
     if not isinstance(results, list) or not results or not isinstance(results[0], dict):

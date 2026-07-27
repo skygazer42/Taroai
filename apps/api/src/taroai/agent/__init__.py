@@ -32,6 +32,10 @@ def apply_agent_runtime_settings(runtime: AgentRuntime, settings) -> AgentRuntim
     runtime.full_auto_requires_isolation = (
         settings.agent_loop_full_auto_requires_isolation
     )
+
+    # 按 loop 阶段路由模型：低风险高频操作（如会话摘要）可走快模型。
+    runtime.loop_fast_model = settings.agent_loop_fast_model
+    runtime.loop_fast_operations = list(settings.agent_loop_fast_operations)
     return runtime
 
 

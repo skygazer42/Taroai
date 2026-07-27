@@ -11012,3 +11012,215 @@ body {
     transition: none;
   }
 }
+
+/* Operations drawer: status bar, disclosures, run actions */
+
+.ops-statusbar {
+  position: sticky;
+  z-index: 4;
+  top: -12px;
+  display: grid;
+  gap: 8px;
+  margin: -12px -4px 0;
+  padding: 10px 12px 12px;
+  border-bottom: 1px solid var(--edge);
+  background: #f0efed;
+}
+
+.ops-statusbar-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.ops-live-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: var(--edge-strong);
+}
+
+.ops-live-dot[data-state="live"] {
+  background: var(--signal);
+  animation: ops-pulse 1.8s ease-in-out infinite;
+}
+
+.ops-live-dot[data-state="warn"] {
+  background: var(--amber);
+}
+
+.ops-live-dot[data-state="done"] {
+  background: var(--green);
+}
+
+.ops-live-dot[data-state="error"] {
+  background: var(--red);
+}
+
+@keyframes ops-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 var(--signal-quiet);
+  }
+
+  50% {
+    box-shadow: 0 0 0 4px var(--signal-quiet);
+  }
+}
+
+.ops-run-status {
+  overflow: hidden;
+  min-width: 0;
+  color: var(--ink);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.74rem;
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ops-stage-chip {
+  overflow: hidden;
+  flex: 0 1 auto;
+  padding: 2px 8px;
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  color: var(--muted);
+  background: var(--paper-raised);
+  font-size: 0.68rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ops-approval-chip {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 3px 10px;
+  border: 1px solid color-mix(in oklab, var(--amber) 45%, var(--edge));
+  border-radius: 999px;
+  color: var(--amber);
+  background: color-mix(in oklab, var(--amber) 10%, var(--paper-raised));
+  font-size: 0.68rem;
+  font-weight: 650;
+}
+
+.ops-approval-chip:hover {
+  background: color-mix(in oklab, var(--amber) 18%, var(--paper-raised));
+}
+
+.ops-progress {
+  overflow: hidden;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--paper-inset);
+}
+
+.ops-progress i {
+  display: block;
+  width: 0%;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--green), var(--signal));
+  transition: width 200ms ease-out;
+}
+
+.ops-progress[data-progress-state="done"] i {
+  background: var(--green);
+}
+
+.ops-progress[data-progress-state="error"] i {
+  background: var(--red);
+}
+
+.ops-approval.is-highlight {
+  border-color: color-mix(in oklab, var(--amber) 55%, var(--edge));
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--amber) 22%, transparent);
+  transition: box-shadow 200ms ease-out, border-color 200ms ease-out;
+}
+
+.ops-disclosure {
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+  background: var(--paper-raised);
+  box-shadow: var(--shadow-panel);
+}
+
+.ops-disclosure > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  color: var(--ink);
+  cursor: pointer;
+  font-size: 0.78rem;
+  font-weight: 650;
+  list-style: none;
+}
+
+.ops-disclosure > summary::-webkit-details-marker {
+  display: none;
+}
+
+.ops-disclosure > summary::before {
+  flex: 0 0 auto;
+  color: var(--muted);
+  content: "\203A";
+  transition: transform 150ms ease-out;
+}
+
+.ops-disclosure[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.ops-disclosure-status {
+  overflow: hidden;
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ops-disclosure > :not(summary) {
+  margin: 0 10px 10px;
+}
+
+.ops-disclosure > .panel {
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.ops-run-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-bottom: 4px;
+}
+
+.ops-run-actions .ops-cancel {
+  border-color: transparent;
+  color: var(--red);
+  background: transparent;
+}
+
+.ops-run-actions .ops-cancel:hover:not(:disabled) {
+  border-color: color-mix(in oklab, var(--red) 35%, var(--edge));
+  background: color-mix(in oklab, var(--red) 8%, var(--paper-raised));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ops-live-dot[data-state="live"] {
+    animation: none;
+  }
+
+  .ops-progress i,
+  .ops-disclosure > summary::before {
+    transition: none;
+  }
+}

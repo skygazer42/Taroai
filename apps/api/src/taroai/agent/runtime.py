@@ -18,6 +18,7 @@ from taroai.agent.exceptions import (
 )
 from taroai.agent.graph import build_runtime_graph
 from taroai.agent.loop import AgentExecutionServices
+from taroai.agent.models import AgentDecision
 from taroai.agent_engines import AgentEngineSessionCreate
 from taroai.coding_workspaces import CodingWorkspaceCreate
 from taroai.agent.planning import PlanStep
@@ -149,6 +150,8 @@ class AgentRuntime(BaseModel):
     loop_action_lease_seconds: int = Field(default=600, ge=1)
     loop_worker_id: str = "agent-loop-v2"
     full_auto_requires_isolation: bool = True
+    loop_fast_model: str | None = None
+    loop_fast_operations: list[str] = Field(default_factory=lambda: ["compact"])
     pending_states: dict[str, AgentRuntimeState] = Field(default_factory=dict)
     model_plan_metadata: dict[str, dict[str, Any]] = Field(
         default_factory=dict,
@@ -162,7 +165,11 @@ class AgentRuntime(BaseModel):
         run = self.store.get_run(tenant_id, run_id)
         execution = AgentExecutionServices(self)
         state = execution._restore_state(run)
-        if run.mode == RunMode.WORKFLOW:
+        snapshot = self._agent_runtime_snapshot(state)
+        if snapshot.get("compiled_playbook") is not None:
+            execution._load_agent_context(state, run)
+            self._load_compiled_playbook(state, run, snapshot)
+        elif run.mode == RunMode.WORKFLOW:
             return self._execute_workflow_preview(run, state)
         if (
             run.mode == RunMode.CHAT
@@ -175,7 +182,6 @@ class AgentRuntime(BaseModel):
         ):
             # ponytail: 普通聊天失败时整轮重试；需要断点恢复时使用 Agent 模式。
             return execution.execute_chat(state, run)
-        snapshot = self._agent_runtime_snapshot(state)
         if str(snapshot.get("engine_type") or "native") != "native":
             return self._execute_external_engine(run, state, snapshot)
         result = self.build_graph().compile().invoke(
@@ -183,6 +189,63 @@ class AgentRuntime(BaseModel):
             config={"recursion_limit": self.loop_max_iterations * 8 + 32},
         )
         return AgentRuntimeState.model_validate(result)
+
+    def _load_compiled_playbook(
+        self,
+        state: AgentRuntimeState,
+        run: Run,
+        snapshot: dict[str, Any],
+    ) -> None:
+        raw = snapshot.get("compiled_playbook")
+        if not isinstance(raw, dict) or raw.get("schema") != "taroai.playbook.v1":
+            raise ValueError("Agent contains an invalid compiled Playbook")
+        decision = AgentDecision.model_validate(raw.get("decision"))
+        if (
+            decision.kind != "action"
+            or decision.tool_name != "sandbox.command"
+            or not (decision.action_key or "").startswith("playbook:")
+        ):
+            raise ValueError("Compiled Playbook action is not supported")
+        result = raw.get("result")
+        if not isinstance(result, dict) or result.get("mode") not in {
+            "raw_stdout",
+            "artifacts",
+        }:
+            raise ValueError("Compiled Playbook result contract is invalid")
+
+        state.runtime_metadata["compiled_playbook"] = raw
+        if state.runtime_metadata.get("compiled_playbook_loaded"):
+            return
+        state.runtime_metadata["compiled_playbook_loaded"] = True
+        if self.store.list_agent_actions(run.tenant_id, run.id):
+            self._save_state(state)
+            return
+
+        step = PlanStep(
+            id=str(raw.get("source_action_id") or "compiled-action"),
+            title=decision.expected_outcome or "Execute compiled Playbook",
+            tool_name=decision.tool_name,
+            tool_input=decision.tool_input,
+            approval_required=decision.approval_required,
+        )
+        state.plan = [step]
+        state.pending_actions = [decision]
+        state.runtime_metadata["prefetched_action"] = True
+        self.store.append_run_event(
+            run,
+            "playbook.loaded",
+            {
+                "source_run_id": raw.get("source_run_id"),
+                "source_action_id": raw.get("source_action_id"),
+                "step_count": 1,
+            },
+        )
+        self.store.append_run_event(
+            run,
+            "plan.created",
+            self._plan_created_event_payload(state),
+        )
+        self._save_state(state)
 
     def _execute_workflow_preview(
         self, run: Run, state: AgentRuntimeState
@@ -331,6 +394,14 @@ class AgentRuntime(BaseModel):
         repository_id = repository_refs[0].id if repository_refs else snapshot_repository_id
         if not repository_id:
             return None
+        cached_workspace_id = state.runtime_metadata.get("coding_workspace_id")
+        if cached_workspace_id:
+            try:
+                return self.coding_workspace_service.registry.get_workspace(
+                    run.tenant_id, str(cached_workspace_id)
+                )
+            except NotFoundError:
+                state.runtime_metadata.pop("coding_workspace_id", None)
         for item in self.coding_workspace_service.registry.list_workspaces(run.tenant_id, run.workspace_id):
             if item.run_id == run.id:
                 state.runtime_metadata["coding_workspace_id"] = item.id
@@ -2246,10 +2317,12 @@ class AgentRuntime(BaseModel):
         error: ToolExecutionError,
         attempt: int,
     ) -> None:
-        if not any(
-            event.type == "tool_call.failed"
-            and event.payload.get("step_id") == step.id
-            for event in self.store.list_run_events(run.tenant_id, run.id)
+        if not self.store.run_event_exists(
+            run.tenant_id,
+            run.id,
+            "tool_call.failed",
+            payload_key="step_id",
+            payload_value=step.id,
         ):
             self.store.append_run_event(
                 run,

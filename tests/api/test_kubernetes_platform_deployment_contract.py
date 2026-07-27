@@ -308,7 +308,7 @@ def test_kubernetes_runtime_config_and_secret_cover_api_workers_and_backing_serv
         "[\"ghcr.io/customer/sandbox-runtime@sha256:*\"]"
     )
     assert config_data["TAROAI_SANDBOX_CONTROLLER_KUBERNETES_ORPHAN_CLEANUP_ENABLED"] == "false"
-    assert config_data["TAROAI_BROWSER_PROVIDER"] == "playwright"
+    assert config_data["TAROAI_BROWSER_PROVIDER"] == "disabled"
     assert config_data["TAROAI_BROWSER_CONTROLLER_BASE_URL"] == (
         "http://browser-controller:8001"
     )

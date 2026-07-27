@@ -256,10 +256,10 @@ def test_release_package_builder_creates_clean_zip_with_generated_manifest(tmp_p
 
     image_names = {image["name"] for image in manifest["images"]}
     assert {"api", "worker", "browser-controller", "web"}.issubset(image_names)
-    assert len(manifest["migrations"]) == 46
+    assert len(manifest["migrations"]) == 49
     assert (
         manifest["migrations"][-1]["id"]
-        == "046_agent_api_keys"
+        == "049_billing_meter_run_index"
     )
 
     forbidden_exact = {".env", "a.md"}
@@ -2634,7 +2634,7 @@ def test_release_package_verifier_rejects_stale_upgrade_matrix(tmp_path: Path):
     assert report.upgrade_matrix_errors == [
         (
             "upgrade matrix must cover migration range "
-            "001_initial to 046_agent_api_keys"
+            "001_initial to 049_billing_meter_run_index"
         )
     ]
 

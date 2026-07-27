@@ -1,7 +1,6 @@
 import json
-from io import BytesIO
-from urllib.error import HTTPError
 
+import httpx
 import pytest
 from pydantic import Field
 
@@ -113,16 +112,14 @@ def test_openai_compatible_embedding_gateway_redacts_provider_error_body_credent
         }
     ).encode("utf-8")
 
-    def raise_provider_error(*args, **kwargs):
-        raise HTTPError(
-            url="https://model.example.com/v1/embeddings",
-            code=401,
-            msg="Unauthorized",
-            hdrs={},
-            fp=BytesIO(response_body),
-        )
-
-    monkeypatch.setattr("taroai.embeddings.gateway.urlopen", raise_provider_error)
+    monkeypatch.setattr(
+        "taroai.embeddings.gateway._HTTP_CLIENT",
+        httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(401, content=response_body)
+            )
+        ),
+    )
     gateway = OpenAICompatibleEmbeddingGateway(
         base_url="https://model.example.com/v1",
         api_key=leaked_key,

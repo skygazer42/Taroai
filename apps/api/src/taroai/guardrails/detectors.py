@@ -1,8 +1,9 @@
 import json
 import re
-import urllib.request
+import threading
 from typing import Any, ClassVar
 
+import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from taroai.guardrails.models import (
@@ -15,6 +16,23 @@ from taroai.guardrails.models import (
 )
 
 
+_HTTP_CLIENT: httpx.Client | None = None
+_HTTP_CLIENT_LOCK = threading.Lock()
+
+
+def _shared_http_client() -> httpx.Client:
+    """Process-wide pooled HTTP client for guardrail detector calls."""
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None:
+        with _HTTP_CLIENT_LOCK:
+            if _HTTP_CLIENT is None:
+                _HTTP_CLIENT = httpx.Client(
+                    timeout=httpx.Timeout(5.0),
+                    follow_redirects=True,
+                )
+    return _HTTP_CLIENT
+
+
 class GuardrailHttpDetectorClient(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -25,18 +43,20 @@ class GuardrailHttpDetectorClient(BaseModel):
         headers: dict[str, str],
         timeout_seconds: int,
     ) -> dict[str, Any]:
-        request = urllib.request.Request(
-            url=url,
-            data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+        response = _shared_http_client().post(
+            url,
+            content=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
             headers={
                 **headers,
                 "Content-Type": "application/json",
                 "Accept": "application/json",
             },
-            method="POST",
+            timeout=timeout_seconds,
         )
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            raw = response.read().decode("utf-8")
+        # urllib raised HTTPError on non-2xx; raise_for_status preserves the
+        # "HTTP error => detector failure action" behavior.
+        response.raise_for_status()
+        raw = response.content.decode("utf-8")
         if not raw:
             return {}
         parsed = json.loads(raw)

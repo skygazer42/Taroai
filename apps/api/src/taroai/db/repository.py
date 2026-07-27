@@ -1,9 +1,10 @@
 import json
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from taroai.db.connection import connect_database
 from taroai.db.migrations import MigrationRunner
@@ -54,6 +55,7 @@ if TYPE_CHECKING:
 
 class SqlControlPlaneRepository(BaseModel):
     config: DatabaseConfig
+    event_notifier: Callable[[str], None] | None = Field(default=None, exclude=True)
 
     def initialize_schema(self, migrations_path: Path) -> None:
         MigrationRunner(config=self.config, migrations_path=migrations_path).apply()
@@ -2006,6 +2008,29 @@ class SqlControlPlaneRepository(BaseModel):
             for row in rows
         ]
 
+    def run_event_exists(
+        self,
+        tenant_id: str,
+        run_id: str,
+        event_type: str,
+        payload_key: str | None = None,
+        payload_value: Any = None,
+    ) -> bool:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT payload FROM run_events
+                WHERE tenant_id = ? AND run_id = ? AND type = ?
+                """,
+                (tenant_id, run_id, event_type),
+            ).fetchall()
+        if payload_key is None:
+            return bool(rows)
+        return any(
+            self._loads(row["payload"]).get(payload_key) == payload_value
+            for row in rows
+        )
+
     def list_thread_events(
         self,
         tenant_id: str,
@@ -2251,7 +2276,7 @@ class SqlControlPlaneRepository(BaseModel):
         return retrying_run
 
     def append_run_event(self, run: Run, event_type: str, payload: dict) -> RunEvent:
-        self.get_run(run.tenant_id, run.id)
+        # 调用方已持有有效 Run；事件追加是热路径，不再做冗余的存在性查询。
         with self._connect() as connection:
             return self._append_run_event(connection, run, event_type, payload)
 
@@ -2753,17 +2778,26 @@ class SqlControlPlaneRepository(BaseModel):
         self, tenant_id: str, workflow_id: str, **changes: Any
     ) -> WorkflowRun:
         workflow = self.get_workflow(tenant_id, workflow_id)
-        allowed = {"status", "approval_id", "completed_at"}
+        allowed = {"status", "approval_id", "completed_at", "spec"}
         unknown = set(changes) - allowed
         if unknown:
             raise ValueError(f"Unsupported workflow fields: {sorted(unknown)}")
         updated = workflow.model_copy(
             update={**changes, "updated_at": utc_now()}, deep=True
         )
-        columns = {"status": "status", "approval_id": "approval_id", "completed_at": "completed_at"}
+        columns = {
+            "status": "status",
+            "approval_id": "approval_id",
+            "completed_at": "completed_at",
+            "spec": "spec",
+        }
         assignments = [f"{columns[key]} = ?" for key in changes]
         values = [
-            self._dt(value) if key == "completed_at" and value is not None else value
+            self._dt(value)
+            if key == "completed_at" and value is not None
+            else self._json(value.model_dump(mode="json", by_alias=True))
+            if key == "spec"
+            else value
             for key, value in changes.items()
         ]
         assignments.append("updated_at = ?")
@@ -2955,7 +2989,7 @@ class SqlControlPlaneRepository(BaseModel):
         )
 
     def save_runtime_state(self, state: Any) -> RunStateSnapshot:
-        self.get_run(state.tenant_id, state.run_id)
+        # 状态保存每个动作触发多次；调用方来源即 store，跳过存在性查询。
         snapshot = RunStateSnapshot.from_runtime_state(state)
         with self._connect() as connection:
             connection.execute(
@@ -3061,6 +3095,18 @@ class SqlControlPlaneRepository(BaseModel):
                 (tenant_id,),
             ).fetchall()
         return [self._billing_meter_from_row(row) for row in rows]
+
+    def sum_run_billing_cost(self, tenant_id: str, run_id: str) -> float:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COALESCE(SUM(cost_estimate), 0) AS total
+                FROM billing_meter_events
+                WHERE tenant_id = ? AND run_id = ?
+                """,
+                (tenant_id, run_id),
+            ).fetchone()
+        return float(row["total"] or 0)
 
     def list_audit_events(self, tenant_id: str) -> list[AuditEvent]:
         with self._connect() as connection:
@@ -3364,7 +3410,19 @@ class SqlControlPlaneRepository(BaseModel):
                 event.thread_sequence,
             ),
         )
+        self._notify_thread_event(event)
         return event
+
+    def _notify_thread_event(self, event: RunEvent) -> None:
+        notifier = self.event_notifier
+        if notifier is None or event.thread_id is None:
+            return
+        try:
+            notifier(event.thread_id)
+        except Exception:
+            # Notification is best-effort; the write must never fail because
+            # a listener misbehaved.
+            pass
 
     def _record_run_meter(self, connection, run: Run) -> BillingMeterEvent:
         meter = BillingMeterEvent(

@@ -1,8 +1,8 @@
 import json
+import threading
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
+import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from taroai.embeddings.models import (
@@ -14,6 +14,23 @@ from taroai.embeddings.models import (
     EmbeddingVector,
 )
 from taroai.provider_errors import redact_provider_error_detail
+
+
+_HTTP_CLIENT: httpx.Client | None = None
+_HTTP_CLIENT_LOCK = threading.Lock()
+
+
+def _shared_http_client() -> httpx.Client:
+    """Process-wide pooled HTTP client for embedding provider calls."""
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None:
+        with _HTTP_CLIENT_LOCK:
+            if _HTTP_CLIENT is None:
+                _HTTP_CLIENT = httpx.Client(
+                    timeout=httpx.Timeout(30.0),
+                    follow_redirects=True,
+                )
+    return _HTTP_CLIENT
 
 
 class EmbeddingGateway(BaseModel):
@@ -99,25 +116,25 @@ class OpenAICompatibleEmbeddingGateway(EmbeddingGateway):
     def _post_embeddings(self, payload: dict[str, Any], api_key: str) -> dict[str, Any]:
         endpoint = f"{self.base_url.rstrip('/')}/embeddings"
         body = json.dumps(payload).encode("utf-8")
-        request = Request(
-            endpoint,
-            data=body,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
         try:
-            with urlopen(request, timeout=self.timeout_seconds) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except HTTPError as error:
-            detail = error.read().decode("utf-8")
-            safe_detail = redact_provider_error_detail(detail, api_key=api_key)
-            raise EmbeddingGatewayResponseError(
-                f"embedding gateway returned HTTP {error.code}: {safe_detail}"
-            ) from error
-        except (URLError, TimeoutError) as error:
+            response = _shared_http_client().post(
+                endpoint,
+                content=body,
+                headers=headers,
+                timeout=self.timeout_seconds,
+            )
+            if response.status_code >= 400:
+                detail = response.text
+                safe_detail = redact_provider_error_detail(detail, api_key=api_key)
+                raise EmbeddingGatewayResponseError(
+                    f"embedding gateway returned HTTP {response.status_code}: {safe_detail}"
+                )
+            return json.loads(response.content.decode("utf-8"))
+        except httpx.HTTPError as error:
             raise EmbeddingGatewayResponseError(
                 f"embedding gateway request failed: {error}"
             ) from error

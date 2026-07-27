@@ -79,6 +79,9 @@ def test_migration_runner_applies_pending_schema_and_records_versions(tmp_path: 
             "044_notifications.sql",
             "045_tenant_invitations.sql",
             "046_agent_api_keys.sql",
+            "047_remove_placeholder_agent_artifacts.sql",
+            "048_remove_placeholder_agent_artifacts_with_rls.sql",
+            "049_billing_meter_run_index.sql",
     ]
     runner = MigrationRunner(
         config=DatabaseConfig(url=f"sqlite:///{database_path}"),
@@ -223,6 +226,9 @@ def test_chat_loop_migration_adds_state_payload_to_existing_runtime_states(
             "044_notifications.sql",
             "045_tenant_invitations.sql",
             "046_agent_api_keys.sql",
+            "047_remove_placeholder_agent_artifacts.sql",
+            "048_remove_placeholder_agent_artifacts_with_rls.sql",
+            "049_billing_meter_run_index.sql",
     ]
     assert "state_payload" in columns
     assert state_payload == "{}"

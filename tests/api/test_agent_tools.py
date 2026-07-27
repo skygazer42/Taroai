@@ -12,6 +12,7 @@ from taroai.agents import (
 )
 from taroai.agent import AgentRuntime, AgentRuntimeState
 from taroai.agent.loop import AgentExecutionServices
+from taroai.agent.models import AgentAction, AgentCycle, AgentDecision, AgentObservation
 from taroai.connectors import ConnectorStatus, ConnectorType
 from taroai.domain import (
     ChatMessageCreate,
@@ -294,6 +295,103 @@ def test_conversation_extraction_uses_the_runtime_model_instead_of_hiding_a_pin(
     )
 
     assert draft.version.model_policy == {}
+
+
+def test_conversation_can_compile_one_successful_sandbox_action_into_a_playbook():
+    store = InMemoryControlPlaneStore()
+    thread = store.create_chat_thread(
+        "tenant_acme",
+        "user_1",
+        ChatThreadCreate(workspace_id="workspace_sales", title="Repeatable math"),
+    )
+    run = store.create_run(
+        "tenant_acme",
+        "user_1",
+        RunCreate(
+            workspace_id="workspace_sales",
+            thread_id=thread.id,
+            message="Calculate the result.",
+        ),
+    )
+    cycle = store.create_agent_cycle(
+        AgentCycle(
+            id="cycle_source",
+            tenant_id=run.tenant_id,
+            workspace_id=run.workspace_id,
+            run_id=run.id,
+            thread_id=thread.id,
+            iteration=1,
+        )
+    )
+    action = store.create_agent_action(
+        AgentAction(
+            id="action_source",
+            tenant_id=run.tenant_id,
+            workspace_id=run.workspace_id,
+            run_id=run.id,
+            thread_id=thread.id,
+            cycle_id=cycle.id,
+            action_key="source-action",
+            decision=AgentDecision(
+                kind="action",
+                tool_name="sandbox.command",
+                tool_input={
+                    "command": 'python3 -c "print(42)"',
+                    "session_id": "sandbox_ephemeral",
+                    "result_mode": "raw_stdout",
+                },
+            ),
+        )
+    )
+    claimed = store.claim_agent_action(
+        run.tenant_id,
+        action.id,
+        lease_owner_id="worker_test",
+        lease_seconds=60,
+    )
+    assert claimed is not None
+    state = AgentRuntimeState(
+        tenant_id=run.tenant_id,
+        workspace_id=run.workspace_id,
+        user_id=run.user_id,
+        run_id=run.id,
+        goal=run.message,
+        status=RunStatus.RUNNING,
+    )
+    store.commit_agent_action_observation(
+        run.tenant_id,
+        action.id,
+        AgentObservation(
+            action_id=action.id,
+            success=True,
+            output={"stdout": "42", "exit_code": 0},
+        ),
+        lease_owner_id="worker_test",
+        lease_generation=claimed.lease_generation,
+        usage={},
+        state_payload=state.model_dump(mode="json"),
+        checksum="test-checksum",
+    )
+    store.update_run_status(run.tenant_id, run.id, RunStatus.SUCCEEDED)
+
+    draft = AgentRegistryService(
+        registry=InMemoryAgentRegistry(),
+        store=store,
+    ).extract(
+        run.tenant_id,
+        thread.id,
+        compile_playbook=True,
+    )
+
+    playbook = draft.version.runtime_snapshot["compiled_playbook"]
+    assert draft.version.input_schema == {"type": "object", "properties": {}}
+    assert playbook["schema"] == "taroai.playbook.v1"
+    assert playbook["result"] == {"mode": "raw_stdout"}
+    assert playbook["decision"]["tool_input"] == {
+        "command": 'python3 -c "print(42)"',
+        "result_mode": "raw_stdout",
+    }
+    assert playbook["decision"]["action_key"] == "playbook:action_source"
 
 
 def test_conversation_extraction_keeps_explicit_files_not_transient_attachments():

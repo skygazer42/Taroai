@@ -1,7 +1,6 @@
 import json
-from io import BytesIO
-from urllib.error import HTTPError
 
+import httpx
 import pytest
 from pydantic import Field
 
@@ -143,16 +142,14 @@ def test_openai_compatible_gateway_redacts_provider_error_body_credentials(monke
         }
     ).encode("utf-8")
 
-    def raise_provider_error(*args, **kwargs):
-        raise HTTPError(
-            url="https://model.example.com/v1/chat/completions",
-            code=401,
-            msg="Unauthorized",
-            hdrs={},
-            fp=BytesIO(response_body),
-        )
-
-    monkeypatch.setattr("taroai.model_gateway.gateway.urlopen", raise_provider_error)
+    monkeypatch.setattr(
+        "taroai.model_gateway.gateway._HTTP_CLIENT",
+        httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(401, content=response_body)
+            )
+        ),
+    )
     gateway = OpenAICompatibleModelGateway(
         base_url="https://model.example.com/v1",
         api_key=leaked_key,
@@ -174,16 +171,14 @@ def test_openai_compatible_gateway_detects_http_safety_refusal(monkeypatch):
         {"error": {"code": "1301", "message": "Sensitive content."}}
     ).encode()
 
-    def raise_provider_error(*args, **kwargs):
-        raise HTTPError(
-            url="https://model.example.com/v1/chat/completions",
-            code=400,
-            msg="Bad Request",
-            hdrs={},
-            fp=BytesIO(response_body),
-        )
-
-    monkeypatch.setattr("taroai.model_gateway.gateway.urlopen", raise_provider_error)
+    monkeypatch.setattr(
+        "taroai.model_gateway.gateway._HTTP_CLIENT",
+        httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(400, content=response_body)
+            )
+        ),
+    )
     gateway = OpenAICompatibleModelGateway(
         base_url="https://model.example.com/v1",
         api_key="sk-provider",
@@ -350,23 +345,19 @@ def test_openai_compatible_gateway_yields_text_before_stream_completion():
 
 
 def test_openai_compatible_gateway_enforces_total_stream_timeout(monkeypatch):
-    class StreamResponse:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def __iter__(self):
-            return iter([b": keep-alive\n", b": keep-alive\n"])
-
     clock = iter([0.0, 0.5, 1.0])
     monkeypatch.setattr(
         "taroai.model_gateway.gateway.time.monotonic", lambda: next(clock)
     )
     monkeypatch.setattr(
-        "taroai.model_gateway.gateway.urlopen",
-        lambda *args, **kwargs: StreamResponse(),
+        "taroai.model_gateway.gateway._HTTP_CLIENT",
+        httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200, content=b": keep-alive\n: keep-alive\n"
+                )
+            )
+        ),
     )
     gateway = OpenAICompatibleModelGateway(
         api_key="sk-provider",
@@ -415,24 +406,14 @@ def test_openai_compatible_gateway_detects_provider_safety_refusal(
     event,
     original_text,
 ):
-    class StreamResponse:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def __iter__(self):
-            return iter(
-                [
-                    f"data: {json.dumps(event)}\n".encode(),
-                    b"data: [DONE]\n",
-                ]
-            )
-
+    stream_body = f"data: {json.dumps(event)}\n".encode() + b"data: [DONE]\n"
     monkeypatch.setattr(
-        "taroai.model_gateway.gateway.urlopen",
-        lambda *args, **kwargs: StreamResponse(),
+        "taroai.model_gateway.gateway._HTTP_CLIENT",
+        httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, content=stream_body)
+            )
+        ),
     )
     gateway = OpenAICompatibleModelGateway(
         api_key="sk-provider",

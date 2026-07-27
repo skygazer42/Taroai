@@ -13,6 +13,7 @@ from taroai.agent.exceptions import (
 from taroai.agent.models import (
     AgentAction,
     AgentCycle,
+    AgentObservation,
     AgentVerificationResult,
 )
 from taroai.agent.state import AgentGraphRoute, AgentRuntimeState
@@ -65,6 +66,46 @@ def _has_unsupported_response_urls(
     response_text: str,
 ) -> bool:
     return bool(_unsupported_response_urls(state, response_text))
+
+
+def _tool_failure_verification(
+    observation: "AgentObservation",
+) -> AgentVerificationResult:
+    """把工具失败的证据逐字放进修复反馈，供下一次决策原样引用。"""
+
+    evidence = [
+        f"failure_class: {observation.failure_class}"
+        if observation.failure_class
+        else None,
+        f"safe_error: {observation.safe_error}" if observation.safe_error else None,
+        (
+            f"error: {observation.error}"
+            if observation.error and observation.error != observation.safe_error
+            else None
+        ),
+    ]
+    return AgentVerificationResult(
+        outcome="repair",
+        feedback=observation.safe_error or observation.error or "Action failed",
+        evidence=[item for item in evidence if item is not None],
+    )
+
+
+def _failure_signature(result: AgentVerificationResult) -> str:
+    """failure_class 加归一化反馈构成连续失败的比较签名。"""
+
+    failure_class = next(
+        (
+            item.removeprefix("failure_class: ")
+            for item in result.evidence
+            if item.startswith("failure_class: ")
+        ),
+        "",
+    )
+    normalized = re.sub(r"\s+", " ", (result.feedback or "").strip().lower())
+    if not failure_class and not normalized:
+        return ""
+    return f"{failure_class}|{normalized}"
 
 
 def _ground_chat_response_url(
@@ -518,12 +559,44 @@ class AgentGraphNodes:
         if observation is None:
             return self._failure(state, "missing_action_observation")
         if observation.success:
+            # 成功观测中断了“连续相同失败”序列，重置升级追踪。
+            state.runtime_metadata.pop("last_repair_failure_signature", None)
             self.runtime.store.complete_agent_cycle(
                 run.tenant_id,
                 action.cycle_id,
                 status="completed",
             )
             stdout = str(observation.output.get("stdout") or "").strip()
+            compiled_playbook = state.runtime_metadata.get("compiled_playbook")
+            compiled_result = (
+                compiled_playbook.get("result")
+                if isinstance(compiled_playbook, dict)
+                else None
+            )
+            if (
+                (action.decision.action_key or "").startswith("playbook:")
+                and isinstance(compiled_result, dict)
+                and (
+                    compiled_result.get("mode") == "artifacts"
+                    or (stdout and len(stdout) <= 4_000)
+                )
+            ):
+                state.final_response_text = (
+                    stdout
+                    if compiled_result.get("mode") == "raw_stdout"
+                    else str(compiled_result.get("response_text") or "Playbook completed.")
+                )
+                state.verifier_result = AgentVerificationResult(
+                    outcome="complete",
+                    feedback="Compiled Playbook completed without a model call",
+                    evidence=["sandbox.command completed successfully"],
+                )
+                self.runtime.store.append_run_event(
+                    run,
+                    "agent.verification.skipped",
+                    {"reason": "compiled_playbook_result"},
+                )
+                return self._route(state, "complete")
             if (
                 run.mode == RunMode.CHAT
                 and action.decision.tool_name == "sandbox.command"
@@ -580,9 +653,8 @@ class AgentGraphNodes:
                 observation.safe_error or "Agent action requires approval",
             )
             return self._route(paused, "end")
-        if action.decision.action_key and action.decision.action_key.startswith(
-            "planned:"
-        ):
+        action_key = action.decision.action_key or ""
+        if action_key.startswith(("planned:", "playbook:")):
             if observation.failure_class == "tool_execution_error":
                 from taroai.tool_gateway import ToolExecutionError
 
@@ -600,7 +672,8 @@ class AgentGraphNodes:
                     int(retries.get(step.id, 0)) + 1,
                 )
             if (
-                observation.failure_class == "tool_execution_error"
+                action_key.startswith("planned:")
+                and observation.failure_class == "tool_execution_error"
                 and self._retry_static_action(
                     state,
                     run,
@@ -608,10 +681,7 @@ class AgentGraphNodes:
                     observation.safe_error,
                 )
             ):
-                state.verifier_result = AgentVerificationResult(
-                    outcome="repair",
-                    feedback=observation.safe_error or "Action failed",
-                )
+                state.verifier_result = _tool_failure_verification(observation)
                 return self._route(state, "repair")
             failure_code = observation.failure_class or "tool_execution_error"
             failure_detail = observation.safe_error or observation.error
@@ -643,14 +713,7 @@ class AgentGraphNodes:
             elif failure_code == "policy_blocked":
                 failure_code = "artifact_guardrail_blocked"
             return self._failure(state, failure_code, failure_detail)
-        state.verifier_result = AgentVerificationResult(
-            outcome="repair",
-            feedback=(
-                observation.safe_error
-                or observation.error
-                or "Action failed"
-            ),
-        )
+        state.verifier_result = _tool_failure_verification(observation)
         return self._route(state, "repair")
 
     def verify(self, state: AgentRuntimeState) -> dict[str, Any]:
@@ -717,6 +780,45 @@ class AgentGraphNodes:
                 verifier_result=result,
             )
         state.repair_attempts += 1
+        signature = _failure_signature(result)
+        # 静态计划重试有独立的 max_step_retries 预算，不参与升级追踪。
+        trackable = bool(signature) and not (
+            state.last_decision is not None
+            and (state.last_decision.action_key or "").startswith("planned:")
+        )
+        escalated = trackable and signature == state.runtime_metadata.get(
+            "last_repair_failure_signature"
+        )
+        if escalated:
+            # 相同失败连续出现两次：换策略而不是再做一次相同的修复。
+            state.runtime_metadata.pop("last_repair_failure_signature", None)
+            state.runtime_metadata["repair_escalated"] = True
+            state.active_plan_revision += 1
+            state.replan_count += 1
+            result = result.model_copy(
+                update={
+                    "feedback": (
+                        "The previous approach failed twice in a row with the "
+                        f"identical failure: {result.feedback}. Do not retry the "
+                        "same approach or tool call with the same inputs. Choose "
+                        "a different approach or tool, or respond truthfully "
+                        "about the limitation."
+                    ),
+                }
+            )
+            state.verifier_result = result
+            self.runtime.store.append_run_event(
+                run,
+                "agent.repair.escalated",
+                {
+                    "repair_attempt": state.repair_attempts,
+                    "failure_signature": signature,
+                    "plan_revision": state.active_plan_revision,
+                },
+            )
+        elif trackable:
+            state.runtime_metadata["last_repair_failure_signature"] = signature
+            state.runtime_metadata.pop("repair_escalated", None)
         state.runtime_metadata["previous_verification"] = result.model_dump(
             mode="json"
         )
@@ -726,6 +828,7 @@ class AgentGraphNodes:
             {
                 "repair_attempt": state.repair_attempts,
                 "feedback": result.feedback,
+                "escalated": escalated,
             },
         )
         self.execution._persist_checkpoint(
@@ -756,6 +859,8 @@ class AgentGraphNodes:
             )
         state.active_plan_revision += 1
         state.replan_count += 1
+        # 重规划本身就是策略切换，连续相同失败的追踪从头开始。
+        state.runtime_metadata.pop("last_repair_failure_signature", None)
         state.runtime_metadata["previous_verification"] = result.model_dump(
             mode="json"
         )
@@ -901,6 +1006,7 @@ class AgentGraphNodes:
     def _route(
         state: AgentRuntimeState,
         route: AgentGraphRoute,
-    ) -> dict[str, Any]:
+    ) -> AgentRuntimeState:
+        # 直接返回状态实例，避免每个节点跳转都全量 model_dump 再重新校验。
         state.graph_route = route
-        return state.model_dump(mode="python")
+        return state

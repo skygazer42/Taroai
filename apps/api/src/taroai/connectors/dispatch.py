@@ -1,11 +1,10 @@
 import json
 import re
+import threading
 from typing import Any, Literal
-from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
-from urllib.request import Request as UrlRequest
-from urllib.request import urlopen
 
+import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from taroai.connectors.models import ConnectorAuthMode, ConnectorDefinition, ConnectorType
@@ -23,6 +22,23 @@ from taroai.secrets import (
 
 class ConnectorDispatchError(RuntimeError):
     pass
+
+
+_HTTP_CLIENT: httpx.Client | None = None
+_HTTP_CLIENT_LOCK = threading.Lock()
+
+
+def _shared_http_client() -> httpx.Client:
+    """Process-wide pooled HTTP client for connector dispatch calls."""
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None:
+        with _HTTP_CLIENT_LOCK:
+            if _HTTP_CLIENT is None:
+                _HTTP_CLIENT = httpx.Client(
+                    timeout=httpx.Timeout(10.0),
+                    follow_redirects=True,
+                )
+    return _HTTP_CLIENT
 
 
 class ConnectorCredentialExpiredError(ConnectorDispatchError):
@@ -132,30 +148,31 @@ class ConnectorDispatchResult(BaseModel):
 
 
 class UrlLibConnectorHttpClient(BaseModel):
+    """Pooled httpx connector HTTP client (class name kept for import compatibility)."""
+
     def send(self, request: ConnectorHttpRequest) -> ConnectorHttpResponse:
-        url_request = UrlRequest(
-            url=request.url,
-            data=request.body,
-            headers=request.headers,
-            method=request.method,
-        )
         try:
-            with urlopen(url_request, timeout=request.timeout_seconds) as response:
-                body = response.read(request.max_response_bytes + 1)
+            with _shared_http_client().stream(
+                request.method,
+                request.url,
+                content=request.body,
+                headers=request.headers,
+                timeout=request.timeout_seconds,
+            ) as response:
+                # 与 urlopen 的 read(max+1) 语义一致：最多读取 max+1 字节，
+                # 让 _build_result 能检测响应超限。
+                body = b""
+                for chunk in response.iter_bytes():
+                    body += chunk
+                    if len(body) > request.max_response_bytes:
+                        break
                 return ConnectorHttpResponse(
-                    status_code=response.status,
+                    status_code=response.status_code,
                     headers=dict(response.headers.items()),
-                    body=body,
+                    body=body[: request.max_response_bytes + 1],
                 )
-        except HTTPError as error:
-            body = error.read(request.max_response_bytes + 1)
-            return ConnectorHttpResponse(
-                status_code=error.code,
-                headers=dict(error.headers.items()),
-                body=body,
-            )
-        except URLError as error:
-            raise ConnectorDispatchError(f"connector HTTP request failed: {error.reason}") from error
+        except httpx.HTTPError as error:
+            raise ConnectorDispatchError(f"connector HTTP request failed: {error}") from error
 
 
 class ConnectorDispatchService(BaseModel):

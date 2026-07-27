@@ -80,7 +80,7 @@ def test_release_transfer_evidence_builder_writes_verified_packet(tmp_path: Path
     assert report.package_version == "0.1.0"
     assert report.app_version == "0.1.0"
     assert report.image_count == 5
-    assert report.migration_count == 45
+    assert report.migration_count == 49
     assert report.required_service_count == 10
     assert evidence_path.exists()
 

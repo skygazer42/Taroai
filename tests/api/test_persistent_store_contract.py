@@ -32,6 +32,7 @@ from taroai.domain import (
     RunStatus,
 )
 from taroai.store import InMemoryControlPlaneStore, NotFoundError, TenantAccessError
+from taroai.workflow import WorkflowPhaseSpec, WorkflowSpec, WorkflowTaskSpec
 
 
 ControlPlaneStore = InMemoryControlPlaneStore | SqlControlPlaneRepository
@@ -110,6 +111,55 @@ def create_pending_agent_action(
         )
     )
     return run, cycle, action
+
+
+@pytest.mark.parametrize(
+    "store_builder",
+    [build_in_memory_store, build_sql_store],
+    ids=["in_memory", "sql"],
+)
+def test_workflow_preview_spec_update_persists(
+    tmp_path: Path,
+    store_builder: Callable[
+        [Path],
+        tuple[ControlPlaneStore, Callable[[], ControlPlaneStore]],
+    ],
+):
+    store, reopen_store = store_builder(tmp_path)
+    run = store.create_run(
+        "tenant_acme",
+        "user_owner",
+        RunCreate(workspace_id="workspace_sales", message="Run workflow"),
+    )
+    spec = WorkflowSpec(
+        name="Original",
+        phases=[
+            WorkflowPhaseSpec(
+                id="phase_1",
+                title="Phase",
+                tasks=[WorkflowTaskSpec(id="task_1", title="Original task")],
+            )
+        ],
+        finalSynthesisPrompt="Return the result.",
+    )
+    workflow = store.create_workflow(run, spec)
+    revised = WorkflowSpec(
+        name="Revised",
+        phases=[
+            WorkflowPhaseSpec(
+                id="phase_1",
+                title="Phase",
+                tasks=[WorkflowTaskSpec(id="task_1", title="Revised task")],
+            )
+        ],
+        finalSynthesisPrompt="Return only the verified result.",
+    )
+
+    store.update_workflow(run.tenant_id, workflow.id, spec=revised)
+
+    persisted = reopen_store().get_workflow(run.tenant_id, workflow.id)
+    assert persisted.spec.name == "Revised"
+    assert persisted.spec.task("task_1").title == "Revised task"
 
 
 @pytest.mark.parametrize(

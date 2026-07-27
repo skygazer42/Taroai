@@ -1,11 +1,10 @@
 import json
+import threading
 from datetime import datetime, timedelta
 from typing import Any
-from urllib.error import URLError
 from urllib.parse import urlencode, urlsplit
-from urllib.request import Request as UrlRequest
-from urllib.request import urlopen
 
+import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from taroai.connectors.models import ConnectorAuthMode, ConnectorDefinition
@@ -20,6 +19,23 @@ from taroai.secrets import (
 
 class ConnectorOAuthError(RuntimeError):
     pass
+
+
+_HTTP_CLIENT: httpx.Client | None = None
+_HTTP_CLIENT_LOCK = threading.Lock()
+
+
+def _shared_http_client() -> httpx.Client:
+    """Process-wide pooled HTTP client for OAuth token calls."""
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None:
+        with _HTTP_CLIENT_LOCK:
+            if _HTTP_CLIENT is None:
+                _HTTP_CLIENT = httpx.Client(
+                    timeout=httpx.Timeout(30.0),
+                    follow_redirects=True,
+                )
+    return _HTTP_CLIENT
 
 
 class OAuthConnectorConfig(BaseModel):
@@ -177,16 +193,18 @@ class UrlLibOAuthTokenClient(BaseModel):
 
     def _post_form(self, url: str, payload: dict[str, str]) -> dict[str, Any]:
         body = urlencode(payload).encode("utf-8")
-        http_request = UrlRequest(
-            url=url,
-            data=body,
-            headers={"content-type": "application/x-www-form-urlencoded"},
-            method="POST",
-        )
         try:
-            with urlopen(http_request, timeout=30) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except (URLError, json.JSONDecodeError, UnicodeDecodeError) as error:
+            response = _shared_http_client().post(
+                url,
+                content=body,
+                headers={"content-type": "application/x-www-form-urlencoded"},
+                timeout=30,
+            )
+            # urllib 的 HTTPError 是 URLError 子类：非 2xx 也映射为
+            # ConnectorOAuthError；raise_for_status 保持相同行为。
+            response.raise_for_status()
+            return json.loads(response.content.decode("utf-8"))
+        except (httpx.HTTPError, json.JSONDecodeError, UnicodeDecodeError) as error:
             raise ConnectorOAuthError("OAuth token request failed") from error
 
 

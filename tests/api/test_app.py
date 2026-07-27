@@ -1737,13 +1737,15 @@ def test_run_trace_returns_runtime_stage_spans_for_executed_run():
         for span in body["spans"]
         if span["name"].startswith("runtime.")
     }
+    # 迁移 047/048 起不再为无产物的运行创建占位 artifact，
+    # 因此纯工具运行不产生 runtime.artifact span。
     assert set(runtime_spans) >= {
         "runtime.context_load",
         "runtime.planning",
         "runtime.step",
         "runtime.tool_call",
-        "runtime.artifact",
     }
+    assert "runtime.artifact" not in runtime_spans
     assert {span["parent_span_id"] for span in runtime_spans.values()} == {root_span_id}
     assert runtime_spans["runtime.planning"]["attributes"]["planned_step_count"] == 1
     assert runtime_spans["runtime.step"]["attributes"]["step_id"] == "step_research"
@@ -1754,10 +1756,6 @@ def test_run_trace_returns_runtime_stage_spans_for_executed_run():
         "attempt": 1,
         "status": "ok",
     }
-    assert (
-        runtime_spans["runtime.artifact"]["attributes"]["artifact_type"] == "document"
-    )
-    assert runtime_spans["runtime.artifact"]["attributes"]["status"] == "ok"
 
 
 def test_run_trace_classifies_failed_tool_runs():

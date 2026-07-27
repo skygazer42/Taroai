@@ -120,6 +120,11 @@ config:
   TAROAI_SANDBOX_CONTROLLER_KUBERNETES_EPHEMERAL_STORAGE_LIMIT: 2Gi
   TAROAI_SANDBOX_CONTROLLER_KUBERNETES_RUN_AS_USER: "65532"
   TAROAI_SANDBOX_CONTROLLER_KUBERNETES_RUN_AS_GROUP: "65532"
+  # Browser automation is disabled by default. To enable it, set
+  # TAROAI_BROWSER_PROVIDER to "playwright" (or "browserbase"), set
+  # TAROAI_BROWSER_CONTROLLER_NAVIGATION_ALLOWED_HOSTS to a non-empty JSON
+  # array of hostnames (e.g. '["example.com", "*.example.org"]'), and
+  # provide TAROAI_BROWSER_CONTROLLER_API_KEY via secrets.
   TAROAI_BROWSER_PROVIDER: disabled
   TAROAI_BROWSER_CONTROLLER_BASE_URL: http://taroai-browser-controller:8001
   TAROAI_BROWSER_CONTROLLER_TIMEOUT_SECONDS: "30"

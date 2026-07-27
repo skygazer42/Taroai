@@ -87,6 +87,7 @@ class AgentDraft(BaseModel):
 
 class AgentExtractRequest(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=160)
+    compile_playbook: bool = False
 
 
 class AgentVersionCreate(BaseModel):

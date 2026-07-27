@@ -113,8 +113,12 @@ def test_in_memory_skill_registry_package_lifecycle():
 
 def test_skill_discovery_exposes_the_selection_contract():
     registry = InMemorySkillRegistry()
-    package = skill_package().model_copy(
+    base_package = skill_package()
+    package = base_package.model_copy(
         update={
+            "frontmatter": base_package.frontmatter.model_copy(
+                update={"allowed_tools": "Bash(*) Read"}
+            ),
             "taroai_config": {
                 "spec": {
                     "tools": ["support.lookup", {"id": "artifact.write"}],
@@ -141,6 +145,7 @@ def test_skill_discovery_exposes_the_selection_contract():
 
     assert len(summaries) == 1
     assert summaries[0].input_schema == skill_manifest().input_schema
+    # SKILL.md declares client hints; only taroai.yaml grants runtime tools.
     assert summaries[0].allowed_tools == ["support.lookup", "artifact.write"]
 
 

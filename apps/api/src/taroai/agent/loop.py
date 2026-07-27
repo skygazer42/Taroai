@@ -52,7 +52,12 @@ from taroai.model_gateway import (
     ModelPolicyDeniedError,
     ReasoningEffort,
 )
-from taroai.memory import MemoryScopeType, MemoryWriteRejectedError, MemoryWriteRequest
+from taroai.memory import (
+    MemoryScopeType,
+    MemoryStatus,
+    MemoryWriteRejectedError,
+    MemoryWriteRequest,
+)
 from taroai.sandbox.models import SandboxFileWrite
 from taroai.tool_gateway import (
     ToolApprovalRequiredError,
@@ -344,12 +349,31 @@ def _model_observations(
         output = json.dumps(payload["output"], ensure_ascii=False)
         if len(output) <= 12_000:
             continue
-        # ponytail: 首尾预览覆盖常见日志；需要随机访问时读取已持久化的完整输出。
+        # 压缩是可恢复的：预览之外的完整输出可用 observation.read 按 action_id 分页读回。
         payload["output"] = {
             "compacted": True,
             "original_characters": len(output),
             "preview": f"{output[:6_000]}\n…\n{output[-6_000:]}",
+            "full_output": (
+                f"call observation.read with action_id={payload['action_id']} "
+                "to page through the complete output"
+            ),
         }
+    older = observations[:-8]
+    if older:
+        payloads.insert(
+            0,
+            {
+                "older_observations_index": [
+                    {"action_id": item.action_id, "success": item.success}
+                    for item in older
+                ],
+                "note": (
+                    "these earlier observations were dropped from the recent window; "
+                    "call observation.read with an action_id to re-read one"
+                ),
+            },
+        )
     return payloads
 
 
@@ -439,7 +463,6 @@ class AgentExecutionServices:
                     "language of the user's current request. Honor explicit scope, format, "
                     "length, and wording; output requested-only fields without a preamble, "
                     "labels, or follow-up. Do not expose hidden reasoning. "
-                    f"Current datetime UTC: {utc_now().isoformat()}. "
                     "A platform timezone is only clock "
                     "context, not evidence of the user's physical location. Tool descriptions "
                     "and JSON schemas are authoritative: decide semantically whether a tool is "
@@ -461,6 +484,15 @@ class AgentExecutionServices:
                 ),
             )
         ]
+        # 时间戳单独放在静态前缀之后并降到分钟粒度，保持前缀字节稳定以命中提供商的 prompt 缓存。
+        messages.append(
+            ModelMessage(
+                role="system",
+                content=(
+                    f"Current datetime UTC: {utc_now().isoformat(timespec='minutes')}."
+                ),
+            )
+        )
         if platform_context := state.runtime_metadata.get("platform_context"):
             messages.append(
                 ModelMessage(
@@ -1246,6 +1278,8 @@ class AgentExecutionServices:
                 "array",
             }:
                 allowed_tools.add("ui.render")
+            # 观察分页读取是内部只读工具，任何受限模式下都允许。
+            allowed_tools.add("observation.read")
             tool_definitions = [
                 tool
                 for tool in tool_definitions
@@ -1262,6 +1296,7 @@ class AgentExecutionServices:
             }
             # 标准 SKILL.md 没有工具清单时沿用宿主工具；非空清单才是白名单。
             if all(declared_tool_sets):
+                allowed_tools.add("observation.read")
                 if run.mode != RunMode.CHAT:
                     allowed_tools.update(_AUTHORING_TOOLS)
                 tool_definitions = [
@@ -1324,10 +1359,10 @@ class AgentExecutionServices:
                     and tool["function"]["name"].replace("__", ".")
                     not in _AUTHORING_TOOLS
                 ]
-        actions = self.runtime.store.list_agent_actions(run.tenant_id, run.id)
+        run_actions = self.runtime.store.list_agent_actions(run.tenant_id, run.id)
         completed_actions = [
             action
-            for action in actions
+            for action in run_actions
             if action.observation is not None and action.observation.success
         ]
         if preferred_tool is not None and any(
@@ -1381,7 +1416,7 @@ class AgentExecutionServices:
             action.decision.tool_name == "ui.render"
             and action.observation is not None
             and not action.observation.success
-            for action in actions
+            for action in run_actions
         ):
             response_text = self._stream_final_response(state, run)
             state.runtime_metadata["assistant_response_streamed"] = True
@@ -1577,7 +1612,9 @@ class AgentExecutionServices:
                         "platform_context": state.runtime_metadata.get(
                             "platform_context"
                         ),
-                        "current_datetime_utc": utc_now().isoformat(),
+                        "current_datetime_utc": utc_now().isoformat(
+                            timespec="minutes"
+                        ),
                         "current_request": {
                             "attachments": run.attachments,
                             "files": self.runtime._attachment_descriptors(run),
@@ -1713,10 +1750,11 @@ class AgentExecutionServices:
         context_sensitivity_level = self.runtime._context_sensitivity_level(
             state.retrieved_context
         )
+        decide_operation = self._decide_operation(state)
         request = self._model_request(
             run,
             messages,
-            operation="decide",
+            operation=decide_operation,
             tool_definitions=tool_definitions,
             sensitivity_level=context_sensitivity_level,
         )
@@ -1727,7 +1765,7 @@ class AgentExecutionServices:
             if stream_native_response:
                 response_text, actions = self._recorded_model_call(
                     run,
-                    "decide",
+                    decide_operation,
                     request,
                     lambda: self._stream_response_or_action(run, request),
                 )
@@ -1751,7 +1789,7 @@ class AgentExecutionServices:
             else:
                 decision = self._recorded_model_call(
                     run,
-                    "decide",
+                    decide_operation,
                     request,
                     lambda: self.runtime.model_gateway.decide_next_action(request),
                 )
@@ -1836,7 +1874,9 @@ class AgentExecutionServices:
             loaded_skills=loaded_skills,
             skill_tools=skill_tools,
         )
-        repeated_failure = self._repeated_failed_action(state, run, decision)
+        repeated_failure = self._repeated_failed_action(
+            state, run, decision, actions=run_actions
+        )
         if repeated_failure is not None:
             failure_detail = (
                 repeated_failure.safe_error or repeated_failure.error or "未知错误"
@@ -1881,7 +1921,9 @@ class AgentExecutionServices:
                     response_text=state.final_response_text,
                     verification_required=False,
                 )
-        if self._repeats_successful_action(state, run, decision, connector_tools):
+        if self._repeats_successful_action(
+            state, run, decision, connector_tools, actions=run_actions
+        ):
             self.runtime.store.append_run_event(
                 run,
                 "agent.action.duplicate_suppressed",
@@ -1934,7 +1976,7 @@ class AgentExecutionServices:
                     skill_tools=skill_tools,
                 )
                 if self._repeats_successful_action(
-                    state, run, decision, connector_tools
+                    state, run, decision, connector_tools, actions=run_actions
                 ):
                     decision = AgentDecision(
                         kind="respond",
@@ -1947,7 +1989,24 @@ class AgentExecutionServices:
                 pending_user_input["unanswered_optional_questions"]
             )
         state.runtime_metadata.pop("previous_verification", None)
+        state.runtime_metadata.pop("repair_escalated", None)
         return decision
+
+    def _decide_operation(self, state: AgentRuntimeState) -> str:
+        """确定性工具失败后的首次修复决策可路由到快模型；升级后回到正常模型。"""
+
+        previous_verification = state.runtime_metadata.get("previous_verification")
+        if (
+            not isinstance(previous_verification, dict)
+            or previous_verification.get("outcome") != "repair"
+            or state.runtime_metadata.get("repair_escalated")
+        ):
+            return "decide"
+        evidence = previous_verification.get("evidence") or []
+        has_tool_failure_evidence = any(
+            str(item).startswith("failure_class: ") for item in evidence
+        )
+        return "repair" if has_tool_failure_evidence else "decide"
 
     def _normalize_decision(
         self,
@@ -2030,6 +2089,7 @@ class AgentExecutionServices:
         run: Run,
         decision: AgentDecision,
         connector_tools: list[dict[str, Any]],
+        actions: list[AgentAction] | None = None,
     ) -> bool:
         if decision.kind == "action" and decision.tool_name == "memory.save":
             return any(
@@ -2039,7 +2099,7 @@ class AgentExecutionServices:
         return any(
             observation.success
             for observation in self._matching_action_observations(
-                state, run, decision, connector_tools
+                state, run, decision, connector_tools, actions=actions
             )
         )
 
@@ -2048,10 +2108,12 @@ class AgentExecutionServices:
         state: AgentRuntimeState,
         run: Run,
         decision: AgentDecision,
+        actions: list[AgentAction] | None = None,
     ) -> AgentObservation | None:
         if decision.kind != "action" or decision.tool_name is None:
             return None
-        actions = self.runtime.store.list_agent_actions(run.tenant_id, run.id)
+        if actions is None:
+            actions = self.runtime.store.list_agent_actions(run.tenant_id, run.id)
         if not actions:
             return None
         observations = {item.action_id: item for item in state.observations}
@@ -2103,9 +2165,12 @@ class AgentExecutionServices:
         run: Run,
         decision: AgentDecision,
         connector_tools: list[dict[str, Any]],
+        actions: list[AgentAction] | None = None,
     ) -> list[AgentObservation]:
         if decision.kind != "action" or decision.tool_name is None:
             return []
+        if actions is None:
+            actions = self.runtime.store.list_agent_actions(run.tenant_id, run.id)
         schemas = {
             name: policy.input_schema
             for name, policy in self.runtime.tool_gateway.policies.items()
@@ -2116,7 +2181,7 @@ class AgentExecutionServices:
         signature = self._action_signature(decision, schemas.get(decision.tool_name))
         observations = {item.action_id: item for item in state.observations}
         matches = []
-        for action in self.runtime.store.list_agent_actions(run.tenant_id, run.id):
+        for action in actions:
             observation = action.observation or observations.get(action.id)
             if (
                 observation is not None
@@ -3075,15 +3140,60 @@ class AgentExecutionServices:
         service = self.runtime.long_term_memory_service
         if service is None or run.agent_id is None or not state.final_response_text:
             return
-        if any(
-            event.type == "agent.memory.candidate_created"
-            for event in self.runtime.store.list_run_events(run.tenant_id, run.id)
+        if self.runtime.store.run_event_exists(
+            run.tenant_id, run.id, "agent.memory.candidate_created"
         ):
             return
         goal = state.goal.strip()[:1_200]
         outcome = state.final_response_text.strip()[:2_400]
         tools = sorted({result.tool_name for result in state.tool_results})
+        content = f"Goal: {goal}\nOutcome: {outcome}"
+        normalized = re.sub(r"\s+", " ", content).strip().casefold()
+        content_digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        capture_metrics = {
+            "goal_characters": len(goal),
+            "outcome_characters": len(outcome),
+            "successful_tool_count": len(tools),
+            "successful_observation_count": sum(
+                observation.success for observation in state.observations
+            ),
+            "artifact_count": len(
+                self.runtime.store.list_artifacts(run.tenant_id, run.id)
+            ),
+        }
         try:
+            existing = next(
+                (
+                    memory
+                    for status in (
+                        MemoryStatus.CANDIDATE,
+                        MemoryStatus.ACTIVE,
+                        MemoryStatus.REJECTED,
+                    )
+                    for memory in service.list_by_scope(
+                        run.tenant_id,
+                        MemoryScopeType.AGENT,
+                        run.agent_id,
+                        status=status,
+                    )
+                    if memory.metadata.get("content_digest") == content_digest
+                    or re.sub(r"\s+", " ", memory.content).strip().casefold()
+                    == normalized
+                ),
+                None,
+            )
+            if existing is not None:
+                self.runtime.store.append_run_event(
+                    run,
+                    "agent.memory.capture_skipped",
+                    {
+                        "reason": "duplicate_session_memory",
+                        "existing_memory_id": existing.id,
+                        "existing_status": existing.status.value,
+                        "capture_metrics": capture_metrics,
+                    },
+                )
+                return
             memory = service.propose_candidate(
                 MemoryWriteRequest(
                     tenant_id=run.tenant_id,
@@ -3091,12 +3201,14 @@ class AgentExecutionServices:
                     scope_type=MemoryScopeType.AGENT,
                     scope_id=run.agent_id,
                     source_run_id=run.id,
-                    content=f"Goal: {goal}\nOutcome: {outcome}",
+                    content=content,
                     created_by=run.user_id,
                     metadata={
                         "source": "agent_session_summary",
-                        "memory_key": f"session.{run.id}",
+                        "memory_key": f"session.{content_digest[:24]}",
+                        "content_digest": content_digest,
                         "successful_tools": tools,
+                        "capture_metrics": capture_metrics,
                         "importance": 0.7,
                     },
                     confidence=0.8,
@@ -3124,6 +3236,7 @@ class AgentExecutionServices:
                 "memory_id": memory.id,
                 "scope_id": run.agent_id,
                 "status": memory.status.value,
+                "capture_metrics": capture_metrics,
             },
         )
 
@@ -3137,10 +3250,12 @@ class AgentExecutionServices:
         if run.thread_id is None or not content:
             return
         # ponytail: the job lease serializes a run; add a DB uniqueness key only if finalizers become concurrent.
-        if completion_key and any(
-            event.type == "assistant.message.completed"
-            and event.payload.get("completion_key") == completion_key
-            for event in self.runtime.store.list_run_events(run.tenant_id, run.id)
+        if completion_key and self.runtime.store.run_event_exists(
+            run.tenant_id,
+            run.id,
+            "assistant.message.completed",
+            payload_key="completion_key",
+            payload_value=completion_key,
         ):
             return
         message = self.runtime.store.append_chat_message(
@@ -3355,8 +3470,14 @@ class AgentExecutionServices:
     ) -> AgentCheckpoint:
         """保存单调递增、带校验和及沙箱引用的恢复点。"""
 
-        latest = self.runtime.store.get_latest_agent_checkpoint(run.tenant_id, run.id)
-        sequence = (latest.sequence if latest is not None else 0) + 1
+        if state.checkpoint_sequence > 0:
+            # state 内的序号与提交路径保持同步，避免每个检查点都回查最新序号。
+            sequence = state.checkpoint_sequence + 1
+        else:
+            latest = self.runtime.store.get_latest_agent_checkpoint(
+                run.tenant_id, run.id
+            )
+            sequence = (latest.sequence if latest is not None else 0) + 1
         state.checkpoint_sequence = sequence
         payload = state.model_dump(mode="json")
         checkpoint = AgentCheckpoint(
@@ -3401,7 +3522,9 @@ class AgentExecutionServices:
 
         decision = action.decision
         step_id = action.id
-        if decision.action_key and decision.action_key.startswith("planned:"):
+        if decision.action_key and decision.action_key.startswith(
+            ("planned:", "playbook:")
+        ):
             step_id = decision.action_key.split(":", 2)[1]
         return PlanStep(
             id=step_id,
@@ -3504,7 +3627,9 @@ class AgentExecutionServices:
             messages=messages,
             tools=tools,
             tool_choice="auto" if tools else None,
-            temperature=0 if tools or operation in {"decide", "verify"} else None,
+            temperature=(
+                0 if tools or operation in {"decide", "verify", "repair"} else None
+            ),
             sensitivity_level=sensitivity_level,
             metadata={
                 "operation": operation,
@@ -3512,6 +3637,24 @@ class AgentExecutionServices:
                 "thread_id": run.thread_id,
             },
         )
+        fast_model = self.runtime.loop_fast_model
+        if (
+            fast_model
+            and operation in self.runtime.loop_fast_operations
+            and fast_model != request.model
+        ):
+            candidate = request.model_copy(update={"model": fast_model})
+            try:
+                resolved_model = self.runtime.model_policy.assert_request_allowed(
+                    candidate
+                )
+            except ModelPolicyDeniedError:
+                # 快模型被策略拒绝时回退到运行指定的模型。
+                pass
+            else:
+                if resolved_model is not None and candidate.model != resolved_model:
+                    candidate = candidate.model_copy(update={"model": resolved_model})
+                return candidate
         resolved_model = self.runtime.model_policy.assert_request_allowed(request)
         if resolved_model is not None and request.model != resolved_model:
             request = request.model_copy(update={"model": resolved_model})
@@ -3739,13 +3882,8 @@ class AgentExecutionServices:
     def _run_cost(self, state: AgentRuntimeState) -> float:
         """汇总本次运行已记录的费用。"""
 
-        meters = self.runtime.store.list_billing_meters(state.tenant_id)
-        return float(
-            sum(
-                meter.cost_estimate or 0
-                for meter in meters
-                if meter.run_id == state.run_id
-            )
+        return self.runtime.store.sum_run_billing_cost(
+            state.tenant_id, state.run_id
         )
 
     def _budget_snapshot(self, state: AgentRuntimeState) -> dict[str, Any]:

@@ -4,6 +4,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from taroai.config import Settings
@@ -23,15 +24,13 @@ from taroai.web_search import register_web_search_tool_handler
 def test_tavily_search_returns_compact_sources_without_exposing_the_key():
     captured = {}
 
-    class Response:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def read(self):
-            return json.dumps(
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["authorization"] = request.headers["Authorization"]
+        captured["payload"] = json.loads(request.content)
+        captured["timeout"] = request.extensions["timeout"]["read"]
+        return httpx.Response(
+            200,
+            content=json.dumps(
                 {
                     "results": [
                         {
@@ -48,20 +47,15 @@ def test_tavily_search_returns_compact_sources_without_exposing_the_key():
                         },
                     ]
                 }
-            ).encode()
-
-    def requester(request, timeout):
-        captured["authorization"] = request.headers["Authorization"]
-        captured["payload"] = json.loads(request.data)
-        captured["timeout"] = timeout
-        return Response()
+            ).encode(),
+        )
 
     gateway = ToolGateway()
     register_web_search_tool_handler(
         gateway,
         "secret-search-key",
         timeout_seconds=9,
-        requester=requester,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
     policy = gateway.policies["web.search"]
     assert "prefer primary sources over aggregators" in policy.description
@@ -113,15 +107,14 @@ def test_tavily_search_returns_compact_sources_without_exposing_the_key():
 def test_tavily_fetch_reads_one_page_without_exposing_the_key():
     captured = {}
 
-    class Response:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def read(self):
-            return json.dumps(
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["authorization"] = request.headers["Authorization"]
+        captured["payload"] = json.loads(request.content)
+        captured["url"] = str(request.url)
+        captured["timeout"] = request.extensions["timeout"]["read"]
+        return httpx.Response(
+            200,
+            content=json.dumps(
                 {
                     "results": [
                         {
@@ -131,21 +124,15 @@ def test_tavily_fetch_reads_one_page_without_exposing_the_key():
                     ],
                     "failed_results": [],
                 }
-            ).encode()
-
-    def requester(request, timeout):
-        captured["authorization"] = request.headers["Authorization"]
-        captured["payload"] = json.loads(request.data)
-        captured["url"] = request.full_url
-        captured["timeout"] = timeout
-        return Response()
+            ).encode(),
+        )
 
     gateway = ToolGateway()
     register_web_search_tool_handler(
         gateway,
         "secret-search-key",
         timeout_seconds=9,
-        requester=requester,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
     result = gateway.execute_request(
         ToolGatewayRequest(

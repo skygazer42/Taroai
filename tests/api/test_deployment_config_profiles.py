@@ -232,6 +232,7 @@ def test_production_environment_requires_browser_controller_api_key_when_browser
                 browser_provider="playwright",
                 browser_controller_base_url="http://browser-controller.taroai.svc.cluster.local",
                 browser_controller_api_key="",
+                browser_controller_navigation_allowed_hosts=["browser.example.com"],
             ),
         )
 
@@ -247,6 +248,7 @@ def test_production_environment_rejects_local_browser_controller_api_key():
                 browser_provider="playwright",
                 browser_controller_base_url="http://browser-controller.taroai.svc.cluster.local",
                 browser_controller_api_key="local_browser_controller_key_2026_dev_only",
+                browser_controller_navigation_allowed_hosts=["browser.example.com"],
             ),
         )
 
@@ -263,6 +265,7 @@ def test_production_environment_requires_browser_controller_endpoint_when_browse
                 browser_provider="playwright",
                 browser_controller_base_url="",
                 browser_controller_api_key="production_browser_controller_key_2026",
+                browser_controller_navigation_allowed_hosts=["browser.example.com"],
             ),
         )
 
@@ -453,6 +456,7 @@ def test_customer_operated_deployment_requires_browser_controller_api_key_when_b
                 browser_provider="playwright",
                 browser_controller_base_url="https://browser.enterprise.example.com",
                 browser_controller_api_key="",
+                browser_controller_navigation_allowed_hosts=["browser.example.com"],
             ),
         )
 
@@ -467,6 +471,7 @@ def test_customer_operated_deployment_requires_browser_controller_endpoint_when_
                 browser_provider="playwright",
                 browser_controller_base_url="",
                 browser_controller_api_key="byoc_browser_controller_key_2026",
+                browser_controller_navigation_allowed_hosts=["browser.example.com"],
             ),
         )
 
@@ -481,6 +486,7 @@ def test_customer_operated_deployment_rejects_default_browser_controller_api_key
                 browser_provider="playwright",
                 browser_controller_base_url="https://browser.private.example.com",
                 browser_controller_api_key="replace-with-browser-controller-key",
+                browser_controller_navigation_allowed_hosts=["browser.example.com"],
             ),
         )
 
@@ -594,6 +600,7 @@ def test_customer_operated_deployment_rejects_short_browser_controller_api_key()
                 browser_provider="playwright",
                 browser_controller_base_url="https://browser.private.example.com",
                 browser_controller_api_key="short_browser_key",
+                browser_controller_navigation_allowed_hosts=["browser.example.com"],
             ),
         )
 
@@ -640,6 +647,7 @@ def test_air_gapped_deployment_accepts_internal_model_and_sandbox_endpoints():
             browser_provider="playwright",
             browser_controller_base_url="http://browser-controller.taroai.svc.cluster.local",
             browser_controller_api_key="air_gapped_browser_controller_key_2026",
+            browser_controller_navigation_allowed_hosts=["browser.example.com"],
         ),
     )
 

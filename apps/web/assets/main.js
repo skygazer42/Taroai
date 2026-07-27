@@ -9,6 +9,7 @@ import { createAgentBrainUI } from "./brain-ui.js?v=20260724-design4";
 import { createFilesUI } from "./files-ui.js?v=20260724-design4";
 import { createEvaluationsUI } from "./evaluations-ui.js?v=20260724-design4";
 import { createWorkspaceUI } from "./workspace-ui.js?v=20260724-design4";
+import { opsStatusbarModel } from "./ops-status.js?v=20260726-ops1";
 
 window.__taroaiThreadChat = true;
 hydrateIcons();
@@ -401,6 +402,12 @@ const elements = {
   approvalResolution: document.querySelector("[data-approval-resolution]"),
   approve: document.querySelector("#approve-button"),
   reject: document.querySelector("#reject-button"),
+  approvalPanel: document.querySelector("[data-testid='approval-panel']"),
+  terminalDisclosure: document.querySelector("[data-testid='sandbox-terminal']"),
+  opsLiveDot: document.querySelector("[data-ops-live-dot]"),
+  opsApprovalChip: document.querySelector("[data-ops-approval-chip]"),
+  opsProgress: document.querySelector("[data-ops-progress]"),
+  opsProgressFill: document.querySelector("[data-ops-progress-fill]"),
 };
 
 function applyUrlConfiguration() {
@@ -484,6 +491,7 @@ function initializeControls() {
   renderBootstrap();
   renderAuth();
   renderExecutionLoop();
+  renderOpsStatusbar();
   renderRunEvidence();
   renderDeliveryChain();
   renderEventIntegrity();
@@ -510,6 +518,7 @@ function switchWorkbenchView(viewName) {
     const isActive = button.dataset.workbenchViewToggle === activeView;
     button.classList.toggle("is-active", isActive);
     button.setAttribute("aria-selected", isActive ? "true" : "false");
+    button.setAttribute("tabindex", isActive ? "0" : "-1");
   });
 }
 
@@ -1709,6 +1718,35 @@ function renderRunControls() {
   renderRunEvidence();
   renderDeliveryChain();
   renderEventIntegrity();
+  renderOpsStatusbar();
+}
+
+function renderOpsStatusbar() {
+  const hasRun = Boolean(state.currentRunId);
+  const pendingApproval = Boolean(state.pendingApprovalId);
+  const model = opsStatusbarModel({
+    hasRun,
+    failed: hasRun && RETRYABLE_RUN_STATUSES.includes(state.runStatus),
+    terminal: hasRun && isRunTerminalStatus(state.runStatus),
+    pendingApproval,
+    stageStates: Object.values(executionLoopStages()).map((stage) => stage.state),
+  });
+  elements.opsProgressFill.style.width = `${model.progress}%`;
+  elements.opsProgress.setAttribute("aria-valuenow", String(model.progress));
+  elements.opsProgress.dataset.progressState = model.progressState;
+  elements.opsLiveDot.dataset.state = model.dotState;
+  elements.opsApprovalChip.hidden = !pendingApproval;
+  elements.executionLoopSummary.hidden = !hasRun;
+}
+
+function revealApprovalPanel() {
+  const panel = elements.approvalPanel;
+  if (!panel) {
+    return;
+  }
+  panel.scrollIntoView({ block: "center" });
+  panel.classList.add("is-highlight");
+  window.setTimeout(() => panel.classList.remove("is-highlight"), 1600);
 }
 
 function renderExecutionLoop() {
@@ -1767,7 +1805,7 @@ function runExecutionLoopStage() {
 
 function planExecutionLoopStage(runtime, plannedSteps, completedSteps) {
   if (!state.currentRunId) {
-    return executionLoopStageLabel("Waiting", "waiting");
+    return executionLoopStageLabel("No run", "waiting");
   }
   if (runtime && plannedSteps.length) {
     const label = `${completedSteps.length}/${plannedSteps.length}`;
@@ -1780,7 +1818,7 @@ function planExecutionLoopStage(runtime, plannedSteps, completedSteps) {
   if (hasEventType("plan.created") || hasEventType("model.plan.created")) {
     return executionLoopStageLabel("Created", "done");
   }
-  return executionLoopStageLabel("Waiting", "waiting");
+  return executionLoopStageLabel("Not started", "waiting");
 }
 
 function latestModelRouteEvent() {
@@ -1825,7 +1863,7 @@ function modelRouteLabel() {
 
 function sandboxExecutionLoopStage(runtime) {
   if (!state.currentRunId) {
-    return executionLoopStageLabel("Waiting", "waiting");
+    return executionLoopStageLabel("No run", "waiting");
   }
   if (hasEventType("sandbox.artifact.promoted")) {
     return executionLoopStageLabel("Promoted", "done");
@@ -1842,12 +1880,12 @@ function sandboxExecutionLoopStage(runtime) {
   ) {
     return executionLoopStageLabel("Active", "active");
   }
-  return executionLoopStageLabel("Waiting", "waiting");
+  return executionLoopStageLabel("Not started", "waiting");
 }
 
 function browserExecutionLoopStage(runtime) {
   if (!state.currentRunId) {
-    return executionLoopStageLabel("Waiting", "waiting");
+    return executionLoopStageLabel("No run", "waiting");
   }
   if (hasEventType("browser.session.destroyed")) {
     return executionLoopStageLabel("Closed", "done");
@@ -1861,12 +1899,12 @@ function browserExecutionLoopStage(runtime) {
   ) {
     return executionLoopStageLabel("Active", "active");
   }
-  return executionLoopStageLabel("Waiting", "waiting");
+  return executionLoopStageLabel("Not used", "waiting");
 }
 
 function artifactExecutionLoopStage(promotedPaths) {
   if (!state.currentRunId) {
-    return executionLoopStageLabel("Waiting", "waiting");
+    return executionLoopStageLabel("No run", "waiting");
   }
   if (state.artifacts.length) {
     return executionLoopStageLabel(`${state.artifacts.length} ready`, "done");
@@ -1880,7 +1918,7 @@ function artifactExecutionLoopStage(promotedPaths) {
   ) {
     return executionLoopStageLabel("Created", "done");
   }
-  return executionLoopStageLabel("Waiting", "waiting");
+  return executionLoopStageLabel("None yet", "waiting");
 }
 
 function executionLoopStageLabel(label, stageState) {
@@ -1952,19 +1990,23 @@ function buildDeliveryChainEvidence() {
   const sandboxSessionId =
     (runtime && runtime.sandbox_session_id) ||
     (commandOutput && commandOutput.session_id) ||
-    "--";
+    DELIVERY_EMPTY_VALUE;
   const chain = {
-    runId: state.currentRunId || "--",
+    runId: state.currentRunId || "No run yet",
     sandboxSessionId,
     artifactStorageIds,
-    terminalStorageId: terminalStorageObject ? terminalStorageObject.id : "--",
-    browserStorageId: browserStorageObject ? browserStorageObject.id : "--",
+    terminalStorageId: terminalStorageObject
+      ? terminalStorageObject.id
+      : DELIVERY_EMPTY_VALUE,
+    browserStorageId: browserStorageObject
+      ? browserStorageObject.id
+      : DELIVERY_EMPTY_VALUE,
   };
   const hasRequiredDelivery =
     Boolean(state.currentRunId) &&
-    chain.sandboxSessionId !== "--" &&
+    chain.sandboxSessionId !== DELIVERY_EMPTY_VALUE &&
     chain.artifactStorageIds.length > 0 &&
-    chain.terminalStorageId !== "--";
+    chain.terminalStorageId !== DELIVERY_EMPTY_VALUE;
   if (!state.currentRunId) {
     return { ...chain, statusLabel: "No delivery chain", status: "waiting" };
   }
@@ -1977,14 +2019,17 @@ function buildDeliveryChainEvidence() {
   return { ...chain, statusLabel: "Collecting delivery evidence", status: "active" };
 }
 
+const DELIVERY_EMPTY_VALUE = "Not recorded";
+
 function setDeliveryChainValue(element, value) {
   const text = Array.isArray(value)
     ? value.length
       ? value.slice(0, 2).join(", ") + (value.length > 2 ? ` +${value.length - 2}` : "")
-      : "--"
-    : value || "--";
+      : DELIVERY_EMPTY_VALUE
+    : value || DELIVERY_EMPTY_VALUE;
   element.textContent = text;
-  element.dataset.deliveryChainValue = text === "--" ? "" : text;
+  element.dataset.deliveryChainValue =
+    text === DELIVERY_EMPTY_VALUE || text === "No run yet" ? "" : text;
 }
 
 function renderEventIntegrity() {
@@ -2001,9 +2046,9 @@ function buildEventIntegrityEvidence() {
     return {
       status: "waiting",
       statusLabel: "No event stream",
-      countLabel: "--",
-      sequenceLabel: "--",
-      closureLabel: "--",
+      countLabel: "No events yet",
+      sequenceLabel: "Stream not started",
+      closureLabel: "Not evaluated",
     };
   }
 
@@ -2171,9 +2216,9 @@ function eventClosureStages(
 }
 
 function setEventIntegrityValue(element, value) {
-  const text = value || "--";
+  const text = value || "Not recorded";
   element.textContent = text;
-  element.dataset.eventIntegrityValue = text === "--" ? "" : text;
+  element.dataset.eventIntegrityValue = text === "Not recorded" ? "" : text;
 }
 
 function buildRunEvidenceItems() {
@@ -2204,7 +2249,7 @@ function buildRunEvidenceItems() {
 
 function planEvidenceItem(runtime, plannedSteps, completedSteps) {
   if (!state.currentRunId) {
-    return evidenceItem("Waiting", "waiting");
+    return evidenceItem("No run yet", "waiting");
   }
   if (plannedSteps.length) {
     return evidenceItem(
@@ -2218,18 +2263,18 @@ function planEvidenceItem(runtime, plannedSteps, completedSteps) {
   if (hasEventType("plan.created") || hasEventType("model.plan.created")) {
     return evidenceItem("Created", "done");
   }
-  return evidenceItem("Waiting", "waiting");
+  return evidenceItem("Not started", "waiting");
 }
 
 function sandboxEvidenceItem(commandOutput) {
   if (!state.currentRunId) {
-    return evidenceItem("Waiting", "waiting");
+    return evidenceItem("No run yet", "waiting");
   }
   if (!commandOutput) {
     if (hasEventType("sandbox.session.created")) {
       return evidenceItem("Session ready", "active");
     }
-    return evidenceItem("Waiting", "waiting");
+    return evidenceItem("No commands yet", "waiting");
   }
   if (commandOutput.exit_code === 0) {
     return evidenceItem("Command passed", "done");
@@ -2239,7 +2284,7 @@ function sandboxEvidenceItem(commandOutput) {
 
 function artifactEvidenceItem(artifactStorageCount) {
   if (!state.currentRunId) {
-    return evidenceItem("Waiting", "waiting");
+    return evidenceItem("No run yet", "waiting");
   }
   if (artifactStorageCount > 0) {
     return evidenceItem(`${artifactStorageCount} downloadable`, "done");
@@ -2250,12 +2295,12 @@ function artifactEvidenceItem(artifactStorageCount) {
   if (hasEventType("sandbox.artifact.promoted")) {
     return evidenceItem("Promoted", "done");
   }
-  return evidenceItem("Waiting", "waiting");
+  return evidenceItem("None yet", "waiting");
 }
 
 function browserEvidenceItem(browserEvent, browserStorageObject) {
   if (!state.currentRunId) {
-    return evidenceItem("Waiting", "waiting");
+    return evidenceItem("No run yet", "waiting");
   }
   if (browserStorageObject) {
     return evidenceItem("Capture stored", "done");
@@ -2272,10 +2317,10 @@ function browserEvidenceItem(browserEvent, browserStorageObject) {
 
 function terminalEvidenceItem(commandOutput) {
   if (!state.currentRunId) {
-    return evidenceItem("Waiting", "waiting");
+    return evidenceItem("No run yet", "waiting");
   }
   if (!commandOutput) {
-    return evidenceItem("Waiting", "waiting");
+    return evidenceItem("No output yet", "waiting");
   }
   if (commandOutput.stdout || commandOutput.stderr) {
     return evidenceItem("Raw output", "failed");
@@ -3247,11 +3292,11 @@ async function invokeSelectedWorkspaceSkill() {
 function renderCustomerSuccess(data = state.customerSuccess, error = null) {
   if (error) {
     elements.customerSuccessStatus.textContent = "Unavailable";
-    elements.customerSuccessHealth.textContent = "--";
-    elements.customerSuccessRuns.textContent = "--";
+    elements.customerSuccessHealth.textContent = "No data";
+    elements.customerSuccessRuns.textContent = "No data";
     elements.customerSuccessFeedback.textContent = error.message;
-    elements.customerSuccessEvalCandidates.textContent = "--";
-    elements.customerSuccessPackCandidates.textContent = "--";
+    elements.customerSuccessEvalCandidates.textContent = "No data";
+    elements.customerSuccessPackCandidates.textContent = "No data";
     setCandidateActionStatus(error.message);
     renderEvaluationCandidateReview({ evaluationCandidates: [] });
     renderSolutionPackCandidateReview({ solutionPackCandidates: [] });
@@ -3260,11 +3305,11 @@ function renderCustomerSuccess(data = state.customerSuccess, error = null) {
   }
   if (!data) {
     elements.customerSuccessStatus.textContent = "Not loaded";
-    elements.customerSuccessHealth.textContent = "--";
-    elements.customerSuccessRuns.textContent = "--";
-    elements.customerSuccessFeedback.textContent = "--";
-    elements.customerSuccessEvalCandidates.textContent = "--";
-    elements.customerSuccessPackCandidates.textContent = "--";
+    elements.customerSuccessHealth.textContent = "No data";
+    elements.customerSuccessRuns.textContent = "No data";
+    elements.customerSuccessFeedback.textContent = "No data";
+    elements.customerSuccessEvalCandidates.textContent = "No data";
+    elements.customerSuccessPackCandidates.textContent = "No data";
     setCandidateActionStatus("Candidate actions idle");
     renderEvaluationCandidateReview({ evaluationCandidates: [] });
     renderSolutionPackCandidateReview({ solutionPackCandidates: [] });
@@ -3273,11 +3318,11 @@ function renderCustomerSuccess(data = state.customerSuccess, error = null) {
   }
   if (data.status === "loading") {
     elements.customerSuccessStatus.textContent = "Loading";
-    elements.customerSuccessHealth.textContent = "--";
-    elements.customerSuccessRuns.textContent = "--";
-    elements.customerSuccessFeedback.textContent = "--";
-    elements.customerSuccessEvalCandidates.textContent = "--";
-    elements.customerSuccessPackCandidates.textContent = "--";
+    elements.customerSuccessHealth.textContent = "No data";
+    elements.customerSuccessRuns.textContent = "No data";
+    elements.customerSuccessFeedback.textContent = "No data";
+    elements.customerSuccessEvalCandidates.textContent = "No data";
+    elements.customerSuccessPackCandidates.textContent = "No data";
     setCandidateActionStatus("Loading candidates");
     renderEvaluationCandidateReview({ evaluationCandidates: [] }, "Loading eval candidates");
     renderSolutionPackCandidateReview(
@@ -4146,20 +4191,20 @@ function renderRunTrace(trace = state.runTrace) {
   elements.traceList.replaceChildren();
   if (!trace) {
     elements.traceStatus.textContent = "Not loaded";
-    elements.traceSpanCount.textContent = "--";
-    elements.traceEventCount.textContent = "--";
-    elements.traceBillingCount.textContent = "--";
-    elements.traceAuditCount.textContent = "--";
+    elements.traceSpanCount.textContent = "Not loaded";
+    elements.traceEventCount.textContent = "Not loaded";
+    elements.traceBillingCount.textContent = "Not loaded";
+    elements.traceAuditCount.textContent = "Not loaded";
     elements.traceErrorClassification.textContent = "No error";
     appendTraceEmpty("No trace loaded.");
     return;
   }
   if (trace.error) {
     elements.traceStatus.textContent = "Unavailable";
-    elements.traceSpanCount.textContent = "--";
-    elements.traceEventCount.textContent = "--";
-    elements.traceBillingCount.textContent = "--";
-    elements.traceAuditCount.textContent = "--";
+    elements.traceSpanCount.textContent = "Not loaded";
+    elements.traceEventCount.textContent = "Not loaded";
+    elements.traceBillingCount.textContent = "Not loaded";
+    elements.traceAuditCount.textContent = "Not loaded";
     elements.traceErrorClassification.textContent = trace.error;
     appendTraceEmpty("Trace requires audit access.");
     return;
@@ -4222,19 +4267,19 @@ async function loadRuntimeState() {
 function renderRuntimeState(runtime = state.runtimeState) {
   if (!runtime) {
     elements.runtimeStateStatus.textContent = "Not loaded";
-    elements.runtimeCurrentStep.textContent = "--";
-    elements.runtimeCompletedCount.textContent = "--";
-    elements.runtimeSandboxSession.textContent = "--";
-    elements.runtimeBrowserSession.textContent = "--";
+    elements.runtimeCurrentStep.textContent = "Not loaded";
+    elements.runtimeCompletedCount.textContent = "Not loaded";
+    elements.runtimeSandboxSession.textContent = "Not loaded";
+    elements.runtimeBrowserSession.textContent = "Not loaded";
     elements.runtimeArtifactCount.textContent = "No promoted artifacts";
     return;
   }
   if (runtime.error) {
     elements.runtimeStateStatus.textContent = "Unavailable";
-    elements.runtimeCurrentStep.textContent = "--";
-    elements.runtimeCompletedCount.textContent = "--";
-    elements.runtimeSandboxSession.textContent = "--";
-    elements.runtimeBrowserSession.textContent = "--";
+    elements.runtimeCurrentStep.textContent = "Not loaded";
+    elements.runtimeCompletedCount.textContent = "Not loaded";
+    elements.runtimeSandboxSession.textContent = "Not loaded";
+    elements.runtimeBrowserSession.textContent = "Not loaded";
     elements.runtimeArtifactCount.textContent = runtime.error;
     return;
   }
@@ -4242,10 +4287,12 @@ function renderRuntimeState(runtime = state.runtimeState) {
   const completedSteps = runtime.completed_step_ids || [];
   const promotedArtifacts = runtime.promoted_sandbox_artifact_paths || [];
   elements.runtimeStateStatus.textContent = runtime.status || "Loaded";
-  elements.runtimeCurrentStep.textContent = runtime.current_step_id || "--";
+  elements.runtimeCurrentStep.textContent = runtime.current_step_id || "None";
   elements.runtimeCompletedCount.textContent = String(completedSteps.length);
-  elements.runtimeSandboxSession.textContent = runtime.sandbox_session_id || "--";
-  elements.runtimeBrowserSession.textContent = runtime.browser_session_id || "--";
+  elements.runtimeSandboxSession.textContent =
+    runtime.sandbox_session_id || "Not used";
+  elements.runtimeBrowserSession.textContent =
+    runtime.browser_session_id || "Not used";
   elements.runtimeArtifactCount.textContent = promotedArtifacts.length
     ? `${promotedArtifacts.length} promoted artifact paths`
     : "No promoted artifacts";
@@ -4296,11 +4343,11 @@ function latestSandboxCommandEvent() {
 function renderBrowser() {
   const event = latestBrowserEvent();
   if (!event) {
-    elements.browserStatus.textContent = "Waiting";
-    elements.browserSession.textContent = "--";
-    elements.browserAction.textContent = "--";
-    elements.browserUrl.textContent = "--";
-    elements.browserStorageObject.textContent = "--";
+    elements.browserStatus.textContent = "Not used";
+    elements.browserSession.textContent = "Not used";
+    elements.browserAction.textContent = "None";
+    elements.browserUrl.textContent = "None";
+    elements.browserStorageObject.textContent = "Not stored";
     clearBrowserCapture("No browser actions.");
     return;
   }
@@ -4310,7 +4357,7 @@ function renderBrowser() {
   const currentUrl = payload.current_url || "about:blank";
   const screenshotUri = payload.screenshot_uri || "";
   elements.browserStatus.textContent = actionType;
-  elements.browserSession.textContent = payload.session_id || "--";
+  elements.browserSession.textContent = payload.session_id || "Unknown";
   elements.browserAction.textContent = actionType;
   elements.browserUrl.textContent = currentUrl;
   elements.browserStorageObject.textContent =
@@ -4370,7 +4417,8 @@ function clearBrowserPreview() {
 }
 
 function renderBrowserPreviewStorageObject(storageObjectId) {
-  elements.browserPreviewStorageObject.textContent = storageObjectId || "--";
+  elements.browserPreviewStorageObject.textContent =
+    storageObjectId || "No capture stored yet";
   elements.browserPreviewStorageObject.dataset.browserPreviewStorageObjectId =
     storageObjectId || "";
 }
@@ -4430,7 +4478,18 @@ function renderTerminalFromEvents() {
     );
   });
   if (!commandEvents.length) {
+    if (elements.terminalDisclosure) {
+      delete elements.terminalDisclosure.dataset.autoOpened;
+    }
     return;
+  }
+  if (
+    elements.terminalDisclosure &&
+    !elements.terminalDisclosure.open &&
+    !elements.terminalDisclosure.dataset.autoOpened
+  ) {
+    elements.terminalDisclosure.open = true;
+    elements.terminalDisclosure.dataset.autoOpened = "true";
   }
   const latestEvent = commandEvents[commandEvents.length - 1];
   const latest = resolveTerminalOutput(latestEvent);
@@ -4473,7 +4532,8 @@ function storageObjectForTerminalOutputUri(outputUri) {
 
 function renderTerminalOutputStorageObject(storageObject) {
   const storageObjectId = storageObject ? storageObject.id : "";
-  elements.terminalOutputStorageObject.textContent = storageObjectId || "--";
+  elements.terminalOutputStorageObject.textContent =
+    storageObjectId || "No terminal output stored yet";
   elements.terminalOutputStorageObject.dataset.terminalStorageObjectId =
     storageObjectId;
 }
@@ -4801,7 +4861,7 @@ function renderArtifactPreview(storageObject, status, content) {
 function clearArtifactPreview() {
   elements.artifactPreviewTitle.textContent = "No artifact selected";
   elements.artifactPreviewStatus.textContent = "Preview idle";
-  elements.artifactPreviewStorageObject.textContent = "--";
+  elements.artifactPreviewStorageObject.textContent = "No preview loaded";
   elements.artifactPreviewStorageObject.dataset.previewStorageObjectId = "";
   elements.artifactPreviewContent.textContent = "Select an artifact preview.";
 }
@@ -4809,7 +4869,8 @@ function clearArtifactPreview() {
 function renderArtifactDownloadStatus(message, status, storageObjectId = "") {
   elements.artifactDownloadStatus.textContent = message;
   elements.artifactDownloadStatus.dataset.downloadState = status;
-  elements.artifactDownloadedStorageObject.textContent = storageObjectId || "--";
+  elements.artifactDownloadedStorageObject.textContent =
+    storageObjectId || "No download yet";
   elements.artifactDownloadedStorageObject.dataset.downloadStorageObjectId =
     storageObjectId;
 }
@@ -4925,6 +4986,7 @@ function renderApproval() {
   renderApprovalResolution(approvalEvent);
   elements.approve.disabled = !hasApproval;
   elements.reject.disabled = !hasApproval;
+  renderOpsStatusbar();
 }
 
 async function approveRun() {
@@ -5196,9 +5258,29 @@ document.querySelectorAll("[data-prompt]").forEach((button) => {
   });
 });
 
-elements.workbenchViewToggles.forEach((button) => {
+elements.workbenchViewToggles.forEach((button, index) => {
   button.addEventListener("click", () => {
     switchWorkbenchView(button.dataset.workbenchViewToggle);
+  });
+  button.addEventListener("keydown", (event) => {
+    const toggles = [...elements.workbenchViewToggles];
+    let nextIndex = null;
+    if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+      nextIndex = (index + 1) % toggles.length;
+    } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+      nextIndex = (index - 1 + toggles.length) % toggles.length;
+    } else if (event.key === "Home") {
+      nextIndex = 0;
+    } else if (event.key === "End") {
+      nextIndex = toggles.length - 1;
+    }
+    if (nextIndex === null) {
+      return;
+    }
+    event.preventDefault();
+    const next = toggles[nextIndex];
+    switchWorkbenchView(next.dataset.workbenchViewToggle);
+    next.focus();
   });
 });
 
@@ -5312,6 +5394,7 @@ elements.runFeedbackPositive.addEventListener("click", () => {
 elements.runFeedbackNegative.addEventListener("click", () => {
   submitRunFeedback(-1);
 });
+elements.opsApprovalChip.addEventListener("click", () => revealApprovalPanel());
 elements.approve.addEventListener("click", () => approveRun());
 elements.reject.addEventListener("click", () => rejectRun());
 elements.bootstrapLoginButton.addEventListener("click", () => bootstrapTenant());

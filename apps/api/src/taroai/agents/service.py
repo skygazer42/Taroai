@@ -22,6 +22,7 @@ from taroai.domain import (
     utc_now,
 )
 from taroai.store import NotFoundError
+from taroai.support.redaction import redact_text_entry
 
 
 class AgentRegistryService:
@@ -113,7 +114,12 @@ class AgentRegistryService:
         return updated
 
     def extract(
-        self, tenant_id: str, thread_id: str, name: str | None = None
+        self,
+        tenant_id: str,
+        thread_id: str,
+        name: str | None = None,
+        *,
+        compile_playbook: bool = False,
     ) -> AgentDraft:
         thread = self.store.get_chat_thread(tenant_id, thread_id)
         runs = [
@@ -157,7 +163,7 @@ class AgentRegistryService:
                 "package_digest": item.get("package_digest"),
                 "source_digest": item.get("source_digest"),
             }
-        return AgentDraft(
+        draft = AgentDraft(
             workspace_id=thread.workspace_id,
             name=name or thread.title or "Agent from conversation",
             description=f"Reusable Agent extracted from Thread {thread.id}",
@@ -198,6 +204,114 @@ class AgentRegistryService:
             source_thread_id=thread.id,
             source_run_id=source_run.id,
         )
+        if not compile_playbook:
+            return draft
+
+        playbook = self._compile_playbook(source_run)
+        return draft.model_copy(
+            update={
+                "description": (
+                    f"Deterministic Playbook compiled from Run {source_run.id}"
+                ),
+                "version": draft.version.model_copy(
+                    update={
+                        "input_schema": {"type": "object", "properties": {}},
+                        "instructions": (
+                            "Execute the reviewed deterministic Playbook exactly once. "
+                            "The compiled action in the runtime snapshot is authoritative."
+                        ),
+                        "runtime_snapshot": {
+                            **draft.version.runtime_snapshot,
+                            "sandbox_enabled": True,
+                            "compiled_playbook": playbook,
+                        },
+                        "change_note": (
+                            "Compiled from one successful sandbox action; review required"
+                        ),
+                    }
+                ),
+            }
+        )
+
+    def _compile_playbook(self, source_run) -> dict[str, Any]:
+        actions = self.store.list_agent_actions(source_run.tenant_id, source_run.id)
+        if len(actions) != 1:
+            raise ValueError(
+                "A deterministic Playbook requires exactly one recorded action"
+            )
+        action = actions[0]
+        observation = action.observation
+        if action.status != "succeeded" or observation is None or not observation.success:
+            raise ValueError("The Playbook source action must have succeeded")
+        if action.decision.tool_name != "sandbox.command":
+            raise ValueError(
+                "Only a successful sandbox.command can be compiled in this version"
+            )
+
+        tool_input = {
+            key: value
+            for key, value in action.decision.tool_input.items()
+            if key
+            in {
+                "command",
+                "cwd",
+                "timeout_seconds",
+                "result_mode",
+                "artifact_path",
+                "artifact_paths",
+            }
+        }
+        command = str(tool_input.get("command") or "").strip()
+        if not command:
+            raise ValueError("The Playbook source command is empty")
+        _redacted, findings = redact_text_entry("compiled-playbook-command", command)
+        if findings or action.decision.tool_input.get("env"):
+            raise ValueError(
+                "Commands containing credentials or environment values cannot be compiled"
+            )
+
+        artifact_paths = [
+            str(path)
+            for path in [
+                tool_input.get("artifact_path"),
+                *(tool_input.get("artifact_paths") or []),
+            ]
+            if path
+        ]
+        stdout = str(observation.output.get("stdout") or "").strip()
+        if artifact_paths:
+            result = {
+                "mode": "artifacts",
+                "response_text": (
+                    "Playbook completed. Generated artifacts are available in this run."
+                ),
+            }
+        elif (
+            tool_input.get("result_mode") == "raw_stdout"
+            and stdout
+            and len(stdout) <= 4_000
+        ):
+            result = {"mode": "raw_stdout"}
+        else:
+            raise ValueError(
+                "The source action must return short raw stdout or declare an artifact"
+            )
+
+        decision = action.decision.model_copy(
+            update={
+                "action_key": f"playbook:{action.id}",
+                "rationale_summary": "Execute the reviewed compiled action",
+                "tool_input": tool_input,
+                "verification_required": False,
+            }
+        )
+        return {
+            "schema": "taroai.playbook.v1",
+            "source_run_id": source_run.id,
+            "source_action_id": action.id,
+            "decision": decision.model_dump(mode="json"),
+            "result": result,
+        }
 
     def create_version(
         self, tenant_id: str, user_id: str, agent_id: str, spec: AgentVersionSpec

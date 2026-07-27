@@ -1,13 +1,31 @@
 import hashlib
 import json
-import urllib.request
+import threading
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
+import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from taroai.observability.models import RunTrace, TraceExportResult, TraceSpan
+
+
+_HTTP_CLIENT: httpx.Client | None = None
+_HTTP_CLIENT_LOCK = threading.Lock()
+
+
+def _shared_http_client() -> httpx.Client:
+    """Process-wide pooled HTTP client for trace export calls."""
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None:
+        with _HTTP_CLIENT_LOCK:
+            if _HTTP_CLIENT is None:
+                _HTTP_CLIENT = httpx.Client(
+                    timeout=httpx.Timeout(5.0),
+                    follow_redirects=True,
+                )
+    return _HTTP_CLIENT
 
 
 SPAN_KIND_MAP = {
@@ -29,18 +47,19 @@ class TraceExportHttpClient(BaseModel):
         headers: dict[str, str],
         timeout_seconds: int,
     ) -> None:
-        request = urllib.request.Request(
-            url=url,
-            data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+        response = _shared_http_client().post(
+            url,
+            content=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
             headers={
                 **headers,
                 "Content-Type": "application/json",
                 "Accept": "application/json",
             },
-            method="POST",
+            timeout=timeout_seconds,
         )
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            response.read()
+        # urllib raised HTTPError on non-2xx; raise_for_status preserves the
+        # "HTTP error => export failed" behavior (caught by the exporter).
+        response.raise_for_status()
 
 
 class OtlpHttpTraceExporter(BaseModel):

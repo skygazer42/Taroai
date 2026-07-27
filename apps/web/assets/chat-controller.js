@@ -2626,6 +2626,7 @@ export class ChatController {
         "approval.requested",
         "approval.resolved",
         "approval.rejected",
+        "approval.cancelled",
         "action_approval",
       ].includes(eventType(item)));
     const resolvedApprovalIds = new Set(approvalEvents.flatMap((item) => {
@@ -2633,6 +2634,7 @@ export class ChatController {
       const payload = eventPayload(item);
       const approvalId = payload.approval_id || payload.manifestId;
       const resolved = ["approval.resolved", "approval.rejected"].includes(type)
+        || type === "approval.cancelled"
         || (type === "action_approval" && payload.status !== "approval_required");
       return resolved && approvalId ? [approvalId] : [];
     }));
@@ -2647,7 +2649,8 @@ export class ChatController {
     const event = pendingEvent || approvalEvents.at(-1);
     if (!event) return null;
     const type = eventType(event);
-    const resolution = ["approval.resolved", "approval.rejected"].includes(type);
+    const resolution = ["approval.resolved", "approval.rejected"].includes(type)
+      || type === "approval.cancelled";
     const resolutionPayload = eventPayload(event);
     const resolutionId = resolutionPayload.approval_id;
     const request = resolution
@@ -2661,7 +2664,7 @@ export class ChatController {
       : resolutionPayload;
     const connectorAction = type === "action_approval" || payload.kind === "connector_action";
     if (
-      !["approval.requested", "approval.resolved", "approval.rejected", "action_approval"].includes(type)
+      !["approval.requested", "approval.resolved", "approval.rejected", "approval.cancelled", "action_approval"].includes(type)
     ) return null;
     const actionStatus = resolution
       ? String(payload.status || (type === "approval.rejected" ? "rejected" : "approved"))
@@ -2675,6 +2678,8 @@ export class ChatController {
       ? [...runEvents].reverse().find((item) => eventType(item) === "workflow_preview")
       : null;
     const workflowSpec = eventPayload(workflowPreview || {}).spec || null;
+    const workflowId = eventPayload(workflowPreview || {}).workflowId
+      || eventPayload(workflowPreview || {}).previewId;
     const workflowSteps = arrayFrom(workflowSpec || {}, "phases")
       .flatMap((phase) => arrayFrom(phase, "tasks"));
     const card = document.createElement("section");
@@ -2767,6 +2772,15 @@ export class ChatController {
       copy.append(list);
     }
     const actions = document.createElement("div");
+    if (!actionComplete && workflowSpec && workflowId) {
+      const edit = document.createElement("button");
+      edit.type = "button";
+      edit.textContent = "Edit plan";
+      edit.addEventListener("click", () => {
+        this.editWorkflowPreview(workflowId, workflowSpec, runId);
+      });
+      actions.append(edit);
+    }
     for (const decision of actionComplete ? [] : ["approve", "reject"]) {
       const button = document.createElement("button");
       button.type = "button";
@@ -2779,6 +2793,42 @@ export class ChatController {
     card.append(marker, copy);
     if (actions.childElementCount) card.append(actions);
     return card;
+  }
+
+  editWorkflowPreview(workflowId, spec, runId = chatState.currentRunId) {
+    const dialog = document.createElement("dialog");
+    dialog.className = "chat-dialog";
+    dialog.innerHTML = `<form class="chat-dialog-card"><header><div><small>Review before approval</small><h2>Edit workflow plan</h2></div><button type="button" data-close aria-label="Close">${icon("x")}</button></header><p>Edit task titles, dependencies, tools, inputs, concurrency, or the final synthesis prompt. Task IDs and phases stay fixed once previewed.</p><label><span>Workflow JSON</span><textarea name="spec" rows="18" data-json-field></textarea></label><footer><button type="button" data-close>Cancel</button><button class="primary" type="submit">Save revised plan</button></footer></form>`;
+    document.body.append(dialog);
+    query('[name="spec"]', dialog).value = JSON.stringify(spec, null, 2);
+    queryAll("[data-close]", dialog).forEach((button) => button.addEventListener("click", () => dialog.close()));
+    query("form", dialog).addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const submit = query('[type="submit"]', dialog);
+      let revised;
+      try {
+        revised = JSON.parse(query('[name="spec"]', dialog).value);
+      } catch {
+        this.network("Workflow plan must be valid JSON", "error");
+        return;
+      }
+      submit.disabled = true;
+      try {
+        await this.api.patch(
+          `/api/workflows/${encodeURIComponent(workflowId)}/preview`,
+          { spec: revised },
+          { scope: "workflow-preview-edit" },
+        );
+        dialog.close();
+        this.network("Workflow plan updated. Review the new approval.", "success");
+        if (chatState.currentThreadId) await this.loadThread(chatState.currentThreadId, false);
+      } catch (error) {
+        submit.disabled = false;
+        this.network(`Could not update workflow plan: ${error.message}`, "error");
+      }
+    });
+    dialog.addEventListener("close", () => dialog.remove());
+    dialog.showModal();
   }
 
   async resolveApproval(approvalId, decision, kind = "action", runId = chatState.currentRunId) {
@@ -4830,6 +4880,7 @@ export class ChatController {
         <label><span>Description</span><textarea name="description" rows="2" placeholder="What this agent reliably accomplishes"></textarea></label>
         <label><span>Instructions</span><textarea name="instructions" rows="5" placeholder="The repeatable approach, constraints, and verification expectations"></textarea></label>
         <label><span>Output format</span><input name="output_format" placeholder="Report, spreadsheet, artifact set…" /></label>
+        <label class="agent-checkbox"><input type="checkbox" name="compile_playbook" /><span><strong>Compile deterministic Playbook</strong><small>Replay one successful sandbox action without model calls. The command remains reviewable before publishing.</small></span></label>
         <div class="agent-draft-bindings"><span>${chatState.resourceRefs.length || arrayFrom(chatState.thread?.resource_refs || []).length} references</span><span>${chatState.artifacts.length} artifacts</span><span>${chatState.selectedModel?.display_name || "Default model"}</span></div>
         <footer><button type="button" data-dialog-close>Cancel</button><button type="submit" class="primary">Create draft</button></footer>
       </form>`;
@@ -4844,7 +4895,10 @@ export class ChatController {
       try {
         const extracted = await this.api.post(
           `/api/threads/${encodeURIComponent(chatState.currentThreadId)}/extract-agent`,
-          { name: form.get("name") },
+          {
+            name: form.get("name"),
+            compile_playbook: form.has("compile_playbook"),
+          },
           { scope: "agent-extract" },
         );
         const version = {

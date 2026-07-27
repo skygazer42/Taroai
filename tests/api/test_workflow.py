@@ -96,6 +96,66 @@ def test_workflow_agent_plans_from_published_instructions():
     assert workflow_goal(store, chat_run) == "Run this workflow"
 
 
+def test_pending_workflow_preview_can_be_edited_before_a_new_approval():
+    store = InMemoryControlPlaneStore()
+    parent = store.create_run(
+        "tenant_acme",
+        "user_1",
+        RunCreate(
+            workspace_id="workspace_sales",
+            message="Research two sources",
+            mode=RunMode.WORKFLOW,
+        ),
+    )
+    runtime = AgentRuntime(store=store)
+    state = runtime._initial_state(parent)
+    state.status = RunStatus.AWAITING_APPROVAL
+    workflow = store.create_workflow(parent, _workflow_spec())
+    approval = store.create_approval_request(
+        parent.tenant_id,
+        parent.id,
+        f"workflow:{workflow.id}",
+        "Approve workflow: 3 steps",
+        kind="workflow",
+        subject_type="workflow",
+        subject_id=workflow.id,
+        preview_payload=workflow.spec.model_dump(mode="json", by_alias=True),
+        validation_payload={"valid": True},
+    )
+    store.update_workflow(parent.tenant_id, workflow.id, approval_id=approval.id)
+    store.update_run_status(parent.tenant_id, parent.id, RunStatus.AWAITING_APPROVAL)
+    state.approval_id = approval.id
+    state.runtime_metadata["workflow_id"] = workflow.id
+    runtime._save_state(state)
+    revised = _workflow_spec().model_dump(mode="json", by_alias=True)
+    revised["phases"][0]["tasks"][0]["title"] = "Review official source A"
+    revised["maxConcurrency"] = 1
+    client = TestClient(create_app(store=store, settings=Settings(_env_file=None)))
+
+    response = client.patch(
+        f"/api/workflows/{workflow.id}/preview",
+        headers={"X-Tenant-ID": parent.tenant_id, "X-User-ID": parent.user_id},
+        json={"spec": revised},
+    )
+
+    assert response.status_code == 200, response.text
+    updated = store.get_workflow(parent.tenant_id, workflow.id)
+    assert updated.spec.task("source_a").title == "Review official source A"
+    assert updated.spec.max_concurrency == 1
+    approvals = store.list_approval_requests(parent.tenant_id, parent.id)
+    assert approvals[0].status == ApprovalStatus.CANCELLED
+    assert approvals[-1].status == ApprovalStatus.PENDING
+    assert response.json()["approval_id"] == approvals[-1].id
+    assert client.app.state.runtime._load_state(
+        parent.tenant_id, parent.id
+    ).approval_id == approvals[-1].id
+    assert {task.task_id for task in store.list_workflow_tasks(parent.tenant_id, workflow.id)} == {
+        "source_a",
+        "source_b",
+        "compare",
+    }
+
+
 def test_workflow_runs_independent_tasks_then_injects_dependency_summaries():
     store = InMemoryControlPlaneStore()
     parent = store.create_run(

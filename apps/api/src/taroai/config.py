@@ -322,6 +322,10 @@ class Settings(BaseSettings):
     agent_loop_cost_limit: float = Field(default=0, ge=0)
     agent_loop_action_lease_seconds: int = Field(default=600, ge=1)
     agent_loop_full_auto_requires_isolation: bool = True
+    agent_loop_fast_model: str | None = None
+    agent_loop_fast_operations: list[str] = Field(
+        default_factory=lambda: ["compact"]
+    )
     run_execution_queue_name: str = "runs.execute"
     billing_queue_name: str = "billing.aggregate"
     cleanup_queue_name: str = "system.cleanup"

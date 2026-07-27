@@ -30,6 +30,8 @@ class ModelBudgetGuard(BaseModel):
     policy: ModelBudgetPolicy = Field(default_factory=ModelBudgetPolicy)
 
     def assert_plan_allowed(self, store, tenant_id: str, run_id: str) -> None:
+        if not self._has_any_limit():
+            return
         run = store.get_run(tenant_id, run_id)
         tenant_meters = self._filter_window_meters(store.list_billing_meters(tenant_id))
         scope_checks = [
@@ -141,6 +143,23 @@ class ModelBudgetGuard(BaseModel):
                 limit=token_limit,
             )
             raise ModelBudgetExceededError("model token budget exceeded", metadata)
+
+    def _has_any_limit(self) -> bool:
+        policy = self.policy
+        return any(
+            (
+                policy.max_model_calls_per_run,
+                policy.max_model_tokens_per_run,
+                policy.max_model_calls_per_tenant,
+                policy.max_model_tokens_per_tenant,
+                policy.max_model_calls_per_workspace,
+                policy.max_model_tokens_per_workspace,
+                policy.max_model_calls_per_user,
+                policy.max_model_tokens_per_user,
+                policy.max_model_calls_per_agent,
+                policy.max_model_tokens_per_agent,
+            )
+        )
 
     def _meter_quantity(self, meters: list, meter_types: set[str]) -> float:
         return sum(

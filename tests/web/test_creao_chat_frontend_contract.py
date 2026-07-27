@@ -103,6 +103,10 @@ def test_create_agent_primary_cta_uses_the_guided_builder():
     assert "persistPendingAgent(outcome)" in source
     assert 'this.api.post("/api/agents"' in source
     assert "/extract-agent" in source
+    assert 'name="compile_playbook"' in source
+    assert 'compile_playbook: form.has("compile_playbook")' in source
+    assert "compiled_playbook" in agents
+    assert "Review sandbox command" in agents
     assert "instructions: pending.description || extracted.version.instructions" in source
     assert 'Create an agent named "${name}"' in builder
     assert "workflow.spec DAG" in builder
@@ -113,6 +117,15 @@ def test_create_agent_primary_cta_uses_the_guided_builder():
     assert "persist-as-workflow-agent skill" not in builder
     assert 'window.location.hash = "chat"' in agent_clicks
     assert "window.taroaiChat?.openAgentBuilderDialog()" in agent_clicks
+
+
+def test_workflow_approval_can_edit_the_preview_before_approval():
+    source = chat_controller_source()
+
+    assert 'edit.textContent = "Edit plan"' in source
+    assert "editWorkflowPreview(workflowId, workflowSpec, runId)" in source
+    assert "/api/workflows/${encodeURIComponent(workflowId)}/preview" in source
+    assert 'this.api.patch(' in source
 
 
 def test_agent_builder_does_not_duplicate_a_tool_created_draft():

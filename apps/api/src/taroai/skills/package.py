@@ -64,8 +64,13 @@ class SkillFrontmatter(BaseModel):
     license: str | None = Field(default=None, max_length=200)
     compatibility: str | None = Field(default=None, max_length=1000)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    allowed_tools: str | None = Field(
+        default=None,
+        alias="allowed-tools",
+        max_length=2000,
+    )
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
 
 
 class SkillDependency(BaseModel):
@@ -174,9 +179,15 @@ class ParsedSkillArchive(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
-_FRONTMATTER_KEYS = {"name", "description", "license", "compatibility", "metadata"}
-_IGNORED_FRONTMATTER_KEYS = {
+_FRONTMATTER_KEYS = {
+    "name",
+    "description",
+    "license",
+    "compatibility",
+    "metadata",
     "allowed-tools",
+}
+_IGNORED_FRONTMATTER_KEYS = {
     "args",
     "argument-hint",
     "disable-model-invocation",

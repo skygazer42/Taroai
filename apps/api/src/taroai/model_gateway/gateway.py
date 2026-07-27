@@ -1,10 +1,10 @@
 import json
+import threading
 import time
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any, Literal
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
+import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from taroai.domain import new_id
@@ -32,6 +32,28 @@ from taroai.provider_errors import redact_provider_error_detail
 
 if TYPE_CHECKING:
     from taroai.agent.models import AgentDecision, AgentVerificationResult
+
+
+_HTTP_CLIENT: httpx.Client | None = None
+_HTTP_CLIENT_LOCK = threading.Lock()
+
+
+def _shared_http_client() -> httpx.Client:
+    """Process-wide pooled HTTP client for model provider calls.
+
+    httpx.Client is thread-safe and reuses TCP+TLS connections (keep-alive),
+    so concurrent LLM calls avoid a fresh handshake per request. Per-call
+    timeouts are passed explicitly on each request.
+    """
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None:
+        with _HTTP_CLIENT_LOCK:
+            if _HTTP_CLIENT is None:
+                _HTTP_CLIENT = httpx.Client(
+                    timeout=httpx.Timeout(30.0),
+                    follow_redirects=True,
+                )
+    return _HTTP_CLIENT
 
 
 class ModelGateway(BaseModel):
@@ -372,34 +394,22 @@ class OpenAICompatibleModelGateway(ModelGateway):
     ) -> dict[str, Any]:
         endpoint = f"{self.base_url.rstrip('/')}/chat/completions"
         body = json.dumps(payload).encode("utf-8")
-        request = Request(
-            endpoint,
-            data=body,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "User-Agent": "Taroai/1.0",
-            },
-            method="POST",
-        )
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "Taroai/1.0",
+        }
         try:
-            with urlopen(request, timeout=self.timeout_seconds) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except HTTPError as error:
-            detail = error.read().decode("utf-8")
-            try:
-                self._raise_for_safety_refusal(
-                    json.loads(detail),
-                    model_id=str(payload.get("model") or "") or None,
-                )
-            except json.JSONDecodeError:
-                pass
-            safe_detail = redact_provider_error_detail(detail, api_key=api_key)
-            raise ModelGatewayResponseError(
-                f"model gateway returned HTTP {error.code}: {safe_detail}",
-                retryable=error.code in {408, 425, 429} or error.code >= 500,
-            ) from error
-        except (URLError, TimeoutError) as error:
+            response = _shared_http_client().post(
+                endpoint,
+                content=body,
+                headers=headers,
+                timeout=self.timeout_seconds,
+            )
+            if response.status_code >= 400:
+                self._raise_for_http_status(response, payload, api_key)
+            return json.loads(response.content.decode("utf-8"))
+        except httpx.HTTPError as error:
             raise ModelGatewayResponseError(
                 f"model gateway request failed: {error}", retryable=True
             ) from error
@@ -407,6 +417,33 @@ class OpenAICompatibleModelGateway(ModelGateway):
             raise ModelGatewayResponseError(
                 "model gateway returned invalid JSON"
             ) from error
+
+    def _raise_for_http_status(
+        self,
+        response: "httpx.Response",
+        payload: dict[str, Any],
+        api_key: str,
+    ) -> None:
+        """Map a non-2xx provider response to the internal error contract.
+
+        Mirrors the urllib HTTPError handling: safety refusals surface as
+        ModelSafetyRefusalError; everything else becomes a
+        ModelGatewayResponseError whose retryable flag follows the status code.
+        """
+        detail = response.text
+        try:
+            self._raise_for_safety_refusal(
+                json.loads(detail),
+                model_id=str(payload.get("model") or "") or None,
+            )
+        except json.JSONDecodeError:
+            pass
+        safe_detail = redact_provider_error_detail(detail, api_key=api_key)
+        status_code = response.status_code
+        raise ModelGatewayResponseError(
+            f"model gateway returned HTTP {status_code}: {safe_detail}",
+            retryable=status_code in {408, 425, 429} or status_code >= 500,
+        )
 
     def _post_chat_completions_stream(
         self,
@@ -425,26 +462,30 @@ class OpenAICompatibleModelGateway(ModelGateway):
     ) -> Iterator[dict[str, Any]]:
         endpoint = f"{self.base_url.rstrip('/')}/chat/completions"
         body = json.dumps(payload).encode("utf-8")
-        request = Request(
-            endpoint,
-            data=body,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "Accept": "text/event-stream",
-                "User-Agent": "Taroai/1.0",
-            },
-            method="POST",
-        )
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            "User-Agent": "Taroai/1.0",
+        }
         started_at = time.monotonic()
         try:
-            with urlopen(request, timeout=self.timeout_seconds) as response:
-                for raw_line in response:
+            with _shared_http_client().stream(
+                "POST",
+                endpoint,
+                content=body,
+                headers=headers,
+                timeout=self.timeout_seconds,
+            ) as response:
+                if response.status_code >= 400:
+                    response.read()
+                    self._raise_for_http_status(response, payload, api_key)
+                for raw_line in response.iter_lines():
                     if time.monotonic() - started_at >= self.timeout_seconds:
                         raise ModelGatewayResponseError(
                             "model gateway stream timed out", retryable=True
                         )
-                    line = raw_line.decode("utf-8").strip()
+                    line = raw_line.strip()
                     if not line.startswith("data:"):
                         continue
                     data = line[5:].strip()
@@ -467,21 +508,7 @@ class OpenAICompatibleModelGateway(ModelGateway):
                     if not isinstance(delta, dict):
                         continue
                     yield delta
-        except HTTPError as error:
-            detail = error.read().decode("utf-8")
-            try:
-                self._raise_for_safety_refusal(
-                    json.loads(detail),
-                    model_id=str(payload.get("model") or "") or None,
-                )
-            except json.JSONDecodeError:
-                pass
-            safe_detail = redact_provider_error_detail(detail, api_key=api_key)
-            raise ModelGatewayResponseError(
-                f"model gateway returned HTTP {error.code}: {safe_detail}",
-                retryable=error.code in {408, 425, 429} or error.code >= 500,
-            ) from error
-        except (URLError, TimeoutError) as error:
+        except httpx.HTTPError as error:
             raise ModelGatewayResponseError(
                 f"model gateway request failed: {error}", retryable=True
             ) from error

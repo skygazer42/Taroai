@@ -123,6 +123,20 @@ license: MIT
     assert body == "# Ponytail\n"
 
 
+def test_skill_frontmatter_preserves_standard_allowed_tools():
+    frontmatter, _body = parse_skill_frontmatter(
+        """---
+name: portable-skill
+description: Exercise the Agent Skills frontmatter contract.
+allowed-tools: Bash(git:*) Read
+---
+# Portable skill
+"""
+    )
+
+    assert frontmatter.allowed_tools == "Bash(git:*) Read"
+
+
 def test_portable_skill_zip_import_evaluate_publish_install_and_invoke(monkeypatch):
     identity, account = create_skill_admin_identity()
     app = create_app(

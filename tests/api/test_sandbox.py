@@ -207,8 +207,8 @@ class RecordingBrowserProvider:
                         "max_sessions": 50,
                         "max_sessions_per_tenant": 20,
                         "max_sessions_per_run": 3,
-                        "navigation_allowlist_enforced": False,
-                        "navigation_allowed_host_count": 0,
+                        "navigation_allowlist_enforced": True,
+                        "navigation_allowed_host_count": 1,
                     }
                     self._write_json(
                         200,
@@ -672,6 +672,7 @@ def test_configured_browser_controller_uses_provider_protocol():
                 browser_provider="playwright",
                 browser_controller_base_url=provider.url,
                 browser_controller_api_key="provider_secret",
+                browser_controller_navigation_allowed_hosts=["browser.example.com"],
                 browser_controller_timeout_seconds=3,
             )
         )
@@ -741,6 +742,7 @@ def test_configured_browser_controller_rejects_cross_tenant_session_response():
                 browser_provider="playwright",
                 browser_controller_base_url=provider.url,
                 browser_controller_api_key="provider_secret",
+                browser_controller_navigation_allowed_hosts=["browser.example.com"],
                 browser_controller_timeout_seconds=3,
             )
         )
@@ -766,6 +768,7 @@ def test_configured_browser_controller_rejects_cross_session_action_response():
                 browser_provider="playwright",
                 browser_controller_base_url=provider.url,
                 browser_controller_api_key="provider_secret",
+                browser_controller_navigation_allowed_hosts=["browser.example.com"],
                 browser_controller_timeout_seconds=3,
             )
         )
@@ -805,6 +808,7 @@ def test_configured_browser_controller_requires_controller_capabilities():
                 browser_provider="playwright",
                 browser_controller_base_url=provider.url,
                 browser_controller_api_key="provider_secret",
+                browser_controller_navigation_allowed_hosts=["browser.example.com"],
                 browser_controller_timeout_seconds=3,
             )
         )
@@ -841,6 +845,7 @@ def test_configured_browser_controller_enforces_global_session_capacity():
                 browser_provider="playwright",
                 browser_controller_base_url=provider.url,
                 browser_controller_api_key="provider_secret",
+                browser_controller_navigation_allowed_hosts=["browser.example.com"],
                 browser_controller_timeout_seconds=3,
             )
         )
@@ -871,6 +876,7 @@ def test_configured_browser_controller_rejects_empty_delete_response():
                 browser_provider="playwright",
                 browser_controller_base_url=provider.url,
                 browser_controller_api_key="provider_secret",
+                browser_controller_navigation_allowed_hosts=["browser.example.com"],
                 browser_controller_timeout_seconds=3,
             )
         )
@@ -895,6 +901,7 @@ def test_configured_browser_controller_rejects_delete_when_session_list_stays_ac
                 browser_provider="playwright",
                 browser_controller_base_url=provider.url,
                 browser_controller_api_key="provider_secret",
+                browser_controller_navigation_allowed_hosts=["browser.example.com"],
                 browser_controller_timeout_seconds=3,
             )
         )
@@ -919,6 +926,7 @@ def test_configured_browser_controller_lists_tenant_scoped_provider_sessions():
                 browser_provider="playwright",
                 browser_controller_base_url=provider.url,
                 browser_controller_api_key="provider_secret",
+                browser_controller_navigation_allowed_hosts=["browser.example.com"],
                 browser_controller_timeout_seconds=3,
             )
         )

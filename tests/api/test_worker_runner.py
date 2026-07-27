@@ -1319,6 +1319,7 @@ def test_build_worker_browser_controller_uses_http_adapter_for_remote_providers(
             browser_controller_base_url="http://browser-controller.internal",
             browser_controller_api_key="browser_key",
             browser_controller_timeout_seconds=12,
+            browser_controller_navigation_allowed_hosts=["browser.example.com"],
             _env_file=None,
         )
     )

@@ -58,10 +58,12 @@ def test_mvp_openapi_contract_exposes_required_routes():
 def test_mvp_openapi_contract_keeps_unversioned_paths_until_versioning_migration():
     schema = create_app().openapi()
 
+    # 内部 API 在版本化迁移前保持无版本；对外公开的 Agent App 接口
+    # (/api/v1/apps/) 是有意从第一天就带版本的例外。
     assert not [
         path
         for path in schema["paths"]
-        if path.startswith("/api/v1/")
+        if path.startswith("/api/v1/") and not path.startswith("/api/v1/apps/")
     ]
 
 

@@ -27,7 +27,14 @@ from taroai.agent.loop import (
     _model_observations,
     _with_source_links,
 )
-from taroai.agent.models import AgentDecision, AgentObservation, AgentVerificationResult
+from taroai.agent.models import (
+    AgentAction,
+    AgentCycle,
+    AgentDecision,
+    AgentObservation,
+    AgentVerificationResult,
+)
+from taroai.observation_read import register_observation_read_tool_handler
 from taroai.agent.nodes import AgentGraphNodes, _ground_chat_response_url
 from taroai.agent.nodes import _has_unsupported_response_urls
 from taroai.agents import (
@@ -349,6 +356,36 @@ def create_runtime_run(message: str = "Create a prospect brief."):
         ),
     )
     return store, run
+
+
+def test_model_request_routes_fast_operations_to_fast_model():
+    store, run = create_runtime_run()
+    runtime = AgentRuntime(store=store)
+    runtime.loop_fast_model = "fast-mini"
+    execution = AgentExecutionServices(runtime)
+    messages = [ModelMessage(role="user", content=run.message)]
+
+    compact = execution._model_request(run, messages, operation="compact")
+    decide = execution._model_request(run, messages, operation="decide")
+
+    assert compact.model == "fast-mini"
+    assert decide.model == run.model_id
+
+
+def test_model_request_fast_model_falls_back_when_policy_denies():
+    store, run = create_runtime_run()
+    runtime = AgentRuntime(
+        store=store,
+        model_policy=ModelPolicy(denied_models=["fast-mini"]),
+    )
+    runtime.loop_fast_model = "fast-mini"
+    execution = AgentExecutionServices(runtime)
+
+    compact = execution._model_request(
+        run, [ModelMessage(role="user", content=run.message)], operation="compact"
+    )
+
+    assert compact.model == run.model_id
 
 
 def test_model_call_retries_one_transient_provider_failure():
@@ -4190,7 +4227,18 @@ def test_chat_run_decides_directly_without_agent_graph():
     assert gateway.decision_requests[0].sensitivity_level == 2
     system_prompt = gateway.decision_requests[0].messages[0].content
     assert "language of the user's current request" in system_prompt
-    assert "Current datetime UTC:" in system_prompt
+    # 时间戳在静态前缀之后的独立 system 消息里，保持首条消息字节稳定以命中 prompt 缓存。
+    system_messages = [
+        message.content
+        for message in gateway.decision_requests[0].messages
+        if message.role == "system"
+    ]
+    assert any(
+        "Current datetime UTC:" in content for content in system_messages[1:]
+    )
+    assert all(
+        "Current datetime UTC:" not in content for content in system_messages[:1]
+    )
     assert "request_user_input" in system_prompt
     assert "decide semantically whether a tool is needed" in system_prompt
     assert "Current or externally verifiable claims require web.search" in system_prompt
@@ -4688,6 +4736,77 @@ def test_chat_can_use_sandbox_stdout_as_the_final_answer(tmp_path: Path):
     assert any(
         event.type == "agent.verification.skipped"
         and event.payload == {"reason": "sandbox_raw_stdout_requested"}
+        for event in store.list_run_events(run.tenant_id, run.id)
+    )
+
+
+def test_compiled_playbook_executes_without_a_model_call(tmp_path: Path):
+    playbook = {
+        "schema": "taroai.playbook.v1",
+        "source_run_id": "run_source",
+        "source_action_id": "action_source",
+        "decision": AgentDecision(
+            kind="action",
+            action_key="playbook:action_source",
+            tool_name="sandbox.command",
+            tool_input={
+                "command": 'python3 -c "print(42)"',
+                "result_mode": "raw_stdout",
+            },
+            verification_required=False,
+        ).model_dump(mode="json"),
+        "result": {"mode": "raw_stdout"},
+    }
+    registry = draft_agent_registry(
+        runtime_snapshot={
+            "sandbox_enabled": True,
+            "compiled_playbook": playbook,
+        }
+    )
+    store = InMemoryControlPlaneStore()
+    run = store.create_run(
+        "tenant_acme",
+        "user_1",
+        RunCreate(
+            workspace_id="workspace_sales",
+            agent_id="agent_draft",
+            message="Run the compiled Playbook.",
+            mode=RunMode.AUTONOMOUS,
+            resource_refs=[
+                ResourceReference(type="agent", id="agent_draft", version="1")
+            ],
+        ),
+    )
+    sandbox = LocalProcessSandboxAdapter(root_dir=tmp_path)
+    tools = ToolGateway()
+    register_sandbox_tool_handlers(tools, sandbox)
+    tools.policies["sandbox.command"] = tools.policies[
+        "sandbox.command"
+    ].model_copy(update={"required_scopes": []})
+    gateway = RecordingGraphGateway()
+    runtime = AgentRuntime(
+        store=store,
+        agent_registry=registry,
+        model_gateway=gateway,
+        model_policy=ModelPolicy(default_model="recording-test"),
+        tool_gateway=tools,
+        sandbox_adapter=sandbox,
+        full_auto_requires_isolation=False,
+    )
+
+    state = runtime.execute_run(run.tenant_id, run.id)
+
+    assert state.status == RunStatus.SUCCEEDED
+    assert state.final_response_text == "42"
+    assert gateway.decision_requests == []
+    assert gateway.verification_requests == []
+    assert gateway.response_requests == []
+    assert "playbook.loaded" in {
+        event.type for event in store.list_run_events(run.tenant_id, run.id)
+    }
+    assert any(
+        event.type == "agent.verification.skipped"
+        and event.payload == {"reason": "compiled_playbook_result"}
         for event in store.list_run_events(run.tenant_id, run.id)
     )
 
@@ -6999,6 +7118,51 @@ def test_langgraph_verifier_receives_reviewed_memory_as_evidence():
     )
     assert len(candidates) == 1
     assert candidates[0].metadata["source"] == "agent_session_summary"
+    assert len(candidates[0].metadata["content_digest"]) == 64
+    assert candidates[0].metadata["capture_metrics"]["outcome_characters"] == len(
+        "简洁的中文回答。"
+    )
+
+
+def test_agent_session_memory_deduplicates_identical_outcomes():
+    store = InMemoryControlPlaneStore()
+    memory_service = InMemoryLongTermMemoryService()
+    runtime = AgentRuntime(
+        store=store,
+        long_term_memory_service=memory_service,
+    )
+    execution = AgentExecutionServices(runtime)
+    runs = [
+        store.create_run(
+            "tenant_acme",
+            "user_1",
+            RunCreate(
+                workspace_id="workspace_sales",
+                agent_id="agent_repeatable",
+                message="Return the same verified result.",
+            ),
+        )
+        for _ in range(2)
+    ]
+    for run in runs:
+        state = runtime._initial_state(run)
+        state.final_response_text = "Verified result."
+        execution._capture_agent_session_memory(state, run)
+
+    candidates = memory_service.list_by_scope(
+        "tenant_acme",
+        MemoryScopeType.AGENT,
+        "agent_repeatable",
+        status=MemoryStatus.CANDIDATE,
+    )
+    assert len(candidates) == 1
+    skipped = [
+        event
+        for event in store.list_run_events("tenant_acme", runs[-1].id)
+        if event.type == "agent.memory.capture_skipped"
+    ]
+    assert skipped[-1].payload["reason"] == "duplicate_session_memory"
+    assert skipped[-1].payload["existing_memory_id"] == candidates[0].id
 
 
 def test_final_response_adds_missing_web_source_links():
@@ -7118,6 +7282,98 @@ def test_model_observations_compact_large_tool_output_without_losing_the_tail():
     assert payload["output"]["compacted"] is True
     assert "start" in payload["output"]["preview"]
     assert payload["output"]["preview"].endswith('important tail"}')
+    assert "action_id=action_sandbox" in payload["output"]["full_output"]
+    assert "observation.read" in payload["output"]["full_output"]
+
+
+def test_model_observations_index_older_entries_beyond_recent_window():
+    observations = [
+        AgentObservation(
+            action_id=f"action_{index}",
+            success=index % 2 == 0,
+            output={"value": index},
+        )
+        for index in range(10)
+    ]
+
+    payloads = _model_observations(observations)
+
+    assert len(payloads) == 9
+    index_entry = payloads[0]
+    assert [item["action_id"] for item in index_entry["older_observations_index"]] == [
+        "action_0",
+        "action_1",
+    ]
+    assert "observation.read" in index_entry["note"]
+    assert payloads[1]["action_id"] == "action_2"
+
+
+def test_observation_read_tool_pages_stored_output_and_scopes_to_run():
+    store, run = create_runtime_run()
+    other_run = store.create_run(
+        tenant_id=run.tenant_id,
+        user_id=run.user_id,
+        payload=RunCreate(
+            workspace_id=run.workspace_id,
+            agent_id=run.agent_id,
+            message="other",
+            mode="autonomous",
+        ),
+    )
+    cycle = store.create_agent_cycle(
+        AgentCycle(
+            id="cycle_obs_read",
+            tenant_id=run.tenant_id,
+            workspace_id=run.workspace_id,
+            run_id=run.id,
+            iteration=1,
+        )
+    )
+    store.create_agent_action(
+        AgentAction(
+            id="action_obs_read",
+            tenant_id=run.tenant_id,
+            workspace_id=run.workspace_id,
+            run_id=run.id,
+            cycle_id=cycle.id,
+            action_key="obs-read",
+            decision=AgentDecision(kind="action", tool_name="sandbox.command"),
+            observation=AgentObservation(
+                action_id="action_obs_read",
+                success=True,
+                output={"stdout": "x" * 15_000},
+            ),
+        )
+    )
+    gateway = ToolGateway()
+    register_observation_read_tool_handler(gateway, store)
+
+    def read(run_id: str, offset: int = 0):
+        return gateway.execute_request(
+            ToolGatewayRequest(
+                tenant_id=run.tenant_id,
+                workspace_id=run.workspace_id,
+                user_id=run.user_id,
+                run_id=run_id,
+                step_id="step_obs_read",
+                tool_name="observation.read",
+                tool_input={"action_id": "action_obs_read", "offset": offset},
+            )
+        )
+
+    first_page = read(run.id).output
+    assert first_page["offset"] == 0
+    assert len(first_page["content"]) == 10_000
+    assert first_page["next_offset"] == 10_000
+
+    last_page = read(run.id, offset=first_page["next_offset"]).output
+    assert last_page["next_offset"] is None
+    assert first_page["content"] + last_page["content"] == json.dumps(
+        {"stdout": "x" * 15_000}, ensure_ascii=False, default=str
+    )
+
+    with pytest.raises(ToolExecutionError):
+        read(other_run.id)
 
 
 def test_model_observations_keep_all_search_results_with_compact_excerpts():
@@ -7429,3 +7685,266 @@ def test_langgraph_resumes_pending_action_after_approval():
     assert paused.status == RunStatus.AWAITING_APPROVAL
     assert resumed.status == RunStatus.SUCCEEDED
     assert len(resumed.observations) == 1
+
+
+def _always_failing_lookup_tool_gateway(error_message: str) -> ToolGateway:
+    tool_gateway = ToolGateway()
+
+    def fail(request: ToolGatewayRequest) -> ToolResult:
+        raise ToolExecutionError(error_message)
+
+    tool_gateway.register_tool(
+        policy=ToolPolicy(
+            tool_name="research.lookup",
+            description="Look up reviewed research records.",
+            input_schema={
+                "type": "object",
+                "required": ["query"],
+                "properties": {"query": {"type": "string"}},
+                "additionalProperties": False,
+            },
+        ),
+        handler=fail,
+    )
+    return tool_gateway
+
+
+def test_tool_failure_signature_uses_failure_class_and_normalized_error():
+    from taroai.agent.nodes import _failure_signature, _tool_failure_verification
+
+    observation = AgentObservation(
+        action_id="action_1",
+        success=False,
+        error="Rate  limit\nExceeded",
+        safe_error="Rate  limit\nExceeded",
+        failure_class="tool_execution_error",
+    )
+
+    result = _tool_failure_verification(observation)
+
+    assert result.outcome == "repair"
+    assert result.feedback == "Rate  limit\nExceeded"
+    assert result.evidence == [
+        "failure_class: tool_execution_error",
+        "safe_error: Rate  limit\nExceeded",
+    ]
+    assert _failure_signature(result) == "tool_execution_error|rate limit exceeded"
+
+
+def test_model_request_repair_operation_routes_fast_only_when_opted_in():
+    store, run = create_runtime_run()
+    runtime = AgentRuntime(store=store)
+    runtime.loop_fast_model = "fast-mini"
+    execution = AgentExecutionServices(runtime)
+    messages = [ModelMessage(role="user", content=run.message)]
+
+    default_repair = execution._model_request(run, messages, operation="repair")
+    runtime.loop_fast_operations = ["repair"]
+    opted_repair = execution._model_request(run, messages, operation="repair")
+
+    assert default_repair.model == run.model_id
+    assert opted_repair.model == "fast-mini"
+    assert opted_repair.temperature == 0
+
+
+def test_first_repair_after_tool_failure_fast_routes_with_verbatim_evidence():
+    store, run = create_runtime_run()
+    gateway = RecordingGraphGateway(
+        decisions=[
+            AgentDecision(
+                kind="action",
+                tool_name="research.lookup",
+                tool_input={"query": "prospect"},
+            ),
+            AgentDecision(kind="respond", response_text="查询失败，已如实说明。"),
+        ],
+        verifications=[AgentVerificationResult(outcome="complete")],
+    )
+    runtime = AgentRuntime(
+        store=store,
+        model_gateway=gateway,
+        tool_gateway=_always_failing_lookup_tool_gateway("invalid query parameter"),
+        full_auto_requires_isolation=False,
+    )
+    runtime.loop_fast_model = "fast-mini"
+    runtime.loop_fast_operations = ["repair"]
+
+    state = runtime.execute_run("tenant_acme", run.id)
+
+    assert state.status == RunStatus.SUCCEEDED
+    assert state.repair_attempts == 1
+    repaired_payload = json.loads(gateway.decision_requests[1].messages[1].content)
+    previous = repaired_payload["previous_verification"]
+    assert previous["feedback"] == "invalid query parameter"
+    assert "failure_class: tool_execution_error" in previous["evidence"]
+    assert "safe_error: invalid query parameter" in previous["evidence"]
+    assert gateway.decision_requests[0].model != "fast-mini"
+    assert gateway.decision_requests[1].model == "fast-mini"
+    operations = [
+        event.payload["operation"]
+        for event in store.list_run_events("tenant_acme", run.id)
+        if event.type == "model.operation.recorded"
+    ]
+    assert operations == ["decide", "repair", "verify"]
+
+
+def test_identical_tool_failure_escalates_to_a_strategy_change():
+    store, run = create_runtime_run()
+    gateway = RecordingGraphGateway(
+        decisions=[
+            AgentDecision(
+                kind="action",
+                tool_name="research.lookup",
+                tool_input={"query": "prospect"},
+            ),
+            AgentDecision(
+                kind="action",
+                tool_name="research.lookup",
+                tool_input={"query": "prospect brief"},
+            ),
+            AgentDecision(kind="respond", response_text="查询无法完成，已如实说明。"),
+        ],
+        verifications=[AgentVerificationResult(outcome="complete")],
+    )
+    runtime = AgentRuntime(
+        store=store,
+        model_gateway=gateway,
+        tool_gateway=_always_failing_lookup_tool_gateway("record service unavailable"),
+        full_auto_requires_isolation=False,
+    )
+    runtime.loop_fast_model = "fast-mini"
+    runtime.loop_fast_operations = ["repair"]
+
+    state = runtime.execute_run("tenant_acme", run.id)
+
+    assert state.status == RunStatus.SUCCEEDED
+    assert state.repair_attempts == 2
+    assert state.replan_count == 1
+    assert state.active_plan_revision == 2
+    assert gateway.decision_requests[1].model == "fast-mini"
+    assert gateway.decision_requests[2].model != "fast-mini"
+    escalated_payload = json.loads(gateway.decision_requests[2].messages[1].content)
+    feedback = escalated_payload["previous_verification"]["feedback"]
+    assert "failed twice in a row" in feedback
+    assert "record service unavailable" in feedback
+    assert "Choose a different approach or tool" in feedback
+    events = store.list_run_events("tenant_acme", run.id)
+    escalated_events = [
+        event for event in events if event.type == "agent.repair.escalated"
+    ]
+    assert len(escalated_events) == 1
+    assert escalated_events[0].payload["failure_signature"] == (
+        "tool_execution_error|record service unavailable"
+    )
+    repair_started = [
+        event.payload for event in events if event.type == "agent.repair.started"
+    ]
+    assert [item["escalated"] for item in repair_started] == [False, True]
+    operations = [
+        event.payload["operation"]
+        for event in events
+        if event.type == "model.operation.recorded"
+    ]
+    assert operations == ["decide", "repair", "decide", "verify"]
+
+
+def test_identical_verifier_feedback_escalates_without_fast_routing():
+    store, run = create_runtime_run()
+    gateway = RecordingGraphGateway(
+        decisions=[
+            AgentDecision(kind="respond", response_text="初稿。"),
+            AgentDecision(kind="respond", response_text="第二稿。"),
+            AgentDecision(
+                kind="respond",
+                response_text="终稿。",
+                verification_required=False,
+            ),
+        ],
+        verifications=[
+            AgentVerificationResult(outcome="repair", feedback="结论缺少证据。"),
+            AgentVerificationResult(outcome="repair", feedback="结论缺少证据。"),
+        ],
+    )
+    runtime = AgentRuntime(
+        store=store,
+        model_gateway=gateway,
+        tool_gateway=DeterministicToolGateway(),
+        full_auto_requires_isolation=False,
+    )
+    runtime.loop_fast_model = "fast-mini"
+    runtime.loop_fast_operations = ["repair"]
+
+    state = runtime.execute_run("tenant_acme", run.id)
+
+    assert state.status == RunStatus.SUCCEEDED
+    assert state.repair_attempts == 2
+    # 校验器反馈不是确定性工具失败，任何修复决策都不路由到快模型。
+    assert all(
+        request.model != "fast-mini" for request in gateway.decision_requests
+    )
+    first_repair_payload = json.loads(gateway.decision_requests[1].messages[1].content)
+    assert first_repair_payload["previous_verification"]["feedback"] == "结论缺少证据。"
+    escalated_payload = json.loads(gateway.decision_requests[2].messages[1].content)
+    feedback = escalated_payload["previous_verification"]["feedback"]
+    assert "failed twice in a row" in feedback
+    assert "结论缺少证据。" in feedback
+    event_types = [
+        event.type for event in store.list_run_events("tenant_acme", run.id)
+    ]
+    assert "agent.repair.escalated" in event_types
+
+
+def test_successful_observation_resets_identical_failure_tracking():
+    store, run = create_runtime_run()
+    gateway = RecordingGraphGateway(
+        decisions=[
+            AgentDecision(
+                kind="action",
+                tool_name="research.lookup",
+                tool_input={"query": "prospect"},
+            ),
+            AgentDecision(
+                kind="action",
+                tool_name="web.fetch",
+                tool_input={"url": "https://example.com/prospect"},
+            ),
+            AgentDecision(
+                kind="action",
+                tool_name="research.lookup",
+                tool_input={"query": "prospect brief"},
+            ),
+            AgentDecision(kind="respond", response_text="查询无法完成，已如实说明。"),
+        ],
+        verifications=[AgentVerificationResult(outcome="complete")],
+    )
+    tool_gateway = _always_failing_lookup_tool_gateway("record service unavailable")
+    tool_gateway.register_tool(
+        policy=ToolPolicy(
+            tool_name="web.fetch",
+            input_schema={
+                "type": "object",
+                "required": ["url"],
+                "properties": {"url": {"type": "string"}},
+            },
+        ),
+        handler=lambda request: ToolResult(
+            tool_name=request.tool_name,
+            output={"url": request.tool_input["url"], "content": "page"},
+        ),
+    )
+    runtime = AgentRuntime(
+        store=store,
+        model_gateway=gateway,
+        tool_gateway=tool_gateway,
+        full_auto_requires_isolation=False,
+    )
+
+    state = runtime.execute_run("tenant_acme", run.id)
+
+    assert state.status == RunStatus.SUCCEEDED
+    assert state.repair_attempts == 2
+    # 中间的成功观测打断了连续失败序列，第二次相同失败不触发升级。
+    event_types = [
+        event.type for event in store.list_run_events("tenant_acme", run.id)
+    ]
+    assert "agent.repair.escalated" not in event_types

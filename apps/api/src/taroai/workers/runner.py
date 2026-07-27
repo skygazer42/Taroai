@@ -114,6 +114,10 @@ from taroai.storage import (
 )
 from taroai.tool_gateway import ToolGateway
 from taroai.web_search import register_web_search_tool_handler
+from taroai.observation_read import (
+    OBSERVATION_READ_TOOL,
+    register_observation_read_tool_handler,
+)
 from taroai.ui_render import UI_RENDER_TOOL, register_ui_render_tool_handler
 from taroai.triggers.repository import SqlTriggerStore
 from taroai.triggers.service import InMemoryTriggerStore, TriggerService
@@ -560,6 +564,10 @@ def build_agent_worker_runner(
         resolved_runtime.coding_workspace_service = coding_workspace_service
     if not resolved_runtime.tool_gateway.can_execute_tool(UI_RENDER_TOOL):
         register_ui_render_tool_handler(resolved_runtime.tool_gateway, resolved_store)
+    if not resolved_runtime.tool_gateway.can_execute_tool(OBSERVATION_READ_TOOL):
+        register_observation_read_tool_handler(
+            resolved_runtime.tool_gateway, resolved_store
+        )
     if not all(
         resolved_runtime.tool_gateway.can_execute_tool(name)
         for name in (CREATE_AGENT_DRAFT_TOOL, UPDATE_AGENT_DRAFT_TOOL)

@@ -112,6 +112,12 @@ class WorkflowSpec(BaseModel):
         raise KeyError(task_id)
 
 
+class WorkflowPreviewUpdate(BaseModel):
+    spec: WorkflowSpec
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class WorkflowRun(BaseModel):
     id: str
     tenant_id: str

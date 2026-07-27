@@ -10,44 +10,14 @@
   <a href="https://www.postgresql.org/"><img alt="PostgreSQL 16" src="https://img.shields.io/badge/PostgreSQL-16-315b8a?style=flat-square&amp;logo=postgresql&amp;logoColor=white" /></a>
   <a href="https://redis.io/"><img alt="Redis 7" src="https://img.shields.io/badge/Redis-7-b52f28?style=flat-square&amp;logo=redis&amp;logoColor=white" /></a>
   <a href="https://docs.docker.com/compose/"><img alt="Docker Compose" src="https://img.shields.io/badge/Docker-Compose-2468ee?style=flat-square&amp;logo=docker&amp;logoColor=white" /></a>
+   <a href="https://github.com/skygazer42/Taroai"><img alt="GitHub Stars" src="https://img.shields.io/github/stars/skygazer42/Taroai?style=for-the-badge&amp;color=2f6bff" /></a>
+  <a href="https://github.com/skygazer42/Taroai/issues"><img alt="GitHub Issues" src="https://img.shields.io/github/issues/skygazer42/Taroai?style=for-the-badge&amp;color=1f2937" /></a>
 </p>
-
-<p align="center">
-  <a href="#产品界面">产品界面</a> ·
-  <a href="#核心能力">核心能力</a> ·
-  <a href="#快速开始">快速开始</a> ·
-  <a href="#系统架构">系统架构</a> ·
-  <a href="docs/">工程文档</a>
-</p>
+ 
 
 Taroai 是面向知识工作者和小团队的云优先、多租户 Agent 工作空间。通过一个界面完成对话、联网搜索、文件处理和代码执行，并将可靠流程发布为可复用 Agent。
 
-## 工作方式
-
-<table>
-  <tr>
-    <td align="center" width="25%">
-      <img src="docs/assets/readme/message-square.svg" width="32" alt="描述目标" /><br />
-      <strong>描述目标</strong><br />
-      <sub>自然语言、文件或数据</sub>
-    </td>
-    <td align="center" width="25%">
-      <img src="docs/assets/readme/workflow.svg" width="32" alt="自主编排" /><br />
-      <strong>自主编排</strong><br />
-      <sub>模型选择技能与工具</sub>
-    </td>
-    <td align="center" width="25%">
-      <img src="docs/assets/readme/square-terminal.svg" width="32" alt="隔离执行" /><br />
-      <strong>隔离执行</strong><br />
-      <sub>沙箱、浏览器与连接器</sub>
-    </td>
-    <td align="center" width="25%">
-      <img src="docs/assets/readme/shield-check.svg" width="32" alt="交付结果" /><br />
-      <strong>交付结果</strong><br />
-      <sub>产物、审计与评估</sub>
-    </td>
-  </tr>
-</table>
+ 
 
 ## 核心能力
 
@@ -104,9 +74,6 @@ curl -fsS http://localhost:8000/healthz
 
 FastAPI 控制平面负责治理和编排，Worker 执行异步任务，Sandbox / Browser Controller 提供隔离边界，PostgreSQL、Redis 与 S3/MinIO 构成数据平面。
 
-<details>
-<summary><strong>展开架构图</strong></summary>
-
 ```mermaid
 flowchart TB
     User["Builder · Operator · Admin · End User"] --> Web["Web Workspace"]
@@ -137,12 +104,9 @@ flowchart TB
 
 Governance、Runtime 与 Intelligence 是 `apps/api` 内部能力模块，不是独立微服务。
 
-</details>
-
 ## 开发与部署
 
-<details>
-<summary><strong>开发与测试</strong></summary>
+### 开发与测试
 
 ```bash
 pip install -r apps/api/requirements.txt
@@ -156,10 +120,7 @@ cd apps/web
 python3 -m http.server 3000
 ```
 
-</details>
-
-<details>
-<summary><strong>部署入口</strong></summary>
+### 部署入口
 
 | 方式 | 入口 | 场景 |
 | --- | --- | --- |
@@ -170,13 +131,8 @@ python3 -m http.server 3000
 
 生产环境应使用不可变镜像、外部 Secret 和持久化数据服务，并在升级前完成备份。参见[气隙安装](docs/operations/air-gapped-install.md)与[升级回滚](docs/operations/private-upgrade-rollback.md)。
 
-</details>
-
 ## 参与项目
 
 如果 Taroai 对你的 Agent 开发与自动化工作有帮助，欢迎为项目添加 Star。问题、功能建议与兼容性反馈请通过 Issues 提交。
 
-<p align="center">
-  <a href="https://github.com/skygazer42/Taroai"><img alt="GitHub Stars" src="https://img.shields.io/github/stars/skygazer42/Taroai?style=for-the-badge&amp;color=2f6bff" /></a>
-  <a href="https://github.com/skygazer42/Taroai/issues"><img alt="GitHub Issues" src="https://img.shields.io/github/issues/skygazer42/Taroai?style=for-the-badge&amp;color=1f2937" /></a>
-</p>
+

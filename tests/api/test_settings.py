@@ -278,6 +278,7 @@ def test_settings_load_from_env_file(tmp_path: Path):
                 "TAROAI_BROWSER_CONTROLLER_BASE_URL=https://browser.example.com",
                 "TAROAI_BROWSER_CONTROLLER_API_KEY=browser_secret",
                 "TAROAI_BROWSER_CONTROLLER_TIMEOUT_SECONDS=12",
+                'TAROAI_BROWSER_CONTROLLER_NAVIGATION_ALLOWED_HOSTS=["browser.example.com"]',
                 "TAROAI_MODEL_GATEWAY_BASE_URL=https://model.example.com/v1",
                 "TAROAI_MODEL_GATEWAY_API_KEY=test_key",
                 "TAROAI_MODEL_GATEWAY_API_KEY_SECRET_REF_ID=secret_model_key",
@@ -1019,6 +1020,7 @@ def test_readyz_reports_browser_controller_configuration():
             browser_provider="playwright",
             browser_controller_base_url="https://browser-controller.example.com",
             browser_controller_api_key="browser_controller_secret_2026",
+            browser_controller_navigation_allowed_hosts=["browser.example.com"],
             _env_file=None,
         ),
         browser_controller=CapabilityReportingBrowserController(),
@@ -1048,6 +1050,7 @@ def test_readyz_rejects_browser_controller_when_capabilities_fail():
             browser_provider="playwright",
             browser_controller_base_url="https://browser-controller.example.com",
             browser_controller_api_key="browser_controller_secret_2026",
+            browser_controller_navigation_allowed_hosts=["browser.example.com"],
             _env_file=None,
         ),
         browser_controller=FailingCapabilityBrowserController(),
@@ -1056,7 +1059,7 @@ def test_readyz_rejects_browser_controller_when_capabilities_fail():
 
     readiness = client.get("/readyz")
 
-    assert readiness.status_code == 200
+    assert readiness.status_code == 503
     browser = readiness.json()["checks"]["browser"]
     assert browser["configured"] is False
     assert browser["controller_configured"] is True
@@ -1069,6 +1072,7 @@ def test_readyz_reports_missing_browser_controller_api_key():
         settings=Settings(
             browser_provider="playwright",
             browser_controller_base_url="https://browser-controller.example.com",
+            browser_controller_navigation_allowed_hosts=["browser.example.com"],
             _env_file=None,
         )
     )
@@ -1076,7 +1080,7 @@ def test_readyz_reports_missing_browser_controller_api_key():
 
     readiness = client.get("/readyz")
 
-    assert readiness.status_code == 200
+    assert readiness.status_code == 503
     assert readiness.json()["checks"]["browser"] == {
         "configured": False,
         "provider": "playwright",

@@ -5,12 +5,15 @@ import hmac
 import json
 import secrets
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import AsyncIterator, Iterable, Iterator
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from html import escape
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 from urllib.parse import urlencode
+
+import anyio.to_thread
 
 from fastapi import (
     BackgroundTasks,
@@ -189,6 +192,7 @@ from taroai.domain import (
     new_id,
     utc_now,
 )
+from taroai.event_stream import ThreadEventHub
 from taroai.embeddings import (
     EmbeddingGateway,
     EmbeddingGatewayRequest,
@@ -357,6 +361,10 @@ from taroai.sandbox.tools import (
     register_sandbox_tool_handlers,
 )
 from taroai.web_search import register_web_search_tool_handler
+from taroai.observation_read import (
+    OBSERVATION_READ_TOOL,
+    register_observation_read_tool_handler,
+)
 from taroai.ui_render import UI_RENDER_TOOL, register_ui_render_tool_handler
 from taroai.scim import (
     InMemoryScimProvisioningStore,
@@ -483,7 +491,7 @@ from taroai.workers import (
     RestoreDrillExecutionJob,
     RunExecutionJob,
 )
-from taroai.workflow import WorkflowCoordinator
+from taroai.workflow import WorkflowCoordinator, WorkflowPreviewUpdate
 
 
 SANDBOX_SECRET_RESOLVER_TOKEN_HEADER = "X-Sandbox-Resolver-Token"
@@ -1556,6 +1564,17 @@ def create_app(
         allow_headers=["*"],
     )
     app.state.store = store or build_control_plane_store(resolved_settings)
+    app.state.thread_event_hub = ThreadEventHub()
+    app.state.store.event_notifier = app.state.thread_event_hub.notify
+
+    async def bind_thread_event_hub_loop() -> None:
+        app.state.thread_event_hub.bind_running_loop()
+
+    def unbind_thread_event_hub_loop() -> None:
+        app.state.thread_event_hub.unbind_loop()
+
+    app.add_event_handler("startup", bind_thread_event_hub_loop)
+    app.add_event_handler("shutdown", unbind_thread_event_hub_loop)
     app.state.knowledge_service = knowledge_service or build_knowledge_service(
         resolved_settings
     )
@@ -1873,6 +1892,7 @@ def create_app(
     register_skill_tool_handlers(tool_gateway, app.state.skill_service)
     register_agent_tool_handlers(tool_gateway, app.state.agent_registry_service)
     register_ui_render_tool_handler(tool_gateway, app.state.store)
+    register_observation_read_tool_handler(tool_gateway, app.state.store)
     app.state.runtime = apply_agent_runtime_settings(
         runtime
         or AgentRuntime(
@@ -1936,6 +1956,10 @@ def create_app(
         app.state.runtime.coding_workspace_service = app.state.coding_workspace_service
     if not app.state.runtime.tool_gateway.can_execute_tool(UI_RENDER_TOOL):
         register_ui_render_tool_handler(app.state.runtime.tool_gateway, app.state.store)
+    if not app.state.runtime.tool_gateway.can_execute_tool(OBSERVATION_READ_TOOL):
+        register_observation_read_tool_handler(
+            app.state.runtime.tool_gateway, app.state.store
+        )
     app.state.workflow_coordinator = WorkflowCoordinator(
         store=app.state.store, runtime=app.state.runtime
     )
@@ -2887,7 +2911,7 @@ def create_app(
         return dispatch.model_dump(mode="json")
 
     @app.get("/api/threads/{thread_id}/events")
-    def get_chat_thread_events(
+    async def get_chat_thread_events(
         thread_id: str,
         after_sequence: int | None = None,
         follow: bool = False,
@@ -2897,18 +2921,27 @@ def create_app(
         replay_after_sequence = resolve_event_replay_sequence(
             after_sequence, last_event_id
         )
+        hub: ThreadEventHub = app.state.thread_event_hub
+        # The startup hook binds the loop; rebinding here also covers callers
+        # that never ran the lifespan (e.g. a TestClient used without a
+        # context manager).
+        hub.bind_running_loop()
 
-        def stream() -> Iterator[str]:
+        async def stream() -> AsyncIterator[str]:
             cursor = replay_after_sequence or 0
             deadline = time.monotonic() + app.state.settings.event_stream_follow_seconds
             next_heartbeat = (
                 time.monotonic() + app.state.settings.event_stream_heartbeat_seconds
             )
+            notified = False
             while True:
-                events = app.state.store.list_thread_events(
-                    context.tenant_id,
-                    thread_id,
-                    after_sequence=cursor,
+                events = await anyio.to_thread.run_sync(
+                    partial(
+                        app.state.store.list_thread_events,
+                        context.tenant_id,
+                        thread_id,
+                        after_sequence=cursor,
+                    )
                 )
                 for event in events:
                     cursor = event.thread_sequence or cursor
@@ -2926,7 +2959,13 @@ def create_app(
                     next_heartbeat = (
                         now + app.state.settings.event_stream_heartbeat_seconds
                     )
-                time.sleep(min(0.25, deadline - now, next_heartbeat - now))
+                timeout = min(deadline - now, next_heartbeat - now)
+                if notified and not events:
+                    # A notification can fire just before the writer's
+                    # transaction commits; re-check shortly instead of
+                    # waiting a full heartbeat interval.
+                    timeout = min(timeout, 0.25)
+                notified = await hub.wait(thread_id, timeout=timeout)
 
         return StreamingResponse(
             stream(),
@@ -4042,7 +4081,10 @@ def create_app(
     ) -> dict[str, Any]:
         request_payload = payload or AgentExtractRequest()
         return app.state.agent_registry_service.extract(
-            context.tenant_id, thread_id, request_payload.name
+            context.tenant_id,
+            thread_id,
+            request_payload.name,
+            compile_playbook=request_payload.compile_playbook,
         ).model_dump(mode="json")
 
     @app.post("/api/agents/{agent_id}/versions", status_code=status.HTTP_201_CREATED)
@@ -6100,6 +6142,108 @@ def create_app(
                     context.tenant_id, workflow.id
                 )
             ],
+        }
+
+    @app.patch("/api/workflows/{workflow_id}/preview")
+    def update_workflow_preview(
+        workflow_id: str,
+        payload: WorkflowPreviewUpdate,
+        context: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        spec = payload.spec
+        workflow = app.state.store.get_workflow(context.tenant_id, workflow_id)
+        if workflow.status != "awaiting_approval":
+            raise HTTPException(
+                status_code=409,
+                detail="Only a pending workflow preview can be edited",
+            )
+        tasks = app.state.store.list_workflow_tasks(
+            context.tenant_id, workflow.id
+        )
+        if any(task.status != "pending" for task in tasks):
+            raise HTTPException(
+                status_code=409,
+                detail="Workflow tasks have already started",
+            )
+        current_phases = {
+            task.id: phase.id
+            for phase in workflow.spec.phases
+            for task in phase.tasks
+        }
+        revised_phases = {
+            task.id: phase.id for phase in spec.phases for task in phase.tasks
+        }
+        if revised_phases != current_phases:
+            raise HTTPException(
+                status_code=409,
+                detail="Preview edits cannot add, remove, or move workflow tasks",
+            )
+
+        updated = app.state.store.update_workflow(
+            context.tenant_id,
+            workflow.id,
+            spec=spec,
+        )
+        app.state.store.cancel_pending_approval_requests(
+            context.tenant_id,
+            workflow.parent_run_id,
+            context.user_id,
+        )
+        approval = app.state.store.create_approval_request(
+            context.tenant_id,
+            workflow.parent_run_id,
+            f"workflow:{workflow.id}",
+            f"Approve workflow: {len(revised_phases)} steps",
+            kind="workflow",
+            subject_type="workflow",
+            subject_id=workflow.id,
+            preview_payload=spec.model_dump(mode="json", by_alias=True),
+            validation_payload={"valid": True},
+        )
+        updated = app.state.store.update_workflow(
+            context.tenant_id,
+            workflow.id,
+            approval_id=approval.id,
+        )
+        state = app.state.runtime._load_state(
+            context.tenant_id, workflow.parent_run_id
+        )
+        state.approval_id = approval.id
+        app.state.runtime._save_state(state)
+        parent_run = app.state.store.get_run(
+            context.tenant_id, workflow.parent_run_id
+        )
+        app.state.store.append_run_event(
+            parent_run,
+            "workflow_preview",
+            {
+                "workflowId": workflow.id,
+                "previewId": workflow.id,
+                "status": "pending",
+                "spec": spec.model_dump(mode="json", by_alias=True),
+            },
+        )
+        app.state.store.append_run_event(
+            parent_run,
+            "workflow.preview_updated",
+            {"workflowId": workflow.id, "approvalId": approval.id},
+        )
+        record_audit_event(
+            app,
+            tenant_id=context.tenant_id,
+            workspace_id=workflow.workspace_id,
+            user_id=context.user_id,
+            run_id=workflow.parent_run_id,
+            event_type="workflow.preview_updated",
+            metadata={
+                "workflow_id": workflow.id,
+                "approval_id": approval.id,
+                "task_count": len(revised_phases),
+            },
+        )
+        return {
+            "workflow": updated.model_dump(mode="json", by_alias=True),
+            "approval_id": approval.id,
         }
 
     @app.post("/api/workflows/{workflow_id}/pause")

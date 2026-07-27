@@ -1,5 +1,6 @@
 import hmac
 import json
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from threading import RLock
 from typing import TYPE_CHECKING, Any
@@ -127,6 +128,7 @@ class InMemoryControlPlaneStore(BaseModel):
     tenant_names: dict[str, str] = Field(default_factory=dict)
     tenant_invitations: dict[str, Any] = Field(default_factory=dict)
     user_tenants: dict[str, str] = Field(default_factory=dict)
+    event_notifier: Callable[[str], None] | None = Field(default=None, exclude=True)
     _repository_lock: RLock = PrivateAttr(default_factory=RLock)
 
     def register_workspace(
@@ -1327,13 +1329,31 @@ class InMemoryControlPlaneStore(BaseModel):
     ) -> list[RunEvent]:
         with self._repository_lock:
             self.get_run(tenant_id, run_id)
-            events = [
+            return [
                 event.model_copy(deep=True)
                 for event in self.run_events.get(run_id, [])
+                if after_sequence is None or event.sequence > after_sequence
             ]
-            if after_sequence is None:
-                return events
-            return [event for event in events if event.sequence > after_sequence]
+
+    def run_event_exists(
+        self,
+        tenant_id: str,
+        run_id: str,
+        event_type: str,
+        payload_key: str | None = None,
+        payload_value: Any = None,
+    ) -> bool:
+        with self._repository_lock:
+            self.get_run(tenant_id, run_id)
+            for event in self.run_events.get(run_id, []):
+                if event.type != event_type:
+                    continue
+                if (
+                    payload_key is None
+                    or event.payload.get(payload_key) == payload_value
+                ):
+                    return True
+            return False
 
     def list_thread_events(
         self,
@@ -1343,24 +1363,22 @@ class InMemoryControlPlaneStore(BaseModel):
     ) -> list[RunEvent]:
         with self._repository_lock:
             self.get_chat_thread(tenant_id, thread_id)
-            events = sorted(
-                [
-                    event.model_copy(deep=True)
+            matched = sorted(
+                (
+                    event
                     for run_events in self.run_events.values()
                     for event in run_events
                     if event.tenant_id == tenant_id
                     and event.thread_id == thread_id
                     and event.thread_sequence is not None
-                ],
+                    and (
+                        after_sequence is None
+                        or event.thread_sequence > after_sequence
+                    )
+                ),
                 key=lambda event: (event.thread_sequence or 0, event.id),
             )
-            if after_sequence is None:
-                return events
-            return [
-                event
-                for event in events
-                if (event.thread_sequence or 0) > after_sequence
-            ]
+            return [event.model_copy(deep=True) for event in matched]
 
     def update_run_status(
         self,
@@ -1369,25 +1387,28 @@ class InMemoryControlPlaneStore(BaseModel):
         status: RunStatus,
         emit_status_event: bool = True,
     ) -> Run:
-        run = self.get_run(tenant_id, run_id)
-        updated_run = run.model_copy(update={"status": status, "updated_at": utc_now()})
-        self.runs[run_id] = updated_run
-        if emit_status_event:
-            self.append_run_event(
-                updated_run,
-                "run.status_changed",
-                {"status": status.value},
+        with self._repository_lock:
+            run = self.get_run(tenant_id, run_id)
+            updated_run = run.model_copy(
+                update={"status": status, "updated_at": utc_now()}
             )
-        is_workflow_task = bool(
-            run.trigger_message_id
-            and self.get_chat_message(tenant_id, run.trigger_message_id).kind
-            == "workflow_task"
-        )
-        if run.status != status and not is_workflow_task:
-            notification = notification_for_agent_run_status(updated_run, status)
-            if notification is not None:
-                self.notifications[notification.id] = notification
-        return updated_run
+            self.runs[run_id] = updated_run
+            if emit_status_event:
+                self.append_run_event(
+                    updated_run,
+                    "run.status_changed",
+                    {"status": status.value},
+                )
+            is_workflow_task = bool(
+                run.trigger_message_id
+                and self.get_chat_message(tenant_id, run.trigger_message_id).kind
+                == "workflow_task"
+            )
+            if run.status != status and not is_workflow_task:
+                notification = notification_for_agent_run_status(updated_run, status)
+                if notification is not None:
+                    self.notifications[notification.id] = notification
+            return updated_run
 
     def list_notifications(
         self, tenant_id: str, user_id: str, limit: int = 50
@@ -1938,6 +1959,15 @@ class InMemoryControlPlaneStore(BaseModel):
     def list_billing_meters(self, tenant_id: str) -> list[BillingMeterEvent]:
         return list(self.billing_meters.get(tenant_id, []))
 
+    def sum_run_billing_cost(self, tenant_id: str, run_id: str) -> float:
+        return float(
+            sum(
+                meter.cost_estimate or 0
+                for meter in self.billing_meters.get(tenant_id, [])
+                if meter.run_id == run_id
+            )
+        )
+
     def list_audit_events(self, tenant_id: str) -> list[AuditEvent]:
         return list(self.audit_events.get(tenant_id, []))
 
@@ -2038,7 +2068,19 @@ class InMemoryControlPlaneStore(BaseModel):
                 thread_sequence=thread_sequence,
             )
             self.run_events.setdefault(run.id, []).append(event)
+        self._notify_thread_event(event)
         return event
+
+    def _notify_thread_event(self, event: RunEvent) -> None:
+        notifier = self.event_notifier
+        if notifier is None or event.thread_id is None:
+            return
+        try:
+            notifier(event.thread_id)
+        except Exception:
+            # Notification is best-effort; the write must never fail because
+            # a listener misbehaved.
+            pass
 
     def _idempotency_record_key(
         self,
